@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (workspace, all features, exclude bulletproofs-cycle)
+        run: cargo clippy --all --benches --tests --examples --all-features --exclude bulletproofs-cycle -- -D warnings
+      - name: Clippy bulletproofs-cycle (cycle-pedersen default)
+        run: cargo clippy -p bulletproofs-cycle --benches --tests -- -D warnings
+      - name: Clippy bulletproofs-cycle (bulletproofs-compat)
+        run: cargo clippy -p bulletproofs-cycle --benches --tests --no-default-features --features bulletproofs-compat -- -D warnings
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace
+        run: cargo check --all-targets --workspace
+      - name: Check golden-core without default features
+        run: cargo check -p golden-core --no-default-features
+      - name: golden-core dependency boundary
+        run: |
+          cargo tree -p golden-core > /tmp/golden-core-tree.txt
+          ! grep -E '(^|[[:space:]])(p256|k256|ark-|bls|frost|pairing)' /tmp/golden-core-tree.txt
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Test golden-core
+        run: cargo nextest run -p golden-core
+      - name: Test P-256 backend
+        run: cargo nextest run -p golden-rustcrypto --features p256
+      - name: Test K-256 backend
+        run: cargo nextest run -p golden-rustcrypto --features k256
+      - name: Test eVRF proof backend
+        run: cargo nextest run -p golden-evrf --features golden-rustcrypto/p256
+      - name: Test Secp/Secq R1CS cycle
+        run: cargo nextest run -p golden-halo2curves --features halo2curves-secp256k1
+      - name: Test Ristretto Cycle impl and upstream byte parity
+        run: cargo nextest run -p bulletproofs-cycle --features ristretto
+      - name: Test bulletproofs-compat (upstream domain separation)
+        run: cargo nextest run -p bulletproofs-cycle --no-default-features --features bulletproofs-compat
+      - name: Test golden-evrf Secp/Secq backend
+        run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1
+      - name: Test workspace feature combination
+        run: cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1
+      - name: Doctests
+        run: cargo test --workspace --doc
+
+  doc:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build documentation
+        run: cargo doc --no-deps --workspace --all-features

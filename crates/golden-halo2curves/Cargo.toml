@@ -1,0 +1,28 @@
+[package]
+name = "golden-halo2curves"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bulletproofs-cycle = { workspace = true }
+ff = { workspace = true }
+golden-core = { workspace = true }
+group = { workspace = true }
+halo2curves = { workspace = true, features = ["std"] }
+rand_core = { workspace = true }
+subtle = { workspace = true }
+
+[dev-dependencies]
+merlin = { workspace = true }
+rand_chacha = { workspace = true }
+
+[features]
+default = []
+halo2curves-secp256k1 = []
+
+[lints]
+workspace = true
