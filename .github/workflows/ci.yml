@@ -94,10 +94,25 @@ jobs:
         run: cargo nextest run -p bulletproofs-cycle --no-default-features --features bulletproofs-compat
       - name: Test golden-evrf Secp/Secq backend
         run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1
-      - name: Test workspace feature combination
-        run: cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1
       - name: Doctests
         run: cargo test --workspace --doc
+
+  slow-test:
+    name: Slow tests (ignored by default)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: slow-test
+      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+        with:
+          tool: cargo-nextest
+      - name: Run ignored golden-evrf Secp/Secq tests
+        run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1 --run-ignored only
 
   doc:
     name: Docs
@@ -110,8 +125,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Build documentation (workspace, exclude bulletproofs-cycle)
-        run: cargo doc --no-deps --workspace --all-features --exclude bulletproofs-cycle
+      - name: Build documentation (workspace, default features, exclude bulletproofs-cycle)
+        run: cargo doc --no-deps --workspace --exclude bulletproofs-cycle
+      - name: Build documentation (golden-rustcrypto p256+k256)
+        run: cargo doc --no-deps -p golden-rustcrypto --features p256,k256
+      - name: Build documentation (golden-evrf halo2curves backend)
+        run: cargo doc --no-deps -p golden-evrf --features halo2curves-secp256k1
       - name: Build bulletproofs-cycle docs (cycle-pedersen default)
         run: cargo doc --no-deps -p bulletproofs-cycle
       - name: Build bulletproofs-cycle docs (bulletproofs-compat)

@@ -122,23 +122,56 @@ macro_rules! impl_cycle {
             }
 
             fn vartime_msm(scalars: &[Self::Scalar], points: &[Self::Point]) -> Self::Point {
-                let mut acc = Self::Point::identity();
-                for (s, p) in scalars.iter().zip(points.iter()) {
-                    acc += *p * *s;
+                // Use halo2curves' Pippenger MSM (msm_best) instead of a naive
+                // acc += p*s loop. The conversion to affine is O(n) inversions
+                // but pays for itself many times over on every Bulletproofs
+                // prove/verify, where each MSM is over thousands of points.
+                //
+                // Drop (scalar, point) pairs whose point is the identity before
+                // handing to msm_best: Pippenger's bucket logic doesn't handle
+                // the point-at-infinity affine representation, and an identity
+                // point contributes nothing to the sum anyway.
+                use group::Group;
+                use halo2curves::msm::msm_best;
+
+                type Affine = <$curve as halo2curves::CurveExt>::AffineExt;
+                let identity = <Self::Point as Group>::identity();
+                let filtered: Vec<_> = scalars
+                    .iter()
+                    .zip(points.iter())
+                    .filter(|(_, p)| **p != identity)
+                    .collect();
+                if filtered.is_empty() {
+                    return identity;
                 }
-                acc
+                let scalars: Vec<_> = filtered.iter().map(|(s, _)| **s).collect();
+                let bases: Vec<Affine> = filtered.iter().map(|(_, p)| (**p).into()).collect();
+                msm_best::<Affine>(&scalars, &bases)
             }
 
             fn vartime_msm_optional(
                 scalars: &[Self::Scalar],
                 points: &[Option<Self::Point>],
             ) -> Option<Self::Point> {
-                let mut acc = Self::Point::identity();
-                for (s, p) in scalars.iter().zip(points.iter()) {
-                    let p = (*p)?;
-                    acc += p * *s;
+                use group::Group;
+                use halo2curves::msm::msm_best;
+
+                type Affine = <$curve as halo2curves::CurveExt>::AffineExt;
+                let identity = <Self::Point as Group>::identity();
+                let filtered: Vec<_> = scalars
+                    .iter()
+                    .zip(points.iter())
+                    .filter(|(_, p)| **p != Some(identity))
+                    .collect();
+                if filtered.is_empty() {
+                    return Some(identity);
                 }
-                Some(acc)
+                let scalars: Vec<_> = filtered.iter().map(|(s, _)| **s).collect();
+                let bases: Vec<Affine> = filtered
+                    .iter()
+                    .map(|(_, p)| (*p).map(|proj| proj.into()))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(msm_best::<Affine>(&scalars, &bases))
             }
         }
     };

@@ -790,6 +790,27 @@ pub mod secp_secq {
     /// Total 1793, padded to 8192 for the inner-product layer.
     const R1CS_GENS_CAPACITY: usize = 8192;
 
+    /// Process-wide cache for the single-receiver `BulletproofGens`.
+    ///
+    /// Construction is 16 384 SHAKE256→Secq256k1 hash-to-curves (~7.5 s on a
+    /// fast machine, longer on CI) and is deterministic in the cycle type, so
+    /// it is computed once per process via `OnceLock` and shared across every
+    /// `evrf_prove` / `evrf_verify` call. Batched paths with a different
+    /// capacity still construct their own gens.
+    fn shared_bp_gens() -> &'static BulletproofGens<R1csCycle> {
+        static GEN: std::sync::OnceLock<BulletproofGens<R1csCycle>> = std::sync::OnceLock::new();
+        GEN.get_or_init(|| BulletproofGens::new(R1CS_GENS_CAPACITY, 1))
+    }
+
+    /// Process-wide cache for the single-receiver `PedersenGens`.
+    ///
+    /// Cheap to build (two points) but constructed identically on every call,
+    /// so it is cached for uniformity with [`shared_bp_gens`].
+    fn shared_pc_gens() -> &'static PedersenGens<R1csCycle> {
+        static GEN: std::sync::OnceLock<PedersenGens<R1csCycle>> = std::sync::OnceLock::new();
+        GEN.get_or_init(PedersenGens::default)
+    }
+
     /// Random-oracle domain tag for `H_{G_in,1}`.
     const H_GIN_1_DOMAIN: &str = "golden-paper-evrf-H-Gin-1-v1";
     /// Random-oracle domain tag for `H_{G_in,2}`.
@@ -943,12 +964,12 @@ pub mod secp_secq {
         }
 
         // Build the R1CS proof.
-        let pc_gens = PedersenGens::<R1csCycle>::default();
-        let bp_gens = BulletproofGens::<R1csCycle>::new(R1CS_GENS_CAPACITY, 1);
+        let pc_gens = shared_pc_gens();
+        let bp_gens = shared_bp_gens();
         let k_blinding = random_scalar::<R1csCycle>(rng);
         let r_blinding = R1csField::ONE; // fixed for prefix link
 
-        let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+        let mut prover = Prover::<R1csCycle, _>::new(pc_gens, Transcript::new(PROOF_DOMAIN));
         let (v_k, var_k) = prover.commit(k, k_blinding);
         let (v_r, var_r) = prover.commit(r, r_blinding);
         build_one_receiver_r1cs(
@@ -970,7 +991,7 @@ pub mod secp_secq {
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
         let r1cs_proof = prover
-            .prove(&bp_gens, rng)
+            .prove(bp_gens, rng)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
         // Step 0, 1: Chaum-Pedersen proof.
@@ -1004,8 +1025,8 @@ pub mod secp_secq {
         let g_in = Gin::generator();
         let g_s = g_in;
         let g_out = Secq256k1::generator();
-        let pc_gens = PedersenGens::<R1csCycle>::default();
-        let bp_gens = BulletproofGens::<R1csCycle>::new(R1CS_GENS_CAPACITY, 1);
+        let pc_gens = shared_pc_gens();
+        let bp_gens = shared_bp_gens();
 
         // Step 0, 1: verify Chaum-Pedersen proof.
         chaum_pedersen_verify(
@@ -1066,7 +1087,7 @@ pub mod secp_secq {
         .map_err(|_| Error::ProofVerificationFailed)?;
 
         verifier
-            .verify(&proof.r1cs, &pc_gens, &bp_gens, rng)
+            .verify(&proof.r1cs, pc_gens, bp_gens, rng)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
         // Step 9: verify DLOG PoK.
@@ -2947,6 +2968,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn evrf_batched_dealer_honest_proof_verifies() {
             let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C1);
             let sk1 = GinScalar::random(&mut rng);
@@ -2961,6 +2983,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn evrf_batched_dealer_rejects_wrong_receiver_pk() {
             let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C2);
             let sk1 = GinScalar::random(&mut rng);
@@ -2983,6 +3006,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn evrf_batched_dealer_rejects_reordered_receivers() {
             let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C3);
             let sk1 = GinScalar::random(&mut rng);
@@ -3005,6 +3029,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn evrf_batched_dealer_rejects_missing_receiver() {
             let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C4);
             let sk1 = GinScalar::random(&mut rng);
@@ -3027,6 +3052,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn evrf_batched_dealer_rejects_wrong_beta() {
             let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C5);
             let sk1 = GinScalar::random(&mut rng);
@@ -3047,6 +3073,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn evrf_batched_dealer_rejects_wrong_r() {
             let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C6);
             let sk1 = GinScalar::random(&mut rng);
@@ -3069,6 +3096,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn evrf_batched_dealer_rejects_wrong_msg() {
             let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C7);
             let sk1 = GinScalar::random(&mut rng);
@@ -3091,6 +3119,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn evrf_batched_dealer_rejects_proof_replay_across_dealer_keys() {
             let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C8);
             let sk1 = GinScalar::random(&mut rng);
@@ -3113,6 +3142,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn evrf_batched_dealer_four_receivers_verifies() {
             // Regression for generator sizing: a 4-receiver batch needs more
             // than R1CS_GENS_CAPACITY generators, so the capacity helper must
@@ -3174,6 +3204,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn dkg_completes_with_batched_evrf_backend() {
             let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
             let config = config();
@@ -3338,6 +3369,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn dkg_rejects_tampered_pad_commitment() {
             assert_dealing_rejected(|msg| {
                 let receiver = idx(2);
@@ -3347,6 +3379,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn dkg_rejects_tampered_dh_commitment() {
             assert_dealing_rejected(|msg| {
                 let receiver = idx(2);
@@ -3356,6 +3389,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn dkg_rejects_tampered_encrypted_share() {
             assert_dealing_rejected(|msg| {
                 let receiver = idx(2);
@@ -3365,6 +3399,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn dkg_rejects_tampered_share_commitment() {
             assert_dealing_rejected(|msg| {
                 // Replace the Feldman commitment with one whose top coefficient
@@ -3377,6 +3412,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn dkg_rejects_tampered_transcript_root() {
             assert_dealing_rejected(|msg| {
                 msg.transcript_root[0] ^= 0x01;
@@ -3384,6 +3420,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn dkg_rejects_tampered_proof_bytes() {
             assert_dealing_rejected(|msg| {
                 if msg.proof.0.is_empty() {
@@ -3394,6 +3431,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn dkg_rejects_swapped_encrypted_shares() {
             let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
             let config = config();
@@ -3433,6 +3471,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn dkg_rejects_missing_encrypted_share() {
             assert_dealing_rejected(|msg| {
                 msg.encrypted_shares.remove(&idx(3));
@@ -3440,6 +3479,7 @@ pub mod secp_secq {
         }
 
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn dkg_rejects_extra_self_receiver() {
             let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
             let config = config();
@@ -3479,6 +3519,7 @@ pub mod secp_secq {
         /// transcript-root check by invoking the backend directly with a
         /// tampered statement, isolating the pad-commitment binding.
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn backend_rejects_pad_commitment_not_opened_by_proof_pad() {
             let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
             let config = config();
@@ -3507,6 +3548,7 @@ pub mod secp_secq {
         /// Symmetric to the above: tamper with `dh_commitment` so it no longer
         /// equals `PK_j^pad` for the proof's pad.
         #[test]
+        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
         fn backend_rejects_dh_commitment_not_opened_by_proof_pad() {
             let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
             let config = config();
