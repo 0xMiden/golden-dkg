@@ -3196,11 +3196,8 @@ pub mod secp_secq {
                 .collect();
 
             for dealing in dealings.values() {
-                verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                    &dealing.message,
-                    &config,
-                )
-                .unwrap();
+                verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config)
+                    .unwrap();
             }
 
             let receiver = idx(2);
@@ -3284,10 +3281,8 @@ pub mod secp_secq {
             verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config)
                 .unwrap();
             tamper(&mut dealing.message);
-            let result = verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                &dealing.message,
-                &config,
-            );
+            let result =
+                verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config);
             assert!(
                 result.is_err(),
                 "tampered dealing must be rejected, got {result:?}"
@@ -3429,10 +3424,8 @@ pub mod secp_secq {
                 .unwrap();
             dealing.message.encrypted_shares.insert(idx(2), b);
             dealing.message.encrypted_shares.insert(idx(3), a);
-            let result = verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                &dealing.message,
-                &config,
-            );
+            let result =
+                verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config);
             assert!(
                 result.is_err(),
                 "swapped encrypted shares must be rejected, got {result:?}"
@@ -3472,10 +3465,8 @@ pub mod secp_secq {
                 .unwrap();
             dealing.message.encrypted_shares.insert(dealer, placeholder);
             dealing.message.transcript_root = dealing.message.recompute_transcript_root();
-            let result = verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                &dealing.message,
-                &config,
-            );
+            let result =
+                verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config);
             assert!(
                 matches!(result, Err(golden_core::Error::UnexpectedShare(d)) if d == dealer.get()),
                 "self-receiver must be rejected with UnexpectedShare({}), got {result:?}",

@@ -1,6 +1,6 @@
 //! Linear proof, a lightweight variant of the Bulletproofs inner-product
 //! argument. Ported from `bulletproofs 5.0.0/src/linear_proof.rs` and
-//! cycle-abstracted over [`Cycle`](crate::cycle::Cycle).
+//! cycle-abstracted over [`Cycle`].
 //!
 //! Proves `<a, b> = c` where `a` is secret and `b` is public.
 //! Protocol: Section E.3 of [GHL'21](https://eprint.iacr.org/2021/1397.pdf).

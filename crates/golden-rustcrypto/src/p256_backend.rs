@@ -162,7 +162,7 @@ impl ConstantTimeEq for P256Element {
 /// P-256 backend marker.
 ///
 /// Empty enum, used as the concrete `Self` for `impl GoldenGroup for
-/// P256Backend`. See [`K256Backend`] for the rationale; the same applies
+/// P256Backend`. See [`crate::K256Backend`] for the rationale; the same applies
 /// here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum P256Backend {}

@@ -23,7 +23,7 @@
 //!
 //! ## Upstream byte parity (Ristretto)
 //!
-//! Behind the `ristretto` feature, the [`ristretto_cycle::RistrettoCycle`]
+//! Behind the `ristretto` feature, the `ristretto_cycle::RistrettoCycle`
 //! impl wires the [`Cycle`] trait to `curve25519-dalek` 4.x. The test suite at
 //! `tests/ristretto_parity.rs` pins that our `BulletproofGens` G generators
 //! and our `LinearProof::create` output reproduce `zkcrypto/bulletproofs`

@@ -21,10 +21,10 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt
       - name: Check formatting
@@ -34,13 +34,13 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Clippy (workspace, all features, exclude bulletproofs-cycle)
         run: cargo clippy --all --benches --tests --examples --all-features --exclude bulletproofs-cycle -- -D warnings
       - name: Clippy bulletproofs-cycle (cycle-pedersen default)
@@ -52,11 +52,11 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Check workspace
         run: cargo check --all-targets --workspace
       - name: Check golden-core without default features
@@ -70,12 +70,12 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
         with:
           tool: cargo-nextest
       - name: Test golden-core
@@ -105,10 +105,14 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build documentation
-        run: cargo doc --no-deps --workspace --all-features
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build documentation (workspace, exclude bulletproofs-cycle)
+        run: cargo doc --no-deps --workspace --all-features --exclude bulletproofs-cycle
+      - name: Build bulletproofs-cycle docs (cycle-pedersen default)
+        run: cargo doc --no-deps -p bulletproofs-cycle
+      - name: Build bulletproofs-cycle docs (bulletproofs-compat)
+        run: cargo doc --no-deps -p bulletproofs-cycle --no-default-features --features bulletproofs-compat

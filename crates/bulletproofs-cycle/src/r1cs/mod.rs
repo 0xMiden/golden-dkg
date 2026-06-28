@@ -1,4 +1,4 @@
-//! R1CS constraint-system proof path, generic over a [`Cycle`].
+//! R1CS constraint-system proof path, generic over a [`crate::cycle::Cycle`].
 
 mod constraint_system;
 mod linear_combination;
