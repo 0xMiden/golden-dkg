@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read # CodeQL upload-sarif telemetry calls GET /actions/runs/{run_id}
       security-events: write # upload SARIF to the repo's code-scanning view
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

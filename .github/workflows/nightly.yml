@@ -1,0 +1,31 @@
+name: Nightly slow tests
+
+on:
+  schedule:
+    - cron: "17 9 * * *" # 09:17 UTC daily; off the :00 mark to spread load
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  slow-test:
+    name: Run #[ignore] slow tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: slow-test
+      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+        with:
+          tool: cargo-nextest
+      - name: Run ignored golden-evrf Secp/Secq tests
+        run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1 --run-ignored only
