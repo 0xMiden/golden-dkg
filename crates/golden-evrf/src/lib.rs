@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 pub mod paper;
 
 /// Curve-agnostic Schnorr/Chaum-Pedersen backend for DKG share/pad/DH
-/// openings. Not the Golden eVRF proof; see [`paper`](crate::paper) for that.
+/// openings. Not the Golden eVRF proof; see [`paper`] for that.
 pub mod prototype {
     use super::*;
 

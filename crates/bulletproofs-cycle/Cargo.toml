@@ -30,5 +30,13 @@ cycle-pedersen = []
 bulletproofs-compat = ["ristretto", "curve25519-dalek/digest"]
 ristretto = ["dep:curve25519-dalek", "curve25519-dalek/group", "curve25519-dalek/rand_core", "curve25519-dalek/alloc"]
 
+[[test]]
+name = "ristretto_smoke"
+required-features = ["cycle-pedersen", "ristretto"]
+
+[[test]]
+name = "ristretto_parity"
+required-features = ["cycle-pedersen", "ristretto"]
+
 [lints]
 workspace = true

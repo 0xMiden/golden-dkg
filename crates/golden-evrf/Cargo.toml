@@ -37,5 +37,17 @@ halo2curves-secp256k1 = [
     "golden-halo2curves/halo2curves-secp256k1",
 ]
 
+[[test]]
+name = "one_receiver"
+required-features = ["halo2curves-secp256k1"]
+
+[[test]]
+name = "batched_dealer"
+required-features = ["halo2curves-secp256k1"]
+
+[[test]]
+name = "dkg_integration"
+required-features = ["halo2curves-secp256k1"]
+
 [lints]
 workspace = true
