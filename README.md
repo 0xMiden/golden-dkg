@@ -1,6 +1,6 @@
 # Golden DKG
 
-[![CI](https://github.com/huitseeker/golden-dkg/actions/workflows/ci.yml/badge.svg)](https://github.com/huitseeker/golden-dkg/actions/workflows/ci.yml)
+[![CI](https://github.com/0xMiden/golden-dkg/actions/workflows/ci.yml/badge.svg)](https://github.com/0xMiden/golden-dkg/actions/workflows/ci.yml)
 
 Rust workspace for distributed key generation and verifiable randomness over a
 generic group abstraction. The long-term goal is a paper-aligned Golden DKG
