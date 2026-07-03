@@ -20,6 +20,7 @@ merlin = { workspace = true, optional = true }
 rand_chacha = { workspace = true, optional = true }
 
 [dev-dependencies]
+ff = { workspace = true }
 golden-rustcrypto = { path = "../golden-rustcrypto", features = ["p256"] }
 rand_chacha = { workspace = true }
 

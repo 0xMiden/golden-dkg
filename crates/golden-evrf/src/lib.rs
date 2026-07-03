@@ -1,15 +1,17 @@
 //! Public-verification proof backends for Golden DKG.
 //!
-//! The current non-paper backend is exposed under [`prototype`]. It is a
-//! generic Schnorr/Chaum-Pedersen proof for the scalar opening of each public
-//! share commitment and pad/DH commitment. It makes the proof boundary real and
-//! transcript-bound, but it is not the Golden eVRF proof from the paper.
+//! [`paper`] is the Golden eVRF backend from the 2024 paper, built on the
+//! Secp256k1/Secq256k1 curve cycle via `bulletproofs-cycle` and
+//! `golden-halo2curves`. It is feature-gated on `halo2curves-secp256k1`
+//! and verifies end-to-end. When the feature is off, `prove_batch` and
+//! `verify_batch` return `Error::ProofVerificationFailed` so a misconfigured
+//! caller fails closed instead of silently skipping the proof.
 //!
-//! [`paper`] is the in-progress Golden eVRF backend built on the Secp/Secq
-//! curve cycle via `bulletproofs-cycle` and `golden-halo2curves`. It is
-//! feature-gated on `halo2curves-secp256k1` and is the target backend once
-//! it verifies end-to-end. Until then it is fail-closed: `prove_batch`
-//! returns `Error::ProofVerificationFailed` unless the feature is on.
+//! [`prototype`] is a lighter Schnorr/Chaum-Pedersen backend that proves the
+//! scalar opening of each public share commitment and pad/DH commitment.
+//! It is not the Golden eVRF proof; it exists as a self-contained,
+//! curve-agnostic fallback for testing the DKG transport without pulling
+//! in the curve-cycle R1CS layer.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -23,7 +25,8 @@ use sha2::{Digest, Sha256};
 
 pub mod paper;
 
-/// Prototype proof backend that is not the Golden paper eVRF proof.
+/// Curve-agnostic Schnorr/Chaum-Pedersen backend for DKG share/pad/DH
+/// openings. Not the Golden eVRF proof; see [`paper`](crate::paper) for that.
 pub mod prototype {
     use super::*;
 

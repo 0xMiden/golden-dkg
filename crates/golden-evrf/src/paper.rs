@@ -15,8 +15,6 @@
 
 #![allow(non_snake_case)]
 
-#[cfg(all(feature = "halo2curves-secp256k1", test))]
-use golden_core::GoldenGroup;
 #[cfg(feature = "halo2curves-secp256k1")]
 use golden_core::{Error, EvrfStatement, EvrfWitness, Result};
 #[cfg(feature = "halo2curves-secp256k1")]
@@ -49,13 +47,16 @@ pub mod secp_secq {
     /// R1CS field: `Fp` (Secp256k1 base field = Secq256k1 scalar field).
     pub type R1csField = Fp;
     /// R1CS commitment group: `Secq256k1` (`G_out`).
-    type R1csCycle = Secq256k1Cycle;
+    pub type R1csCycle = Secq256k1Cycle;
     /// `G_in` group: `Secp256k1`.
-    type Gin = Secp256k1;
+    pub type Gin = Secp256k1;
     /// `G_in` scalar field: `Fq`.
-    type GinScalar = Fq;
+    pub type GinScalar = Fq;
+    /// `G_out` commitment group: `Secq256k1`. Exposed so integration tests can
+    /// construct random `R_j` points without re-deriving the cycle alias.
+    pub type Gout = Secq256k1;
     /// `G_out` compressed point.
-    type GoutCompressed = <R1csCycle as Cycle>::Compressed;
+    pub type GoutCompressed = <R1csCycle as Cycle>::Compressed;
 
     /// Transcript domain label for the paper eVRF proof.
     pub const PROOF_DOMAIN: &[u8] = b"golden-paper-evrf-v1";
@@ -314,7 +315,6 @@ pub mod secp_secq {
 
     /// Evaluate the chord-rule exponentiation and return the `G_in` point
     /// `L_λ = k · X` (with `c_j` corrections reducing `k` mod `|G_in|`).
-    #[cfg(test)]
     fn chord_evaluate_point(bits: &[bool], X: &Gin, g_s: &Gin, lambda: usize) -> Result<Gin> {
         if bits.len() != lambda + 1 {
             return Err(Error::ProofVerificationFailed);
@@ -2036,6 +2036,118 @@ pub mod secp_secq {
         }
     }
 
+    /// Test-only helpers exposed so integration tests under `tests/` can
+    /// build honest statements without re-implementing the protocol's
+    /// chord-rule derivation. Marked `#[doc(hidden)]` because these exist
+    /// purely for the crate's own test suite.
+    #[doc(hidden)]
+    pub mod testing {
+        use super::*;
+
+        /// Build a valid `(statement, witness)` pair for the one-receiver
+        /// relation, deriving all public values from `sk1`, `pk2`, `msg`,
+        /// and `beta`. Mirrors the steps the prover runs internally.
+        pub fn build_statement_witness(
+            msg: &[u8; MESSAGE_BYTES],
+            sk1: GinScalar,
+            pk2: Gin,
+            beta: R1csField,
+        ) -> (SecpSecqEvrfStatement, SecpSecqEvrfWitness) {
+            let g_in = Gin::generator();
+
+            let pk1 = g_in * sk1;
+            let s = pk2 * sk1;
+            let (k, _) = affine(&s).expect("S affine");
+
+            let h1 = h_gin_1(msg);
+            let h2 = h_gin_2(msg);
+
+            let mut bits = [false; K_BITS + 1];
+            decompose_k_fp(&k, &mut bits);
+            let t1 = chord_evaluate_point(&bits, &h1, &g_in, K_BITS).expect("T1");
+            let t2 = chord_evaluate_point(&bits, &h2, &g_in, K_BITS).expect("T2");
+
+            let (t1_x, _) = affine(&t1).expect("T1 affine");
+            let (t2_x, _) = affine(&t2).expect("T2 affine");
+            let r = beta * t1_x + t2_x;
+
+            let g_out = Secq256k1::generator();
+            let r_point = g_out * r;
+
+            let statement = SecpSecqEvrfStatement {
+                msg: *msg,
+                pk1,
+                pk2,
+                s,
+                h1,
+                h2,
+                t1,
+                t2,
+                r_point,
+                beta,
+            };
+            let witness = SecpSecqEvrfWitness { sk1 };
+            (statement, witness)
+        }
+
+        /// Build a valid batched `(statement, witness)` pair for `n`
+        /// receivers (one per `pkj`), deriving all public values from
+        /// `sk1` and the receiver public keys.
+        pub fn build_batched(
+            msg: &[u8; MESSAGE_BYTES],
+            sk1: GinScalar,
+            pkjs: &[Gin],
+            beta: R1csField,
+        ) -> (BatchedEvrfStatement, BatchedEvrfWitness) {
+            let g_in = Gin::generator();
+            let pk1 = g_in * sk1;
+            let h1 = h_gin_1(msg);
+            let h2 = h_gin_2(msg);
+            let g_out = Secq256k1::generator();
+
+            let receivers: Vec<BatchedReceiverStatement> = pkjs
+                .iter()
+                .map(|&pkj| {
+                    let sj = pkj * sk1;
+                    let (k, _) = affine(&sj).expect("S affine");
+                    let mut bits = [false; K_BITS + 1];
+                    decompose_k_fp(&k, &mut bits);
+                    let t1j = chord_evaluate_point(&bits, &h1, &g_in, K_BITS).expect("T1");
+                    let t2j = chord_evaluate_point(&bits, &h2, &g_in, K_BITS).expect("T2");
+                    let (t1_x, _) = affine(&t1j).expect("T1 affine");
+                    let (t2_x, _) = affine(&t2j).expect("T2 affine");
+                    let r = beta * t1_x + t2_x;
+                    let r_point_j = g_out * r;
+                    BatchedReceiverStatement {
+                        pkj,
+                        sj,
+                        t1j,
+                        t2j,
+                        r_point_j,
+                    }
+                })
+                .collect();
+
+            let statement = BatchedEvrfStatement {
+                msg: *msg,
+                pk1,
+                beta,
+                receivers,
+            };
+            let witness = BatchedEvrfWitness { sk1 };
+            (statement, witness)
+        }
+
+        /// Commit `k` under a fresh Pedersen blinding base. Used by
+        /// integration tests that swap a proof's `k_commitment` to drive
+        /// the verifier's commitment-binding check.
+        pub fn commit_k_for_test(k: R1csField) -> GoutCompressed {
+            let pc_gens = PedersenGens::<R1csCycle>::default();
+            let v_k = pc_gens.commit(k, R1csField::ONE);
+            R1csCycle::point_compress(&v_k)
+        }
+    }
+
     #[cfg(test)]
     mod chord_tests {
         use super::*;
@@ -2662,607 +2774,11 @@ pub mod secp_secq {
     }
 
     #[cfg(test)]
-    mod one_receiver_tests {
-        use super::*;
-        use rand_chacha::rand_core::SeedableRng;
-        use rand_chacha::ChaCha20Rng;
-
-        /// Build a valid `(statement, witness)` pair for the one-receiver
-        /// relation, deriving all public values from `sk1` and `msg`.
-        fn build_statement_witness(
-            msg: &[u8; MESSAGE_BYTES],
-            sk1: GinScalar,
-            pk2: Gin,
-            beta: R1csField,
-        ) -> (SecpSecqEvrfStatement, SecpSecqEvrfWitness) {
-            let g_in = Gin::generator();
-
-            // Step 0: PK_1 = g_in^sk_1
-            let pk1 = g_in * sk1;
-            // Step 1: S = PK_2^sk_1
-            let s = pk2 * sk1;
-            // Step 2: k = int(S.x)
-            let (k, _) = affine(&s).expect("S affine");
-
-            // H_{G_in,1}(msg), H_{G_in,2}(msg): derive from msg via the same
-            // helpers the prover/verifier use, so the statement's h1/h2 match.
-            let h1 = h_gin_1(msg);
-            let h2 = h_gin_2(msg);
-
-            // Steps 4, 5: T_1 = H_1^k, T_2 = H_2^k via chord-rule (handles
-            // k mod |G_in| reduction since k is an Fp element).
-            let mut bits = [false; K_BITS + 1];
-            decompose_k_fp(&k, &mut bits);
-            let t1 = chord_evaluate_point(&bits, &h1, &g_in, K_BITS).expect("T1");
-            let t2 = chord_evaluate_point(&bits, &h2, &g_in, K_BITS).expect("T2");
-
-            // Steps 6, 7, 8: r = beta * T_1.x + T_2.x
-            let (t1_x, _) = affine(&t1).expect("T1 affine");
-            let (t2_x, _) = affine(&t2).expect("T2 affine");
-            let r = beta * t1_x + t2_x;
-
-            // Step 9: R = g_out^r
-            let g_out = Secq256k1::generator();
-            let r_point = g_out * r;
-
-            let statement = SecpSecqEvrfStatement {
-                msg: *msg,
-                pk1,
-                pk2,
-                s,
-                h1,
-                h2,
-                t1,
-                t2,
-                r_point,
-                beta,
-            };
-            let witness = SecpSecqEvrfWitness { sk1 };
-            (statement, witness)
-        }
-
-        fn make_msg(seed: u64) -> [u8; MESSAGE_BYTES] {
-            let mut msg = [0u8; MESSAGE_BYTES];
-            msg[..8].copy_from_slice(&seed.to_le_bytes());
-            msg
-        }
-
-        #[test]
-        fn evrf_one_receiver_honest_proof_verifies() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xFEED);
-            let sk1 = GinScalar::random(&mut rng);
-            let pk2 = Gin::generator() * GinScalar::random(&mut rng);
-            let beta = R1csField::from(0xBEE_u64);
-            let msg = make_msg(0xCAFEBABE);
-            let (statement, witness) = build_statement_witness(&msg, sk1, pk2, beta);
-
-            let proof = evrf_prove(&statement, &witness, &mut rng).expect("prove");
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            evrf_verify(&statement, &proof, &mut verify_rng).expect("verify");
-        }
-
-        #[test]
-        fn evrf_one_receiver_rejects_wrong_pk2() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0001);
-            let sk1 = GinScalar::random(&mut rng);
-            let pk2 = Gin::generator() * GinScalar::random(&mut rng);
-            let beta = R1csField::from(42u64);
-            let msg = make_msg(1);
-            let (statement, witness) = build_statement_witness(&msg, sk1, pk2, beta);
-
-            let proof = evrf_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Swap PK_2 for a different receiver.  The Chaum-Pedersen proof
-            // (bound to the original PK_2) must fail.
-            let wrong_pk2 = Gin::generator() * GinScalar::random(&mut rng);
-            let mut bad = statement.clone();
-            bad.pk2 = wrong_pk2;
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject wrong receiver PK_2"
-            );
-        }
-
-        #[test]
-        fn evrf_one_receiver_rejects_wrong_beta() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_BEEF);
-            let sk1 = GinScalar::random(&mut rng);
-            let pk2 = Gin::generator() * GinScalar::random(&mut rng);
-            let beta = R1csField::from(7u64);
-            let msg = make_msg(2);
-            let (statement, witness) = build_statement_witness(&msg, sk1, pk2, beta);
-
-            let proof = evrf_prove(&statement, &witness, &mut rng).expect("prove");
-
-            let mut bad = statement.clone();
-            bad.beta = R1csField::from(99u64);
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject wrong beta"
-            );
-        }
-
-        #[test]
-        fn evrf_one_receiver_rejects_wrong_r() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0002);
-            let sk1 = GinScalar::random(&mut rng);
-            let pk2 = Gin::generator() * GinScalar::random(&mut rng);
-            let beta = R1csField::from(3u64);
-            let msg = make_msg(3);
-            let (statement, witness) = build_statement_witness(&msg, sk1, pk2, beta);
-
-            let proof = evrf_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Swap R for a random point.  The prefix link and DLOG PoK must fail.
-            let g_out = Secq256k1::generator();
-            let mut bad = statement.clone();
-            bad.r_point = g_out * R1csField::random(&mut rng);
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject wrong R"
-            );
-        }
-
-        #[test]
-        fn evrf_one_receiver_rejects_wrong_transcript_domain() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0003);
-            let sk1 = GinScalar::random(&mut rng);
-            let pk2 = Gin::generator() * GinScalar::random(&mut rng);
-            let beta = R1csField::from(5u64);
-            let msg = make_msg(4);
-            let (statement, witness) = build_statement_witness(&msg, sk1, pk2, beta);
-
-            let proof = evrf_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Verify the R1CS proof under a wrong transcript domain by
-            // re-running the verifier with a different PROOF_DOMAIN.  We can't
-            // easily override the constant, so instead we verify that the proof
-            // bytes are bound to the correct domain by checking that a proof
-            // generated under one domain fails under another.  This is covered
-            // by the r1cs_smoke test's wrong-domain check; here we verify the
-            // envelope's R1CS proof rejects a swapped k_commitment, which is
-            // the same class of transcript-binding failure.
-            let mut bad_proof = proof.clone();
-            // Corrupt the k_commitment so the verifier's commitment doesn't
-            // match the proof's internal transcript.
-            let wrong_k = R1csField::random(&mut rng);
-            let pc_gens = PedersenGens::<R1csCycle>::default();
-            let wrong_v_k = pc_gens.commit(wrong_k, R1csField::ONE);
-            bad_proof.k_commitment = R1csCycle::point_compress(&wrong_v_k);
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_verify(&statement, &bad_proof, &mut verify_rng).is_err(),
-                "verifier must reject a proof whose k_commitment is swapped"
-            );
-        }
-
-        #[test]
-        fn evrf_one_receiver_rejects_wrong_sk1() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0004);
-            let sk1 = GinScalar::random(&mut rng);
-            let pk2 = Gin::generator() * GinScalar::random(&mut rng);
-            let beta = R1csField::from(11u64);
-            let msg = make_msg(5);
-            let (statement, _witness) = build_statement_witness(&msg, sk1, pk2, beta);
-
-            // Prove with the wrong sk1 (inconsistent with S).
-            let wrong_sk1 = GinScalar::random(&mut rng);
-            let bad_witness = SecpSecqEvrfWitness { sk1: wrong_sk1 };
-            assert!(
-                evrf_prove(&statement, &bad_witness, &mut rng).is_err(),
-                "prover must refuse to prove with a sk1 inconsistent with S"
-            );
-        }
-
-        #[test]
-        fn evrf_one_receiver_rejects_wrong_msg() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0005);
-            let sk1 = GinScalar::random(&mut rng);
-            let pk2 = Gin::generator() * GinScalar::random(&mut rng);
-            let beta = R1csField::from(13u64);
-            let msg = make_msg(6);
-            let (statement, witness) = build_statement_witness(&msg, sk1, pk2, beta);
-
-            let proof = evrf_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Flip a bit in msg but keep h1/h2 from the original msg.  The
-            // verifier recomputes h1/h2 from the mutated msg and must reject.
-            let mut bad = statement.clone();
-            bad.msg[0] ^= 0x01;
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject a proof whose msg has been mutated"
-            );
-        }
-
-        #[test]
-        fn evrf_one_receiver_rejects_wrong_s() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0006);
-            let sk1 = GinScalar::random(&mut rng);
-            let pk2 = Gin::generator() * GinScalar::random(&mut rng);
-            let beta = R1csField::from(17u64);
-            let msg = make_msg(7);
-            let (statement, witness) = build_statement_witness(&msg, sk1, pk2, beta);
-
-            let proof = evrf_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Swap S for a different DH point.  The Chaum-Pedersen proof (bound
-            // to the original S) and the var_k = int(S.x) constraint must fail.
-            let wrong_s = pk2 * GinScalar::random(&mut rng);
-            let mut bad = statement.clone();
-            bad.s = wrong_s;
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject a proof whose S has been swapped"
-            );
-        }
-    }
-
-    #[cfg(test)]
-    mod batched_dealer_tests {
-        use super::*;
-        use rand_chacha::rand_core::SeedableRng;
-        use rand_chacha::ChaCha20Rng;
-
-        /// Build a valid batched `(statement, witness)` pair for `n` receivers.
-        fn build_batched(
-            msg: &[u8; MESSAGE_BYTES],
-            sk1: GinScalar,
-            pkjs: &[Gin],
-            beta: R1csField,
-        ) -> (BatchedEvrfStatement, BatchedEvrfWitness) {
-            let g_in = Gin::generator();
-            let pk1 = g_in * sk1;
-            let h1 = h_gin_1(msg);
-            let h2 = h_gin_2(msg);
-            let g_out = Secq256k1::generator();
-
-            let receivers: Vec<BatchedReceiverStatement> = pkjs
-                .iter()
-                .map(|&pkj| {
-                    let sj = pkj * sk1;
-                    let (k, _) = affine(&sj).expect("S affine");
-                    let mut bits = [false; K_BITS + 1];
-                    decompose_k_fp(&k, &mut bits);
-                    let t1j = chord_evaluate_point(&bits, &h1, &g_in, K_BITS).expect("T1");
-                    let t2j = chord_evaluate_point(&bits, &h2, &g_in, K_BITS).expect("T2");
-                    let (t1_x, _) = affine(&t1j).expect("T1 affine");
-                    let (t2_x, _) = affine(&t2j).expect("T2 affine");
-                    let r = beta * t1_x + t2_x;
-                    let r_point_j = g_out * r;
-                    BatchedReceiverStatement {
-                        pkj,
-                        sj,
-                        t1j,
-                        t2j,
-                        r_point_j,
-                    }
-                })
-                .collect();
-
-            let statement = BatchedEvrfStatement {
-                msg: *msg,
-                pk1,
-                beta,
-                receivers,
-            };
-            let witness = BatchedEvrfWitness { sk1 };
-            (statement, witness)
-        }
-
-        fn make_msg(seed: u64) -> [u8; MESSAGE_BYTES] {
-            let mut msg = [0u8; MESSAGE_BYTES];
-            msg[..8].copy_from_slice(&seed.to_le_bytes());
-            msg
-        }
-
-        fn make_pkjs(rng: &mut ChaCha20Rng, n: usize) -> Vec<Gin> {
-            (0..n)
-                .map(|_| Gin::generator() * GinScalar::random(&mut *rng))
-                .collect()
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn evrf_batched_dealer_honest_proof_verifies() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C1);
-            let sk1 = GinScalar::random(&mut rng);
-            let pkjs = make_pkjs(&mut rng, 2);
-            let beta = R1csField::from(7u64);
-            let msg = make_msg(0xABCD);
-            let (statement, witness) = build_batched(&msg, sk1, &pkjs, beta);
-
-            let proof = evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            evrf_batched_verify(&statement, &proof, &mut verify_rng).expect("verify");
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn evrf_batched_dealer_rejects_wrong_receiver_pk() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C2);
-            let sk1 = GinScalar::random(&mut rng);
-            let pkjs = make_pkjs(&mut rng, 2);
-            let beta = R1csField::from(7u64);
-            let msg = make_msg(1);
-            let (statement, witness) = build_batched(&msg, sk1, &pkjs, beta);
-
-            let proof = evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Swap one receiver's PK_j.  The batched Chaum-Pedersen proof
-            // (bound to the original PK_j) must fail.
-            let mut bad = statement.clone();
-            bad.receivers[0].pkj = Gin::generator() * GinScalar::random(&mut rng);
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject a swapped receiver PK_j"
-            );
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn evrf_batched_dealer_rejects_reordered_receivers() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C3);
-            let sk1 = GinScalar::random(&mut rng);
-            let pkjs = make_pkjs(&mut rng, 3);
-            let beta = R1csField::from(7u64);
-            let msg = make_msg(2);
-            let (statement, witness) = build_batched(&msg, sk1, &pkjs, beta);
-
-            let proof = evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Reorder the receiver list.  The batched CP transcript binds the
-            // ordered (PK_j, S_j) list, so the reordered statement must fail.
-            let mut bad = statement.clone();
-            bad.receivers.reverse();
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject a reordered receiver list"
-            );
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn evrf_batched_dealer_rejects_missing_receiver() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C4);
-            let sk1 = GinScalar::random(&mut rng);
-            let pkjs = make_pkjs(&mut rng, 3);
-            let beta = R1csField::from(7u64);
-            let msg = make_msg(3);
-            let (statement, witness) = build_batched(&msg, sk1, &pkjs, beta);
-
-            let proof = evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Drop one receiver.  The proof envelope length and the CP
-            // transcript both bind the receiver count.
-            let mut bad = statement.clone();
-            bad.receivers.pop();
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject a missing receiver"
-            );
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn evrf_batched_dealer_rejects_wrong_beta() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C5);
-            let sk1 = GinScalar::random(&mut rng);
-            let pkjs = make_pkjs(&mut rng, 2);
-            let beta = R1csField::from(7u64);
-            let msg = make_msg(4);
-            let (statement, witness) = build_batched(&msg, sk1, &pkjs, beta);
-
-            let proof = evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
-
-            let mut bad = statement.clone();
-            bad.beta = R1csField::from(99u64);
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject wrong beta"
-            );
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn evrf_batched_dealer_rejects_wrong_r() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C6);
-            let sk1 = GinScalar::random(&mut rng);
-            let pkjs = make_pkjs(&mut rng, 2);
-            let beta = R1csField::from(7u64);
-            let msg = make_msg(5);
-            let (statement, witness) = build_batched(&msg, sk1, &pkjs, beta);
-
-            let proof = evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Swap one receiver's R_j.  The prefix link and DLOG PoK must fail.
-            let g_out = Secq256k1::generator();
-            let mut bad = statement.clone();
-            bad.receivers[1].r_point_j = g_out * R1csField::random(&mut rng);
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject a swapped R_j"
-            );
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn evrf_batched_dealer_rejects_wrong_msg() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C7);
-            let sk1 = GinScalar::random(&mut rng);
-            let pkjs = make_pkjs(&mut rng, 2);
-            let beta = R1csField::from(7u64);
-            let msg = make_msg(6);
-            let (statement, witness) = build_batched(&msg, sk1, &pkjs, beta);
-
-            let proof = evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Flip a bit in msg.  The verifier recomputes h1/h2 from the
-            // mutated msg and the R1CS constraints must fail.
-            let mut bad = statement.clone();
-            bad.msg[0] ^= 0x01;
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject a mutated msg"
-            );
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn evrf_batched_dealer_rejects_proof_replay_across_dealer_keys() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C8);
-            let sk1 = GinScalar::random(&mut rng);
-            let pkjs = make_pkjs(&mut rng, 2);
-            let beta = R1csField::from(7u64);
-            let msg = make_msg(7);
-            let (statement, witness) = build_batched(&msg, sk1, &pkjs, beta);
-
-            let proof = evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
-
-            // Build a second statement with a different dealer key.  The
-            // batched CP proof (bound to the original PK_1) must fail.
-            let sk1_b = GinScalar::random(&mut rng);
-            let (bad, _) = build_batched(&msg, sk1_b, &pkjs, beta);
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            assert!(
-                evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
-                "verifier must reject a proof replayed across dealer keys"
-            );
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn evrf_batched_dealer_four_receivers_verifies() {
-            // Regression for generator sizing: a 4-receiver batch needs more
-            // than R1CS_GENS_CAPACITY generators, so the capacity helper must
-            // round up to the next power of two above 4 * 8192 = 32768.
-            let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C9);
-            let sk1 = GinScalar::random(&mut rng);
-            let pkjs = make_pkjs(&mut rng, 4);
-            let beta = R1csField::from(7u64);
-            let msg = make_msg(8);
-            let (statement, witness) = build_batched(&msg, sk1, &pkjs, beta);
-
-            let proof = evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
-            let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-            evrf_batched_verify(&statement, &proof, &mut verify_rng).expect("verify");
-        }
-    }
-
-    #[cfg(test)]
     #[allow(clippy::unwrap_used)]
-    mod dkg_integration_tests {
+    mod dkg_unit_tests {
         use super::*;
-        use golden_core::{
-            complete, create_dealing, verify_dealing, DkgConfig, GoldenScalar, ParticipantIndex,
-            ParticipantRegistry, SessionId,
-        };
-        use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
-        use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-        use std::collections::BTreeMap;
+        use halo2curves::secp256k1::Fp;
 
-        fn idx(value: u32) -> ParticipantIndex {
-            ParticipantIndex::new(value).unwrap()
-        }
-
-        fn identity_secret(participant: ParticipantIndex) -> Secp256k1Scalar {
-            Secp256k1Scalar::from_u64(100 + u64::from(participant.get())).unwrap()
-        }
-
-        fn config() -> DkgConfig<Secp256k1GoldenGroup> {
-            let participants = [idx(1), idx(2), idx(3)];
-            let registry = ParticipantRegistry::new(
-                participants
-                    .iter()
-                    .map(|p| {
-                        (
-                            *p,
-                            Secp256k1GoldenGroup::mul_generator(&identity_secret(*p)),
-                        )
-                    })
-                    .collect(),
-            )
-            .unwrap();
-            DkgConfig::new(
-                2,
-                SessionId([42u8; 32]),
-                Secp256k1Scalar::from_u64(77).unwrap(),
-                registry,
-            )
-            .unwrap()
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn dkg_completes_with_batched_evrf_backend() {
-            let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-            let config = config();
-
-            let dealings: BTreeMap<_, _> = config
-                .registry
-                .indexes()
-                .map(|dealer| {
-                    (
-                        dealer,
-                        create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                            dealer,
-                            &identity_secret(dealer),
-                            &config,
-                            &mut rng,
-                        )
-                        .unwrap(),
-                    )
-                })
-                .collect();
-
-            for dealing in dealings.values() {
-                verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config)
-                    .unwrap();
-            }
-
-            let receiver = idx(2);
-            let own_dealing = dealings.get(&receiver).unwrap();
-            let peer_dealings = dealings
-                .iter()
-                .filter_map(|(dealer, dealing)| {
-                    if *dealer == receiver {
-                        None
-                    } else {
-                        Some((*dealer, dealing.message.clone()))
-                    }
-                })
-                .collect();
-            let output = complete::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                receiver,
-                &identity_secret(receiver),
-                own_dealing,
-                &peer_dealings,
-                &config,
-            )
-            .unwrap();
-
-            assert_eq!(
-                output.public_key_shares[&receiver],
-                Secp256k1GoldenGroup::mul_generator(&output.secret_share.value)
-            );
-            assert_eq!(output.public_key_shares.len(), 3);
-        }
-
-        /// Verify the wrap-detection helper used by the R_j link check. When
-        /// `pad + q < p` the sum is canonical and greater than `pad`; when
-        /// `pad + q >= p` the wrapped sum is less than `pad`. The link check
-        /// accepts the `pad + q` case only in the first (no-wrap) situation.
         #[test]
         fn fp_canonical_lt_detects_pad_plus_q_wrap() {
             use super::{fp_canonical_lt, Q_AS_FP};
@@ -3280,302 +2796,6 @@ pub mod secp_secq {
             assert!(!fp_canonical_lt(&p_minus_1, &wrapped));
         }
 
-        /// Tamper helper: a different group element (point + generator).
-        fn tamper_element(
-            point: &<Secp256k1GoldenGroup as GoldenGroup>::Element,
-        ) -> <Secp256k1GoldenGroup as GoldenGroup>::Element {
-            Secp256k1GoldenGroup::add(point, &Secp256k1GoldenGroup::generator())
-        }
-
-        /// Tamper helper: a different scalar (scalar + one).
-        fn tamper_scalar(s: &Secp256k1Scalar) -> Secp256k1Scalar {
-            Secp256k1Scalar::add(s, &Secp256k1Scalar::one())
-        }
-
-        /// Run `verify_dealing` against `config` for a single dealer after
-        /// applying `tamper` to the freshly built dealer message.
-        fn assert_dealing_rejected<F>(tamper: F)
-        where
-            F: FnOnce(&mut golden_core::DealerMessage<Secp256k1GoldenGroup, SecpSecqProof>),
-        {
-            let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-            let config = config();
-            let dealer = idx(1);
-            let mut dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                dealer,
-                &identity_secret(dealer),
-                &config,
-                &mut rng,
-            )
-            .unwrap();
-            // Baseline: the honest dealing verifies.
-            verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config)
-                .unwrap();
-            tamper(&mut dealing.message);
-            let result =
-                verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config);
-            assert!(
-                result.is_err(),
-                "tampered dealing must be rejected, got {result:?}"
-            );
-        }
-
-        /// Build the `EvrfStatement` list exactly as `verify_dealing` does, so
-        /// the backend's `verify_batch` can be invoked directly with a tampered
-        /// statement. `golden_core::statement_for_receiver` is private, so the
-        /// statement is assembled field-by-field from the public config and
-        /// dealing message.
-        fn build_statements(
-            dealing: &golden_core::DkgDealing<Secp256k1GoldenGroup, SecpSecqProof>,
-            config: &DkgConfig<Secp256k1GoldenGroup>,
-            dealer: ParticipantIndex,
-        ) -> Vec<golden_core::EvrfStatement<Secp256k1GoldenGroup>> {
-            use golden_core::{EvrfStatement, PROTOCOL_VERSION};
-            let mut statements = Vec::new();
-            for receiver in config.registry.indexes() {
-                if receiver == dealer {
-                    continue;
-                }
-                let share_commitment = dealing
-                    .message
-                    .commitment
-                    .public_key_share(receiver)
-                    .unwrap();
-                let encrypted_share = dealing
-                    .message
-                    .encrypted_shares
-                    .get(&receiver)
-                    .cloned()
-                    .unwrap();
-                statements.push(EvrfStatement {
-                    protocol_version: PROTOCOL_VERSION,
-                    backend_id: <Secp256k1GoldenGroup as GoldenGroup>::BACKEND_ID,
-                    session_id: config.session_id,
-                    registry_root: config.registry.root(),
-                    dealer,
-                    receiver,
-                    msg_i: dealing.message.msg_i,
-                    beta: config.beta,
-                    dealer_public_key: *config.registry.public_key(dealer).unwrap(),
-                    receiver_public_key: *config.registry.public_key(receiver).unwrap(),
-                    share_commitment,
-                    pad_commitment: encrypted_share.pad_commitment,
-                    dh_commitment: encrypted_share.dh_commitment,
-                    encrypted_share: encrypted_share.encrypted_share,
-                    transcript_root: dealing.message.transcript_root,
-                });
-            }
-            statements
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn dkg_rejects_tampered_pad_commitment() {
-            assert_dealing_rejected(|msg| {
-                let receiver = idx(2);
-                let entry = msg.encrypted_shares.get_mut(&receiver).unwrap();
-                entry.pad_commitment = tamper_element(&entry.pad_commitment);
-            });
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn dkg_rejects_tampered_dh_commitment() {
-            assert_dealing_rejected(|msg| {
-                let receiver = idx(2);
-                let entry = msg.encrypted_shares.get_mut(&receiver).unwrap();
-                entry.dh_commitment = tamper_element(&entry.dh_commitment);
-            });
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn dkg_rejects_tampered_encrypted_share() {
-            assert_dealing_rejected(|msg| {
-                let receiver = idx(2);
-                let entry = msg.encrypted_shares.get_mut(&receiver).unwrap();
-                entry.encrypted_share = tamper_scalar(&entry.encrypted_share);
-            });
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn dkg_rejects_tampered_share_commitment() {
-            assert_dealing_rejected(|msg| {
-                // Replace the Feldman commitment with one whose top coefficient
-                // differs, so the derived share commitment for receivers changes.
-                let mut coeffs = msg.commitment.coefficients().to_vec();
-                let last = coeffs.last_mut().unwrap();
-                *last = tamper_element(last);
-                msg.commitment = golden_core::FeldmanCommitment::from_coefficients(coeffs).unwrap();
-            });
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn dkg_rejects_tampered_transcript_root() {
-            assert_dealing_rejected(|msg| {
-                msg.transcript_root[0] ^= 0x01;
-            });
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn dkg_rejects_tampered_proof_bytes() {
-            assert_dealing_rejected(|msg| {
-                if msg.proof.0.is_empty() {
-                    msg.proof.0.push(0);
-                }
-                msg.proof.0[0] ^= 0x01;
-            });
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn dkg_rejects_swapped_encrypted_shares() {
-            let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-            let config = config();
-            let dealer = idx(1);
-            let mut dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                dealer,
-                &identity_secret(dealer),
-                &config,
-                &mut rng,
-            )
-            .unwrap();
-            verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config)
-                .unwrap();
-            // Swap the encrypted shares for receivers idx(2) and idx(3). The
-            // proof binds per-receiver statements by receiver index, so a swap
-            // breaks either the commitment check or the backend verification.
-            let a = dealing
-                .message
-                .encrypted_shares
-                .get(&idx(2))
-                .cloned()
-                .unwrap();
-            let b = dealing
-                .message
-                .encrypted_shares
-                .get(&idx(3))
-                .cloned()
-                .unwrap();
-            dealing.message.encrypted_shares.insert(idx(2), b);
-            dealing.message.encrypted_shares.insert(idx(3), a);
-            let result =
-                verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config);
-            assert!(
-                result.is_err(),
-                "swapped encrypted shares must be rejected, got {result:?}"
-            );
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn dkg_rejects_missing_encrypted_share() {
-            assert_dealing_rejected(|msg| {
-                msg.encrypted_shares.remove(&idx(3));
-            });
-        }
-
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn dkg_rejects_extra_self_receiver() {
-            let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-            let config = config();
-            let dealer = idx(1);
-            let mut dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                dealer,
-                &identity_secret(dealer),
-                &config,
-                &mut rng,
-            )
-            .unwrap();
-            verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config)
-                .unwrap();
-            // Insert an encrypted share for the dealer itself, then recompute
-            // the transcript root so the dealing-root check passes and
-            // verification reaches `ensure_public_share_keys`, which rejects
-            // the self-receiver entry.
-            let placeholder = dealing
-                .message
-                .encrypted_shares
-                .get(&idx(2))
-                .cloned()
-                .unwrap();
-            dealing.message.encrypted_shares.insert(dealer, placeholder);
-            dealing.message.transcript_root = dealing.message.recompute_transcript_root();
-            let result =
-                verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config);
-            assert!(
-                matches!(result, Err(golden_core::Error::UnexpectedShare(d)) if d == dealer.get()),
-                "self-receiver must be rejected with UnexpectedShare({}), got {result:?}",
-                dealer.get()
-            );
-        }
-
-        /// The backend binding check must reject a proof whose carried pad
-        /// does not open the DKG `pad_commitment`. This bypasses the DKG
-        /// transcript-root check by invoking the backend directly with a
-        /// tampered statement, isolating the pad-commitment binding.
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn backend_rejects_pad_commitment_not_opened_by_proof_pad() {
-            let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-            let config = config();
-            let dealer = idx(1);
-            let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                dealer,
-                &identity_secret(dealer),
-                &config,
-                &mut rng,
-            )
-            .unwrap();
-            let mut statements = build_statements(&dealing, &config, dealer);
-            // Baseline: the backend accepts the honest statement list.
-            SecpSecqBackend::verify_batch(&statements, &dealing.message.proof).unwrap();
-            // Tamper with the first receiver's pad_commitment. The backend
-            // checks pad_commitment == g_in^pad (pad from the proof), so this
-            // must fail.
-            statements[0].pad_commitment = tamper_element(&statements[0].pad_commitment);
-            let result = SecpSecqBackend::verify_batch(&statements, &dealing.message.proof);
-            assert!(
-                result.is_err(),
-                "backend must reject pad_commitment not opened by proof pad, got {result:?}"
-            );
-        }
-
-        /// Symmetric to the above: tamper with `dh_commitment` so it no longer
-        /// equals `PK_j^pad` for the proof's pad.
-        #[test]
-        #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-        fn backend_rejects_dh_commitment_not_opened_by_proof_pad() {
-            let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-            let config = config();
-            let dealer = idx(1);
-            let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                dealer,
-                &identity_secret(dealer),
-                &config,
-                &mut rng,
-            )
-            .unwrap();
-            let mut statements = build_statements(&dealing, &config, dealer);
-            SecpSecqBackend::verify_batch(&statements, &dealing.message.proof).unwrap();
-            statements[0].dh_commitment = tamper_element(&statements[0].dh_commitment);
-            let result = SecpSecqBackend::verify_batch(&statements, &dealing.message.proof);
-            assert!(
-                result.is_err(),
-                "backend must reject dh_commitment not opened by proof pad, got {result:?}"
-            );
-        }
-
-        /// Decoders that return `Result` must reject short input slices
-        /// rather than panicking. Each of the four fixed-width decoders
-        /// (`decode_gin`, `decode_gout`, `decode_fp`, `decode_fq`) is called
-        /// with a slice one byte shorter than the fixed width; all must
-        /// return `ProofVerificationFailed` (or whatever error the crate
-        /// maps to) rather than abort the process.
         #[test]
         fn decoders_reject_short_inputs() {
             use super::{decode_fp, decode_fq, decode_gin, decode_gout};
