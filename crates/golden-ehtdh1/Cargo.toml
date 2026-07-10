@@ -1,0 +1,31 @@
+[package]
+name = "golden-ehtdh1"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+chacha20 = { workspace = true }
+golden-core = { workspace = true }
+hkdf = { workspace = true }
+rand_core = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+golden-evrf = { workspace = true, features = ["halo2curves-secp256k1"] }
+golden-halo2curves = { workspace = true, features = ["halo2curves-secp256k1"] }
+golden-rustcrypto = { path = "../golden-rustcrypto", features = ["p256"] }
+rand_chacha = { workspace = true }
+
+[features]
+default = []
+prototype-bridge = []
+halo2curves-secp256k1 = []
+
+[lints]
+workspace = true
