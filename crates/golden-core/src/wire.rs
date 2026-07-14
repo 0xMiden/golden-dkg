@@ -8,6 +8,10 @@ use std::collections::BTreeMap;
 
 #[cfg(feature = "serde")]
 use core::marker::PhantomData;
+#[cfg(feature = "miden-serde")]
+use miden_serde_utils::{
+    ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
+};
 #[cfg(feature = "serde")]
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -432,6 +436,210 @@ impl WireMessage for Vec<u8> {
     const TAG: u8 = TAG_PROOF_BYTES;
 }
 
+#[cfg(feature = "miden-serde")]
+impl Serializable for SessionId {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        write_miden_wire(self, target);
+    }
+
+    fn get_size_hint(&self) -> usize {
+        to_wire_bytes(self).len()
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl Deserializable for SessionId {
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        read_miden_wire(source)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl Serializable for DealerMessageNonce {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        write_miden_wire(self, target);
+    }
+
+    fn get_size_hint(&self) -> usize {
+        to_wire_bytes(self).len()
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl Deserializable for DealerMessageNonce {
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        read_miden_wire(source)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Serializable for EncryptedShare<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        write_miden_wire(self, target);
+    }
+
+    fn get_size_hint(&self) -> usize {
+        to_wire_bytes(self).len()
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Deserializable for EncryptedShare<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        read_miden_wire(source)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Serializable for FeldmanCommitment<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        write_miden_wire(self, target);
+    }
+
+    fn get_size_hint(&self) -> usize {
+        to_wire_bytes(self).len()
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Deserializable for FeldmanCommitment<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        read_miden_wire(source)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Serializable for ParticipantRegistry<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        write_miden_wire(self, target);
+    }
+
+    fn get_size_hint(&self) -> usize {
+        to_wire_bytes(self).len()
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Deserializable for ParticipantRegistry<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        read_miden_wire(source)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Serializable for DkgConfig<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        write_miden_wire(self, target);
+    }
+
+    fn get_size_hint(&self) -> usize {
+        to_wire_bytes(self).len()
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Deserializable for DkgConfig<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        read_miden_wire(source)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G, P> Serializable for DealerMessage<G, P>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+    P: WireEncode + WireDecode,
+{
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        write_miden_wire(self, target);
+    }
+
+    fn get_size_hint(&self) -> usize {
+        to_wire_bytes(self).len()
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G, P> Deserializable for DealerMessage<G, P>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+    P: WireEncode + WireDecode,
+{
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        read_miden_wire(source)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+fn write_miden_wire<T, W>(value: &T, target: &mut W)
+where
+    T: WireMessage,
+    W: ByteWriter,
+{
+    target.write_bytes(&to_wire_bytes(value));
+}
+
+#[cfg(feature = "miden-serde")]
+fn read_miden_wire<T, R>(source: &mut R) -> core::result::Result<T, DeserializationError>
+where
+    T: WireMessage,
+    R: ByteReader,
+{
+    let mut bytes = Vec::new();
+    while source.has_more_bytes() {
+        bytes.push(source.read_u8()?);
+    }
+    from_wire_bytes(&bytes).map_err(|err| DeserializationError::InvalidValue(err.to_string()))
+}
+
 #[cfg(feature = "serde")]
 impl Serialize for SessionId {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
@@ -794,5 +1002,17 @@ mod tests {
         let bytes: &'static [u8] = Box::leak(to_wire_bytes(&session_id).into_boxed_slice());
 
         assert_tokens(&session_id, &[Token::Bytes(bytes)]);
+    }
+
+    #[cfg(feature = "miden-serde")]
+    #[test]
+    fn miden_serde_uses_canonical_wire_bytes() {
+        use miden_serde_utils::{Deserializable, Serializable};
+
+        let session_id = SessionId([12u8; 32]);
+        let bytes = session_id.to_bytes();
+
+        assert_eq!(bytes, to_wire_bytes(&session_id));
+        assert_eq!(SessionId::read_from_bytes(&bytes).unwrap(), session_id);
     }
 }
