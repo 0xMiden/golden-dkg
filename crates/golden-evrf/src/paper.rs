@@ -19,6 +19,10 @@
 use golden_core::{
     wire, Error, EvrfStatement, EvrfWitness, ParticipantIndex, Result, TranscriptRoot,
 };
+#[cfg(all(feature = "halo2curves-secp256k1", feature = "miden-serde"))]
+use miden_serde_utils::{
+    ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
+};
 #[cfg(feature = "halo2curves-secp256k1")]
 use rand_core::CryptoRngCore;
 #[cfg(all(feature = "halo2curves-secp256k1", feature = "serde"))]
@@ -1916,6 +1920,31 @@ pub mod secp_secq {
         const TAG: u8 = wire::TAG_PROOF_BYTES;
     }
 
+    #[cfg(feature = "miden-serde")]
+    impl Serializable for SecpSecqProof {
+        fn write_into<W: ByteWriter>(&self, target: &mut W) {
+            target.write_bytes(&wire::to_wire_bytes(self));
+        }
+
+        fn get_size_hint(&self) -> usize {
+            wire::to_wire_bytes(self).len()
+        }
+    }
+
+    #[cfg(feature = "miden-serde")]
+    impl Deserializable for SecpSecqProof {
+        fn read_from<R: ByteReader>(
+            source: &mut R,
+        ) -> core::result::Result<Self, DeserializationError> {
+            let mut bytes = Vec::new();
+            while source.has_more_bytes() {
+                bytes.push(source.read_u8()?);
+            }
+            wire::from_wire_bytes(&bytes)
+                .map_err(|err| DeserializationError::InvalidValue(err.to_string()))
+        }
+    }
+
     #[cfg(feature = "serde")]
     impl Serialize for SecpSecqProof {
         fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
@@ -3330,6 +3359,18 @@ pub mod secp_secq {
             let bytes: &'static [u8] = Box::leak(wire::to_wire_bytes(&proof).into_boxed_slice());
 
             assert_tokens(&proof, &[Token::Bytes(bytes)]);
+        }
+
+        #[cfg(feature = "miden-serde")]
+        #[test]
+        fn secp_secq_proof_miden_serde_uses_canonical_wire_bytes() {
+            use miden_serde_utils::{Deserializable, Serializable};
+
+            let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
+            let bytes = proof.to_bytes();
+
+            assert_eq!(bytes, wire::to_wire_bytes(&proof));
+            assert_eq!(SecpSecqProof::read_from_bytes(&bytes).unwrap(), proof);
         }
     }
 }

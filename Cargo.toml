@@ -13,7 +13,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/0xMiden/golden-dkg"
-rust-version = "1.86"
+rust-version = "1.93"
 
 [workspace.dependencies]
 bulletproofs = { version = "5.0.0", default-features = false }
@@ -30,6 +30,7 @@ hex = "0.4"
 hkdf = "0.12"
 k256 = { version = "0.13", default-features = false }
 merlin = { version = "3", default-features = false }
+miden-serde-utils = { version = "0.28", default-features = false }
 rand_chacha = "0.3"
 rand_core = "0.6"
 serde = { version = "1", default-features = false, features = ["alloc"] }

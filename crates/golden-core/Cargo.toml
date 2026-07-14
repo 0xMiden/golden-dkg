@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+miden-serde-utils = { workspace = true, optional = true }
 rand_core = { workspace = true }
 serde = { workspace = true, optional = true }
 sha2 = { workspace = true }
@@ -21,6 +22,7 @@ serde_test = { workspace = true }
 
 [features]
 default = []
+miden-serde = ["dep:miden-serde-utils"]
 serde = ["dep:serde"]
 
 [lints]

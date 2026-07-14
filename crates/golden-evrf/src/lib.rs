@@ -20,6 +20,10 @@ use golden_core::{
     wire, Error, EvrfProofBackend, EvrfStatement, EvrfWitness, GoldenGroup, GoldenScalar,
     ParticipantIndex, Result, TranscriptRoot,
 };
+#[cfg(feature = "miden-serde")]
+use miden_serde_utils::{
+    ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
+};
 use rand_core::CryptoRngCore;
 #[cfg(feature = "serde")]
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -138,6 +142,39 @@ pub mod prototype {
         G::ElementRepr: TryFrom<Vec<u8>>,
     {
         const TAG: u8 = wire::TAG_PROOF_BYTES;
+    }
+
+    #[cfg(feature = "miden-serde")]
+    impl<G> Serializable for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn write_into<W: ByteWriter>(&self, target: &mut W) {
+            target.write_bytes(&wire::to_wire_bytes(self));
+        }
+
+        fn get_size_hint(&self) -> usize {
+            wire::to_wire_bytes(self).len()
+        }
+    }
+
+    #[cfg(feature = "miden-serde")]
+    impl<G> Deserializable for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn read_from<R: ByteReader>(
+            source: &mut R,
+        ) -> core::result::Result<Self, DeserializationError> {
+            let mut bytes = Vec::new();
+            while source.has_more_bytes() {
+                bytes.push(source.read_u8()?);
+            }
+            wire::from_wire_bytes(&bytes)
+                .map_err(|err| DeserializationError::InvalidValue(err.to_string()))
+        }
     }
 
     #[cfg(feature = "serde")]
@@ -483,6 +520,28 @@ mod tests {
         let bytes: &'static [u8] = Box::leak(to_wire_bytes(&proof).into_boxed_slice());
 
         assert_tokens(&proof, &[Token::Bytes(bytes)]);
+    }
+
+    #[cfg(feature = "miden-serde")]
+    #[test]
+    fn share_opening_batched_proof_miden_serde_uses_canonical_wire_bytes() {
+        use miden_serde_utils::{Deserializable, Serializable};
+
+        let proof = ShareOpeningProof::<P256Backend> {
+            nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(2).unwrap()),
+            response: P256Scalar::from_u64(11).unwrap(),
+            pad_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(3).unwrap()),
+            dh_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(5).unwrap()),
+            pad_response: P256Scalar::from_u64(13).unwrap(),
+        };
+        let proof = ShareOpeningBatchedProof(BTreeMap::from([(idx(2), proof)]));
+        let bytes = proof.to_bytes();
+
+        assert_eq!(bytes, to_wire_bytes(&proof));
+        assert_eq!(
+            ShareOpeningBatchedProof::<P256Backend>::read_from_bytes(&bytes).unwrap(),
+            proof
+        );
     }
 
     fn prove_one<G: GoldenGroup>(
