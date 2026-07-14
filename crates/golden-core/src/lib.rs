@@ -13,6 +13,7 @@ pub mod group;
 pub mod participant;
 pub mod shamir;
 pub mod transcript;
+pub mod wire;
 
 #[cfg(test)]
 mod test_support;
