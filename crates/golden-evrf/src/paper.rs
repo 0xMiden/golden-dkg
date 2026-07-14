@@ -21,6 +21,8 @@ use golden_core::{
 };
 #[cfg(feature = "halo2curves-secp256k1")]
 use rand_core::CryptoRngCore;
+#[cfg(all(feature = "halo2curves-secp256k1", feature = "serde"))]
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 /// Byte length of the paper `msg_i` nonce (256-bit security parameter).
 pub const MESSAGE_BYTES: usize = 256 / 8;
@@ -1914,6 +1916,45 @@ pub mod secp_secq {
         const TAG: u8 = wire::TAG_PROOF_BYTES;
     }
 
+    #[cfg(feature = "serde")]
+    impl Serialize for SecpSecqProof {
+        fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(&wire::to_wire_bytes(self))
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    impl<'de> Deserialize<'de> for SecpSecqProof {
+        fn deserialize<D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> core::result::Result<Self, D::Error> {
+            deserializer.deserialize_bytes(SecpSecqProofBytes)
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    struct SecpSecqProofBytes;
+
+    #[cfg(feature = "serde")]
+    impl<'de> de::Visitor<'de> for SecpSecqProofBytes {
+        type Value = SecpSecqProof;
+
+        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("canonical Golden Secp/Secq proof bytes")
+        }
+
+        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> core::result::Result<Self::Value, E> {
+            wire::from_wire_bytes(value).map_err(|err| E::custom(err.to_string()))
+        }
+
+        fn visit_byte_buf<E: de::Error>(
+            self,
+            value: Vec<u8>,
+        ) -> core::result::Result<Self::Value, E> {
+            wire::from_wire_bytes(&value).map_err(|err| E::custom(err.to_string()))
+        }
+    }
+
     /// Serialize the proof envelope into a flat byte vector.
     fn encode_proof(envelope: &BatchedEvrfProofEnvelope, num_receivers: usize) -> Result<Vec<u8>> {
         let n = u32::try_from(num_receivers).map_err(|_| Error::ProofVerificationFailed)?;
@@ -3278,6 +3319,17 @@ pub mod secp_secq {
             let decoded = wire::from_wire_bytes::<SecpSecqProof>(&bytes).unwrap();
 
             assert_eq!(decoded, proof);
+        }
+
+        #[cfg(feature = "serde")]
+        #[test]
+        fn secp_secq_proof_serde_uses_canonical_wire_bytes() {
+            use serde_test::{assert_tokens, Token};
+
+            let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
+            let bytes: &'static [u8] = Box::leak(wire::to_wire_bytes(&proof).into_boxed_slice());
+
+            assert_tokens(&proof, &[Token::Bytes(bytes)]);
         }
     }
 }

@@ -21,6 +21,8 @@ use golden_core::{
     ParticipantIndex, Result, TranscriptRoot,
 };
 use rand_core::CryptoRngCore;
+#[cfg(feature = "serde")]
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 pub mod paper;
@@ -136,6 +138,57 @@ pub mod prototype {
         G::ElementRepr: TryFrom<Vec<u8>>,
     {
         const TAG: u8 = wire::TAG_PROOF_BYTES;
+    }
+
+    #[cfg(feature = "serde")]
+    impl<G> Serialize for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(&wire::to_wire_bytes(self))
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    impl<'de, G> Deserialize<'de> for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn deserialize<D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> core::result::Result<Self, D::Error> {
+            deserializer.deserialize_bytes(ShareOpeningProofBytes::<G>(core::marker::PhantomData))
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    struct ShareOpeningProofBytes<G>(core::marker::PhantomData<G>);
+
+    #[cfg(feature = "serde")]
+    impl<'de, G> de::Visitor<'de> for ShareOpeningProofBytes<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        type Value = ShareOpeningBatchedProof<G>;
+
+        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("canonical Golden share-opening proof bytes")
+        }
+
+        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> core::result::Result<Self::Value, E> {
+            wire::from_wire_bytes(value).map_err(|err| E::custom(err.to_string()))
+        }
+
+        fn visit_byte_buf<E: de::Error>(
+            self,
+            value: Vec<u8>,
+        ) -> core::result::Result<Self::Value, E> {
+            wire::from_wire_bytes(&value).map_err(|err| E::custom(err.to_string()))
+        }
     }
 
     /// Generic proof backend for DKG share, pad, and DH commitments.
@@ -412,6 +465,24 @@ mod tests {
             from_wire_bytes::<ShareOpeningBatchedProof<P256Backend>>(&bytes).unwrap_err(),
             Error::InvalidEncoding
         );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn share_opening_batched_proof_serde_uses_canonical_wire_bytes() {
+        use serde_test::{assert_tokens, Token};
+
+        let proof = ShareOpeningProof::<P256Backend> {
+            nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(2).unwrap()),
+            response: P256Scalar::from_u64(11).unwrap(),
+            pad_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(3).unwrap()),
+            dh_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(5).unwrap()),
+            pad_response: P256Scalar::from_u64(13).unwrap(),
+        };
+        let proof = ShareOpeningBatchedProof(BTreeMap::from([(idx(2), proof)]));
+        let bytes: &'static [u8] = Box::leak(to_wire_bytes(&proof).into_boxed_slice());
+
+        assert_tokens(&proof, &[Token::Bytes(bytes)]);
     }
 
     fn prove_one<G: GoldenGroup>(
