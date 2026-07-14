@@ -659,6 +659,12 @@ where
     R: ByteReader,
 {
     let len = source.read_usize()?;
+    if len > source.max_alloc(1) {
+        return Err(DeserializationError::InvalidValue(format!(
+            "wire payload length {len} exceeds reader allocation budget"
+        )));
+    }
+    source.check_eor(len)?;
     let bytes = source.read_vec(len)?;
     from_wire_bytes(&bytes).map_err(|err| DeserializationError::InvalidValue(err.to_string()))
 }
@@ -1081,5 +1087,9 @@ mod tests {
 
         assert_eq!(SessionId::read_from(&mut reader).unwrap(), session_id);
         assert_eq!(SessionId::read_from(&mut reader).unwrap(), other);
+
+        let mut oversized = usize::MAX.to_bytes();
+        oversized.push(0);
+        assert!(SessionId::read_from_bytes(&oversized).is_err());
     }
 }
