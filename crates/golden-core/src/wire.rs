@@ -40,6 +40,8 @@ pub const TAG_DKG_CONFIG: u8 = 0x06;
 pub const TAG_DEALER_MESSAGE: u8 = 0x07;
 /// Top-level tag for opaque proof bytes.
 pub const TAG_PROOF_BYTES: u8 = 0x08;
+/// Top-level tag for prototype share-opening batch proofs.
+pub const TAG_SHARE_OPENING_BATCHED_PROOF: u8 = 0x09;
 
 /// Encode a value into its nested canonical wire representation.
 pub trait WireEncode {
@@ -124,6 +126,23 @@ impl<'a> WireReader<'a> {
     /// Read a length prefix as a `usize`.
     pub fn read_len(&mut self) -> Result<usize> {
         usize::try_from(self.read_u64()?).map_err(|_| Error::InvalidEncoding)
+    }
+
+    /// Return the number of unread bytes.
+    pub fn remaining(&self) -> usize {
+        self.bytes.len() - self.cursor
+    }
+
+    /// Validate that at least `count * min_item_size` bytes remain.
+    pub fn ensure_remaining_items(&self, count: usize, min_item_size: usize) -> Result<()> {
+        let required = count
+            .checked_mul(min_item_size)
+            .ok_or(Error::InvalidEncoding)?;
+        if required <= self.remaining() {
+            Ok(())
+        } else {
+            Err(Error::InvalidEncoding)
+        }
     }
 
     /// Read `N` bytes into an array.
@@ -265,6 +284,7 @@ where
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let len = reader.read_len()?;
+        reader.ensure_remaining_items(len, G::encode_element(&G::identity()).as_ref().len())?;
         let mut coefficients = Vec::with_capacity(len);
         for _ in 0..len {
             coefficients.push(read_element::<G>(reader)?);
@@ -283,15 +303,10 @@ where
 
 impl<G: GoldenGroup> WireEncode for ParticipantRegistry<G> {
     fn write_wire(&self, out: &mut Vec<u8>) {
-        let indexes: Vec<_> = self.indexes().collect();
-        write_len(out, indexes.len());
-        for participant in indexes {
+        write_len(out, self.len());
+        for (participant, public_key) in self.entries() {
             participant.write_wire(out);
-            write_element::<G>(
-                out,
-                self.public_key(participant)
-                    .expect("registry index must have public key"),
-            );
+            write_element::<G>(out, public_key);
         }
     }
 }
@@ -303,6 +318,8 @@ where
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let len = reader.read_len()?;
+        let entry_len = 4 + G::encode_element(&G::identity()).as_ref().len();
+        reader.ensure_remaining_items(len, entry_len)?;
         let mut entries = Vec::with_capacity(len);
         let mut last = None;
         for _ in 0..len {
@@ -387,6 +404,10 @@ where
         let msg_i = DealerMessageNonce::read_wire(reader)?;
         let commitment = FeldmanCommitment::<G>::read_wire(reader)?;
         let len = reader.read_len()?;
+        let encrypted_share_len = 4
+            + 2 * G::encode_element(&G::identity()).as_ref().len()
+            + G::Scalar::zero().to_repr().as_ref().len();
+        reader.ensure_remaining_items(len, encrypted_share_len)?;
         let mut encrypted_shares = BTreeMap::new();
         let mut last = None;
         for _ in 0..len {
@@ -443,7 +464,7 @@ impl Serializable for SessionId {
     }
 
     fn get_size_hint(&self) -> usize {
-        to_wire_bytes(self).len()
+        miden_wire_size_hint(self)
     }
 }
 
@@ -463,7 +484,7 @@ impl Serializable for DealerMessageNonce {
     }
 
     fn get_size_hint(&self) -> usize {
-        to_wire_bytes(self).len()
+        miden_wire_size_hint(self)
     }
 }
 
@@ -487,7 +508,7 @@ where
     }
 
     fn get_size_hint(&self) -> usize {
-        to_wire_bytes(self).len()
+        miden_wire_size_hint(self)
     }
 }
 
@@ -515,7 +536,7 @@ where
     }
 
     fn get_size_hint(&self) -> usize {
-        to_wire_bytes(self).len()
+        miden_wire_size_hint(self)
     }
 }
 
@@ -543,7 +564,7 @@ where
     }
 
     fn get_size_hint(&self) -> usize {
-        to_wire_bytes(self).len()
+        miden_wire_size_hint(self)
     }
 }
 
@@ -571,7 +592,7 @@ where
     }
 
     fn get_size_hint(&self) -> usize {
-        to_wire_bytes(self).len()
+        miden_wire_size_hint(self)
     }
 }
 
@@ -600,7 +621,7 @@ where
     }
 
     fn get_size_hint(&self) -> usize {
-        to_wire_bytes(self).len()
+        miden_wire_size_hint(self)
     }
 }
 
@@ -619,25 +640,41 @@ where
 }
 
 #[cfg(feature = "miden-serde")]
-fn write_miden_wire<T, W>(value: &T, target: &mut W)
+/// Write a length-delimited top-level wire message into a Miden byte writer.
+pub fn write_miden_wire<T, W>(value: &T, target: &mut W)
 where
     T: WireMessage,
     W: ByteWriter,
 {
-    target.write_bytes(&to_wire_bytes(value));
+    let bytes = to_wire_bytes(value);
+    target.write_usize(bytes.len());
+    target.write_bytes(&bytes);
 }
 
 #[cfg(feature = "miden-serde")]
-fn read_miden_wire<T, R>(source: &mut R) -> core::result::Result<T, DeserializationError>
+/// Read a length-delimited top-level wire message from a Miden byte reader.
+pub fn read_miden_wire<T, R>(source: &mut R) -> core::result::Result<T, DeserializationError>
 where
     T: WireMessage,
     R: ByteReader,
 {
-    let mut bytes = Vec::new();
-    while source.has_more_bytes() {
-        bytes.push(source.read_u8()?);
-    }
+    let len = source.read_usize()?;
+    let bytes = source.read_vec(len)?;
     from_wire_bytes(&bytes).map_err(|err| DeserializationError::InvalidValue(err.to_string()))
+}
+
+#[cfg(feature = "miden-serde")]
+/// Return the serialized size hint for a length-delimited Miden wire message.
+pub fn miden_wire_size_hint<T: WireMessage>(value: &T) -> usize {
+    let len = to_wire_bytes(value).len();
+    miden_usize_size(len) + len
+}
+
+#[cfg(feature = "miden-serde")]
+fn miden_usize_size(value: usize) -> usize {
+    let zeros = (value as u64).leading_zeros() as usize;
+    let len = zeros.saturating_sub(1) / 7;
+    9 - core::cmp::min(len, 8)
 }
 
 #[cfg(feature = "serde")]
@@ -819,6 +856,17 @@ where
     fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> core::result::Result<Self::Value, E> {
         from_wire_bytes(&value).map_err(|err| E::custom(err.to_string()))
     }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(byte) = seq.next_element()? {
+            bytes.push(byte);
+        }
+        from_wire_bytes(&bytes).map_err(|err| de::Error::custom(err.to_string()))
+    }
 }
 
 /// Write a big-endian `u32`.
@@ -996,23 +1044,42 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn serde_uses_canonical_wire_bytes() {
-        use serde_test::{assert_tokens, Token};
+        use serde_test::{assert_de_tokens, assert_tokens, Token};
 
         let session_id = SessionId([11u8; 32]);
         let bytes: &'static [u8] = Box::leak(to_wire_bytes(&session_id).into_boxed_slice());
 
         assert_tokens(&session_id, &[Token::Bytes(bytes)]);
+
+        let mut seq = Vec::with_capacity(bytes.len() + 2);
+        seq.push(Token::Seq {
+            len: Some(bytes.len()),
+        });
+        seq.extend(bytes.iter().copied().map(Token::U8));
+        seq.push(Token::SeqEnd);
+
+        assert_de_tokens(&session_id, &seq);
     }
 
     #[cfg(feature = "miden-serde")]
     #[test]
     fn miden_serde_uses_canonical_wire_bytes() {
-        use miden_serde_utils::{Deserializable, Serializable};
+        use miden_serde_utils::{Deserializable, Serializable, SliceReader};
 
         let session_id = SessionId([12u8; 32]);
         let bytes = session_id.to_bytes();
+        let wire_bytes = to_wire_bytes(&session_id);
 
-        assert_eq!(bytes, to_wire_bytes(&session_id));
+        assert!(bytes.ends_with(&wire_bytes));
         assert_eq!(SessionId::read_from_bytes(&bytes).unwrap(), session_id);
+
+        let other = SessionId([13u8; 32]);
+        let mut adjacent = Vec::new();
+        session_id.write_into(&mut adjacent);
+        other.write_into(&mut adjacent);
+        let mut reader = SliceReader::new(&adjacent);
+
+        assert_eq!(SessionId::read_from(&mut reader).unwrap(), session_id);
+        assert_eq!(SessionId::read_from(&mut reader).unwrap(), other);
     }
 }

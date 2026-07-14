@@ -122,6 +122,10 @@ pub mod prototype {
     {
         fn read_wire(reader: &mut wire::WireReader<'_>) -> Result<Self> {
             let len = reader.read_len()?;
+            let item_len = 4
+                + 3 * G::encode_element(&G::identity()).as_ref().len()
+                + 2 * G::Scalar::zero().to_repr().as_ref().len();
+            reader.ensure_remaining_items(len, item_len)?;
             let mut map = std::collections::BTreeMap::new();
             let mut last = None;
             for _ in 0..len {
@@ -141,7 +145,7 @@ pub mod prototype {
         G: GoldenGroup,
         G::ElementRepr: TryFrom<Vec<u8>>,
     {
-        const TAG: u8 = wire::TAG_PROOF_BYTES;
+        const TAG: u8 = wire::TAG_SHARE_OPENING_BATCHED_PROOF;
     }
 
     #[cfg(feature = "miden-serde")]
@@ -151,11 +155,11 @@ pub mod prototype {
         G::ElementRepr: TryFrom<Vec<u8>>,
     {
         fn write_into<W: ByteWriter>(&self, target: &mut W) {
-            target.write_bytes(&wire::to_wire_bytes(self));
+            wire::write_miden_wire(self, target);
         }
 
         fn get_size_hint(&self) -> usize {
-            wire::to_wire_bytes(self).len()
+            wire::miden_wire_size_hint(self)
         }
     }
 
@@ -168,12 +172,7 @@ pub mod prototype {
         fn read_from<R: ByteReader>(
             source: &mut R,
         ) -> core::result::Result<Self, DeserializationError> {
-            let mut bytes = Vec::new();
-            while source.has_more_bytes() {
-                bytes.push(source.read_u8()?);
-            }
-            wire::from_wire_bytes(&bytes)
-                .map_err(|err| DeserializationError::InvalidValue(err.to_string()))
+            wire::read_miden_wire(source)
         }
     }
 
@@ -225,6 +224,17 @@ pub mod prototype {
             value: Vec<u8>,
         ) -> core::result::Result<Self::Value, E> {
             wire::from_wire_bytes(&value).map_err(|err| E::custom(err.to_string()))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(byte) = seq.next_element()? {
+                bytes.push(byte);
+            }
+            wire::from_wire_bytes(&bytes).map_err(|err| de::Error::custom(err.to_string()))
         }
     }
 
@@ -507,7 +517,7 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn share_opening_batched_proof_serde_uses_canonical_wire_bytes() {
-        use serde_test::{assert_tokens, Token};
+        use serde_test::{assert_de_tokens, assert_tokens, Token};
 
         let proof = ShareOpeningProof::<P256Backend> {
             nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(2).unwrap()),
@@ -520,12 +530,21 @@ mod tests {
         let bytes: &'static [u8] = Box::leak(to_wire_bytes(&proof).into_boxed_slice());
 
         assert_tokens(&proof, &[Token::Bytes(bytes)]);
+
+        let mut seq = Vec::with_capacity(bytes.len() + 2);
+        seq.push(Token::Seq {
+            len: Some(bytes.len()),
+        });
+        seq.extend(bytes.iter().copied().map(Token::U8));
+        seq.push(Token::SeqEnd);
+
+        assert_de_tokens(&proof, &seq);
     }
 
     #[cfg(feature = "miden-serde")]
     #[test]
     fn share_opening_batched_proof_miden_serde_uses_canonical_wire_bytes() {
-        use miden_serde_utils::{Deserializable, Serializable};
+        use miden_serde_utils::{Deserializable, Serializable, SliceReader};
 
         let proof = ShareOpeningProof::<P256Backend> {
             nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(2).unwrap()),
@@ -536,10 +555,25 @@ mod tests {
         };
         let proof = ShareOpeningBatchedProof(BTreeMap::from([(idx(2), proof)]));
         let bytes = proof.to_bytes();
+        let wire_bytes = to_wire_bytes(&proof);
 
-        assert_eq!(bytes, to_wire_bytes(&proof));
+        assert!(bytes.ends_with(&wire_bytes));
         assert_eq!(
             ShareOpeningBatchedProof::<P256Backend>::read_from_bytes(&bytes).unwrap(),
+            proof
+        );
+
+        let mut adjacent = Vec::new();
+        proof.write_into(&mut adjacent);
+        proof.write_into(&mut adjacent);
+        let mut reader = SliceReader::new(&adjacent);
+
+        assert_eq!(
+            ShareOpeningBatchedProof::<P256Backend>::read_from(&mut reader).unwrap(),
+            proof
+        );
+        assert_eq!(
+            ShareOpeningBatchedProof::<P256Backend>::read_from(&mut reader).unwrap(),
             proof
         );
     }
@@ -599,7 +633,13 @@ mod tests {
     }
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
     }
 
     #[test]
