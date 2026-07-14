@@ -93,7 +93,7 @@ impl GoldenScalar for TinyScalar {
 }
 
 /// Tiny additive group over the scalar field.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TinyGroup {}
 
 impl GoldenGroup for TinyGroup {
