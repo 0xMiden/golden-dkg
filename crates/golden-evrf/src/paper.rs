@@ -1923,11 +1923,11 @@ pub mod secp_secq {
     #[cfg(feature = "miden-serde")]
     impl Serializable for SecpSecqProof {
         fn write_into<W: ByteWriter>(&self, target: &mut W) {
-            target.write_bytes(&wire::to_wire_bytes(self));
+            wire::write_miden_wire(self, target);
         }
 
         fn get_size_hint(&self) -> usize {
-            wire::to_wire_bytes(self).len()
+            wire::miden_wire_size_hint(self)
         }
     }
 
@@ -1936,12 +1936,7 @@ pub mod secp_secq {
         fn read_from<R: ByteReader>(
             source: &mut R,
         ) -> core::result::Result<Self, DeserializationError> {
-            let mut bytes = Vec::new();
-            while source.has_more_bytes() {
-                bytes.push(source.read_u8()?);
-            }
-            wire::from_wire_bytes(&bytes)
-                .map_err(|err| DeserializationError::InvalidValue(err.to_string()))
+            wire::read_miden_wire(source)
         }
     }
 
@@ -1981,6 +1976,17 @@ pub mod secp_secq {
             value: Vec<u8>,
         ) -> core::result::Result<Self::Value, E> {
             wire::from_wire_bytes(&value).map_err(|err| E::custom(err.to_string()))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(byte) = seq.next_element()? {
+                bytes.push(byte);
+            }
+            wire::from_wire_bytes(&bytes).map_err(|err| de::Error::custom(err.to_string()))
         }
     }
 
@@ -3353,24 +3359,42 @@ pub mod secp_secq {
         #[cfg(feature = "serde")]
         #[test]
         fn secp_secq_proof_serde_uses_canonical_wire_bytes() {
-            use serde_test::{assert_tokens, Token};
+            use serde_test::{assert_de_tokens, assert_tokens, Token};
 
             let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
             let bytes: &'static [u8] = Box::leak(wire::to_wire_bytes(&proof).into_boxed_slice());
 
             assert_tokens(&proof, &[Token::Bytes(bytes)]);
+
+            let mut seq = Vec::with_capacity(bytes.len() + 2);
+            seq.push(Token::Seq {
+                len: Some(bytes.len()),
+            });
+            seq.extend(bytes.iter().copied().map(Token::U8));
+            seq.push(Token::SeqEnd);
+
+            assert_de_tokens(&proof, &seq);
         }
 
         #[cfg(feature = "miden-serde")]
         #[test]
         fn secp_secq_proof_miden_serde_uses_canonical_wire_bytes() {
-            use miden_serde_utils::{Deserializable, Serializable};
+            use miden_serde_utils::{Deserializable, Serializable, SliceReader};
 
             let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
             let bytes = proof.to_bytes();
+            let wire_bytes = wire::to_wire_bytes(&proof);
 
-            assert_eq!(bytes, wire::to_wire_bytes(&proof));
+            assert!(bytes.ends_with(&wire_bytes));
             assert_eq!(SecpSecqProof::read_from_bytes(&bytes).unwrap(), proof);
+
+            let mut adjacent = Vec::new();
+            proof.write_into(&mut adjacent);
+            proof.write_into(&mut adjacent);
+            let mut reader = SliceReader::new(&adjacent);
+
+            assert_eq!(SecpSecqProof::read_from(&mut reader).unwrap(), proof);
+            assert_eq!(SecpSecqProof::read_from(&mut reader).unwrap(), proof);
         }
     }
 }

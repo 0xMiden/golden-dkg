@@ -105,6 +105,13 @@ impl<G: GoldenGroup> ParticipantRegistry<G> {
     pub fn indexes(&self) -> impl Iterator<Item = ParticipantIndex> + '_ {
         self.participants.keys().copied()
     }
+
+    /// Return participant entries in canonical order.
+    pub fn entries(&self) -> impl Iterator<Item = (ParticipantIndex, &G::Element)> + '_ {
+        self.participants
+            .iter()
+            .map(|(participant, public_key)| (*participant, public_key))
+    }
 }
 
 /// DKG configuration.
