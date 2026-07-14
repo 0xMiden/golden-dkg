@@ -1070,7 +1070,7 @@ mod tests {
     #[cfg(feature = "miden-serde")]
     #[test]
     fn miden_serde_uses_canonical_wire_bytes() {
-        use miden_serde_utils::{Deserializable, Serializable, SliceReader};
+        use miden_serde_utils::{BudgetedReader, Deserializable, Serializable, SliceReader};
 
         let session_id = SessionId([12u8; 32]);
         let bytes = session_id.to_bytes();
@@ -1091,5 +1091,11 @@ mod tests {
         let mut oversized = usize::MAX.to_bytes();
         oversized.push(0);
         assert!(SessionId::read_from_bytes(&oversized).is_err());
+
+        let mut budgeted = SliceReader::new(&bytes);
+        let declared_len = budgeted.read_usize().unwrap();
+        assert!(declared_len > 8);
+        let mut budgeted = BudgetedReader::new(SliceReader::new(&bytes), 8);
+        assert!(read_miden_wire::<SessionId, _>(&mut budgeted).is_err());
     }
 }
