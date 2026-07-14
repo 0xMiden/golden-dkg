@@ -17,7 +17,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use golden_core::{
-    Error, EvrfProofBackend, EvrfStatement, EvrfWitness, GoldenGroup, GoldenScalar,
+    wire, Error, EvrfProofBackend, EvrfStatement, EvrfWitness, GoldenGroup, GoldenScalar,
     ParticipantIndex, Result, TranscriptRoot,
 };
 use rand_core::CryptoRngCore;
@@ -59,6 +59,32 @@ pub mod prototype {
 
     impl<G: GoldenGroup> Eq for ShareOpeningProof<G> {}
 
+    impl<G: GoldenGroup> wire::WireEncode for ShareOpeningProof<G> {
+        fn write_wire(&self, out: &mut Vec<u8>) {
+            wire::write_element::<G>(out, &self.nonce_commitment);
+            wire::write_scalar::<G>(out, &self.response);
+            wire::write_element::<G>(out, &self.pad_nonce_commitment);
+            wire::write_element::<G>(out, &self.dh_nonce_commitment);
+            wire::write_scalar::<G>(out, &self.pad_response);
+        }
+    }
+
+    impl<G> wire::WireDecode for ShareOpeningProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn read_wire(reader: &mut wire::WireReader<'_>) -> Result<Self> {
+            Ok(Self {
+                nonce_commitment: wire::read_element::<G>(reader)?,
+                response: wire::read_scalar::<G>(reader)?,
+                pad_nonce_commitment: wire::read_element::<G>(reader)?,
+                dh_nonce_commitment: wire::read_element::<G>(reader)?,
+                pad_response: wire::read_scalar::<G>(reader)?,
+            })
+        }
+    }
+
     /// Batched proof: one [`ShareOpeningProof`] per receiver, keyed by receiver.
     #[derive(Clone, Debug)]
     pub struct ShareOpeningBatchedProof<G: GoldenGroup>(
@@ -72,6 +98,45 @@ pub mod prototype {
     }
 
     impl<G: GoldenGroup> Eq for ShareOpeningBatchedProof<G> {}
+
+    impl<G: GoldenGroup> wire::WireEncode for ShareOpeningBatchedProof<G> {
+        fn write_wire(&self, out: &mut Vec<u8>) {
+            wire::write_len(out, self.0.len());
+            for (receiver, proof) in &self.0 {
+                wire::WireEncode::write_wire(receiver, out);
+                wire::WireEncode::write_wire(proof, out);
+            }
+        }
+    }
+
+    impl<G> wire::WireDecode for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn read_wire(reader: &mut wire::WireReader<'_>) -> Result<Self> {
+            let len = reader.read_len()?;
+            let mut map = std::collections::BTreeMap::new();
+            let mut last = None;
+            for _ in 0..len {
+                let receiver = <ParticipantIndex as wire::WireDecode>::read_wire(reader)?;
+                if last.is_some_and(|previous| previous >= receiver) {
+                    return Err(Error::DuplicateParticipantIndex(receiver.get()));
+                }
+                last = Some(receiver);
+                map.insert(receiver, ShareOpeningProof::<G>::read_wire(reader)?);
+            }
+            Ok(Self(map))
+        }
+    }
+
+    impl<G> wire::WireMessage for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        const TAG: u8 = wire::TAG_PROOF_BYTES;
+    }
 
     /// Generic proof backend for DKG share, pad, and DH commitments.
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -291,9 +356,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use golden_core::{
-        complete, create_dealing, verify_dealing, DealerMessage, DealerMessageNonce, DkgConfig,
-        DkgDealing, FeldmanCommitment, ParticipantIndex, ParticipantRegistry, Polynomial,
-        SessionId, Share,
+        complete, create_dealing, verify_dealing,
+        wire::{from_wire_bytes, to_wire_bytes},
+        DealerMessage, DealerMessageNonce, DkgConfig, DkgDealing, FeldmanCommitment, GoldenGroup,
+        ParticipantIndex, ParticipantRegistry, Polynomial, SessionId, Share,
     };
     use golden_rustcrypto::{P256Backend, P256Scalar};
     use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
@@ -306,6 +372,46 @@ mod tests {
 
     fn idx(value: u32) -> ParticipantIndex {
         ParticipantIndex::new(value).unwrap()
+    }
+
+    #[test]
+    fn share_opening_batched_proof_wire_round_trips() {
+        let response = P256Scalar::from_u64(11).unwrap();
+        let pad_response = P256Scalar::from_u64(13).unwrap();
+        let proof = ShareOpeningProof::<P256Backend> {
+            nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(2).unwrap()),
+            response,
+            pad_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(3).unwrap()),
+            dh_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(5).unwrap()),
+            pad_response,
+        };
+        let proof = ShareOpeningBatchedProof(BTreeMap::from([(idx(2), proof)]));
+
+        let decoded =
+            from_wire_bytes::<ShareOpeningBatchedProof<P256Backend>>(&to_wire_bytes(&proof))
+                .unwrap();
+
+        assert_eq!(decoded, proof);
+    }
+
+    #[test]
+    fn share_opening_batched_proof_wire_rejects_malformed_point() {
+        let proof = ShareOpeningProof::<P256Backend> {
+            nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(2).unwrap()),
+            response: P256Scalar::from_u64(11).unwrap(),
+            pad_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(3).unwrap()),
+            dh_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(5).unwrap()),
+            pad_response: P256Scalar::from_u64(13).unwrap(),
+        };
+        let proof = ShareOpeningBatchedProof(BTreeMap::from([(idx(2), proof)]));
+        let mut bytes = to_wire_bytes(&proof);
+        let first_point = golden_core::wire::MAGIC.len() + 1 + 8 + 4;
+        bytes[first_point] = 0xff;
+
+        assert_eq!(
+            from_wire_bytes::<ShareOpeningBatchedProof<P256Backend>>(&bytes).unwrap_err(),
+            Error::InvalidEncoding
+        );
     }
 
     fn prove_one<G: GoldenGroup>(
