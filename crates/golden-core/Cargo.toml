@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 rand_core = { workspace = true }
+serde = { workspace = true, optional = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
@@ -16,6 +17,11 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 rand_chacha = { workspace = true }
+serde_test = { workspace = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
 
 [lints]
 workspace = true

@@ -6,6 +6,11 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(feature = "serde")]
+use core::marker::PhantomData;
+#[cfg(feature = "serde")]
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::{
     DealerMessage, DealerMessageNonce, DkgConfig, EncryptedShare, Error, FeldmanCommitment,
     GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, Result, SessionId,
@@ -427,6 +432,187 @@ impl WireMessage for Vec<u8> {
     const TAG: u8 = TAG_PROOF_BYTES;
 }
 
+#[cfg(feature = "serde")]
+impl Serialize for SessionId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serialize_wire(self, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserialize_wire(deserializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for DealerMessageNonce {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serialize_wire(self, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for DealerMessageNonce {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserialize_wire(deserializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<G> Serialize for EncryptedShare<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serialize_wire(self, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G> Deserialize<'de> for EncryptedShare<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserialize_wire(deserializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<G> Serialize for FeldmanCommitment<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serialize_wire(self, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G> Deserialize<'de> for FeldmanCommitment<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserialize_wire(deserializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<G> Serialize for ParticipantRegistry<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serialize_wire(self, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G> Deserialize<'de> for ParticipantRegistry<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserialize_wire(deserializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<G> Serialize for DkgConfig<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serialize_wire(self, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G> Deserialize<'de> for DkgConfig<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserialize_wire(deserializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<G, P> Serialize for DealerMessage<G, P>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+    P: WireEncode + WireDecode,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serialize_wire(self, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G, P> Deserialize<'de> for DealerMessage<G, P>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+    P: WireEncode + WireDecode,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserialize_wire(deserializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+fn serialize_wire<T, S>(value: &T, serializer: S) -> core::result::Result<S::Ok, S::Error>
+where
+    T: WireMessage,
+    S: Serializer,
+{
+    serializer.serialize_bytes(&to_wire_bytes(value))
+}
+
+#[cfg(feature = "serde")]
+fn deserialize_wire<'de, T, D>(deserializer: D) -> core::result::Result<T, D::Error>
+where
+    T: WireMessage,
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_bytes(WireBytesVisitor::<T>(PhantomData))
+}
+
+#[cfg(feature = "serde")]
+struct WireBytesVisitor<T>(PhantomData<T>);
+
+#[cfg(feature = "serde")]
+impl<'de, T> de::Visitor<'de> for WireBytesVisitor<T>
+where
+    T: WireMessage,
+{
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("canonical Golden DKG wire bytes")
+    }
+
+    fn visit_bytes<E: de::Error>(self, value: &[u8]) -> core::result::Result<Self::Value, E> {
+        from_wire_bytes(value).map_err(|err| E::custom(err.to_string()))
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> core::result::Result<Self::Value, E> {
+        from_wire_bytes(&value).map_err(|err| E::custom(err.to_string()))
+    }
+}
+
 /// Write a big-endian `u32`.
 pub fn write_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_be_bytes());
@@ -597,5 +783,16 @@ mod tests {
 
         assert_eq!(decoded, message);
         assert_eq!(decoded.transcript_root, [7u8; 32]);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_uses_canonical_wire_bytes() {
+        use serde_test::{assert_tokens, Token};
+
+        let session_id = SessionId([11u8; 32]);
+        let bytes: &'static [u8] = Box::leak(to_wire_bytes(&session_id).into_boxed_slice());
+
+        assert_tokens(&session_id, &[Token::Bytes(bytes)]);
     }
 }
