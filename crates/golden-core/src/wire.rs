@@ -427,30 +427,36 @@ impl WireMessage for Vec<u8> {
     const TAG: u8 = TAG_PROOF_BYTES;
 }
 
-fn write_u32(out: &mut Vec<u8>, value: u32) {
+/// Write a big-endian `u32`.
+pub fn write_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
-fn write_len(out: &mut Vec<u8>, value: usize) {
+/// Write a collection length as a big-endian `u64`.
+pub fn write_len(out: &mut Vec<u8>, value: usize) {
     out.extend_from_slice(&(value as u64).to_be_bytes());
 }
 
-fn write_scalar<G: GoldenGroup>(out: &mut Vec<u8>, scalar: &G::Scalar) {
+/// Write a scalar using its canonical Golden representation.
+pub fn write_scalar<G: GoldenGroup>(out: &mut Vec<u8>, scalar: &G::Scalar) {
     out.extend_from_slice(scalar.to_repr().as_ref());
 }
 
-fn read_scalar<G: GoldenGroup>(reader: &mut WireReader<'_>) -> Result<G::Scalar> {
+/// Read a scalar using its canonical Golden representation.
+pub fn read_scalar<G: GoldenGroup>(reader: &mut WireReader<'_>) -> Result<G::Scalar> {
     let repr_len = G::Scalar::zero().to_repr().as_ref().len();
     let repr = <G::Scalar as GoldenScalar>::Repr::try_from(reader.read_exact(repr_len)?.to_vec())
         .map_err(|_| Error::InvalidEncoding)?;
     G::Scalar::from_repr(&repr)
 }
 
-fn write_element<G: GoldenGroup>(out: &mut Vec<u8>, element: &G::Element) {
+/// Write a group element using its canonical Golden representation.
+pub fn write_element<G: GoldenGroup>(out: &mut Vec<u8>, element: &G::Element) {
     out.extend_from_slice(G::encode_element(element).as_ref());
 }
 
-fn read_element<G>(reader: &mut WireReader<'_>) -> Result<G::Element>
+/// Read a group element using its canonical Golden representation.
+pub fn read_element<G>(reader: &mut WireReader<'_>) -> Result<G::Element>
 where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,

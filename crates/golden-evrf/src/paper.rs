@@ -16,7 +16,9 @@
 #![allow(non_snake_case)]
 
 #[cfg(feature = "halo2curves-secp256k1")]
-use golden_core::{Error, EvrfStatement, EvrfWitness, ParticipantIndex, Result, TranscriptRoot};
+use golden_core::{
+    wire, Error, EvrfStatement, EvrfWitness, ParticipantIndex, Result, TranscriptRoot,
+};
 #[cfg(feature = "halo2curves-secp256k1")]
 use rand_core::CryptoRngCore;
 
@@ -1896,6 +1898,22 @@ pub mod secp_secq {
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct SecpSecqProof(pub Vec<u8>);
 
+    impl wire::WireEncode for SecpSecqProof {
+        fn write_wire(&self, out: &mut Vec<u8>) {
+            wire::WireEncode::write_wire(&self.0, out);
+        }
+    }
+
+    impl wire::WireDecode for SecpSecqProof {
+        fn read_wire(reader: &mut wire::WireReader<'_>) -> Result<Self> {
+            Ok(Self(<Vec<u8> as wire::WireDecode>::read_wire(reader)?))
+        }
+    }
+
+    impl wire::WireMessage for SecpSecqProof {
+        const TAG: u8 = wire::TAG_PROOF_BYTES;
+    }
+
     /// Serialize the proof envelope into a flat byte vector.
     fn encode_proof(envelope: &BatchedEvrfProofEnvelope, num_receivers: usize) -> Result<Vec<u8>> {
         let n = u32::try_from(num_receivers).map_err(|_| Error::ProofVerificationFailed)?;
@@ -3251,6 +3269,15 @@ pub mod secp_secq {
                 ensure_same_batch_context(&changed, &first).unwrap_err(),
                 Error::ProofVerificationFailed
             );
+        }
+
+        #[test]
+        fn secp_secq_proof_wire_wraps_complete_proof_bytes() {
+            let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
+            let bytes = wire::to_wire_bytes(&proof);
+            let decoded = wire::from_wire_bytes::<SecpSecqProof>(&bytes).unwrap();
+
+            assert_eq!(decoded, proof);
         }
     }
 }
