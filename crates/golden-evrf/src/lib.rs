@@ -94,7 +94,7 @@ pub mod prototype {
                 // Fail fast on inconsistent statements so the dealer surfaces a
                 // programming error at prove time rather than relying on every
                 // downstream verifier to re-check the relation.
-                ensure_encrypted_share_relation::<G>(statement)?;
+                ensure_public_relations::<G>(statement)?;
                 let share_nonce = random_nonzero_scalar::<G>(rng);
                 let pad_nonce = random_nonzero_scalar::<G>(rng);
                 let nonce_commitment = G::mul_generator(&share_nonce);
@@ -145,7 +145,7 @@ pub mod prototype {
                     return Err(Error::ProofVerificationFailed);
                 }
                 ensure_backend_matches::<G>(statement)?;
-                ensure_encrypted_share_relation::<G>(statement)?;
+                ensure_public_relations::<G>(statement)?;
                 let entry = proof
                     .0
                     .get(&statement.receiver)
@@ -206,11 +206,38 @@ pub mod prototype {
         }
     }
 
+    fn ensure_public_relations<G: GoldenGroup>(statement: &EvrfStatement<G>) -> Result<()> {
+        ensure_feldman_share_relation::<G>(statement)?;
+        ensure_encrypted_share_relation::<G>(statement)
+    }
+
     fn ensure_encrypted_share_relation<G: GoldenGroup>(statement: &EvrfStatement<G>) -> Result<()> {
         let encrypted_share_commitment = G::mul_generator(&statement.encrypted_share);
         let expected_encrypted_share_commitment =
             G::add(&statement.share_commitment, &statement.pad_commitment);
         if encrypted_share_commitment == expected_encrypted_share_commitment {
+            Ok(())
+        } else {
+            Err(Error::ProofVerificationFailed)
+        }
+    }
+
+    fn ensure_feldman_share_relation<G: GoldenGroup>(statement: &EvrfStatement<G>) -> Result<()> {
+        if statement.commitment_coefficients.is_empty()
+            || statement.commitment_coefficients.len() != statement.threshold
+        {
+            return Err(Error::ProofVerificationFailed);
+        }
+
+        let x = statement.receiver.to_scalar::<G::Scalar>()?;
+        let mut x_pow = G::Scalar::one();
+        let mut expected = G::identity();
+        for coefficient in &statement.commitment_coefficients {
+            expected = G::add(&expected, &G::mul(coefficient, &x_pow));
+            x_pow = x_pow.mul(&x);
+        }
+
+        if expected == statement.share_commitment {
             Ok(())
         } else {
             Err(Error::ProofVerificationFailed)
@@ -388,12 +415,14 @@ mod tests {
             backend_id: P256Backend::BACKEND_ID,
             session_id: config.session_id,
             registry_root: config.registry.root(),
+            threshold: config.threshold,
             dealer: message.dealer,
             receiver,
             msg_i: message.msg_i,
             beta: config.beta.clone(),
             dealer_public_key: *config.registry.public_key(message.dealer).unwrap(),
             receiver_public_key: *config.registry.public_key(receiver).unwrap(),
+            commitment_coefficients: message.commitment.coefficients().to_vec(),
             share_commitment: message.commitment.public_key_share(receiver).unwrap(),
             pad_commitment: message.encrypted_shares[&receiver].pad_commitment,
             dh_commitment: message.encrypted_shares[&receiver].dh_commitment,
@@ -644,12 +673,14 @@ mod tests {
             backend_id: P256Backend::BACKEND_ID,
             session_id: config.session_id,
             registry_root: config.registry.root(),
+            threshold: config.threshold,
             dealer: idx(1),
             receiver: idx(2),
             msg_i: DealerMessageNonce([7u8; 32]),
             beta: config.beta.clone(),
             dealer_public_key: *config.registry.public_key(idx(1)).unwrap(),
             receiver_public_key: *config.registry.public_key(idx(2)).unwrap(),
+            commitment_coefficients: commitment.coefficients().to_vec(),
             share_commitment,
             pad_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(5).unwrap()),
             dh_commitment: P256Backend::mul(
@@ -661,10 +692,36 @@ mod tests {
         };
         let witness = EvrfWitness {
             identity_secret: identity_secret(idx(1)),
+            polynomial_coefficients: polynomial.coefficients().to_vec(),
             share: share.value,
             pad: P256Scalar::from_u64(5).unwrap(),
         };
         let proof = prove_one(&statement, &witness, &mut rng).unwrap();
+
+        let mut wrong_commitment = statement.clone();
+        wrong_commitment.commitment_coefficients[0] = P256Backend::add(
+            &wrong_commitment.commitment_coefficients[0],
+            &P256Backend::generator(),
+        );
+        assert_eq!(
+            prove_one(&wrong_commitment, &witness, &mut rng).unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+        assert_eq!(
+            verify_one(&wrong_commitment, &proof).unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+
+        let mut wrong_threshold = statement.clone();
+        wrong_threshold.threshold += 1;
+        assert_eq!(
+            prove_one(&wrong_threshold, &witness, &mut rng).unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+        assert_eq!(
+            verify_one(&wrong_threshold, &proof).unwrap_err(),
+            Error::ProofVerificationFailed
+        );
 
         statement.share_commitment =
             P256Backend::add(&statement.share_commitment, &P256Backend::generator());
@@ -718,6 +775,7 @@ mod tests {
             .keys()
             .map(|receiver| EvrfWitness {
                 identity_secret: identity_secret(idx(1)),
+                polynomial_coefficients: vec![P256Scalar::zero()],
                 share: dealing
                     .message
                     .commitment
@@ -767,6 +825,7 @@ mod tests {
         let statement = statement_for(&config, &dealing.message, idx(2));
         let witness = EvrfWitness {
             identity_secret: identity_secret(idx(1)),
+            polynomial_coefficients: vec![P256Scalar::zero()],
             share: P256Scalar::zero(),
             pad: P256Scalar::zero(),
         };
@@ -800,6 +859,7 @@ mod tests {
         statement.encrypted_share = statement.encrypted_share.add(&P256Scalar::one());
         let witness = EvrfWitness {
             identity_secret: identity_secret(idx(1)),
+            polynomial_coefficients: vec![P256Scalar::zero()],
             share: P256Scalar::zero(),
             pad: P256Scalar::zero(),
         };
