@@ -147,10 +147,10 @@ fn linear_verify<C: Cycle>(c: &mut Criterion, curve: &str) {
 
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, _| {
             bench.iter_batched(
-                || Transcript::new(b"LinearProofBenchmark"),
-                |mut transcript| {
+                || (Transcript::new(b"LinearProofBenchmark"), b.clone()),
+                |(mut transcript, b)| {
                     proof
-                        .verify(&mut transcript, &C_commit, &G, &F, &B, b.clone())
+                        .verify(&mut transcript, &C_commit, &G, &F, &B, b)
                         .unwrap();
                 },
                 BatchSize::SmallInput,
