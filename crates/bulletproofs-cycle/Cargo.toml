@@ -54,5 +54,10 @@ name = "linear_proof"
 harness = false
 required-features = ["cycle-pedersen"]
 
+[[bench]]
+name = "r1cs"
+harness = false
+required-features = ["cycle-pedersen"]
+
 [lints]
 workspace = true
