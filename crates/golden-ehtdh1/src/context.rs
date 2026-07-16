@@ -1,4 +1,7 @@
 //! Shared EHTDH1 setup data and transcript errors.
+//!
+//! See crate root for the paper-to-crate symbol map. The generic `G` supplies
+//! the paper group `G`, scalar field order `q`, and identity `O`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -9,9 +12,9 @@ use sha2::{Digest, Sha256};
 /// Public share material for one participant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicShare<G: GoldenGroup> {
-    /// `X_i = x_i G`, used to check the decryption part of a share.
+    /// `X_i = x_i G` (paper Section 3 Key generation).
     pub decryption: G::Element,
-    /// `Z_i = z_i G`, where `z_i` shares zero and binds shares to context.
+    /// `Z_i = z_i G` for the zero sharing (paper Section 3 Key generation).
     pub context: G::Element,
 }
 
@@ -20,9 +23,9 @@ pub struct PublicShare<G: GoldenGroup> {
 pub struct SecretShare<G: GoldenGroup> {
     /// Participant that owns this share.
     pub participant: ParticipantIndex,
-    /// `x_i`, the participant's share of the collective decryption secret.
+    /// `x_i`, one of `(x_1..x_N)` sharing `x` (paper Section 3 Key generation).
     pub decryption: G::Scalar,
-    /// `z_i`, the participant's share of zero for context binding.
+    /// `z_i`, one of `(z_1..z_N)` sharing zero (paper Section 3 Key generation).
     pub context: G::Scalar,
 }
 
@@ -37,14 +40,14 @@ impl<G: GoldenGroup> fmt::Debug for SecretShare<G> {
     }
 }
 
-/// Public EHTDH1 key set derived from Golden setup.
+/// Paper `pkc = (X; X_i; Z_i)` plus the reconstruction threshold.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicKeySet<G: GoldenGroup> {
     /// Number of shares required to decrypt.
     pub threshold: usize,
-    /// Joint ElGamal public key `X`.
+    /// `X = xG`, the joint public key (paper Section 3 Key generation).
     pub joint_public_key: G::Element,
-    /// Public shares `(X_i, Z_i)`, keyed by participant.
+    /// `X_i = x_i G` and `Z_i = z_i G`, keyed by participant.
     pub public_shares: BTreeMap<ParticipantIndex, PublicShare<G>>,
 }
 
@@ -75,7 +78,12 @@ impl<G: GoldenGroup> PublicKeySet<G> {
     }
 }
 
-/// Golden setup context bound into decryption share transcripts.
+/// Golden setup context bound into `Hdgd` and `Hdcd`.
+///
+/// This is the crate's addition to paper Section 3: Golden DKG transcript
+/// roots, registry root, session ids, and epoch are bound through
+/// [`SetupContext::root`]. The zero sharing session id is derived by
+/// [`derive_context_session_id`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupContext {
     /// Stable Golden backend id.
@@ -121,7 +129,7 @@ impl SetupContext {
     }
 }
 
-/// Derive the zero sharing session id from an `x` session id.
+/// Golden setup derivation for the zero sharing session id, not in the paper.
 pub fn derive_context_session_id(decryption_session_id: SessionId) -> SessionId {
     let mut transcript = Transcript::new(b"golden-ehtdh1-context-session-v1");
     transcript.bytes(b"label", b"zero-sharing");
@@ -234,6 +242,7 @@ impl Transcript {
     }
 }
 
+/// `Hecd`/`Hdcd` reduction to `Zq`; the paper models this as a random oracle.
 pub(crate) fn hash_to_nonzero_scalar<G: GoldenGroup>(
     domain: &[u8],
     message: &[u8],

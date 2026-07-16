@@ -1,4 +1,6 @@
 //! Validator decryption shares and combiners.
+//!
+//! See crate root for the paper-to-crate symbol map.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -12,7 +14,7 @@ use crate::context::{
 };
 use crate::encrypt::{apply_payload_mask, random_nonzero_scalar, verify_ciphertext, Ciphertext};
 
-/// Secret share wrapper used by validators to produce partial decryptions.
+/// Validator wrapper around `sk_i = (x_i, z_i)` from paper Section 3.
 #[derive(Clone)]
 pub struct UnsealingShare<G: GoldenHashToGroup> {
     share: SecretShare<G>,
@@ -56,7 +58,9 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
         )
     }
 
-    /// Produce a partial decryption and require this associated data.
+    /// Paper Section 3 Decryption, producing `(W_i, e_i, x_i'', z_i'')`.
+    ///
+    /// Field docs and helpers below name the individual paper symbols.
     pub fn decrypt_share_with_associated_data<R: RngCore + CryptoRng>(
         &self,
         rng: &mut R,
@@ -109,22 +113,22 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
     }
 }
 
-/// Partial decryption and proof from one validator.
+/// Decryption share `(W_i, e_i, x_i'', z_i'')` from paper Section 3.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecryptionShare<G: GoldenHashToGroup> {
     /// Participant index.
     pub participant: ParticipantIndex,
-    /// `W_i = x_i R + z_i S`.
+    /// `W_i = x_i R + z_i S` (paper Section 3 Decryption).
     pub share: G::Element,
-    /// Fiat Shamir challenge.
+    /// `e_i = Hdcd(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
     pub challenge: G::Scalar,
-    /// Response for `x_i`.
+    /// `x_i'' = x_i' + e_i x_i` (paper Section 3 Decryption).
     pub decryption_response: G::Scalar,
-    /// Response for `z_i`.
+    /// `z_i'' = z_i' + e_i z_i` (paper Section 3 Decryption).
     pub context_response: G::Scalar,
 }
 
-/// Combiner for checking shares and opening plaintext.
+/// Combiner for paper `pkc`, checking shares and opening plaintext.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Combiner<G: GoldenHashToGroup> {
     public_key_set: PublicKeySet<G>,
@@ -132,7 +136,7 @@ pub struct Combiner<G: GoldenHashToGroup> {
 }
 
 impl<G: GoldenHashToGroup> Combiner<G> {
-    /// Construct a combiner and check that setup data matches the key set.
+    /// Construct a combiner and run crate-side setup consistency checks.
     pub fn new(
         public_key_set: PublicKeySet<G>,
         setup_context: SetupContext,
@@ -144,7 +148,7 @@ impl<G: GoldenHashToGroup> Combiner<G> {
         })
     }
 
-    /// Check exactly threshold shares and open plaintext.
+    /// Paper combiner with exactly `t` decryption shares.
     pub fn combine_exact(
         &self,
         message: &Ciphertext<G>,
@@ -174,7 +178,7 @@ impl<G: GoldenHashToGroup> Combiner<G> {
         self.combine_exact(message, decryption_context, shares)
     }
 
-    /// Search for a valid threshold set and open plaintext.
+    /// Crate search variant that runs the paper combiner on a valid `t`-subset.
     pub fn combine_quorum(
         &self,
         message: &Ciphertext<G>,
@@ -238,6 +242,7 @@ impl<G: GoldenHashToGroup> Combiner<G> {
         self.combine_quorum(message, decryption_context, shares)
     }
 
+    /// Computes `U = sum_j lambda_j^(J) W_j = xR`, then `m = Ds(Hkd(R, U), c)`.
     fn combine_selected(
         &self,
         message: &Ciphertext<G>,
@@ -318,6 +323,7 @@ fn validate_combiner_setup<G: GoldenHashToGroup>(
     Ok(())
 }
 
+/// Paper equation (2): reconstruct `X_i'`, `Z_i'`, and `W_i'`.
 fn verify_decryption_share<G: GoldenHashToGroup>(
     setup_context: &SetupContext,
     message: &Ciphertext<G>,
@@ -359,6 +365,7 @@ fn verify_decryption_share<G: GoldenHashToGroup>(
     }
 }
 
+/// `S = Hdgd(ad, dc, ctxt)`, additionally binding `SetupContext::root`.
 fn decryption_group<G: GoldenHashToGroup>(
     setup_context: &SetupContext,
     message: &Ciphertext<G>,
@@ -389,6 +396,9 @@ struct ShareChallengeInputs<'a, G: GoldenGroup> {
     share_commitment: &'a G::Element,
 }
 
+/// `e_i = Hdcd(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
+///
+/// Commitments are `X_i' = x_i'G`, `Z_i' = z_i'G`, and `W_i' = x_i'R + z_i'S`.
 fn share_challenge<G: GoldenGroup>(
     inputs: ShareChallengeInputs<'_, G>,
 ) -> Result<G::Scalar, Error> {
@@ -405,6 +415,7 @@ fn share_challenge<G: GoldenGroup>(
     hash_to_nonzero_scalar::<G>(b"golden-ehtdh1-hdcd-v1", &transcript.root())
 }
 
+/// Paper coefficients `lambda_j^(J)` at 0, used to recover `xR`.
 fn lagrange_at_zero<G: GoldenGroup>(
     participant: ParticipantIndex,
     participants: impl IntoIterator<Item = ParticipantIndex>,

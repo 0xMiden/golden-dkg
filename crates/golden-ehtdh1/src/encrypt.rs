@@ -1,4 +1,6 @@
 //! Client side EHTDH1 sealing and ciphertext proof checks.
+//!
+//! See crate root for the paper-to-crate symbol map.
 
 use chacha20::{
     cipher::{KeyIvInit, StreamCipher},
@@ -12,14 +14,14 @@ use zeroize::Zeroizing;
 
 use crate::context::{hash_to_nonzero_scalar, Error, Transcript};
 
-/// Public key used to seal EHTDH1 messages.
+/// `pk = X`, the paper Section 3 encryption public key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealingKey<G: GoldenHashToGroup> {
     joint_public_key: G::Element,
 }
 
 impl<G: GoldenHashToGroup> SealingKey<G> {
-    /// Construct from the Golden DKG joint public key `X`.
+    /// Construct from `X`, rejecting the identity as a defensive guard.
     pub fn new(joint_public_key: G::Element) -> Result<Self, Error> {
         if bool::from(G::is_identity(&joint_public_key)) {
             return Err(Error::InvalidJointPublicKey);
@@ -41,7 +43,9 @@ impl<G: GoldenHashToGroup> SealingKey<G> {
         self.seal_bytes_with_associated_data(rng, plaintext, &[])
     }
 
-    /// Seal bytes with associated data.
+    /// Paper Section 3 Encryption, outputting `(R, V, e, r'', c)`.
+    ///
+    /// Computes `U = rX`, `R' = r'G`, and `V' = r'Y`; helpers name the rest.
     pub fn seal_bytes_with_associated_data<R: RngCore + CryptoRng>(
         &self,
         rng: &mut R,
@@ -82,20 +86,20 @@ impl<G: GoldenHashToGroup> SealingKey<G> {
     }
 }
 
-/// EHTDH1 ciphertext and proof data.
+/// EHTDH1 ciphertext tuple `(R, V, e, r'', c)` from paper Section 3 Encryption.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ciphertext<G: GoldenHashToGroup> {
-    /// Associated data `ad`.
+    /// Associated data `ad` bound into `Hegd(R, R', ad, c)`.
     pub associated_data: Vec<u8>,
-    /// Masked payload `c`.
+    /// `c = Es(k, m)` (paper Section 3 Encryption).
     pub encrypted_payload: Vec<u8>,
-    /// `R = rG`.
+    /// `R = rG` (paper Section 3 Encryption).
     pub ephemeral_public: G::Element,
-    /// `V = rY`.
+    /// `V = rY` (paper Section 3 Encryption).
     pub encryption_point: G::Element,
-    /// `e = Hecd(Y, V, V')`.
+    /// `e = Hecd(Y, V, V')` (paper Section 3 Encryption).
     pub challenge: G::Scalar,
-    /// `r'' = r' + re`.
+    /// `r'' = r' + re` (paper Section 3 Encryption).
     pub response: G::Scalar,
 }
 
@@ -126,6 +130,9 @@ impl<G: GoldenHashToGroup> Ciphertext<G> {
     }
 }
 
+/// Paper equation (1): reconstruct `R' = r''G - eR`, `Y`, and `V'`.
+///
+/// The identity checks are crate-side guards against degenerate inputs.
 pub(crate) fn verify_ciphertext<G: GoldenHashToGroup>(
     message: &Ciphertext<G>,
 ) -> Result<(), Error> {
@@ -162,6 +169,7 @@ pub(crate) fn verify_ciphertext<G: GoldenHashToGroup>(
     }
 }
 
+/// `Y = Hegd(R, R', ad, c)` (paper Section 3 Encryption).
 pub(crate) fn encryption_group<G: GoldenHashToGroup>(
     ephemeral_public: &G::Element,
     proof_commitment: &G::Element,
@@ -178,6 +186,7 @@ pub(crate) fn encryption_group<G: GoldenHashToGroup>(
         .map_err(|_| Error::InvalidEncoding)
 }
 
+/// `e = Hecd(Y, V, V')` (paper Section 3 Encryption).
 pub(crate) fn encryption_challenge<G: GoldenGroup>(
     encryption_group: &G::Element,
     encryption_point: &G::Element,
@@ -191,6 +200,7 @@ pub(crate) fn encryption_challenge<G: GoldenGroup>(
     hash_to_nonzero_scalar::<G>(b"golden-ehtdh1-hecd-v1", &transcript.root())
 }
 
+/// Realizes `c = Es(Hkd(R, U), m)` with HKDF-SHA256 and XChaCha20.
 pub(crate) fn apply_payload_mask<G: GoldenGroup>(
     target: &mut [u8],
     ephemeral_public: &G::Element,
@@ -207,6 +217,7 @@ pub(crate) fn apply_payload_mask<G: GoldenGroup>(
     Ok(())
 }
 
+/// `Hkd(R, U) -> k`, expanded here into XChaCha20 key and nonce material.
 fn derive_payload_mask_material<G: GoldenGroup, const N: usize>(
     ephemeral_public: &G::Element,
     dh_point: &G::Element,
@@ -222,6 +233,7 @@ fn derive_payload_mask_material<G: GoldenGroup, const N: usize>(
     Ok(material)
 }
 
+/// Samples paper scalars such as `r, r' in Zq`, resampling to avoid zero.
 pub(crate) fn random_nonzero_scalar<G: GoldenGroup, R: RngCore + CryptoRng>(
     rng: &mut R,
 ) -> G::Scalar {

@@ -1,4 +1,6 @@
 //! Bridge from completed Golden DKG runs to EHTDH1 key material.
+//!
+//! See crate root for the paper-to-crate symbol map.
 
 use std::{collections::BTreeMap, fmt};
 
@@ -12,13 +14,13 @@ use crate::encrypt::SealingKey;
 /// EHTDH1 material for one local participant.
 #[derive(Clone)]
 pub struct Ehtdh1Material<G: GoldenHashToGroup> {
-    /// Public key used by clients to seal payloads.
+    /// Paper `pk = X`, used by clients to seal payloads.
     pub sealing_key: SealingKey<G>,
-    /// Public key set used by combiners.
+    /// Paper `pkc = (X; X_i; Z_i)`, plus the threshold.
     pub public_key_set: PublicKeySet<G>,
-    /// Secret share for the local validator.
+    /// Paper `sk_i = (x_i, z_i)` for the local validator.
     pub secret_share: SecretShare<G>,
-    /// Setup context used in decryption share transcripts.
+    /// Golden setup binding added to `Hdgd` and `Hdcd`.
     pub setup_context: SetupContext,
 }
 
@@ -34,7 +36,12 @@ impl<G: GoldenHashToGroup> fmt::Debug for Ehtdh1Material<G> {
     }
 }
 
-/// Convert one normal DKG run and one zero sharing DKG run into EHTDH1 material.
+/// Convert two Golden DKG runs into paper `(pk, pkc, sk_1..sk_N)` material.
+///
+/// The paper treats key generation as centralized. This bridge checks matching
+/// threshold, registry, context session, participants, local share owner, zero
+/// key identity, and non-identity decryption key. `PublicKeySet::new` also
+/// checks that `X_i` interpolates to `X` and `Z_i` interpolates to identity.
 pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
     decryption_config: &DkgConfig<G>,
     decryption_output: &DkgOutput<G>,
