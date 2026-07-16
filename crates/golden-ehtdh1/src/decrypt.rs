@@ -136,7 +136,7 @@ pub struct Combiner<G: GoldenHashToGroup> {
 }
 
 impl<G: GoldenHashToGroup> Combiner<G> {
-    /// Construct a combiner and run crate-side setup consistency checks.
+    /// Construct a combiner and run setup consistency checks not in the paper.
     pub fn new(
         public_key_set: PublicKeySet<G>,
         setup_context: SetupContext,
