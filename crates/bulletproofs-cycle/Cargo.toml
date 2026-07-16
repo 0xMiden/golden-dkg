@@ -20,6 +20,7 @@ digest = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 bulletproofs = { workspace = true }
+criterion = "0.5"
 curve25519-dalek = { workspace = true }
 halo2curves = { workspace = true, features = ["std"] }
 rand_chacha = { workspace = true }
@@ -37,6 +38,26 @@ required-features = ["cycle-pedersen", "ristretto"]
 [[test]]
 name = "ristretto_parity"
 required-features = ["cycle-pedersen", "ristretto"]
+
+[[bench]]
+name = "generators"
+harness = false
+required-features = ["cycle-pedersen"]
+
+[[bench]]
+name = "inner_product_proof"
+harness = false
+required-features = ["cycle-pedersen"]
+
+[[bench]]
+name = "linear_proof"
+harness = false
+required-features = ["cycle-pedersen"]
+
+[[bench]]
+name = "r1cs"
+harness = false
+required-features = ["cycle-pedersen"]
 
 [lints]
 workspace = true
