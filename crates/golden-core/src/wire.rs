@@ -1,8 +1,12 @@
-//! Canonical byte encoding for Golden DKG wire messages.
+//! Canonical byte encoding for Golden DKG wire values.
 //!
-//! Top-level wire messages start with [`MAGIC`] followed by a one-byte type
-//! tag. Nested fields omit that prefix and are encoded in the order documented
-//! by each type's [`WireEncode`] implementation.
+//! Standalone wire values start with [`MAGIC`] followed by a one-byte type tag.
+//! Nested fields omit that prefix and are encoded in the order documented by
+//! each type's [`WireEncode`] implementation.
+//!
+//! In the DKG protocol, [`DealerMessage`] is the broadcast message. The other
+//! tagged values are standalone encodings for setup artifacts, nested fields,
+//! tests, persistence, or proof payload adapters.
 
 use std::collections::BTreeMap;
 
@@ -21,26 +25,28 @@ use crate::{
     TranscriptRoot,
 };
 
-/// Magic prefix for every top-level DKG wire message.
+/// Magic prefix for every standalone DKG wire value.
 pub const MAGIC: &[u8; 18] = b"golden-dkg-wire-v1";
 
-/// Top-level tag for [`SessionId`].
+/// Standalone tag for [`SessionId`].
 pub const TAG_SESSION_ID: u8 = 0x01;
-/// Top-level tag for [`DealerMessageNonce`].
+/// Standalone tag for [`DealerMessageNonce`].
 pub const TAG_DEALER_MESSAGE_NONCE: u8 = 0x02;
-/// Top-level tag for [`EncryptedShare`].
+/// Standalone tag for [`EncryptedShare`].
 pub const TAG_ENCRYPTED_SHARE: u8 = 0x03;
-/// Top-level tag for [`FeldmanCommitment`].
+/// Standalone tag for [`FeldmanCommitment`].
 pub const TAG_FELDMAN_COMMITMENT: u8 = 0x04;
-/// Top-level tag for [`ParticipantRegistry`].
+/// Standalone tag for [`ParticipantRegistry`].
 pub const TAG_PARTICIPANT_REGISTRY: u8 = 0x05;
-/// Top-level tag for [`DkgConfig`].
+/// Standalone tag for [`DkgConfig`].
 pub const TAG_DKG_CONFIG: u8 = 0x06;
-/// Top-level tag for [`DealerMessage`].
+/// Protocol broadcast tag for [`DealerMessage`].
 pub const TAG_DEALER_MESSAGE: u8 = 0x07;
-/// Top-level tag for opaque proof bytes.
+/// Standalone tag for opaque proof payloads.
+///
+/// DKG dealer broadcasts carry these bytes nested in [`DealerMessage::proof`].
 pub const TAG_PROOF_BYTES: u8 = 0x08;
-/// Top-level tag for prototype share-opening batch proofs.
+/// Standalone tag for prototype share-opening batch proofs.
 pub const TAG_SHARE_OPENING_BATCHED_PROOF: u8 = 0x09;
 
 /// Encode a value into its nested canonical wire representation.
@@ -62,13 +68,13 @@ pub trait WireDecode: Sized {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self>;
 }
 
-/// A top-level wire message with a stable tag.
+/// A standalone wire value with a stable tag.
 pub trait WireMessage: WireEncode + WireDecode {
-    /// Top-level type tag.
+    /// Standalone type tag.
     const TAG: u8;
 }
 
-/// Return a top-level canonical wire message.
+/// Return a standalone canonical wire value.
 pub fn to_wire_bytes<T: WireMessage>(value: &T) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -77,7 +83,7 @@ pub fn to_wire_bytes<T: WireMessage>(value: &T) -> Vec<u8> {
     out
 }
 
-/// Decode a top-level canonical wire message and reject trailing bytes.
+/// Decode a standalone canonical wire value and reject trailing bytes.
 pub fn from_wire_bytes<T: WireMessage>(bytes: &[u8]) -> Result<T> {
     let mut reader = WireReader::new(bytes);
     reader.expect_magic()?;
@@ -163,7 +169,7 @@ impl<'a> WireReader<'a> {
         Ok(slice)
     }
 
-    /// Read and validate the top-level magic prefix.
+    /// Read and validate the standalone magic prefix.
     pub fn expect_magic(&mut self) -> Result<()> {
         if self.read_exact(MAGIC.len())? == MAGIC.as_slice() {
             Ok(())
@@ -640,7 +646,7 @@ where
 }
 
 #[cfg(feature = "miden-serde")]
-/// Write a length-delimited top-level wire message into a Miden byte writer.
+/// Write a length-delimited standalone wire value into a Miden byte writer.
 pub fn write_miden_wire<T, W>(value: &T, target: &mut W)
 where
     T: WireMessage,
@@ -652,7 +658,7 @@ where
 }
 
 #[cfg(feature = "miden-serde")]
-/// Read a length-delimited top-level wire message from a Miden byte reader.
+/// Read a length-delimited standalone wire value from a Miden byte reader.
 pub fn read_miden_wire<T, R>(source: &mut R) -> core::result::Result<T, DeserializationError>
 where
     T: WireMessage,
@@ -670,7 +676,7 @@ where
 }
 
 #[cfg(feature = "miden-serde")]
-/// Return the serialized size hint for a length-delimited Miden wire message.
+/// Return the serialized size hint for a length-delimited Miden wire value.
 pub fn miden_wire_size_hint<T: WireMessage>(value: &T) -> usize {
     let len = to_wire_bytes(value).len();
     miden_usize_size(len) + len
