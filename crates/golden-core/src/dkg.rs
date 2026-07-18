@@ -701,14 +701,13 @@ impl<G: GoldenGroup, P> DealerMessage<G, P> {
     /// Recompute the dealing transcript root from the current message fields.
     ///
     /// This is the same root `create_dealing` embedded at construction. It
-    /// exists so that callers that mutate a `DealerMessage` (currently only
-    /// in-house tests, but the API is public so downstream protocol test
-    /// harnesses can do the same) can re-align the root before verification,
-    /// rather than reconstructing the message from scratch. Production
-    /// verification code MUST NOT call this: a message whose fields have
-    /// changed but whose root was just recomputed is no longer the message
-    /// the dealer signed. Treat this as a test-only helper with a stable
-    /// contract.
+    /// exists so callers can rebuild the root after constructing a message
+    /// from fields that do not carry it, such as wire decode.
+    ///
+    /// Do not call this after mutating fields that will be verified. A message
+    /// whose fields changed and whose root was just recomputed is no longer
+    /// the message the dealer signed. Tests may use this helper when they need
+    /// a stable root for a constructed fixture.
     pub fn recompute_transcript_root(&self) -> TranscriptRoot {
         dealing_root(
             self.session_id,
@@ -1342,6 +1341,25 @@ mod tests {
         assert_eq!(
             dealing.message.recompute_transcript_root(),
             dealing.message.transcript_root,
+        );
+    }
+
+    #[test]
+    fn tampered_transcript_root_fails_dealing_verification() {
+        let config = config();
+        let mut rng = ChaCha20Rng::from_seed([32u8; 32]);
+        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
+            idx(1),
+            &identity_secret(idx(1)),
+            &config,
+            &mut rng,
+        )
+        .unwrap();
+        dealing.message.transcript_root[0] ^= 1;
+
+        assert_eq!(
+            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
+            Error::ProofVerificationFailed
         );
     }
 
