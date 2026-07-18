@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// Magic prefix for every standalone DKG wire value.
-pub const MAGIC: &[u8; 18] = b"golden-dkg-wire-v1";
+pub const MAGIC: &[u8; 18] = b"golden-dkg-wire-v2";
 
 /// Standalone tag for [`SessionId`].
 pub const TAG_SESSION_ID: u8 = 0x01;
@@ -393,7 +393,6 @@ where
             encrypted_share.write_wire(out);
         }
         self.proof.write_wire(out);
-        self.transcript_root.write_wire(out);
     }
 }
 
@@ -422,8 +421,7 @@ where
             encrypted_shares.insert(receiver, EncryptedShare::<G>::read_wire(reader)?);
         }
         let proof = P::read_wire(reader)?;
-        let transcript_root = TranscriptRoot::read_wire(reader)?;
-        Ok(Self {
+        let mut message = Self {
             session_id,
             registry_root,
             dealer,
@@ -431,8 +429,10 @@ where
             commitment,
             encrypted_shares,
             proof,
-            transcript_root,
-        })
+            transcript_root: [0u8; 32],
+        };
+        message.transcript_root = message.recompute_transcript_root();
+        Ok(message)
     }
 }
 
@@ -955,6 +955,18 @@ mod tests {
     }
 
     #[test]
+    fn old_wire_magic_is_rejected() {
+        let session_id = SessionId([7u8; 32]);
+        let mut bytes = to_wire_bytes(&session_id);
+        bytes[MAGIC.len() - 1] = b'1';
+
+        assert_eq!(
+            from_wire_bytes::<SessionId>(&bytes).unwrap_err(),
+            Error::InvalidEncoding
+        );
+    }
+
+    #[test]
     fn wrong_top_level_tag_is_rejected() {
         let nonce = DealerMessageNonce([9u8; 32]);
         let bytes = to_wire_bytes(&nonce);
@@ -1024,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn dealer_message_preserves_transcript_root() {
+    fn dealer_message_derives_transcript_root_on_decode() {
         let commitment = FeldmanCommitment::<TinyGroup>::from_coefficients(vec![
             TinyScalar::from_u64(10).unwrap(),
             TinyScalar::from_u64(20).unwrap(),
@@ -1045,12 +1057,52 @@ mod tests {
             proof: vec![4, 5, 6],
             transcript_root: [7u8; 32],
         };
+        let expected_root = message.recompute_transcript_root();
 
         let decoded =
             from_wire_bytes::<DealerMessage<TinyGroup, Vec<u8>>>(&to_wire_bytes(&message)).unwrap();
 
-        assert_eq!(decoded, message);
-        assert_eq!(decoded.transcript_root, [7u8; 32]);
+        assert_eq!(decoded.session_id, message.session_id);
+        assert_eq!(decoded.registry_root, message.registry_root);
+        assert_eq!(decoded.dealer, message.dealer);
+        assert_eq!(decoded.msg_i, message.msg_i);
+        assert_eq!(decoded.commitment, message.commitment);
+        assert_eq!(decoded.encrypted_shares, message.encrypted_shares);
+        assert_eq!(decoded.proof, message.proof);
+        assert_ne!(decoded.transcript_root, message.transcript_root);
+        assert_eq!(decoded.transcript_root, expected_root);
+        assert_eq!(decoded.transcript_root, decoded.recompute_transcript_root());
+    }
+
+    #[test]
+    fn dealer_message_rejects_trailing_transcript_root() {
+        let commitment = FeldmanCommitment::<TinyGroup>::from_coefficients(vec![
+            TinyScalar::from_u64(10).unwrap(),
+            TinyScalar::from_u64(20).unwrap(),
+        ])
+        .unwrap();
+        let encrypted_share = EncryptedShare::<TinyGroup> {
+            pad_commitment: TinyScalar::from_u64(2).unwrap(),
+            dh_commitment: TinyScalar::from_u64(3).unwrap(),
+            encrypted_share: TinyScalar::from_u64(4).unwrap(),
+        };
+        let message = DealerMessage::<TinyGroup, Vec<u8>> {
+            session_id: SessionId([1u8; 32]),
+            registry_root: [2u8; 32],
+            dealer: idx(1),
+            msg_i: DealerMessageNonce([3u8; 32]),
+            commitment,
+            encrypted_shares: BTreeMap::from([(idx(2), encrypted_share)]),
+            proof: vec![4, 5, 6],
+            transcript_root: [7u8; 32],
+        };
+        let mut bytes = to_wire_bytes(&message);
+        bytes.extend_from_slice(&message.transcript_root);
+
+        assert_eq!(
+            from_wire_bytes::<DealerMessage<TinyGroup, Vec<u8>>>(&bytes).unwrap_err(),
+            Error::InvalidEncoding
+        );
     }
 
     #[cfg(feature = "serde")]
