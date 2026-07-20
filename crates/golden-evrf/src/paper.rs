@@ -540,6 +540,10 @@ pub mod secp_secq {
         /// `s_i` for `i = 1..=lambda` (slope of the chord between
         /// `L_{i-1}` and `Δ_i`).
         slopes: Vec<R1csField>,
+        /// `(x_{L_{i-1}} - x_{Δ_i})^{-1}` for `i = 1..=lambda`.
+        denom_delta_inverses: Vec<R1csField>,
+        /// `(x_{L_{i-1}} - x_{L_i})^{-1}` for `i = 1..=lambda`.
+        denom_result_inverses: Vec<R1csField>,
     }
 
     /// Compute the full chord-rule witness: all intermediate `L_i` points and
@@ -557,6 +561,8 @@ pub mod secp_secq {
 
         let mut l_coords = Vec::with_capacity(lambda + 1);
         let mut slopes = Vec::with_capacity(lambda);
+        let mut denom_delta_inverses = Vec::with_capacity(lambda);
+        let mut denom_result_inverses = Vec::with_capacity(lambda);
 
         let mut p_j = *X;
         let mut l = Gin::identity();
@@ -575,19 +581,22 @@ pub mod secp_secq {
 
                 let dx: R1csField = x_prev - x_delta;
                 let dy: R1csField = y_prev - y_delta;
-                // dx must be non-zero for the chord rule (guaranteed by the
-                // c_j correction terms with overwhelming probability over a
-                // random oracle H).  If dx == 0 we hit an exceptional case
-                // (L_{j-1} = ±Δ_j) that the chord-rule gadget does not handle.
-                // Return an error rather than fabricating a wrong slope.
-                let dx_inv: Option<R1csField> = Option::from(dx.invert());
-                let s_j = match dx_inv {
-                    Some(inv) => dy * inv,
+                let dx_inv = match Option::from(dx.invert()) {
+                    Some(inv) => inv,
                     None => return Err(Error::ProofVerificationFailed),
                 };
+                let s_j = dy * dx_inv;
                 slopes.push(s_j);
+                denom_delta_inverses.push(dx_inv);
 
                 l += delta;
+                let (x_l, _) = affine(&l)?;
+                let result_dx: R1csField = x_prev - x_l;
+                let result_dx_inv = match Option::from(result_dx.invert()) {
+                    Some(inv) => inv,
+                    None => return Err(Error::ProofVerificationFailed),
+                };
+                denom_result_inverses.push(result_dx_inv);
             }
 
             let coords = affine(&l)?;
@@ -595,7 +604,12 @@ pub mod secp_secq {
             p_j = p_j.double();
         }
 
-        Ok(ChordWitness { l_coords, slopes })
+        Ok(ChordWitness {
+            l_coords,
+            slopes,
+            denom_delta_inverses,
+            denom_result_inverses,
+        })
     }
 
     /// Build the linear combination for `x_{Δ_j}` = `k_j * (x_{D_j} - x_{C_j})
@@ -656,7 +670,11 @@ pub mod secp_secq {
             return Err(R1CSError::FormatError);
         }
         if let Some(w) = witness {
-            if w.l_coords.len() != lambda_plus_one || w.slopes.len() != lambda_plus_one - 1 {
+            if w.l_coords.len() != lambda_plus_one
+                || w.slopes.len() != lambda_plus_one - 1
+                || w.denom_delta_inverses.len() != lambda_plus_one - 1
+                || w.denom_result_inverses.len() != lambda_plus_one - 1
+            {
                 return Err(R1CSError::FormatError);
             }
         }
@@ -676,18 +694,30 @@ pub mod secp_secq {
         for (i, &bit_var) in bit_vars.iter().enumerate().skip(1) {
             // Slope s_i and L_i coordinates (witness values).
             let s_assign = witness.map(|w| w.slopes[i - 1]);
+            let denom_delta_inv_assign = witness.map(|w| w.denom_delta_inverses[i - 1]);
+            let denom_result_inv_assign = witness.map(|w| w.denom_result_inverses[i - 1]);
             let (x_l_assign, y_l_assign) = witness.map(|w| w.l_coords[i]).unzip();
 
             let s_var = cs.allocate(s_assign)?;
+            let denom_delta_inv = cs.allocate(denom_delta_inv_assign)?;
+            let denom_result_inv = cs.allocate(denom_result_inv_assign)?;
             let x_l = cs.allocate(x_l_assign)?;
             let y_l = cs.allocate(y_l_assign)?;
 
             // Linear combinations for Δ_i in terms of k_i_var.
             let dx_i = delta_x_lc(bit_var, precomp, i);
             let dy_i = delta_y_lc(bit_var, precomp, i);
+            let denom_delta = x_prev - dx_i.clone();
+            let denom_result = x_prev - x_l;
+
+            let (_, _, delta_nonzero) = cs.multiply(denom_delta_inv.into(), denom_delta.clone());
+            cs.constrain(delta_nonzero - R1csField::ONE);
+
+            let (_, _, result_nonzero) = cs.multiply(denom_result_inv.into(), denom_result.clone());
+            cs.constrain(result_nonzero - R1csField::ONE);
 
             // Constraint 1: s_i * (x_{L_{i-1}} - x_{Δ_i}) = y_{L_{i-1}} - y_{Δ_i}
-            let (_, _, out1) = cs.multiply(s_var.into(), x_prev - dx_i.clone());
+            let (_, _, out1) = cs.multiply(s_var.into(), denom_delta);
             cs.constrain(out1 - (y_prev - dy_i.clone()));
 
             // Constraint 2: s_i^2 = x_{L_{i-1}} + x_{L_i} + x_{Δ_i}
@@ -695,7 +725,7 @@ pub mod secp_secq {
             cs.constrain(out2 - (x_prev + x_l + dx_i.clone()));
 
             // Constraint 3: s_i * (x_{L_{i-1}} - x_{L_i}) = y_{L_{i-1}} + y_{L_i}
-            let (_, _, out3) = cs.multiply(s_var.into(), x_prev - x_l);
+            let (_, _, out3) = cs.multiply(s_var.into(), denom_result);
             cs.constrain(out3 - (y_prev + y_l));
 
             x_prev = x_l;
@@ -2742,6 +2772,8 @@ pub mod secp_secq {
             let truncated_witness = ChordWitness {
                 l_coords: vec![(R1csField::ZERO, R1csField::ZERO); K_BITS],
                 slopes: vec![R1csField::ZERO; K_BITS],
+                denom_delta_inverses: vec![R1csField::ZERO; K_BITS],
+                denom_result_inverses: vec![R1csField::ZERO; K_BITS],
             };
 
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
@@ -2809,6 +2841,16 @@ pub mod secp_secq {
             g_s: &Gin,
             result_override: Option<(Fp, Fp)>,
         ) -> core::result::Result<(), R1CSError> {
+            run_chord_exp_with_witness(k_val, X, g_s, result_override, |_| {})
+        }
+
+        fn run_chord_exp_with_witness(
+            k_val: u64,
+            X: &Gin,
+            g_s: &Gin,
+            result_override: Option<(Fp, Fp)>,
+            mutate_witness: impl FnOnce(&mut ChordWitness),
+        ) -> core::result::Result<(), R1CSError> {
             let pc_gens = PedersenGens::<R1csCycle>::default();
             // bit_decompose: 257 gates, chord_exp: ~768+ gates.  Pad to 4096.
             let bp_gens = BulletproofGens::<R1csCycle>::new(4096, 1);
@@ -2828,7 +2870,8 @@ pub mod secp_secq {
             let precomp = precompute_chord(X, g_s, K_BITS).expect("precompute");
 
             // Compute witness: all intermediate L_i and s_i.
-            let witness = chord_compute_witness(&bits, X, g_s, K_BITS).expect("witness");
+            let mut witness = chord_compute_witness(&bits, X, g_s, K_BITS).expect("witness");
+            mutate_witness(&mut witness);
 
             // Expected result: T = k * X.
             let t_point = X * k_fq;
@@ -2861,7 +2904,7 @@ pub mod secp_secq {
                 Some(&witness),
             )
             .expect("chord_exp");
-            let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
+            let proof = prover.prove(&bp_gens, &mut rng)?;
 
             // Verifier
             let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
@@ -2926,6 +2969,32 @@ pub mod secp_secq {
             assert!(
                 run_chord_exp(0xDEADBEEFu64, &X, &g_s, Some((tx, neg_y))).is_err(),
                 "verifier must reject -T (same x, negated y)"
+            );
+        }
+
+        #[test]
+        fn chord_exp_rejects_wrong_delta_denominator_inverse() {
+            let g_s = Gin::generator();
+            let X = g_s * Fq::from(42u64);
+            assert!(
+                run_chord_exp_with_witness(0xDEADBEEFu64, &X, &g_s, None, |w| {
+                    w.denom_delta_inverses[0] += R1csField::ONE;
+                })
+                .is_err(),
+                "verifier must reject a wrong inverse for x_L_prev - x_Delta"
+            );
+        }
+
+        #[test]
+        fn chord_exp_rejects_wrong_result_denominator_inverse() {
+            let g_s = Gin::generator();
+            let X = g_s * Fq::from(42u64);
+            assert!(
+                run_chord_exp_with_witness(0xDEADBEEFu64, &X, &g_s, None, |w| {
+                    w.denom_result_inverses[0] += R1csField::ONE;
+                })
+                .is_err(),
+                "verifier must reject a wrong inverse for x_L_prev - x_L"
             );
         }
     }
