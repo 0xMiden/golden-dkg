@@ -4,7 +4,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use golden_core::{DkgConfig, DkgOutput, GoldenGroup, GoldenHashToGroup, ParticipantIndex};
+use golden_core::{DkgConfig, DkgOutput, GoldenHashToGroup};
 
 use crate::context::{
     derive_context_session_id, Error, PublicKeySet, PublicShare, SecretShare, SetupContext,
@@ -77,8 +77,8 @@ pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
         return Err(Error::InvalidBridge("decryption public key is identity"));
     }
 
-    let participants = collect_participants(decryption_config);
-    if participants != collect_participants(context_config) {
+    let participants = decryption_config.registry.indexes().collect::<Vec<_>>();
+    if participants != context_config.registry.indexes().collect::<Vec<_>>() {
         return Err(Error::InvalidBridge("participant set mismatch"));
     }
 
@@ -132,8 +132,4 @@ pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
         secret_share,
         setup_context,
     })
-}
-
-fn collect_participants<G: GoldenGroup>(config: &DkgConfig<G>) -> Vec<ParticipantIndex> {
-    config.registry.indexes().collect()
 }

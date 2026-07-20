@@ -28,4 +28,4 @@ pub use feldman::FeldmanCommitment;
 pub use group::{FieldByteOrder, GoldenEvrfCurve, GoldenGroup, GoldenHashToGroup, GoldenScalar};
 pub use participant::ParticipantIndex;
 pub use shamir::{lagrange_interpolate_at_zero, reconstruct_secret, Polynomial, Share};
-pub use transcript::TranscriptRoot;
+pub use transcript::{TranscriptBuilder, TranscriptRoot};

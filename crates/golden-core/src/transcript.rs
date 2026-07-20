@@ -22,53 +22,64 @@ pub(crate) fn transcript_root_from_slice(bytes: &[u8]) -> Result<TranscriptRoot>
     Ok(root)
 }
 
-pub(crate) struct TranscriptBuilder {
+/// Deterministic SHA-256 transcript builder for Golden protocol roots.
+pub struct TranscriptBuilder {
     hasher: Sha256,
 }
 
 impl TranscriptBuilder {
     pub(crate) fn new(label: &'static [u8]) -> Self {
+        Self::with_prefix(b"golden-core-v1", label)
+    }
+
+    /// Build a transcript with an explicit protocol prefix.
+    pub fn with_prefix(prefix: &'static [u8], label: &'static [u8]) -> Self {
         let mut hasher = Sha256::new();
-        // Domain separator: a fixed ASCII tag that scopes every Golden
-        // transcript away from any other SHA-256 use of the same labels.
-        // Unlike labels and payloads below, it is not length-prefixed:
-        // the tag is a compile-time constant with no parsing ambiguity,
-        // and prefixing it would change the digest for no security gain
-        // (an attacker cannot control it). The asymmetry is deliberate.
-        hasher.update(b"golden-core-v1");
+        // Domain separator: a fixed ASCII tag that scopes one protocol away
+        // from any other SHA-256 use of the same labels. Unlike labels and
+        // payloads below, it is not length-prefixed because callers supply
+        // compile-time constants, not attacker-controlled strings.
+        hasher.update(prefix);
         hasher.update((label.len() as u64).to_be_bytes());
         hasher.update(label);
         Self { hasher }
     }
 
-    pub(crate) fn bytes(&mut self, label: &'static [u8], bytes: &[u8]) {
+    /// Append a byte slice under a fixed label.
+    pub fn bytes(&mut self, label: &'static [u8], bytes: &[u8]) {
         self.hasher.update((label.len() as u64).to_be_bytes());
         self.hasher.update(label);
         self.hasher.update((bytes.len() as u64).to_be_bytes());
         self.hasher.update(bytes);
     }
 
-    pub(crate) fn u32(&mut self, label: &'static [u8], value: u32) {
+    /// Append a `u32` under a fixed label.
+    pub fn u32(&mut self, label: &'static [u8], value: u32) {
         self.bytes(label, &value.to_be_bytes());
     }
 
-    pub(crate) fn usize(&mut self, label: &'static [u8], value: usize) {
+    /// Append a `usize` as a fixed-width `u64` under a fixed label.
+    pub fn usize(&mut self, label: &'static [u8], value: usize) {
         self.bytes(label, &(value as u64).to_be_bytes());
     }
 
-    pub(crate) fn participant(&mut self, label: &'static [u8], value: ParticipantIndex) {
+    /// Append a participant index under a fixed label.
+    pub fn participant(&mut self, label: &'static [u8], value: ParticipantIndex) {
         self.u32(label, value.get());
     }
 
-    pub(crate) fn scalar<G: GoldenGroup>(&mut self, label: &'static [u8], value: &G::Scalar) {
+    /// Append a scalar's canonical representation under a fixed label.
+    pub fn scalar<G: GoldenGroup>(&mut self, label: &'static [u8], value: &G::Scalar) {
         self.bytes(label, value.to_repr().as_ref());
     }
 
-    pub(crate) fn element<G: GoldenGroup>(&mut self, label: &'static [u8], value: &G::Element) {
+    /// Append a group element's canonical representation under a fixed label.
+    pub fn element<G: GoldenGroup>(&mut self, label: &'static [u8], value: &G::Element) {
         self.bytes(label, G::encode_element(value).as_ref());
     }
 
-    pub(crate) fn root(self) -> TranscriptRoot {
+    /// Finish the transcript and return its root.
+    pub fn root(self) -> TranscriptRoot {
         self.hasher.finalize().into()
     }
 }
@@ -180,6 +191,15 @@ mod tests {
                 0x31, 0x51, 0xa6, 0x30
             ]
         );
+    }
+
+    #[test]
+    fn transcript_builder_custom_prefix_changes_root() {
+        let mut core = TranscriptBuilder::new(b"setup");
+        core.bytes(b"value", b"abc");
+        let mut ehtdh1 = TranscriptBuilder::with_prefix(b"golden-ehtdh1-v1", b"setup");
+        ehtdh1.bytes(b"value", b"abc");
+        assert_ne!(core.root(), ehtdh1.root());
     }
 
     #[test]

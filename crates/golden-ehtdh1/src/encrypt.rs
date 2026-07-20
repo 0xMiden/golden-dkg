@@ -6,13 +6,13 @@ use chacha20::{
     cipher::{KeyIvInit, StreamCipher},
     XChaCha20,
 };
-use golden_core::{GoldenGroup, GoldenHashToGroup, GoldenScalar};
+use golden_core::{GoldenGroup, GoldenHashToGroup, GoldenScalar, TranscriptBuilder};
 use hkdf::Hkdf;
 use rand_core::{CryptoRng, RngCore};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::context::{hash_to_nonzero_scalar, Error, Transcript};
+use crate::context::{hash_to_nonzero_scalar, Error, TRANSCRIPT_PREFIX};
 
 /// `pk = X`, the paper Section 3 encryption public key.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,7 +189,7 @@ pub(crate) fn encryption_group<G: GoldenHashToGroup>(
     associated_data: &[u8],
     encrypted_payload: &[u8],
 ) -> Result<G::Element, Error> {
-    let mut transcript = Transcript::new(b"golden-ehtdh1-hegd-v1");
+    let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"hegd");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
     // The paper's `Hegd` input tuple is `(R, R', ad, c)`.
     transcript.element::<G>(b"R", ephemeral_public);
@@ -206,7 +206,7 @@ pub(crate) fn encryption_challenge<G: GoldenGroup>(
     encryption_point: &G::Element,
     encryption_commitment: &G::Element,
 ) -> Result<G::Scalar, Error> {
-    let mut transcript = Transcript::new(b"golden-ehtdh1-hecd-v1");
+    let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"hecd");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
     // The paper's `Hecd` input tuple is `(Y, V, V')`.
     transcript.element::<G>(b"Y", encryption_group);
@@ -237,7 +237,7 @@ fn derive_payload_mask_material<G: GoldenGroup, const N: usize>(
     ephemeral_public: &G::Element,
     dh_point: &G::Element,
 ) -> Result<Zeroizing<[u8; N]>, Error> {
-    let mut transcript = Transcript::new(b"golden-ehtdh1-hkd-ikm-v1");
+    let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"hkd-ikm");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
     // The paper's `Hkd` input tuple is `(R, U)`.
     transcript.element::<G>(b"R", ephemeral_public);

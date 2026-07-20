@@ -6,8 +6,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use golden_core::{GoldenGroup, GoldenScalar, ParticipantIndex, SessionId, TranscriptRoot};
-use sha2::{Digest, Sha256};
+use golden_core::{
+    GoldenGroup, GoldenScalar, ParticipantIndex, SessionId, TranscriptBuilder, TranscriptRoot,
+};
+
+pub(crate) const TRANSCRIPT_PREFIX: &[u8] = b"golden-ehtdh1-v1";
 
 /// Public share material for one participant.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,7 +112,7 @@ pub struct SetupContext {
 impl SetupContext {
     /// Compute the root used in EHTDH1 decryption transcripts.
     pub fn root(&self) -> TranscriptRoot {
-        let mut transcript = Transcript::new(b"golden-ehtdh1-setup-context-v1");
+        let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"setup-context");
         transcript.bytes(b"backend", self.backend_id.as_bytes());
         transcript.usize(b"threshold", self.threshold);
         transcript.bytes(b"registry-root", &self.registry_root);
@@ -131,7 +134,7 @@ impl SetupContext {
 
 /// Golden setup derivation for the zero sharing session id, not in the paper.
 pub fn derive_context_session_id(decryption_session_id: SessionId) -> SessionId {
-    let mut transcript = Transcript::new(b"golden-ehtdh1-context-session-v1");
+    let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"context-session");
     transcript.bytes(b"label", b"zero-sharing");
     transcript.bytes(b"decryption-session", &decryption_session_id.0);
     SessionId(transcript.root())
@@ -195,51 +198,6 @@ pub enum CombineError {
     /// Malformed shares, listed by participant id.
     #[error("malformed shares from participants {0:?}")]
     MalformedShares(Vec<u32>),
-}
-
-pub(crate) struct Transcript {
-    hasher: Sha256,
-}
-
-impl Transcript {
-    pub(crate) fn new(domain: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update((domain.len() as u64).to_be_bytes());
-        hasher.update(domain);
-        Self { hasher }
-    }
-
-    pub(crate) fn bytes(&mut self, label: &'static [u8], bytes: &[u8]) {
-        self.raw_bytes(label);
-        self.raw_bytes(bytes);
-    }
-
-    pub(crate) fn participant(&mut self, label: &'static [u8], participant: ParticipantIndex) {
-        self.bytes(label, &participant.get().to_be_bytes());
-    }
-
-    pub(crate) fn usize(&mut self, label: &'static [u8], value: usize) {
-        self.bytes(label, &(value as u64).to_be_bytes());
-    }
-
-    pub(crate) fn element<G: GoldenGroup>(&mut self, label: &'static [u8], point: &G::Element) {
-        let encoded = G::encode_element(point);
-        self.bytes(label, encoded.as_ref());
-    }
-
-    pub(crate) fn scalar<G: GoldenGroup>(&mut self, label: &'static [u8], scalar: &G::Scalar) {
-        let encoded = scalar.to_repr();
-        self.bytes(label, encoded.as_ref());
-    }
-
-    pub(crate) fn root(self) -> TranscriptRoot {
-        self.hasher.finalize().into()
-    }
-
-    fn raw_bytes(&mut self, bytes: &[u8]) {
-        self.hasher.update((bytes.len() as u64).to_be_bytes());
-        self.hasher.update(bytes);
-    }
 }
 
 /// `Hecd`/`Hdcd` reduction to `Zq`; the paper models this as a random oracle.

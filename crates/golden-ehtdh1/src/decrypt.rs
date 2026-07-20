@@ -5,12 +5,14 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use golden_core::{GoldenGroup, GoldenHashToGroup, GoldenScalar, ParticipantIndex};
+use golden_core::{
+    GoldenGroup, GoldenHashToGroup, GoldenScalar, ParticipantIndex, TranscriptBuilder,
+};
 use rand_core::{CryptoRng, RngCore};
 
 use crate::context::{
     hash_to_nonzero_scalar, CombineError, Error, PublicKeySet, PublicShare, SecretShare,
-    SetupContext, Transcript,
+    SetupContext, TRANSCRIPT_PREFIX,
 };
 use crate::encrypt::{apply_payload_mask, random_nonzero_scalar, verify_ciphertext, Ciphertext};
 
@@ -394,7 +396,7 @@ fn decryption_group<G: GoldenHashToGroup>(
     message: &Ciphertext<G>,
     decryption_context: &[u8],
 ) -> Result<G::Element, Error> {
-    let mut transcript = Transcript::new(b"golden-ehtdh1-hdgd-v1");
+    let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"hdgd");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
     // The paper's `Hdgd` input is `(ad, dc, ctxt)`.
     // This crate also binds `SetupContext::root` into that transcript.
@@ -428,7 +430,7 @@ struct ShareChallengeInputs<'a, G: GoldenGroup> {
 fn share_challenge<G: GoldenGroup>(
     inputs: ShareChallengeInputs<'_, G>,
 ) -> Result<G::Scalar, Error> {
-    let mut transcript = Transcript::new(b"golden-ehtdh1-hdcd-v1");
+    let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"hdcd");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
     transcript.bytes(b"setup-context-root", &inputs.setup_context.root());
     // The paper's `Hdcd` input tuple is `(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
