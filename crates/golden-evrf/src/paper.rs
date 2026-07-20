@@ -1285,10 +1285,18 @@ pub mod secp_secq {
             || statement.commitment_coefficients.is_empty()
             || statement.commitment_coefficients.len() != statement.threshold
             || statement.statement_roots.len() != statement.receivers.len()
+            || is_identity(&statement.pk1)
         {
             return Err(Error::ProofVerificationFailed);
         }
         for rec in &statement.receivers {
+            if is_identity(&rec.pkj)
+                || is_identity(&rec.share_commitment)
+                || is_identity(&rec.pad_commitment)
+                || is_identity(&rec.dh_commitment)
+            {
+                return Err(Error::ProofVerificationFailed);
+            }
             if feldman_share_commitment(&statement.commitment_coefficients, rec.receiver)
                 != rec.share_commitment
             {
@@ -1421,7 +1429,7 @@ pub mod secp_secq {
         pad_bits: Vec<Option<R1csField>>,
         share: R1csField,
         share_bits: Vec<Option<R1csField>>,
-        share_commitment: Option<ChordWitness>,
+        share_commitment: ChordWitness,
         pad_commitment: ChordWitness,
         dh_commitment: ChordWitness,
     }
@@ -1560,64 +1568,46 @@ pub mod secp_secq {
             reduce,
         )?;
 
-        if is_identity(&rec.pad_commitment) {
-            for &bit_var in &pad_bit_vars {
-                cs.constrain(bit_var.into());
-            }
-        } else {
-            let (pad_commitment_x, pad_commitment_y) =
-                affine(&rec.pad_commitment).map_err(|_| R1CSError::VerificationError)?;
-            let precomp_pad =
-                precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
-            chord_exponentiate_r1cs_with_result(
-                cs,
-                &pad_bit_vars,
-                &precomp_pad,
-                Some((pad_commitment_x, pad_commitment_y)),
-                witness.map(|w| &w.pad_commitment),
-            )?;
-        }
+        let (pad_commitment_x, pad_commitment_y) =
+            affine(&rec.pad_commitment).map_err(|_| R1CSError::VerificationError)?;
+        let precomp_pad =
+            precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        chord_exponentiate_r1cs_with_result(
+            cs,
+            &pad_bit_vars,
+            &precomp_pad,
+            Some((pad_commitment_x, pad_commitment_y)),
+            witness.map(|w| &w.pad_commitment),
+        )?;
 
         let share_var = cs.allocate(witness.map(|w| w.share))?;
         let verifier_share_bits = vec![None; K_BITS + 1];
         let share_bits =
             witness.map_or(verifier_share_bits.as_slice(), |w| w.share_bits.as_slice());
         let share_bit_vars = bit_decompose_q(cs, share_var, share_bits, K_BITS)?;
-        if is_identity(&rec.share_commitment) {
-            for &bit_var in &share_bit_vars {
-                cs.constrain(bit_var.into());
-            }
-        } else {
-            let (share_commitment_x, share_commitment_y) =
-                affine(&rec.share_commitment).map_err(|_| R1CSError::VerificationError)?;
-            let precomp_share =
-                precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
-            chord_exponentiate_r1cs_with_result(
-                cs,
-                &share_bit_vars,
-                &precomp_share,
-                Some((share_commitment_x, share_commitment_y)),
-                witness.and_then(|w| w.share_commitment.as_ref()),
-            )?;
-        }
+        let (share_commitment_x, share_commitment_y) =
+            affine(&rec.share_commitment).map_err(|_| R1CSError::VerificationError)?;
+        let precomp_share =
+            precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        chord_exponentiate_r1cs_with_result(
+            cs,
+            &share_bit_vars,
+            &precomp_share,
+            Some((share_commitment_x, share_commitment_y)),
+            witness.map(|w| &w.share_commitment),
+        )?;
 
-        if is_identity(&rec.dh_commitment) {
-            for &bit_var in &pad_bit_vars {
-                cs.constrain(bit_var.into());
-            }
-        } else {
-            let (dh_commitment_x, dh_commitment_y) =
-                affine(&rec.dh_commitment).map_err(|_| R1CSError::VerificationError)?;
-            let precomp_dh =
-                precompute_chord(&rec.pkj, K_BITS).map_err(|_| R1CSError::VerificationError)?;
-            chord_exponentiate_r1cs_with_result(
-                cs,
-                &pad_bit_vars,
-                &precomp_dh,
-                Some((dh_commitment_x, dh_commitment_y)),
-                witness.map(|w| &w.dh_commitment),
-            )?;
-        }
+        let (dh_commitment_x, dh_commitment_y) =
+            affine(&rec.dh_commitment).map_err(|_| R1CSError::VerificationError)?;
+        let precomp_dh =
+            precompute_chord(&rec.pkj, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        chord_exponentiate_r1cs_with_result(
+            cs,
+            &pad_bit_vars,
+            &precomp_dh,
+            Some((dh_commitment_x, dh_commitment_y)),
+            witness.map(|w| &w.dh_commitment),
+        )?;
 
         Ok(())
     }
@@ -1681,12 +1671,6 @@ pub mod secp_secq {
         let mut share_bool_bits = [false; K_BITS + 1];
         decompose_k_fp(&share_fp, &mut share_bool_bits);
 
-        let share_commitment_witness = if is_identity(&share_commitment) {
-            None
-        } else {
-            Some(chord_compute_witness(&share_bool_bits, &g_in, K_BITS)?)
-        };
-
         Ok(HiddenReceiverWitness {
             sk_pkj: chord_compute_witness(&sk_bits, &rec.pkj, K_BITS)?,
             k_bits,
@@ -1697,7 +1681,7 @@ pub mod secp_secq {
             pad_bits: bit_options(&pad_bool_bits),
             share: share_fp,
             share_bits: bit_options(&share_bool_bits),
-            share_commitment: share_commitment_witness,
+            share_commitment: chord_compute_witness(&share_bool_bits, &g_in, K_BITS)?,
             pad_commitment: chord_compute_witness(&pad_bool_bits, &g_in, K_BITS)?,
             dh_commitment: chord_compute_witness(&pad_bool_bits, &rec.pkj, K_BITS)?,
         })
@@ -2606,10 +2590,8 @@ pub mod secp_secq {
             decompose_k_fp(&wrong_share_fp, &mut wrong_share_bits);
             rec_witness.share = wrong_share_fp;
             rec_witness.share_bits = bit_options(&wrong_share_bits);
-            rec_witness.share_commitment = Some(
-                chord_compute_witness(&wrong_share_bits, &g_in, K_BITS)
-                    .expect("wrong share commitment witness"),
-            );
+            rec_witness.share_commitment = chord_compute_witness(&wrong_share_bits, &g_in, K_BITS)
+                .expect("wrong share commitment witness");
 
             let pc_gens = PedersenGens::<R1csCycle>::default();
             let bp_gens = BulletproofGens::<R1csCycle>::new(batched_gens_capacity(1), 1);
@@ -3257,6 +3239,52 @@ pub mod secp_secq {
                 validate_batched_public_relations(&statement).unwrap_err(),
                 Error::ProofVerificationFailed
             );
+        }
+
+        fn assert_batched_statement_rejects_identity(
+            mutate: impl FnOnce(&mut BatchedEvrfStatement),
+        ) {
+            let mut statement = context_statement();
+            mutate(&mut statement);
+            assert_eq!(
+                validate_batched_public_relations(&statement).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        #[test]
+        fn batched_statement_rejects_identity_pk1() {
+            assert_batched_statement_rejects_identity(|statement| {
+                statement.pk1 = Gin::identity();
+            });
+        }
+
+        #[test]
+        fn batched_statement_rejects_identity_receiver_pk() {
+            assert_batched_statement_rejects_identity(|statement| {
+                statement.receivers[0].pkj = Gin::identity();
+            });
+        }
+
+        #[test]
+        fn batched_statement_rejects_identity_share_commitment() {
+            assert_batched_statement_rejects_identity(|statement| {
+                statement.receivers[0].share_commitment = Gin::identity();
+            });
+        }
+
+        #[test]
+        fn batched_statement_rejects_identity_pad_commitment() {
+            assert_batched_statement_rejects_identity(|statement| {
+                statement.receivers[0].pad_commitment = Gin::identity();
+            });
+        }
+
+        #[test]
+        fn batched_statement_rejects_identity_dh_commitment() {
+            assert_batched_statement_rejects_identity(|statement| {
+                statement.receivers[0].dh_commitment = Gin::identity();
+            });
         }
 
         #[test]

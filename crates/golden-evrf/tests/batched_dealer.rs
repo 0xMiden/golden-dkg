@@ -41,7 +41,7 @@ fn evrf_batched_dealer_honest_proof_verifies() {
 
 #[test]
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-fn evrf_batched_dealer_zero_share_verifies() {
+fn evrf_batched_dealer_rejects_identity_share_commitment() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C10);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 1);
@@ -57,9 +57,10 @@ fn evrf_batched_dealer_zero_share_verifies() {
     statement.receivers[0].share_commitment = Gin::identity();
     statement.receivers[0].encrypted_share = pad;
 
-    let proof = paper::evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
-    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-    paper::evrf_batched_verify(&statement, &proof, &mut verify_rng).expect("verify");
+    assert!(
+        paper::evrf_batched_prove(&statement, &witness, &mut rng).is_err(),
+        "batched proof should reject identity share commitments before circuit construction"
+    );
 }
 
 #[test]
