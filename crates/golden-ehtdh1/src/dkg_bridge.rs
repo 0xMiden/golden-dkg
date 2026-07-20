@@ -16,7 +16,7 @@ use crate::encrypt::SealingKey;
 pub struct Ehtdh1Material<G: GoldenHashToGroup> {
     /// Paper `pk = X`, used by clients to seal payloads.
     pub sealing_key: SealingKey<G>,
-    /// Paper `pkc = (X; X_i; Z_i)`, plus the threshold.
+    /// Paper `pkc = (X; [(X_i, Z_i)]_i)`, plus the threshold.
     pub public_key_set: PublicKeySet<G>,
     /// Paper `sk_i = (x_i, z_i)` for the local validator.
     pub secret_share: SecretShare<G>,

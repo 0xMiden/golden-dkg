@@ -60,7 +60,7 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
 
     /// Paper Section 3 Decryption, producing `(W_i, e_i, x_i'', z_i'')`.
     ///
-    /// Field docs and helpers below name the individual paper symbols.
+    /// The share proof is a double Schnorr proof for `W_i = x_i R + z_i S`.
     pub fn decrypt_share_with_associated_data<R: RngCore + CryptoRng>(
         &self,
         rng: &mut R,
@@ -74,22 +74,30 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
         }
         verify_ciphertext(message)?;
 
+        // `X_i = x_i G`, `Z_i = z_i G`, and `S = Hdgd(ad, dc, ctxt)`.
         let public_decryption_share = G::mul_generator(&self.share.decryption);
         let public_context_share = G::mul_generator(&self.share.context);
         let decryption_group = decryption_group::<G>(setup_context, message, decryption_context)?;
+
+        // `W_i = x_i R + z_i S`.
         let share = G::add(
             &G::mul(&message.ephemeral_public, &self.share.decryption),
             &G::mul(&decryption_group, &self.share.context),
         );
 
+        // Paper nonces `x_i', z_i' in Zq`.
         let decryption_nonce = random_nonzero_scalar::<G, _>(rng);
         let context_nonce = random_nonzero_scalar::<G, _>(rng);
+
+        // `X_i' = x_i'G`, `Z_i' = z_i'G`, and `W_i' = x_i'R + z_i'S`.
         let public_decryption_commitment = G::mul_generator(&decryption_nonce);
         let public_context_commitment = G::mul_generator(&context_nonce);
         let share_commitment = G::add(
             &G::mul(&message.ephemeral_public, &decryption_nonce),
             &G::mul(&decryption_group, &context_nonce),
         );
+
+        // `e_i = Hdcd(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
         let challenge = share_challenge::<G>(ShareChallengeInputs {
             setup_context,
             decryption_group: &decryption_group,
@@ -100,6 +108,8 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
             public_context_commitment: &public_context_commitment,
             share_commitment: &share_commitment,
         })?;
+
+        // `x_i'' = x_i' + e_i x_i` and `z_i'' = z_i' + e_i z_i`.
         let decryption_response = decryption_nonce.add(&challenge.mul(&self.share.decryption));
         let context_response = context_nonce.add(&challenge.mul(&self.share.context));
 
@@ -114,6 +124,8 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
 }
 
 /// Decryption share `(W_i, e_i, x_i'', z_i'')` from paper Section 3.
+///
+/// `(e_i, x_i'', z_i'')` is a double Schnorr proof for `W_i = x_i R + z_i S`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecryptionShare<G: GoldenHashToGroup> {
     /// Participant index.
@@ -324,6 +336,8 @@ fn validate_combiner_setup<G: GoldenHashToGroup>(
 }
 
 /// Paper equation (2): reconstruct `X_i'`, `Z_i'`, and `W_i'`.
+///
+/// This verifies the double Schnorr proof for `W_i = x_i R + z_i S`.
 fn verify_decryption_share<G: GoldenHashToGroup>(
     setup_context: &SetupContext,
     message: &Ciphertext<G>,
@@ -331,15 +345,22 @@ fn verify_decryption_share<G: GoldenHashToGroup>(
     share: &DecryptionShare<G>,
     public_share: &PublicShare<G>,
 ) -> Result<(), Error> {
+    // `S = Hdgd(ad, dc, ctxt)`.
     let decryption_group = decryption_group::<G>(setup_context, message, decryption_context)?;
+
+    // `X_i' = x_i''G - e_i X_i`.
     let public_decryption_commitment = G::sub(
         &G::mul_generator(&share.decryption_response),
         &G::mul(&public_share.decryption, &share.challenge),
     );
+
+    // `Z_i' = z_i''G - e_i Z_i`.
     let public_context_commitment = G::sub(
         &G::mul_generator(&share.context_response),
         &G::mul(&public_share.context, &share.challenge),
     );
+
+    // `W_i' = x_i''R + z_i''S - e_i W_i`.
     let share_commitment = G::sub(
         &G::add(
             &G::mul(&message.ephemeral_public, &share.decryption_response),
@@ -347,6 +368,8 @@ fn verify_decryption_share<G: GoldenHashToGroup>(
         ),
         &G::mul(&share.share, &share.challenge),
     );
+
+    // Accept only when `e_i = Hdcd(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
     let expected = share_challenge::<G>(ShareChallengeInputs {
         setup_context,
         decryption_group: &decryption_group,
@@ -373,9 +396,12 @@ fn decryption_group<G: GoldenHashToGroup>(
 ) -> Result<G::Element, Error> {
     let mut transcript = Transcript::new(b"golden-ehtdh1-hdgd-v1");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
+    // The paper's `Hdgd` input is `(ad, dc, ctxt)`.
+    // This crate also binds `SetupContext::root` into that transcript.
     transcript.bytes(b"setup-context-root", &setup_context.root());
     transcript.bytes(b"ad", &message.associated_data);
     transcript.bytes(b"dc", decryption_context);
+    // `ctxt = (R, V, e, r'', c)`.
     transcript.element::<G>(b"R", &message.ephemeral_public);
     transcript.element::<G>(b"V", &message.encryption_point);
     transcript.scalar::<G>(b"e", &message.challenge);
@@ -405,6 +431,7 @@ fn share_challenge<G: GoldenGroup>(
     let mut transcript = Transcript::new(b"golden-ehtdh1-hdcd-v1");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
     transcript.bytes(b"setup-context-root", &inputs.setup_context.root());
+    // The paper's `Hdcd` input tuple is `(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
     transcript.element::<G>(b"S", inputs.decryption_group);
     transcript.element::<G>(b"X-i", inputs.public_decryption_share);
     transcript.element::<G>(b"Z-i", inputs.public_context_share);
@@ -424,6 +451,7 @@ fn lagrange_at_zero<G: GoldenGroup>(
     let mut numerator = G::Scalar::one();
     let mut denominator = G::Scalar::one();
 
+    // `lambda_i^(J)(0) = product_j (0 - j) / product_j (i - j)`.
     for other in participants {
         if other == participant {
             continue;

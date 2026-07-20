@@ -40,14 +40,14 @@ impl<G: GoldenGroup> fmt::Debug for SecretShare<G> {
     }
 }
 
-/// Paper `pkc = (X; X_i; Z_i)` plus the reconstruction threshold.
+/// Paper `pkc = (X; [(X_i, Z_i)]_i)` plus the reconstruction threshold.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicKeySet<G: GoldenGroup> {
     /// Number of shares required to decrypt.
     pub threshold: usize,
     /// `X = xG`, the joint public key (paper Section 3 Key generation).
     pub joint_public_key: G::Element,
-    /// `X_i = x_i G` and `Z_i = z_i G`, keyed by participant.
+    /// Pairs `(X_i, Z_i) = (x_i G, z_i G)`, keyed by participant.
     pub public_shares: BTreeMap<ParticipantIndex, PublicShare<G>>,
 }
 
@@ -257,6 +257,8 @@ fn validate_public_shares<G: GoldenGroup>(
 ) -> Result<(), Error> {
     let participants = public_shares.keys().copied().collect::<Vec<_>>();
     let basis = &participants[..threshold];
+
+    // Interpolate `X_i` shares at 0 and check that they recover `X`.
     let decryption = interpolate_public_key_share::<G>(
         basis,
         G::Scalar::zero(),
@@ -266,6 +268,8 @@ fn validate_public_shares<G: GoldenGroup>(
     if decryption != *joint_public_key {
         return Err(Error::InvalidPublicKeySet);
     }
+
+    // Interpolate `Z_i` shares at 0 and check that they recover the identity.
     let context = interpolate_public_key_share::<G>(
         basis,
         G::Scalar::zero(),
@@ -278,6 +282,7 @@ fn validate_public_shares<G: GoldenGroup>(
 
     for participant in participants.iter().skip(threshold) {
         let x = participant.to_scalar::<G::Scalar>()?;
+        // Check that each remaining `(X_i, Z_i)` lies on the same polynomials.
         let expected_decryption = interpolate_public_key_share::<G>(
             basis,
             x.clone(),
@@ -325,6 +330,7 @@ fn lagrange_at<G: GoldenGroup>(
     let mut numerator = G::Scalar::one();
     let mut denominator = G::Scalar::one();
 
+    // Lagrange basis value at `x`: product_j (x - j) / product_j (i - j).
     for other in participants {
         if other == participant {
             continue;
