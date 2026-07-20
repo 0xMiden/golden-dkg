@@ -385,46 +385,31 @@ pub mod secp_secq {
         cs: &mut CS,
         k_var: Variable<R1csField>,
         bit_assignments: &[Option<R1csField>],
-        lambda: usize,
     ) -> core::result::Result<Vec<Variable<R1csField>>, R1CSError> {
-        bit_decompose_bounded(
-            cs,
-            k_var,
-            bit_assignments,
-            lambda,
-            &SECP256K1_BASE_MODULUS_LE,
-        )
+        bit_decompose_bounded(cs, k_var, bit_assignments, &SECP256K1_BASE_MODULUS_LE)
     }
 
     fn bit_decompose_q<CS: ConstraintSystem<R1csCycle>>(
         cs: &mut CS,
         k_var: Variable<R1csField>,
         bit_assignments: &[Option<R1csField>],
-        lambda: usize,
     ) -> core::result::Result<Vec<Variable<R1csField>>, R1CSError> {
-        bit_decompose_bounded(
-            cs,
-            k_var,
-            bit_assignments,
-            lambda,
-            &SECP256K1_SCALAR_MODULUS_LE,
-        )
+        bit_decompose_bounded(cs, k_var, bit_assignments, &SECP256K1_SCALAR_MODULUS_LE)
     }
 
     fn bit_decompose_bounded<CS: ConstraintSystem<R1csCycle>>(
         cs: &mut CS,
         k_var: Variable<R1csField>,
         bit_assignments: &[Option<R1csField>],
-        lambda: usize,
         modulus_le: &[u8; 32],
     ) -> core::result::Result<Vec<Variable<R1csField>>, R1CSError> {
-        if lambda != K_BITS || bit_assignments.len() != lambda + 1 {
+        if bit_assignments.len() != K_BITS + 1 {
             return Err(R1CSError::FormatError);
         }
-        let mut bit_vars = Vec::with_capacity(lambda + 1);
+        let mut bit_vars = Vec::with_capacity(K_BITS + 1);
         let mut k_lc = LinearCombination::default();
 
-        for (j, &bit) in bit_assignments.iter().enumerate().take(lambda + 1) {
+        for (j, &bit) in bit_assignments.iter().enumerate() {
             // One multiplier gate: left = k_j, right = 1 - k_j, out = k_j*(1-k_j).
             let (left, right, out) =
                 cs.allocate_multiplier(bit.map(|bit| (bit, R1csField::ONE - bit)))?;
@@ -450,7 +435,7 @@ pub mod secp_secq {
         // 0, rejecting the value p itself.
         let mut prefix_equal = LinearCombination::from(R1csField::ONE);
         let mut prefix_equal_assignment = Some(R1csField::ONE);
-        for j in (0..=lambda).rev() {
+        for j in (0..=K_BITS).rev() {
             let bit_assignment = bit_assignments[j];
             let product_assignment = match (prefix_equal_assignment, bit_assignment) {
                 (Some(eq), Some(bit)) => Some((eq, bit)),
@@ -485,18 +470,17 @@ pub mod secp_secq {
         cs: &mut CS,
         bit_vars: &[Variable<R1csField>],
         bit_assignments: &[Option<R1csField>],
-        lambda: usize,
         bound_le: &[u8; 32],
         condition_var: Variable<R1csField>,
     ) -> core::result::Result<(), R1CSError> {
-        if lambda != K_BITS || bit_vars.len() != lambda + 1 || bit_assignments.len() != lambda + 1 {
+        if bit_vars.len() != K_BITS + 1 || bit_assignments.len() != K_BITS + 1 {
             return Err(R1CSError::FormatError);
         }
 
         let condition_lc = LinearCombination::from(condition_var);
         let mut prefix_equal = LinearCombination::from(R1csField::ONE);
         let mut prefix_equal_assignment = Some(R1csField::ONE);
-        for j in (0..=lambda).rev() {
+        for j in (0..=K_BITS).rev() {
             let bit_assignment = bit_assignments[j];
             let product_assignment = match (prefix_equal_assignment, bit_assignment) {
                 (Some(eq), Some(bit)) => Some((eq, bit)),
@@ -1064,7 +1048,7 @@ pub mod secp_secq {
         // unrelated to S.x and still satisfy the chord-rule constraints.
         cs.constrain(var_k - s_x);
 
-        let bit_vars = bit_decompose(cs, var_k, bit_assignments, K_BITS)?;
+        let bit_vars = bit_decompose(cs, var_k, bit_assignments)?;
 
         let precomp1 = precompute_chord(h1, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         let precomp2 = precompute_chord(h2, K_BITS).map_err(|_| R1CSError::VerificationError)?;
@@ -1420,17 +1404,29 @@ pub mod secp_secq {
 
     #[derive(Clone, Debug)]
     struct HiddenReceiverWitness {
+        /// Chord witness for `S_j = PK_j^sk_1`.
         sk_pkj: ChordWitness,
+        /// Bits of `k_j = int(S_j.x)`.
         k_bits: Vec<Option<R1csField>>,
+        /// Chord witness for `T_{1,j} = H1(msg)^k_j`.
         t1: ChordWitness,
+        /// Chord witness for `T_{2,j} = H2(msg)^k_j`.
         t2: ChordWitness,
+        /// Boolean `reduce_q` selecting whether `r_j` reduced by `q`.
         reduce_q: R1csField,
+        /// `pad_j = beta * T_{1,j}.x + T_{2,j}.x mod q`.
         pad: R1csField,
+        /// Bits of `pad_j`.
         pad_bits: Vec<Option<R1csField>>,
+        /// Private dealer share `s_j`.
         share: R1csField,
+        /// Bits of `s_j`.
         share_bits: Vec<Option<R1csField>>,
+        /// Chord witness for `g_in^s_j`.
         share_commitment: ChordWitness,
+        /// Chord witness for `g_in^pad_j`.
         pad_commitment: ChordWitness,
+        /// Chord witness for `PK_j^pad_j`.
         dh_commitment: ChordWitness,
     }
 
@@ -1452,7 +1448,7 @@ pub mod secp_secq {
                 vec![None; K_BITS + 1]
             };
             let scalar_var = cs.allocate(scalar_fp)?;
-            let scalar_bit_vars = bit_decompose_q(cs, scalar_var, &scalar_bits, K_BITS)?;
+            let scalar_bit_vars = bit_decompose_q(cs, scalar_var, &scalar_bits)?;
             if is_identity(coefficient) {
                 for &bit_var in &scalar_bit_vars {
                     cs.constrain(bit_var.into());
@@ -1527,7 +1523,7 @@ pub mod secp_secq {
 
         let verifier_k_bits = vec![None; K_BITS + 1];
         let k_bits = witness.map_or(verifier_k_bits.as_slice(), |w| w.k_bits.as_slice());
-        let k_bit_vars = bit_decompose(cs, s_x, k_bits, K_BITS)?;
+        let k_bit_vars = bit_decompose(cs, s_x, k_bits)?;
 
         let precomp1 = precompute_chord(h1, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         let precomp2 = precompute_chord(h2, K_BITS).map_err(|_| R1CSError::VerificationError)?;
@@ -1558,15 +1554,8 @@ pub mod secp_secq {
 
         let verifier_pad_bits = vec![None; K_BITS + 1];
         let pad_bits = witness.map_or(verifier_pad_bits.as_slice(), |w| w.pad_bits.as_slice());
-        let pad_bit_vars = bit_decompose_q(cs, pad_var, pad_bits, K_BITS)?;
-        constrain_bits_lt_bound_when(
-            cs,
-            &pad_bit_vars,
-            pad_bits,
-            K_BITS,
-            &SECP256K1_P_MINUS_Q_LE,
-            reduce,
-        )?;
+        let pad_bit_vars = bit_decompose_q(cs, pad_var, pad_bits)?;
+        constrain_bits_lt_bound_when(cs, &pad_bit_vars, pad_bits, &SECP256K1_P_MINUS_Q_LE, reduce)?;
 
         let (pad_commitment_x, pad_commitment_y) =
             affine(&rec.pad_commitment).map_err(|_| R1CSError::VerificationError)?;
@@ -1584,7 +1573,7 @@ pub mod secp_secq {
         let verifier_share_bits = vec![None; K_BITS + 1];
         let share_bits =
             witness.map_or(verifier_share_bits.as_slice(), |w| w.share_bits.as_slice());
-        let share_bit_vars = bit_decompose_q(cs, share_var, share_bits, K_BITS)?;
+        let share_bit_vars = bit_decompose_q(cs, share_var, share_bits)?;
         let (share_commitment_x, share_commitment_y) =
             affine(&rec.share_commitment).map_err(|_| R1CSError::VerificationError)?;
         let precomp_share =
@@ -1731,7 +1720,7 @@ pub mod secp_secq {
         let sk_var = prover
             .allocate(Some(sk_fp))
             .map_err(|_| Error::ProofVerificationFailed)?;
-        let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &sk_bit_assignments, K_BITS)
+        let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &sk_bit_assignments)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
         let pk1_witness = chord_compute_witness(&sk_bool_bits, &g_in, K_BITS)?;
@@ -1804,7 +1793,7 @@ pub mod secp_secq {
             .allocate(None)
             .map_err(|_| Error::ProofVerificationFailed)?;
         let verifier_sk_bits = vec![None; K_BITS + 1];
-        let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits, K_BITS)
+        let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
         let pk1_precomp =
@@ -2424,13 +2413,13 @@ pub mod secp_secq {
 
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
             let (v_k, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
-            bit_decompose(&mut prover, var_k, bit_assignments, K_BITS)?;
+            bit_decompose(&mut prover, var_k, bit_assignments)?;
             let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
 
             let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
             let v_k_var = verifier.commit(v_k);
             let verifier_bits = vec![None; K_BITS + 1];
-            bit_decompose(&mut verifier, v_k_var, &verifier_bits, K_BITS)?;
+            bit_decompose(&mut verifier, v_k_var, &verifier_bits)?;
             verifier.verify(&proof, &pc_gens, &bp_gens, &mut rng)
         }
 
@@ -2453,12 +2442,11 @@ pub mod secp_secq {
                 LinearCombination::from(R1csField::ONE) - var_reduce,
             );
             prover.constrain(reduce_boolean.into());
-            let bit_vars = bit_decompose_q(&mut prover, var_pad, &bits, K_BITS)?;
+            let bit_vars = bit_decompose_q(&mut prover, var_pad, &bits)?;
             constrain_bits_lt_bound_when(
                 &mut prover,
                 &bit_vars,
                 &bits,
-                K_BITS,
                 &SECP256K1_P_MINUS_Q_LE,
                 var_reduce,
             )?;
@@ -2473,12 +2461,11 @@ pub mod secp_secq {
             );
             verifier.constrain(reduce_boolean.into());
             let verifier_bits = vec![None; K_BITS + 1];
-            let bit_vars = bit_decompose_q(&mut verifier, var_pad, &verifier_bits, K_BITS)?;
+            let bit_vars = bit_decompose_q(&mut verifier, var_pad, &verifier_bits)?;
             constrain_bits_lt_bound_when(
                 &mut verifier,
                 &bit_vars,
                 &verifier_bits,
-                K_BITS,
                 &SECP256K1_P_MINUS_Q_LE,
                 var_reduce,
             )?;
@@ -2601,7 +2588,7 @@ pub mod secp_secq {
             let mut sk_bits = [false; K_BITS + 1];
             decompose_k_fp(&sk_fp, &mut sk_bits);
             let sk_var = prover.allocate(Some(sk_fp)).expect("allocate sk");
-            let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &bit_options(&sk_bits), K_BITS)
+            let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &bit_options(&sk_bits))
                 .expect("sk bit decomposition");
 
             let pk1_precomp = precompute_chord(&g_in, K_BITS).expect("PK1 precompute");
@@ -2630,7 +2617,7 @@ pub mod secp_secq {
             let mut verifier = Verifier::<R1csCycle, _>::new(batched_r1cs_transcript(&statement));
             let sk_var = verifier.allocate(None).expect("allocate verifier sk");
             let verifier_sk_bits = vec![None; K_BITS + 1];
-            let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits, K_BITS)
+            let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits)
                 .expect("verifier sk bit decomposition");
             chord_exponentiate_r1cs_with_result(
                 &mut verifier,
@@ -2669,7 +2656,7 @@ pub mod secp_secq {
             decompose_k(&k, &mut bits);
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
-            let _ = bit_decompose(&mut prover, var_k, &bits, K_BITS).expect("gadget");
+            let _ = bit_decompose(&mut prover, var_k, &bits).expect("gadget");
 
             // One multiplier gate per bit for bitness, plus one per bit for
             // the canonical `< p` range check.
@@ -2677,7 +2664,7 @@ pub mod secp_secq {
             assert_eq!(
                 metrics.multipliers,
                 2 * (K_BITS + 1),
-                "expected exactly 2*(λ+1) multiplier gates, got {}",
+                "expected exactly 2*(K_BITS + 1) multiplier gates, got {}",
                 metrics.multipliers
             );
         }
@@ -2689,13 +2676,13 @@ pub mod secp_secq {
             let k = R1csField::from(0xABCDu64);
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
-            // Only λ bits supplied instead of λ+1: gadget must refuse to build
-            // a truncated circuit.
+            // Only K_BITS bits supplied instead of K_BITS + 1: gadget must
+            // refuse to build a truncated circuit.
             let short_bits = vec![None; K_BITS];
-            let result = bit_decompose(&mut prover, var_k, &short_bits, K_BITS);
+            let result = bit_decompose(&mut prover, var_k, &short_bits);
             assert!(
                 result.is_err(),
-                "bit_decompose must reject bit_assignments.len() != lambda + 1"
+                "bit_decompose must reject bit_assignments.len() != K_BITS + 1"
             );
         }
 
@@ -2722,8 +2709,7 @@ pub mod secp_secq {
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
             let mut bit_assignments = vec![None; K_BITS + 1];
             decompose_k(&k, &mut bit_assignments);
-            let bit_vars =
-                bit_decompose(&mut prover, var_k, &bit_assignments, K_BITS).expect("bit_decomp");
+            let bit_vars = bit_decompose(&mut prover, var_k, &bit_assignments).expect("bit_decomp");
             let result = chord_exponentiate_r1cs(
                 &mut prover,
                 &bit_vars,
@@ -2832,8 +2818,7 @@ pub mod secp_secq {
             // Prover
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
             let (v_k, var_k) = prover.commit(k_fp, random_scalar::<R1csCycle>(&mut rng));
-            let bit_vars =
-                bit_decompose(&mut prover, var_k, &bit_assignments, K_BITS).expect("bit_decomp");
+            let bit_vars = bit_decompose(&mut prover, var_k, &bit_assignments).expect("bit_decomp");
             chord_exponentiate_r1cs(
                 &mut prover,
                 &bit_vars,
@@ -2850,7 +2835,7 @@ pub mod secp_secq {
             let v_k_var = verifier.commit(v_k);
             let verifier_bits = vec![None; K_BITS + 1];
             let bit_vars =
-                bit_decompose(&mut verifier, v_k_var, &verifier_bits, K_BITS).expect("bit_decomp");
+                bit_decompose(&mut verifier, v_k_var, &verifier_bits).expect("bit_decomp");
             chord_exponentiate_r1cs(&mut verifier, &bit_vars, &precomp, result_x, result_y, None)
                 .expect("chord_exp");
             verifier.verify(&proof, &pc_gens, &bp_gens, &mut rng)
