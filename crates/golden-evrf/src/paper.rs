@@ -307,15 +307,17 @@ pub mod secp_secq {
     }
 
     /// Precompute the `C_j` and `D_j` coordinates for a chord-rule
-    /// exponentiation of base `X` with `lambda + 1` bits, using `G_S` as the
-    /// `G_in` generator.  All coordinates are native `Fp` elements.
-    fn precompute_chord(X: &Gin, g_s: &Gin, lambda: usize) -> Result<ChordPrecomp> {
+    /// exponentiation of base `X` with `lambda + 1` bits.  The correction
+    /// generator `G_S(X)` is derived from `X`, so each base gets independent
+    /// correction points.  All coordinates are native `Fp` elements.
+    fn precompute_chord(X: &Gin, lambda: usize) -> Result<ChordPrecomp> {
+        let g_s = chord_correction_generator(X);
         let mut c = Vec::with_capacity(lambda + 1);
         let mut d = Vec::with_capacity(lambda + 1);
         let mut p_j = *X; // P_0 = 2^0 · X = X
         for j in 0..=lambda {
             let cj = chord_cj(j, lambda);
-            let c_j_point = *g_s * cj; // C_j = c_j · G_S
+            let c_j_point = g_s * cj; // C_j = c_j · G_S(X)
             let d_j_point = p_j + c_j_point; // D_j = P_j + C_j
             c.push(affine(&c_j_point)?);
             d.push(affine(&d_j_point)?);
@@ -332,21 +334,22 @@ pub mod secp_secq {
     /// of `L_λ`.  Used to generate the `L_i` witness coordinates for the R1CS
     /// and to verify correctness in tests.
     #[cfg(test)]
-    fn chord_evaluate(bits: &[bool], X: &Gin, g_s: &Gin, lambda: usize) -> Result<(Fp, Fp)> {
-        chord_evaluate_point(bits, X, g_s, lambda).and_then(|p| affine(&p))
+    fn chord_evaluate(bits: &[bool], X: &Gin, lambda: usize) -> Result<(Fp, Fp)> {
+        chord_evaluate_point(bits, X, lambda).and_then(|p| affine(&p))
     }
 
     /// Evaluate the chord-rule exponentiation and return the `G_in` point
     /// `L_λ = k · X` (with `c_j` corrections reducing `k` mod `|G_in|`).
-    fn chord_evaluate_point(bits: &[bool], X: &Gin, g_s: &Gin, lambda: usize) -> Result<Gin> {
+    fn chord_evaluate_point(bits: &[bool], X: &Gin, lambda: usize) -> Result<Gin> {
         if bits.len() != lambda + 1 {
             return Err(Error::ProofVerificationFailed);
         }
+        let g_s = chord_correction_generator(X);
         let mut p_j = *X;
         let mut l = Gin::identity();
         for (j, &bit) in bits.iter().enumerate().take(lambda + 1) {
             let cj = chord_cj(j, lambda);
-            let c_j_point = *g_s * cj;
+            let c_j_point = g_s * cj;
             let delta = if bit { p_j + c_j_point } else { c_j_point };
             l = if j == 0 { delta } else { l + delta };
             p_j = p_j.double();
@@ -549,12 +552,7 @@ pub mod secp_secq {
     /// Compute the full chord-rule witness: all intermediate `L_i` points and
     /// slopes `s_i`.  Uses actual elliptic curve point arithmetic in `G_in`
     /// and field inversion in `Fp` for the slopes.
-    fn chord_compute_witness(
-        bits: &[bool],
-        X: &Gin,
-        g_s: &Gin,
-        lambda: usize,
-    ) -> Result<ChordWitness> {
+    fn chord_compute_witness(bits: &[bool], X: &Gin, lambda: usize) -> Result<ChordWitness> {
         if bits.len() != lambda + 1 {
             return Err(Error::ProofVerificationFailed);
         }
@@ -564,12 +562,13 @@ pub mod secp_secq {
         let mut denom_delta_inverses = Vec::with_capacity(lambda);
         let mut denom_result_inverses = Vec::with_capacity(lambda);
 
+        let g_s = chord_correction_generator(X);
         let mut p_j = *X;
         let mut l = Gin::identity();
 
         for (j, &bit) in bits.iter().enumerate().take(lambda + 1) {
             let cj = chord_cj(j, lambda);
-            let c_j_point = *g_s * cj;
+            let c_j_point = g_s * cj;
             let delta = if bit { p_j + c_j_point } else { c_j_point };
 
             if j == 0 {
@@ -995,7 +994,7 @@ pub mod secp_secq {
     const H_GIN_1_DOMAIN: &str = "golden-paper-evrf-H-Gin-1-v1";
     /// Random-oracle domain tag for `H_{G_in,2}`.
     const H_GIN_2_DOMAIN: &str = "golden-paper-evrf-H-Gin-2-v1";
-    /// Random-oracle domain tag for the fixed chord-rule correction generator.
+    /// Random-oracle domain tag for per-base chord-rule correction generators.
     const CHORD_CORRECTION_DOMAIN: &str = "golden-paper-evrf-chord-correction-v1";
 
     /// Compute `H_{G_in,1}(msg)` as a `G_in` point derived from `msg` via
@@ -1017,9 +1016,10 @@ pub mod secp_secq {
         <Secp256k1 as CurveExt>::hash_to_curve(H_GIN_2_DOMAIN)(&buf[..])
     }
 
-    /// Fixed correction generator used by the batched hidden-witness relation.
-    fn chord_correction_generator() -> Gin {
-        <Secp256k1 as CurveExt>::hash_to_curve(CHORD_CORRECTION_DOMAIN)(b"")
+    /// Derive `G_S(X)` for the chord-rule correction terms used with base `X`.
+    fn chord_correction_generator(X: &Gin) -> Gin {
+        let compressed = Secp256k1Cycle::point_compress(X);
+        <Secp256k1 as CurveExt>::hash_to_curve(CHORD_CORRECTION_DOMAIN)(compressed.as_ref())
     }
 
     /// Decompose an `Fp` element into little-endian bits via its canonical
@@ -1058,7 +1058,6 @@ pub mod secp_secq {
         bit_assignments: &[Option<R1csField>],
         witness1: Option<&ChordWitness>,
         witness2: Option<&ChordWitness>,
-        g_s: &Gin,
     ) -> core::result::Result<(), R1CSError> {
         // Step 2: bind the committed k to the public int(S.x).  Without this
         // constraint, a malicious prover could commit to an arbitrary exponent
@@ -1067,10 +1066,8 @@ pub mod secp_secq {
 
         let bit_vars = bit_decompose(cs, var_k, bit_assignments, K_BITS)?;
 
-        let precomp1 =
-            precompute_chord(h1, g_s, K_BITS).map_err(|_| R1CSError::VerificationError)?;
-        let precomp2 =
-            precompute_chord(h2, g_s, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let precomp1 = precompute_chord(h1, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let precomp2 = precompute_chord(h2, K_BITS).map_err(|_| R1CSError::VerificationError)?;
 
         let (x_t1, _) = chord_exponentiate_r1cs(cs, &bit_vars, &precomp1, t1_x, t1_y, witness1)?;
         let (x_t2, _) = chord_exponentiate_r1cs(cs, &bit_vars, &precomp2, t2_x, t2_y, witness2)?;
@@ -1088,7 +1085,6 @@ pub mod secp_secq {
         rng: &mut impl CryptoRngCore,
     ) -> Result<EvrfProofEnvelope> {
         let g_in = Gin::generator();
-        let g_s = g_in;
 
         // Step 1: S = PK_2^sk_1.  Verify the witness is consistent with the
         // public S before proving.
@@ -1131,8 +1127,8 @@ pub mod secp_secq {
             .collect();
 
         // Steps 4, 5: compute chord-rule witnesses for T_1, T_2.
-        let witness1 = chord_compute_witness(&bits, &h1, &g_s, K_BITS)?;
-        let witness2 = chord_compute_witness(&bits, &h2, &g_s, K_BITS)?;
+        let witness1 = chord_compute_witness(&bits, &h1, K_BITS)?;
+        let witness2 = chord_compute_witness(&bits, &h2, K_BITS)?;
 
         // Public T_1, T_2 coordinates.
         let (t1_x, t1_y) = affine(&statement.t1)?;
@@ -1174,7 +1170,6 @@ pub mod secp_secq {
             &bit_assignments,
             Some(&witness1),
             Some(&witness2),
-            &g_s,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
         let r1cs_proof = prover
@@ -1210,7 +1205,6 @@ pub mod secp_secq {
         rng: &mut impl CryptoRngCore,
     ) -> Result<()> {
         let g_in = Gin::generator();
-        let g_s = g_in;
         let g_out = Secq256k1::generator();
         let pc_gens = shared_pc_gens();
         let bp_gens = shared_bp_gens();
@@ -1269,7 +1263,6 @@ pub mod secp_secq {
             &verifier_bits,
             None,
             None,
-            &g_s,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
@@ -1438,10 +1431,8 @@ pub mod secp_secq {
         coefficients: &[Gin],
         coefficient_scalars: Option<&[GinScalar]>,
         g_in: &Gin,
-        g_s: &Gin,
     ) -> core::result::Result<(), R1CSError> {
-        let precomp =
-            precompute_chord(g_in, g_s, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let precomp = precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
 
         for (i, coefficient) in coefficients.iter().enumerate() {
             let scalar_fp = coefficient_scalars.map(|scalars| fq_to_fp(&scalars[i]));
@@ -1465,7 +1456,7 @@ pub mod secp_secq {
                     let mut bits = [false; K_BITS + 1];
                     decompose_k_fp(scalar_fp, &mut bits);
                     Some(
-                        chord_compute_witness(&bits, g_in, g_s, K_BITS)
+                        chord_compute_witness(&bits, g_in, K_BITS)
                             .map_err(|_| R1CSError::VerificationError)?,
                     )
                 } else {
@@ -1514,11 +1505,10 @@ pub mod secp_secq {
         h2: &Gin,
         beta: R1csField,
         g_in: &Gin,
-        g_s: &Gin,
         witness: Option<&HiddenReceiverWitness>,
     ) -> core::result::Result<(), R1CSError> {
         let precomp_s =
-            precompute_chord(&rec.pkj, g_s, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+            precompute_chord(&rec.pkj, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         let (s_x, _) = chord_exponentiate_r1cs_with_result(
             cs,
             sk_bit_vars,
@@ -1531,10 +1521,8 @@ pub mod secp_secq {
         let k_bits = witness.map_or(verifier_k_bits.as_slice(), |w| w.k_bits.as_slice());
         let k_bit_vars = bit_decompose(cs, s_x, k_bits, K_BITS)?;
 
-        let precomp1 =
-            precompute_chord(h1, g_s, K_BITS).map_err(|_| R1CSError::VerificationError)?;
-        let precomp2 =
-            precompute_chord(h2, g_s, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let precomp1 = precompute_chord(h1, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let precomp2 = precompute_chord(h2, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         let (x_t1, _) = chord_exponentiate_r1cs_with_result(
             cs,
             &k_bit_vars,
@@ -1580,7 +1568,7 @@ pub mod secp_secq {
             let (pad_commitment_x, pad_commitment_y) =
                 affine(&rec.pad_commitment).map_err(|_| R1CSError::VerificationError)?;
             let precomp_pad =
-                precompute_chord(g_in, g_s, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+                precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
             chord_exponentiate_r1cs_with_result(
                 cs,
                 &pad_bit_vars,
@@ -1603,7 +1591,7 @@ pub mod secp_secq {
             let (share_commitment_x, share_commitment_y) =
                 affine(&rec.share_commitment).map_err(|_| R1CSError::VerificationError)?;
             let precomp_share =
-                precompute_chord(g_in, g_s, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+                precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
             chord_exponentiate_r1cs_with_result(
                 cs,
                 &share_bit_vars,
@@ -1620,8 +1608,8 @@ pub mod secp_secq {
         } else {
             let (dh_commitment_x, dh_commitment_y) =
                 affine(&rec.dh_commitment).map_err(|_| R1CSError::VerificationError)?;
-            let precomp_dh = precompute_chord(&rec.pkj, g_s, K_BITS)
-                .map_err(|_| R1CSError::VerificationError)?;
+            let precomp_dh =
+                precompute_chord(&rec.pkj, K_BITS).map_err(|_| R1CSError::VerificationError)?;
             chord_exponentiate_r1cs_with_result(
                 cs,
                 &pad_bit_vars,
@@ -1642,7 +1630,6 @@ pub mod secp_secq {
         beta: &Fp,
     ) -> Result<HiddenReceiverWitness> {
         let g_in = Gin::generator();
-        let g_s = chord_correction_generator();
         let h1 = h_gin_1(msg);
         let h2 = h_gin_2(msg);
         let sj = rec.pkj * *sk1;
@@ -1650,8 +1637,8 @@ pub mod secp_secq {
         let mut k_bool_bits = [false; K_BITS + 1];
         decompose_k_fp(&s_x, &mut k_bool_bits);
         let k_bits = bit_options(&k_bool_bits);
-        let t1 = chord_evaluate_point(&k_bool_bits, &h1, &g_s, K_BITS)?;
-        let t2 = chord_evaluate_point(&k_bool_bits, &h2, &g_s, K_BITS)?;
+        let t1 = chord_evaluate_point(&k_bool_bits, &h1, K_BITS)?;
+        let t2 = chord_evaluate_point(&k_bool_bits, &h2, K_BITS)?;
         let (t1_x, _) = affine(&t1)?;
         let (t2_x, _) = affine(&t2)?;
         let r = *beta * t1_x + t2_x;
@@ -1697,27 +1684,22 @@ pub mod secp_secq {
         let share_commitment_witness = if is_identity(&share_commitment) {
             None
         } else {
-            Some(chord_compute_witness(
-                &share_bool_bits,
-                &g_in,
-                &g_s,
-                K_BITS,
-            )?)
+            Some(chord_compute_witness(&share_bool_bits, &g_in, K_BITS)?)
         };
 
         Ok(HiddenReceiverWitness {
-            sk_pkj: chord_compute_witness(&sk_bits, &rec.pkj, &g_s, K_BITS)?,
+            sk_pkj: chord_compute_witness(&sk_bits, &rec.pkj, K_BITS)?,
             k_bits,
-            t1: chord_compute_witness(&k_bool_bits, &h1, &g_s, K_BITS)?,
-            t2: chord_compute_witness(&k_bool_bits, &h2, &g_s, K_BITS)?,
+            t1: chord_compute_witness(&k_bool_bits, &h1, K_BITS)?,
+            t2: chord_compute_witness(&k_bool_bits, &h2, K_BITS)?,
             reduce_q,
             pad,
             pad_bits: bit_options(&pad_bool_bits),
             share: share_fp,
             share_bits: bit_options(&share_bool_bits),
             share_commitment: share_commitment_witness,
-            pad_commitment: chord_compute_witness(&pad_bool_bits, &g_in, &g_s, K_BITS)?,
-            dh_commitment: chord_compute_witness(&pad_bool_bits, &rec.pkj, &g_s, K_BITS)?,
+            pad_commitment: chord_compute_witness(&pad_bool_bits, &g_in, K_BITS)?,
+            dh_commitment: chord_compute_witness(&pad_bool_bits, &rec.pkj, K_BITS)?,
         })
     }
 
@@ -1734,7 +1716,6 @@ pub mod secp_secq {
             return Err(Error::ProofVerificationFailed);
         }
         let g_in = Gin::generator();
-        let g_s = chord_correction_generator();
 
         ensure_feldman_coefficient_openings(
             &statement.commitment_coefficients,
@@ -1769,9 +1750,9 @@ pub mod secp_secq {
         let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &sk_bit_assignments, K_BITS)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
-        let pk1_witness = chord_compute_witness(&sk_bool_bits, &g_in, &g_s, K_BITS)?;
+        let pk1_witness = chord_compute_witness(&sk_bool_bits, &g_in, K_BITS)?;
         let pk1_precomp =
-            precompute_chord(&g_in, &g_s, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
+            precompute_chord(&g_in, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
         let (pk1_x, pk1_y) = affine(&statement.pk1)?;
         chord_exponentiate_r1cs_with_result(
             &mut prover,
@@ -1787,7 +1768,6 @@ pub mod secp_secq {
             &statement.commitment_coefficients,
             Some(&witness.coefficient_scalars),
             &g_in,
-            &g_s,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
@@ -1807,7 +1787,6 @@ pub mod secp_secq {
                 &h2,
                 statement.beta,
                 &g_in,
-                &g_s,
                 Some(&rec_witness),
             )
             .map_err(|_| Error::ProofVerificationFailed)?;
@@ -1828,7 +1807,6 @@ pub mod secp_secq {
     ) -> Result<()> {
         validate_batched_public_relations(statement)?;
         let g_in = Gin::generator();
-        let g_s = chord_correction_generator();
         let pc_gens = PedersenGens::<R1csCycle>::default();
         let bp_gens =
             BulletproofGens::<R1csCycle>::new(batched_gens_capacity(statement.receivers.len()), 1);
@@ -1846,7 +1824,7 @@ pub mod secp_secq {
             .map_err(|_| Error::ProofVerificationFailed)?;
 
         let pk1_precomp =
-            precompute_chord(&g_in, &g_s, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
+            precompute_chord(&g_in, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
         let (pk1_x, pk1_y) = affine(&statement.pk1)?;
         chord_exponentiate_r1cs_with_result(
             &mut verifier,
@@ -1862,7 +1840,6 @@ pub mod secp_secq {
             &statement.commitment_coefficients,
             None,
             &g_in,
-            &g_s,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
@@ -1875,7 +1852,6 @@ pub mod secp_secq {
                 &h2,
                 statement.beta,
                 &g_in,
-                &g_s,
                 None,
             )
             .map_err(|_| Error::ProofVerificationFailed)?;
@@ -2202,8 +2178,8 @@ pub mod secp_secq {
 
             let mut bits = [false; K_BITS + 1];
             decompose_k_fp(&k, &mut bits);
-            let t1 = chord_evaluate_point(&bits, &h1, &g_in, K_BITS).expect("T1");
-            let t2 = chord_evaluate_point(&bits, &h2, &g_in, K_BITS).expect("T2");
+            let t1 = chord_evaluate_point(&bits, &h1, K_BITS).expect("T1");
+            let t2 = chord_evaluate_point(&bits, &h2, K_BITS).expect("T2");
 
             let (t1_x, _) = affine(&t1).expect("T1 affine");
             let (t2_x, _) = affine(&t2).expect("T2 affine");
@@ -2238,7 +2214,6 @@ pub mod secp_secq {
             beta: R1csField,
         ) -> (BatchedEvrfStatement, BatchedEvrfWitness) {
             let g_in = Gin::generator();
-            let g_s = chord_correction_generator();
             let pk1 = g_in * sk1;
             let h1 = h_gin_1(msg);
             let h2 = h_gin_2(msg);
@@ -2257,8 +2232,8 @@ pub mod secp_secq {
                     let (k, _) = affine(&sj).expect("S affine");
                     let mut bits = [false; K_BITS + 1];
                     decompose_k_fp(&k, &mut bits);
-                    let t1j = chord_evaluate_point(&bits, &h1, &g_s, K_BITS).expect("T1");
-                    let t2j = chord_evaluate_point(&bits, &h2, &g_s, K_BITS).expect("T2");
+                    let t1j = chord_evaluate_point(&bits, &h1, K_BITS).expect("T1");
+                    let t2j = chord_evaluate_point(&bits, &h2, K_BITS).expect("T2");
                     let (t1_x, _) = affine(&t1j).expect("T1 affine");
                     let (t2_x, _) = affine(&t2j).expect("T2 affine");
                     let r = beta * t1_x + t2_x;
@@ -2344,8 +2319,7 @@ pub mod secp_secq {
 
         #[test]
         fn chord_evaluate_matches_direct_scalar_mul() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
+            let X = Gin::generator() * Fq::from(42u64);
             let k = Fq::from_raw([
                 0xDEADBEEFCAFEBABE,
                 0x0123456789ABCDEF,
@@ -2355,7 +2329,7 @@ pub mod secp_secq {
             let mut bits = [false; K_BITS + 1];
             decompose(&k, &mut bits);
 
-            let (lx, ly) = chord_evaluate(&bits, &X, &g_s, K_BITS).expect("eval");
+            let (lx, ly) = chord_evaluate(&bits, &X, K_BITS).expect("eval");
             let expected = X * k;
             let (ex, ey) = affine(&expected).expect("affine");
             assert_eq!(lx, ex, "L_λ x-coordinate mismatch");
@@ -2364,13 +2338,12 @@ pub mod secp_secq {
 
         #[test]
         fn chord_evaluate_small_exponent() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(99u64);
+            let X = Gin::generator() * Fq::from(99u64);
             let k = Fq::from(5u64);
             let mut bits = [false; K_BITS + 1];
             decompose(&k, &mut bits);
 
-            let (lx, ly) = chord_evaluate(&bits, &X, &g_s, K_BITS).expect("eval");
+            let (lx, ly) = chord_evaluate(&bits, &X, K_BITS).expect("eval");
             let expected = X * k;
             let (ex, ey) = affine(&expected).expect("affine");
             assert_eq!(lx, ex);
@@ -2379,9 +2352,9 @@ pub mod secp_secq {
 
         #[test]
         fn precompute_chord_coordinates_are_correct() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(123u64);
-            let precomp = precompute_chord(&X, &g_s, K_BITS).expect("precompute");
+            let X = Gin::generator() * Fq::from(123u64);
+            let g_s = chord_correction_generator(&X);
+            let precomp = precompute_chord(&X, K_BITS).expect("precompute");
 
             assert_eq!(precomp.c.len(), K_BITS + 1, "c vector length");
             assert_eq!(precomp.d.len(), K_BITS + 1, "d vector length");
@@ -2403,23 +2376,13 @@ pub mod secp_secq {
         }
 
         #[test]
-        fn chord_compute_witness_rejects_exceptional_addition() {
-            // With X = g_s, k_0 = 1, k_1 = 0:
-            //   L_0 = Delta_0 = 1*g_s + 1*g_s = 2*g_s
-            //   Delta_1 = 0*P_1 + 2*g_s = 2*g_s
-            //   x_{L_0} = x_{Delta_1}  ⟹  dx = 0 (exceptional case)
-            // The witness computation must return an error, not fabricate
-            // a zero slope.
-            let g_s = Gin::generator();
-            let X = g_s;
-            let mut bits = [false; K_BITS + 1];
-            bits[0] = true; // k_0 = 1
-            bits[1] = false; // k_1 = 0
-
-            let result = chord_compute_witness(&bits, &X, &g_s, K_BITS);
-            assert!(
-                result.is_err(),
-                "chord_compute_witness must reject exceptional dx=0 case"
+        fn chord_correction_generator_is_base_bound() {
+            let x1 = Gin::generator() * Fq::from(123u64);
+            let x2 = Gin::generator() * Fq::from(456u64);
+            assert_ne!(
+                Secp256k1Cycle::point_compress(&chord_correction_generator(&x1)).as_ref(),
+                Secp256k1Cycle::point_compress(&chord_correction_generator(&x2)).as_ref(),
+                "different chord bases should derive different correction generators"
             );
         }
     }
@@ -2625,7 +2588,6 @@ pub mod secp_secq {
             let (statement, witness) = testing::build_batched(&msg, sk1, &[pkj], beta);
             let rec = &statement.receivers[0];
             let g_in = Gin::generator();
-            let g_s = chord_correction_generator();
             let h1 = h_gin_1(&statement.msg);
             let h2 = h_gin_2(&statement.msg);
 
@@ -2645,7 +2607,7 @@ pub mod secp_secq {
             rec_witness.share = wrong_share_fp;
             rec_witness.share_bits = bit_options(&wrong_share_bits);
             rec_witness.share_commitment = Some(
-                chord_compute_witness(&wrong_share_bits, &g_in, &g_s, K_BITS)
+                chord_compute_witness(&wrong_share_bits, &g_in, K_BITS)
                     .expect("wrong share commitment witness"),
             );
 
@@ -2660,14 +2622,14 @@ pub mod secp_secq {
             let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &bit_options(&sk_bits), K_BITS)
                 .expect("sk bit decomposition");
 
-            let pk1_precomp = precompute_chord(&g_in, &g_s, K_BITS).expect("PK1 precompute");
+            let pk1_precomp = precompute_chord(&g_in, K_BITS).expect("PK1 precompute");
             let (pk1_x, pk1_y) = affine(&statement.pk1).expect("PK1 affine");
             chord_exponentiate_r1cs_with_result(
                 &mut prover,
                 &sk_bit_vars,
                 &pk1_precomp,
                 Some((pk1_x, pk1_y)),
-                Some(&chord_compute_witness(&sk_bits, &g_in, &g_s, K_BITS).expect("PK1 witness")),
+                Some(&chord_compute_witness(&sk_bits, &g_in, K_BITS).expect("PK1 witness")),
             )
             .expect("PK1 constraint");
             build_hidden_receiver_slot(
@@ -2678,7 +2640,6 @@ pub mod secp_secq {
                 &h2,
                 statement.beta,
                 &g_in,
-                &g_s,
                 Some(&rec_witness),
             )
             .expect("receiver slot");
@@ -2705,7 +2666,6 @@ pub mod secp_secq {
                 &h2,
                 statement.beta,
                 &g_in,
-                &g_s,
                 None,
             )
             .expect("verifier receiver slot");
@@ -2762,9 +2722,8 @@ pub mod secp_secq {
             let pc_gens = PedersenGens::<R1csCycle>::default();
             let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0002);
 
-            let g_s = Gin::generator();
-            let X = g_s * GinScalar::from(12345u64);
-            let precomp = precompute_chord(&X, &g_s, K_BITS).expect("precompute");
+            let X = Gin::generator() * GinScalar::from(12345u64);
+            let precomp = precompute_chord(&X, K_BITS).expect("precompute");
 
             // bit_vars and precomp agree on λ+1 = 257 entries; build a witness
             // whose l_coords is one short so the length check fires before any
@@ -2838,16 +2797,14 @@ pub mod secp_secq {
         fn run_chord_exp(
             k_val: u64,
             X: &Gin,
-            g_s: &Gin,
             result_override: Option<(Fp, Fp)>,
         ) -> core::result::Result<(), R1CSError> {
-            run_chord_exp_with_witness(k_val, X, g_s, result_override, |_| {})
+            run_chord_exp_with_witness(k_val, X, result_override, |_| {})
         }
 
         fn run_chord_exp_with_witness(
             k_val: u64,
             X: &Gin,
-            g_s: &Gin,
             result_override: Option<(Fp, Fp)>,
             mutate_witness: impl FnOnce(&mut ChordWitness),
         ) -> core::result::Result<(), R1CSError> {
@@ -2867,10 +2824,10 @@ pub mod secp_secq {
             }
 
             // Precompute C_j/D_j for base X.
-            let precomp = precompute_chord(X, g_s, K_BITS).expect("precompute");
+            let precomp = precompute_chord(X, K_BITS).expect("precompute");
 
             // Compute witness: all intermediate L_i and s_i.
-            let mut witness = chord_compute_witness(&bits, X, g_s, K_BITS).expect("witness");
+            let mut witness = chord_compute_witness(&bits, X, K_BITS).expect("witness");
             mutate_witness(&mut witness);
 
             // Expected result: T = k * X.
@@ -2919,65 +2876,59 @@ pub mod secp_secq {
 
         #[test]
         fn chord_exp_honest_proof_verifies() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
-            run_chord_exp(0xDEADBEEFu64, &X, &g_s, None).expect("honest proof verifies");
+            let X = Gin::generator() * Fq::from(42u64);
+            run_chord_exp(0xDEADBEEFu64, &X, None).expect("honest proof verifies");
         }
 
         #[test]
         fn chord_exp_small_exponent_verifies() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(7u64);
-            run_chord_exp(3u64, &X, &g_s, None).expect("honest proof verifies");
+            let X = Gin::generator() * Fq::from(7u64);
+            run_chord_exp(3u64, &X, None).expect("honest proof verifies");
         }
 
         #[test]
         fn chord_exp_rejects_wrong_result_x() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
+            let X = Gin::generator() * Fq::from(42u64);
             let t = X * Fq::from(0xDEADBEEFu64);
             let (tx, ty) = affine(&t).expect("T affine");
             let wrong_x = tx + R1csField::ONE;
             assert!(
-                run_chord_exp(0xDEADBEEFu64, &X, &g_s, Some((wrong_x, ty))).is_err(),
+                run_chord_exp(0xDEADBEEFu64, &X, Some((wrong_x, ty))).is_err(),
                 "verifier must reject wrong result x"
             );
         }
 
         #[test]
         fn chord_exp_rejects_wrong_result_y() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
+            let X = Gin::generator() * Fq::from(42u64);
             let t = X * Fq::from(0xDEADBEEFu64);
             let (tx, ty) = affine(&t).expect("T affine");
             let wrong_y = ty + R1csField::ONE;
             assert!(
-                run_chord_exp(0xDEADBEEFu64, &X, &g_s, Some((tx, wrong_y))).is_err(),
+                run_chord_exp(0xDEADBEEFu64, &X, Some((tx, wrong_y))).is_err(),
                 "verifier must reject wrong result y"
             );
         }
 
         #[test]
         fn chord_exp_rejects_negated_result_y() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
+            let X = Gin::generator() * Fq::from(42u64);
             let t = X * Fq::from(0xDEADBEEFu64);
             let (tx, ty) = affine(&t).expect("T affine");
             // -T has the same x but negated y.  The full-point binding
             // (x AND y) must reject this, unlike an x-only check.
             let neg_y = -ty;
             assert!(
-                run_chord_exp(0xDEADBEEFu64, &X, &g_s, Some((tx, neg_y))).is_err(),
+                run_chord_exp(0xDEADBEEFu64, &X, Some((tx, neg_y))).is_err(),
                 "verifier must reject -T (same x, negated y)"
             );
         }
 
         #[test]
         fn chord_exp_rejects_wrong_delta_denominator_inverse() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
+            let X = Gin::generator() * Fq::from(42u64);
             assert!(
-                run_chord_exp_with_witness(0xDEADBEEFu64, &X, &g_s, None, |w| {
+                run_chord_exp_with_witness(0xDEADBEEFu64, &X, None, |w| {
                     w.denom_delta_inverses[0] += R1csField::ONE;
                 })
                 .is_err(),
@@ -2987,10 +2938,9 @@ pub mod secp_secq {
 
         #[test]
         fn chord_exp_rejects_wrong_result_denominator_inverse() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
+            let X = Gin::generator() * Fq::from(42u64);
             assert!(
-                run_chord_exp_with_witness(0xDEADBEEFu64, &X, &g_s, None, |w| {
+                run_chord_exp_with_witness(0xDEADBEEFu64, &X, None, |w| {
                     w.denom_result_inverses[0] += R1csField::ONE;
                 })
                 .is_err(),
