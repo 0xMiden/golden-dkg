@@ -335,13 +335,42 @@ where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
 {
+    create_dealing_with_secret::<G, B>(
+        dealer,
+        dealer_identity_secret,
+        G::Scalar::random(rng),
+        config,
+        rng,
+    )
+}
+
+/// Create one dealer message with a caller chosen polynomial constant.
+///
+/// This is the same dealing flow as [`create_dealing`], except the caller sets
+/// the dealer polynomial's constant term. Ordinary DKG callers should keep
+/// using [`create_dealing`].
+///
+/// EHTDH1 uses this helper for its zero sharing run. First, run normal DKG for
+/// `x`. Then run a second DKG where every dealer passes `G::Scalar::zero()` as
+/// `polynomial_secret`. The EHTDH1 adapter derives the second session id. It
+/// rejects the result unless the aggregate public key is the group identity.
+pub fn create_dealing_with_secret<G, B>(
+    dealer: ParticipantIndex,
+    dealer_identity_secret: &G::Scalar,
+    polynomial_secret: G::Scalar,
+    config: &DkgConfig<G>,
+    rng: &mut impl CryptoRngCore,
+) -> Result<DkgDealing<G, B::Proof>>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
     let dealer_public_key = config.registry.public_key(dealer)?;
     if G::mul_generator(dealer_identity_secret) != *dealer_public_key {
         return Err(Error::IdentityKeyMismatch);
     }
 
-    let secret = G::Scalar::random(rng);
-    let polynomial = Polynomial::random_with_secret(secret, config.threshold, rng)?;
+    let polynomial = Polynomial::random_with_secret(polynomial_secret, config.threshold, rng)?;
     let commitment = FeldmanCommitment::<G>::commit(&polynomial)?;
     let msg_i = DealerMessageNonce::random(rng);
 
@@ -1059,6 +1088,56 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn create_dealing_with_secret_sets_dealer_constant() {
+        let config = config();
+        let dealer = idx(1);
+        let secret = TinyScalar::from_u64(37).unwrap();
+        let mut rng = ChaCha20Rng::from_seed([21u8; 32]);
+
+        let dealing = create_dealing_with_secret::<TinyGroup, FakeEvrfBackend>(
+            dealer,
+            &identity_secret(dealer),
+            secret,
+            &config,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(
+            dealing.message.commitment.public_key(),
+            TinyGroup::mul_generator(&secret)
+        );
+        assert!(dealing
+            .message
+            .commitment
+            .verify_share(&dealing.private_share)
+            .unwrap());
+        verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap();
+    }
+
+    #[test]
+    fn zero_secret_dealing_has_identity_public_key_commitment() {
+        let config = config();
+        let dealer = idx(2);
+        let mut rng = ChaCha20Rng::from_seed([22u8; 32]);
+
+        let dealing = create_dealing_with_secret::<TinyGroup, FakeEvrfBackend>(
+            dealer,
+            &identity_secret(dealer),
+            TinyScalar::zero(),
+            &config,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(
+            dealing.message.commitment.public_key(),
+            TinyGroup::identity()
+        );
+        verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap();
     }
 
     #[test]
