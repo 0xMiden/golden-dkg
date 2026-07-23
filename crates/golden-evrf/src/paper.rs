@@ -16,7 +16,7 @@
 #![allow(non_snake_case)]
 
 #[cfg(feature = "halo2curves-secp256k1")]
-use golden_core::{Error, EvrfStatement, EvrfWitness, Result};
+use golden_core::{Error, EvrfStatement, EvrfWitness, ParticipantIndex, Result, TranscriptRoot};
 #[cfg(feature = "halo2curves-secp256k1")]
 use rand_core::CryptoRngCore;
 
@@ -33,7 +33,7 @@ pub mod secp_secq {
         cycle::random_scalar,
         generators::{BulletproofGens, PedersenGens},
         r1cs::{Prover, Verifier},
-        transcript::{append_point, challenge_scalar},
+        transcript::{append_point, append_scalar, challenge_scalar},
         ConstraintSystem, Cycle, LinearCombination, R1CSError, R1CSProof, Variable,
     };
     use ff::{Field, PrimeField};
@@ -142,25 +142,25 @@ pub mod secp_secq {
     //
     // One dealer message covers all non-self receivers in a single R1CS
     // relation. The dealer identity secret `sk_1` and public key `PK_1` are
-    // shared across the batch; each receiver has its own `PK_j`, `S_j`, `k_j`,
-    // `T_{1,j}`, `T_{2,j}`, `r_j`, and `R_j`. Steps 0 and 1 use a batched
-    // Chaum-Pedersen proof (one nonce, one response, per-receiver nonce
-    // commitments). Step 9 uses a per-receiver DLOG PoK with prefix link.
+    // shared across the batch; per-receiver eVRF intermediates, pads, and
+    // shares stay private witnesses.
     // ------------------------------------------------------------------
 
     /// Per-receiver public inputs for the batched dealer proof.
     #[derive(Clone, Debug)]
     pub struct BatchedReceiverStatement {
+        /// Receiver participant index.
+        pub receiver: ParticipantIndex,
         /// Receiver identity public key `PK_j` in `G_in`.
         pub pkj: Gin,
-        /// DH shared point `S_j = PK_j^sk_1` in `G_in`.
-        pub sj: Gin,
-        /// `T_{1,j} = H_{G_in,1}(msg)^{k_j}` in `G_in`.
-        pub t1j: Gin,
-        /// `T_{2,j} = H_{G_in,2}(msg)^{k_j}` in `G_in`.
-        pub t2j: Gin,
-        /// eVRF output commitment `R_j = g_out^{r_j}` in `G_out`.
-        pub r_point_j: Secq256k1,
+        /// Public commitment `g_in^share_j` to the receiver share.
+        pub share_commitment: Gin,
+        /// Published pad commitment `g_in^pad_j` in the dealer broadcast.
+        pub pad_commitment: Gin,
+        /// Published DH commitment `PK_j^pad_j` in the dealer broadcast.
+        pub dh_commitment: Gin,
+        /// Published encrypted share scalar `share_j + pad_j`.
+        pub encrypted_share: GinScalar,
     }
 
     /// Public statement for the batched dealer proof.
@@ -172,54 +172,45 @@ pub mod secp_secq {
         pub pk1: Gin,
         /// Public coefficient `beta` in `Fp` (shared).
         pub beta: R1csField,
+        /// DKG threshold.
+        pub threshold: usize,
+        /// Ordered Feldman commitment coefficients for the dealer polynomial.
+        pub commitment_coefficients: Vec<Gin>,
+        /// Full DKG `EvrfStatement` roots, in the same canonical receiver
+        /// order as `receivers`.
+        pub statement_roots: Vec<TranscriptRoot>,
         /// Per-receiver statements, in the canonical ordered receiver list.
         pub receivers: Vec<BatchedReceiverStatement>,
     }
 
-    /// Witness for the batched dealer proof. Only the shared dealer identity
-    /// secret is needed; all per-receiver values are derived from it.
+    /// Witness for the batched dealer proof.
     #[derive(Clone)]
     pub struct BatchedEvrfWitness {
         /// Dealer identity secret `sk_1` in `Fq` (shared across the batch).
         pub sk1: GinScalar,
+        /// Dealer polynomial coefficients in ascending degree order.
+        pub coefficient_scalars: Vec<GinScalar>,
+        /// Receiver shares in the same order as the public statement.
+        pub shares: Vec<GinScalar>,
     }
 
     impl core::fmt::Debug for BatchedEvrfWitness {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.debug_struct("BatchedEvrfWitness")
                 .field("sk1", &"<redacted>")
+                .field("coefficient_scalars", &"<redacted>")
+                .field("shares", &"<redacted>")
                 .finish()
         }
     }
 
-    /// Batched Chaum-Pedersen proof of `log_{g_in}(PK_1) = sk_1` and
-    /// `log_{PK_j}(S_j) = sk_1` for every receiver `j`. One nonce `r`, one
-    /// challenge `c`, one response `z = r + c * sk_1`.
-    #[derive(Clone, Debug)]
-    pub struct BatchedChaumPedersenProof {
-        /// Nonce commitment `R_0 = g_in^r`.
-        pub r0: Gin,
-        /// Per-receiver nonce commitments `R_j = PK_j^r`.
-        pub rjs: Vec<Gin>,
-        /// Response `z = r + c * sk_1`.
-        pub z: GinScalar,
-    }
-
-    /// Batched proof envelope carrying the combined R1CS proof, per-receiver
-    /// commitments, the batched Chaum-Pedersen proof, and per-receiver DLOG
-    /// proofs.
+    /// Batched proof envelope carrying the combined R1CS proof. Per-receiver
+    /// eVRF internals are hidden witnesses and are not serialized as public
+    /// proof payload.
     #[derive(Clone, Debug)]
     pub struct BatchedEvrfProofEnvelope {
-        /// Combined Bulletproofs R1CS proof for all receivers (steps 2-8).
+        /// Combined Bulletproofs R1CS proof for all receivers.
         pub r1cs: R1CSProof<R1csCycle>,
-        /// Per-receiver Pedersen commitments to `k_j = int(S_j.x)`.
-        pub k_commitments: Vec<GoutCompressed>,
-        /// Per-receiver Pedersen commitments to `r_j` (the R1CS prefix `theta_j`).
-        pub r_commitments: Vec<GoutCompressed>,
-        /// Batched Chaum-Pedersen proof for steps 0 and 1.
-        pub cp: BatchedChaumPedersenProof,
-        /// Per-receiver discrete-log proofs for step 9.
-        pub dlogs: Vec<DlogProof>,
     }
 
     /// Extract affine `(x, y)` coordinates of a non-identity `G_in` point.
@@ -232,10 +223,42 @@ pub mod secp_secq {
             .ok_or(Error::ProofVerificationFailed)
     }
 
+    fn is_identity(point: &Gin) -> bool {
+        *point == Gin::identity()
+    }
+
     /// Bit length used for the `k = int(S.x)` decomposition. The Secp256k1
     /// base field modulus fits in 256 bits, so 256 bits cover every canonical
     /// `Fp` element.
     const K_BITS: usize = 256;
+
+    /// Secp256k1 base-field modulus `p`, encoded little-endian.
+    const SECP256K1_BASE_MODULUS_LE: [u8; 32] = [
+        0x2f, 0xfc, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff,
+    ];
+
+    /// Secp256k1 scalar-field modulus `q`, encoded little-endian.
+    const SECP256K1_SCALAR_MODULUS_LE: [u8; 32] = [
+        0x41, 0x41, 0x36, 0xd0, 0x8c, 0x5e, 0xd2, 0xbf, 0x3b, 0xa0, 0x48, 0xaf, 0xe6, 0xdc, 0xae,
+        0xba, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff,
+    ];
+
+    /// Difference between the Secp256k1 base-field modulus `p` and scalar
+    /// modulus `q`, encoded little-endian.
+    const SECP256K1_P_MINUS_Q_LE: [u8; 32] = [
+        0xee, 0xba, 0xc9, 0x2f, 0x72, 0xa1, 0x2d, 0x40, 0xc4, 0x5f, 0xb7, 0x50, 0x19, 0x23, 0x51,
+        0x45, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ];
+
+    fn modulus_bit(modulus_le: &[u8; 32], j: usize) -> bool {
+        let byte_idx = j / 8;
+        let bit_idx = j % 8;
+        byte_idx < modulus_le.len() && (modulus_le[byte_idx] >> bit_idx) & 1 == 1
+    }
 
     // ------------------------------------------------------------------
     // Chord-rule exponentiation gadget (paper Section 4.3, Boneh et al.
@@ -284,15 +307,17 @@ pub mod secp_secq {
     }
 
     /// Precompute the `C_j` and `D_j` coordinates for a chord-rule
-    /// exponentiation of base `X` with `lambda + 1` bits, using `G_S` as the
-    /// `G_in` generator.  All coordinates are native `Fp` elements.
-    fn precompute_chord(X: &Gin, g_s: &Gin, lambda: usize) -> Result<ChordPrecomp> {
+    /// exponentiation of base `X` with `lambda + 1` bits.  The correction
+    /// generator `G_S(X)` is derived from `X`, so each base gets independent
+    /// correction points.  All coordinates are native `Fp` elements.
+    fn precompute_chord(X: &Gin, lambda: usize) -> Result<ChordPrecomp> {
+        let g_s = chord_correction_generator(X);
         let mut c = Vec::with_capacity(lambda + 1);
         let mut d = Vec::with_capacity(lambda + 1);
         let mut p_j = *X; // P_0 = 2^0 · X = X
         for j in 0..=lambda {
             let cj = chord_cj(j, lambda);
-            let c_j_point = *g_s * cj; // C_j = c_j · G_S
+            let c_j_point = g_s * cj; // C_j = c_j · G_S(X)
             let d_j_point = p_j + c_j_point; // D_j = P_j + C_j
             c.push(affine(&c_j_point)?);
             d.push(affine(&d_j_point)?);
@@ -309,21 +334,22 @@ pub mod secp_secq {
     /// of `L_λ`.  Used to generate the `L_i` witness coordinates for the R1CS
     /// and to verify correctness in tests.
     #[cfg(test)]
-    fn chord_evaluate(bits: &[bool], X: &Gin, g_s: &Gin, lambda: usize) -> Result<(Fp, Fp)> {
-        chord_evaluate_point(bits, X, g_s, lambda).and_then(|p| affine(&p))
+    fn chord_evaluate(bits: &[bool], X: &Gin, lambda: usize) -> Result<(Fp, Fp)> {
+        chord_evaluate_point(bits, X, lambda).and_then(|p| affine(&p))
     }
 
     /// Evaluate the chord-rule exponentiation and return the `G_in` point
     /// `L_λ = k · X` (with `c_j` corrections reducing `k` mod `|G_in|`).
-    fn chord_evaluate_point(bits: &[bool], X: &Gin, g_s: &Gin, lambda: usize) -> Result<Gin> {
+    fn chord_evaluate_point(bits: &[bool], X: &Gin, lambda: usize) -> Result<Gin> {
         if bits.len() != lambda + 1 {
             return Err(Error::ProofVerificationFailed);
         }
+        let g_s = chord_correction_generator(X);
         let mut p_j = *X;
         let mut l = Gin::identity();
         for (j, &bit) in bits.iter().enumerate().take(lambda + 1) {
             let cj = chord_cj(j, lambda);
-            let c_j_point = *g_s * cj;
+            let c_j_point = g_s * cj;
             let delta = if bit { p_j + c_j_point } else { c_j_point };
             l = if j == 0 { delta } else { l + delta };
             p_j = p_j.double();
@@ -344,39 +370,46 @@ pub mod secp_secq {
         result
     }
 
-    /// Bit-decomposition gadget (paper Section 4.2).  Given a committed
+    /// Bit-decomposition gadget (paper Section 4.2). Given a committed
     /// variable `k_var` holding `k ∈ Fp` and `λ+1` bit assignments, constrains:
     /// - `k_j · (1 - k_j) = 0` for each `j` (each `k_j` is binary)
     /// - `k = Σ_{j=0}^{λ} 2^j · k_j` (the bits reconstruct `k`)
+    /// - `Σ 2^j · k_j < p`, where `p` is the Secp256k1 base-field modulus
     ///
-    /// Returns the allocated bit variables `k_0, ..., k_λ`.  Uses exactly
-    /// `λ+1` multiplication gates (one per bit via `allocate_multiplier`) plus
-    /// linear constraints (folded into one by the Bulletproofs verifier).
-    ///
-    /// The reconstruction constraint is modular: `Σ 2^j · k_j ≡ k (mod p)`.
-    /// This allows non-canonical bit patterns (e.g. bits encoding `k + p`).
-    /// In the full paper eVRF relation, the chord-rule gadget's final
-    /// constraint binds the **full point** `L_λ = T` (both x and y
-    /// coordinates), not just the x-coordinate.  An x-only check would be
-    /// insufficient because `(k + p) · X = -k · X` shares the same
-    /// x-coordinate as `k · X` when `2k + p ≡ 0 (mod |G_in|)`.  Binding y
-    /// as well distinguishes `L_λ` from `-L_λ` and rejects all non-canonical
-    /// aliases.  The bit-decomposition gadget is always composed with the
-    /// chord-rule exponentiation, never used in isolation for the paper
-    /// relation.
+    /// Returns the allocated bit variables `k_0, ..., k_λ`. The range check is
+    /// necessary because reconstruction is otherwise only modular in `Fp`;
+    /// bits encoding `k + p` would reconstruct the same field element while
+    /// producing a different scalar after reduction modulo the `G_in` scalar
+    /// field.
     fn bit_decompose<CS: ConstraintSystem<R1csCycle>>(
         cs: &mut CS,
         k_var: Variable<R1csField>,
         bit_assignments: &[Option<R1csField>],
-        lambda: usize,
     ) -> core::result::Result<Vec<Variable<R1csField>>, R1CSError> {
-        if bit_assignments.len() != lambda + 1 {
+        bit_decompose_bounded(cs, k_var, bit_assignments, &SECP256K1_BASE_MODULUS_LE)
+    }
+
+    fn bit_decompose_q<CS: ConstraintSystem<R1csCycle>>(
+        cs: &mut CS,
+        k_var: Variable<R1csField>,
+        bit_assignments: &[Option<R1csField>],
+    ) -> core::result::Result<Vec<Variable<R1csField>>, R1CSError> {
+        bit_decompose_bounded(cs, k_var, bit_assignments, &SECP256K1_SCALAR_MODULUS_LE)
+    }
+
+    fn bit_decompose_bounded<CS: ConstraintSystem<R1csCycle>>(
+        cs: &mut CS,
+        k_var: Variable<R1csField>,
+        bit_assignments: &[Option<R1csField>],
+        modulus_le: &[u8; 32],
+    ) -> core::result::Result<Vec<Variable<R1csField>>, R1CSError> {
+        if bit_assignments.len() != K_BITS + 1 {
             return Err(R1CSError::FormatError);
         }
-        let mut bit_vars = Vec::with_capacity(lambda + 1);
+        let mut bit_vars = Vec::with_capacity(K_BITS + 1);
         let mut k_lc = LinearCombination::default();
 
-        for (j, &bit) in bit_assignments.iter().enumerate().take(lambda + 1) {
+        for (j, &bit) in bit_assignments.iter().enumerate() {
             // One multiplier gate: left = k_j, right = 1 - k_j, out = k_j*(1-k_j).
             let (left, right, out) =
                 cs.allocate_multiplier(bit.map(|bit| (bit, R1csField::ONE - bit)))?;
@@ -392,7 +425,93 @@ pub mod secp_secq {
         // k = Σ 2^j * k_j
         cs.constrain(k_lc - k_var);
 
+        // Canonical integer range check: bits must encode a value strictly
+        // below the Secp256k1 base modulus p. We scan from MSB to LSB and keep
+        // a linear-combination flag `prefix_equal` that is 1 exactly while all
+        // higher bits still match p. If p_j is 0, setting bit j while the
+        // prefix is equal would make the value greater than p, so constrain
+        // `prefix_equal * k_j = 0`. If p_j is 1, `prefix_equal * k_j` carries
+        // equality to the next bit. The final equality flag is constrained to
+        // 0, rejecting the value p itself.
+        let mut prefix_equal = LinearCombination::from(R1csField::ONE);
+        let mut prefix_equal_assignment = Some(R1csField::ONE);
+        for j in (0..=K_BITS).rev() {
+            let bit_assignment = bit_assignments[j];
+            let product_assignment = match (prefix_equal_assignment, bit_assignment) {
+                (Some(eq), Some(bit)) => Some((eq, bit)),
+                _ => None,
+            };
+            let (left, right, out) = cs.allocate_multiplier(product_assignment)?;
+            cs.constrain(left - prefix_equal.clone());
+            cs.constrain(right - bit_vars[j]);
+
+            let product_lc: LinearCombination<R1csField> = out.into();
+            if modulus_bit(modulus_le, j) {
+                prefix_equal = product_lc;
+                prefix_equal_assignment = match (prefix_equal_assignment, bit_assignment) {
+                    (Some(eq), Some(bit)) => Some(eq * bit),
+                    _ => None,
+                };
+            } else {
+                cs.constrain(product_lc.clone());
+                prefix_equal = prefix_equal - product_lc;
+                prefix_equal_assignment = match (prefix_equal_assignment, bit_assignment) {
+                    (Some(eq), Some(bit)) => Some(eq * (R1csField::ONE - bit)),
+                    _ => None,
+                };
+            }
+        }
+        cs.constrain(prefix_equal);
+
         Ok(bit_vars)
+    }
+
+    fn constrain_bits_lt_bound_when<CS: ConstraintSystem<R1csCycle>>(
+        cs: &mut CS,
+        bit_vars: &[Variable<R1csField>],
+        bit_assignments: &[Option<R1csField>],
+        bound_le: &[u8; 32],
+        condition_var: Variable<R1csField>,
+    ) -> core::result::Result<(), R1CSError> {
+        if bit_vars.len() != K_BITS + 1 || bit_assignments.len() != K_BITS + 1 {
+            return Err(R1CSError::FormatError);
+        }
+
+        let condition_lc = LinearCombination::from(condition_var);
+        let mut prefix_equal = LinearCombination::from(R1csField::ONE);
+        let mut prefix_equal_assignment = Some(R1csField::ONE);
+        for j in (0..=K_BITS).rev() {
+            let bit_assignment = bit_assignments[j];
+            let product_assignment = match (prefix_equal_assignment, bit_assignment) {
+                (Some(eq), Some(bit)) => Some((eq, bit)),
+                _ => None,
+            };
+            let (left, right, out) = cs.allocate_multiplier(product_assignment)?;
+            cs.constrain(left - prefix_equal.clone());
+            cs.constrain(right - bit_vars[j]);
+
+            let product_lc: LinearCombination<R1csField> = out.into();
+            if modulus_bit(bound_le, j) {
+                prefix_equal = product_lc;
+                prefix_equal_assignment = match (prefix_equal_assignment, bit_assignment) {
+                    (Some(eq), Some(bit)) => Some(eq * bit),
+                    _ => None,
+                };
+            } else {
+                let (_, _, violation) = cs.multiply(condition_lc.clone(), product_lc.clone());
+                cs.constrain(violation.into());
+                prefix_equal = prefix_equal - product_lc;
+                prefix_equal_assignment = match (prefix_equal_assignment, bit_assignment) {
+                    (Some(eq), Some(bit)) => Some(eq * (R1csField::ONE - bit)),
+                    _ => None,
+                };
+            }
+        }
+
+        let (_, _, equality_violation) = cs.multiply(condition_lc, prefix_equal);
+        cs.constrain(equality_violation.into());
+
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -408,30 +527,29 @@ pub mod secp_secq {
         /// `s_i` for `i = 1..=lambda` (slope of the chord between
         /// `L_{i-1}` and `Δ_i`).
         slopes: Vec<R1csField>,
+        /// `(x_{L_{i-1}} - x_{Δ_i})^{-1}` for `i = 1..=lambda`.
+        denom_delta_inverses: Vec<R1csField>,
     }
 
     /// Compute the full chord-rule witness: all intermediate `L_i` points and
     /// slopes `s_i`.  Uses actual elliptic curve point arithmetic in `G_in`
     /// and field inversion in `Fp` for the slopes.
-    fn chord_compute_witness(
-        bits: &[bool],
-        X: &Gin,
-        g_s: &Gin,
-        lambda: usize,
-    ) -> Result<ChordWitness> {
+    fn chord_compute_witness(bits: &[bool], X: &Gin, lambda: usize) -> Result<ChordWitness> {
         if bits.len() != lambda + 1 {
             return Err(Error::ProofVerificationFailed);
         }
 
         let mut l_coords = Vec::with_capacity(lambda + 1);
         let mut slopes = Vec::with_capacity(lambda);
+        let mut denom_delta_inverses = Vec::with_capacity(lambda);
 
+        let g_s = chord_correction_generator(X);
         let mut p_j = *X;
         let mut l = Gin::identity();
 
         for (j, &bit) in bits.iter().enumerate().take(lambda + 1) {
             let cj = chord_cj(j, lambda);
-            let c_j_point = *g_s * cj;
+            let c_j_point = g_s * cj;
             let delta = if bit { p_j + c_j_point } else { c_j_point };
 
             if j == 0 {
@@ -443,17 +561,13 @@ pub mod secp_secq {
 
                 let dx: R1csField = x_prev - x_delta;
                 let dy: R1csField = y_prev - y_delta;
-                // dx must be non-zero for the chord rule (guaranteed by the
-                // c_j correction terms with overwhelming probability over a
-                // random oracle H).  If dx == 0 we hit an exceptional case
-                // (L_{j-1} = ±Δ_j) that the chord-rule gadget does not handle.
-                // Return an error rather than fabricating a wrong slope.
-                let dx_inv: Option<R1csField> = Option::from(dx.invert());
-                let s_j = match dx_inv {
-                    Some(inv) => dy * inv,
+                let dx_inv = match Option::from(dx.invert()) {
+                    Some(inv) => inv,
                     None => return Err(Error::ProofVerificationFailed),
                 };
+                let s_j = dy * dx_inv;
                 slopes.push(s_j);
+                denom_delta_inverses.push(dx_inv);
 
                 l += delta;
             }
@@ -463,7 +577,11 @@ pub mod secp_secq {
             p_j = p_j.double();
         }
 
-        Ok(ChordWitness { l_coords, slopes })
+        Ok(ChordWitness {
+            l_coords,
+            slopes,
+            denom_delta_inverses,
+        })
     }
 
     /// Build the linear combination for `x_{Δ_j}` = `k_j * (x_{D_j} - x_{C_j})
@@ -489,15 +607,15 @@ pub mod secp_secq {
         LinearCombination::from(cy) + k_j_var * (dy - cy)
     }
 
-    /// Chord-rule exponentiation R1CS gadget (paper Section 4.3).  Given the
+    /// Chord-rule exponentiation R1CS gadget (paper Section 4.3). Given the
     /// bit variables from [`bit_decompose`], the precomputed `C_j`/`D_j`
-    /// coordinates, and the public result point `(result_x, result_y)`,
+    /// coordinates, and an optional public result point `(result_x, result_y)`,
     /// constrains:
     /// - `L_0 = Δ_0` (base case, 2 linear constraints)
     /// - `L_i = L_{i-1} + Δ_i` for `i = 1..λ` (3 multiplication gates per
     ///   iteration via the chord-rule formulas)
-    /// - `L_λ = (result_x, result_y)` (final full-point binding, 2 linear
-    ///   constraints)
+    /// - when `result` is present, `L_λ = (result_x, result_y)` (final
+    ///   full-point binding, 2 linear constraints)
     ///
     /// The full-point binding (both x and y) is critical for soundness: an
     /// x-only check cannot distinguish `L_λ` from `-L_λ`, which would allow
@@ -505,12 +623,11 @@ pub mod secp_secq {
     ///
     /// Returns the `(x_{L_λ}, y_{L_λ})` variables.  Uses `3λ` multiplication
     /// gates plus linear constraints.
-    fn chord_exponentiate_r1cs<CS: ConstraintSystem<R1csCycle>>(
+    fn chord_exponentiate_r1cs_with_result<CS: ConstraintSystem<R1csCycle>>(
         cs: &mut CS,
         bit_vars: &[Variable<R1csField>],
         precomp: &ChordPrecomp,
-        result_x: R1csField,
-        result_y: R1csField,
+        result: Option<(R1csField, R1csField)>,
         witness: Option<&ChordWitness>,
     ) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
         // The chord-rule gadget consumes bit_vars[0..=λ], precomp.{c,d}[0..=λ],
@@ -525,7 +642,10 @@ pub mod secp_secq {
             return Err(R1CSError::FormatError);
         }
         if let Some(w) = witness {
-            if w.l_coords.len() != lambda_plus_one || w.slopes.len() != lambda_plus_one - 1 {
+            if w.l_coords.len() != lambda_plus_one
+                || w.slopes.len() != lambda_plus_one - 1
+                || w.denom_delta_inverses.len() != lambda_plus_one - 1
+            {
                 return Err(R1CSError::FormatError);
             }
         }
@@ -545,18 +665,25 @@ pub mod secp_secq {
         for (i, &bit_var) in bit_vars.iter().enumerate().skip(1) {
             // Slope s_i and L_i coordinates (witness values).
             let s_assign = witness.map(|w| w.slopes[i - 1]);
+            let denom_delta_inv_assign = witness.map(|w| w.denom_delta_inverses[i - 1]);
             let (x_l_assign, y_l_assign) = witness.map(|w| w.l_coords[i]).unzip();
 
             let s_var = cs.allocate(s_assign)?;
+            let denom_delta_inv = cs.allocate(denom_delta_inv_assign)?;
             let x_l = cs.allocate(x_l_assign)?;
             let y_l = cs.allocate(y_l_assign)?;
 
             // Linear combinations for Δ_i in terms of k_i_var.
             let dx_i = delta_x_lc(bit_var, precomp, i);
             let dy_i = delta_y_lc(bit_var, precomp, i);
+            let denom_delta = x_prev - dx_i.clone();
+            let denom_result = x_prev - x_l;
+
+            let (_, _, delta_nonzero) = cs.multiply(denom_delta_inv.into(), denom_delta.clone());
+            cs.constrain(delta_nonzero - R1csField::ONE);
 
             // Constraint 1: s_i * (x_{L_{i-1}} - x_{Δ_i}) = y_{L_{i-1}} - y_{Δ_i}
-            let (_, _, out1) = cs.multiply(s_var.into(), x_prev - dx_i.clone());
+            let (_, _, out1) = cs.multiply(s_var.into(), denom_delta);
             cs.constrain(out1 - (y_prev - dy_i.clone()));
 
             // Constraint 2: s_i^2 = x_{L_{i-1}} + x_{L_i} + x_{Δ_i}
@@ -564,18 +691,37 @@ pub mod secp_secq {
             cs.constrain(out2 - (x_prev + x_l + dx_i.clone()));
 
             // Constraint 3: s_i * (x_{L_{i-1}} - x_{L_i}) = y_{L_{i-1}} + y_{L_i}
-            let (_, _, out3) = cs.multiply(s_var.into(), x_prev - x_l);
+            let (_, _, out3) = cs.multiply(s_var.into(), denom_result);
             cs.constrain(out3 - (y_prev + y_l));
 
             x_prev = x_l;
             y_prev = y_l;
         }
 
-        // Final full-point binding: L_λ = (result_x, result_y).
-        cs.constrain(x_prev - result_x);
-        cs.constrain(y_prev - result_y);
+        if let Some((result_x, result_y)) = result {
+            // Final full-point binding: L_λ = (result_x, result_y).
+            cs.constrain(x_prev - result_x);
+            cs.constrain(y_prev - result_y);
+        }
 
         Ok((x_prev, y_prev))
+    }
+
+    fn chord_exponentiate_r1cs<CS: ConstraintSystem<R1csCycle>>(
+        cs: &mut CS,
+        bit_vars: &[Variable<R1csField>],
+        precomp: &ChordPrecomp,
+        result_x: R1csField,
+        result_y: R1csField,
+        witness: Option<&ChordWitness>,
+    ) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
+        chord_exponentiate_r1cs_with_result(
+            cs,
+            bit_vars,
+            precomp,
+            Some((result_x, result_y)),
+            witness,
+        )
     }
 
     // ------------------------------------------------------------------
@@ -786,8 +932,8 @@ pub mod secp_secq {
     // ------------------------------------------------------------------
 
     /// Bulletproofs generator capacity for the one-receiver relation.
-    /// Bit-decomp uses 257 multiplier gates; each chord-rule uses 3*256 = 768.
-    /// Total 1793, padded to 8192 for the inner-product layer.
+    /// Bit-decomp uses 257 multiplier gates; each chord-rule uses 4*256 = 1024.
+    /// Total 2305, padded to 8192 for the inner-product layer.
     const R1CS_GENS_CAPACITY: usize = 8192;
 
     /// Process-wide cache for the single-receiver `BulletproofGens`.
@@ -815,6 +961,8 @@ pub mod secp_secq {
     const H_GIN_1_DOMAIN: &str = "golden-paper-evrf-H-Gin-1-v1";
     /// Random-oracle domain tag for `H_{G_in,2}`.
     const H_GIN_2_DOMAIN: &str = "golden-paper-evrf-H-Gin-2-v1";
+    /// Random-oracle domain tag for per-base chord-rule correction generators.
+    const CHORD_CORRECTION_DOMAIN: &str = "golden-paper-evrf-chord-correction-v1";
 
     /// Compute `H_{G_in,1}(msg)` as a `G_in` point derived from `msg` via
     /// `hash_to_curve` under the `H_GIN_1_DOMAIN` tag.  Used by both prover and
@@ -833,6 +981,12 @@ pub mod secp_secq {
         let mut buf = [0u8; 64];
         buf[..MESSAGE_BYTES].copy_from_slice(msg);
         <Secp256k1 as CurveExt>::hash_to_curve(H_GIN_2_DOMAIN)(&buf[..])
+    }
+
+    /// Derive `G_S(X)` for the chord-rule correction terms used with base `X`.
+    fn chord_correction_generator(X: &Gin) -> Gin {
+        let compressed = Secp256k1Cycle::point_compress(X);
+        <Secp256k1 as CurveExt>::hash_to_curve(CHORD_CORRECTION_DOMAIN)(compressed.as_ref())
     }
 
     /// Decompose an `Fp` element into little-endian bits via its canonical
@@ -871,19 +1025,16 @@ pub mod secp_secq {
         bit_assignments: &[Option<R1csField>],
         witness1: Option<&ChordWitness>,
         witness2: Option<&ChordWitness>,
-        g_s: &Gin,
     ) -> core::result::Result<(), R1CSError> {
         // Step 2: bind the committed k to the public int(S.x).  Without this
         // constraint, a malicious prover could commit to an arbitrary exponent
         // unrelated to S.x and still satisfy the chord-rule constraints.
         cs.constrain(var_k - s_x);
 
-        let bit_vars = bit_decompose(cs, var_k, bit_assignments, K_BITS)?;
+        let bit_vars = bit_decompose(cs, var_k, bit_assignments)?;
 
-        let precomp1 =
-            precompute_chord(h1, g_s, K_BITS).map_err(|_| R1CSError::VerificationError)?;
-        let precomp2 =
-            precompute_chord(h2, g_s, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let precomp1 = precompute_chord(h1, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let precomp2 = precompute_chord(h2, K_BITS).map_err(|_| R1CSError::VerificationError)?;
 
         let (x_t1, _) = chord_exponentiate_r1cs(cs, &bit_vars, &precomp1, t1_x, t1_y, witness1)?;
         let (x_t2, _) = chord_exponentiate_r1cs(cs, &bit_vars, &precomp2, t2_x, t2_y, witness2)?;
@@ -901,7 +1052,6 @@ pub mod secp_secq {
         rng: &mut impl CryptoRngCore,
     ) -> Result<EvrfProofEnvelope> {
         let g_in = Gin::generator();
-        let g_s = g_in;
 
         // Step 1: S = PK_2^sk_1.  Verify the witness is consistent with the
         // public S before proving.
@@ -944,8 +1094,8 @@ pub mod secp_secq {
             .collect();
 
         // Steps 4, 5: compute chord-rule witnesses for T_1, T_2.
-        let witness1 = chord_compute_witness(&bits, &h1, &g_s, K_BITS)?;
-        let witness2 = chord_compute_witness(&bits, &h2, &g_s, K_BITS)?;
+        let witness1 = chord_compute_witness(&bits, &h1, K_BITS)?;
+        let witness2 = chord_compute_witness(&bits, &h2, K_BITS)?;
 
         // Public T_1, T_2 coordinates.
         let (t1_x, t1_y) = affine(&statement.t1)?;
@@ -987,7 +1137,6 @@ pub mod secp_secq {
             &bit_assignments,
             Some(&witness1),
             Some(&witness2),
-            &g_s,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
         let r1cs_proof = prover
@@ -1023,7 +1172,6 @@ pub mod secp_secq {
         rng: &mut impl CryptoRngCore,
     ) -> Result<()> {
         let g_in = Gin::generator();
-        let g_s = g_in;
         let g_out = Secq256k1::generator();
         let pc_gens = shared_pc_gens();
         let bp_gens = shared_bp_gens();
@@ -1082,7 +1230,6 @@ pub mod secp_secq {
             &verifier_bits,
             None,
             None,
-            &g_s,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
@@ -1097,74 +1244,109 @@ pub mod secp_secq {
     }
 
     // ------------------------------------------------------------------
-    // Batched Chaum-Pedersen proof (paper steps 0 and 1, batched).
-    //
-    // Proves `log_{g_in}(PK_1) = sk_1` and `log_{PK_j}(S_j) = sk_1` for every
-    // receiver j with a single nonce r, single challenge c, and single
-    // response z = r + c * sk_1.  The transcript binds msg, PK_1, and the full
-    // ordered receiver list (PK_j, S_j) so the proof cannot be replayed against
-    // a different dealer message, dealer key, receiver set, or receiver order.
+    // Batched statement validation and transcript binding.
     // ------------------------------------------------------------------
 
-    /// Transcript domain label for the batched Chaum-Pedersen sub-proof.
-    const BATCHED_CP_DOMAIN: &[u8] = b"golden-paper-evrf-batched-cp-v1";
-
-    /// Build a Merlin transcript for the batched Chaum-Pedersen proof, binding
-    /// `msg`, `g_in`, `PK_1`, and every `(PK_j, S_j)` in order.
-    fn batched_cp_transcript(
-        msg: &[u8; MESSAGE_BYTES],
-        g_in: &Gin,
-        pk1: &Gin,
-        receivers: &[BatchedReceiverStatement],
-    ) -> Transcript {
-        let mut t = Transcript::new(BATCHED_CP_DOMAIN);
-        t.append_message(b"msg", msg);
-        append_point::<Secp256k1Cycle>(&mut t, b"g_in", &Secp256k1Cycle::point_compress(g_in));
-        append_point::<Secp256k1Cycle>(&mut t, b"PK_1", &Secp256k1Cycle::point_compress(pk1));
-        for (j, r) in receivers.iter().enumerate() {
-            t.append_message(b"idx", &(j as u64).to_le_bytes());
-            append_point::<Secp256k1Cycle>(
-                &mut t,
-                b"PK_j",
-                &Secp256k1Cycle::point_compress(&r.pkj),
-            );
-            append_point::<Secp256k1Cycle>(&mut t, b"S_j", &Secp256k1Cycle::point_compress(&r.sj));
+    fn validate_batched_public_relations(statement: &BatchedEvrfStatement) -> Result<()> {
+        if statement.receivers.is_empty()
+            || statement.commitment_coefficients.is_empty()
+            || statement.commitment_coefficients.len() != statement.threshold
+            || statement.statement_roots.len() != statement.receivers.len()
+            || is_identity(&statement.pk1)
+        {
+            return Err(Error::ProofVerificationFailed);
         }
-        t
+        for rec in &statement.receivers {
+            if is_identity(&rec.pkj)
+                || is_identity(&rec.share_commitment)
+                || is_identity(&rec.pad_commitment)
+                || is_identity(&rec.dh_commitment)
+            {
+                return Err(Error::ProofVerificationFailed);
+            }
+            if feldman_share_commitment(&statement.commitment_coefficients, rec.receiver)
+                != rec.share_commitment
+            {
+                return Err(Error::ProofVerificationFailed);
+            }
+            if Gin::generator() * rec.encrypted_share != rec.share_commitment + rec.pad_commitment {
+                return Err(Error::ProofVerificationFailed);
+            }
+        }
+        Ok(())
     }
 
-    /// Generate a batched Chaum-Pedersen proof.
-    fn batched_chaum_pedersen_prove(
-        msg: &[u8; MESSAGE_BYTES],
-        g_in: &Gin,
-        pk1: &Gin,
-        receivers: &[BatchedReceiverStatement],
-        sk1: &GinScalar,
-        rng: &mut impl CryptoRngCore,
-    ) -> Result<BatchedChaumPedersenProof> {
-        let r = GinScalar::random(rng);
-        let r0 = *g_in * r;
-        let rjs: Vec<Gin> = receivers.iter().map(|rec| rec.pkj * r).collect();
+    fn feldman_share_commitment(coefficients: &[Gin], receiver: ParticipantIndex) -> Gin {
+        let x = Fq::from(u64::from(receiver.get()));
+        let mut x_pow = Fq::ONE;
+        let mut result = Gin::identity();
+        for coefficient in coefficients {
+            result += *coefficient * x_pow;
+            x_pow *= x;
+        }
+        result
+    }
 
-        let mut transcript = batched_cp_transcript(msg, g_in, pk1, receivers);
+    fn append_batched_statement_context(
+        transcript: &mut Transcript,
+        statement: &BatchedEvrfStatement,
+    ) {
+        transcript.append_message(b"msg", &statement.msg);
+        let beta_repr = statement.beta.to_repr();
+        transcript.append_message(b"beta", beta_repr.as_ref());
+        transcript.append_message(b"threshold", &(statement.threshold as u64).to_le_bytes());
         append_point::<Secp256k1Cycle>(
-            &mut transcript,
-            b"R_0",
-            &Secp256k1Cycle::point_compress(&r0),
+            transcript,
+            b"PK_1",
+            &Secp256k1Cycle::point_compress(&statement.pk1),
         );
-        for (j, rj) in rjs.iter().enumerate() {
-            t_append_idx(&mut transcript, j);
+        transcript.append_message(
+            b"commitment-len",
+            &(statement.commitment_coefficients.len() as u64).to_le_bytes(),
+        );
+        for coefficient in &statement.commitment_coefficients {
             append_point::<Secp256k1Cycle>(
-                &mut transcript,
-                b"R_j",
-                &Secp256k1Cycle::point_compress(rj),
+                transcript,
+                b"commitment",
+                &Secp256k1Cycle::point_compress(coefficient),
             );
         }
-        let c = challenge_scalar::<Secp256k1Cycle>(&mut transcript, b"c");
+        transcript.append_message(
+            b"num-receivers",
+            &(statement.receivers.len() as u64).to_le_bytes(),
+        );
+        for (j, rec) in statement.receivers.iter().enumerate() {
+            t_append_idx(transcript, j);
+            transcript.append_message(b"statement-root", &statement.statement_roots[j]);
+            transcript.append_message(b"receiver", &u64::from(rec.receiver.get()).to_le_bytes());
+            append_point::<Secp256k1Cycle>(
+                transcript,
+                b"PK_j",
+                &Secp256k1Cycle::point_compress(&rec.pkj),
+            );
+            append_point::<Secp256k1Cycle>(
+                transcript,
+                b"share-commitment",
+                &Secp256k1Cycle::point_compress(&rec.share_commitment),
+            );
+            append_point::<Secp256k1Cycle>(
+                transcript,
+                b"pad-commitment",
+                &Secp256k1Cycle::point_compress(&rec.pad_commitment),
+            );
+            append_point::<Secp256k1Cycle>(
+                transcript,
+                b"dh-commitment",
+                &Secp256k1Cycle::point_compress(&rec.dh_commitment),
+            );
+            append_scalar::<Secp256k1Cycle>(transcript, b"encrypted-share", &rec.encrypted_share);
+        }
+    }
 
-        let z = r + c * *sk1;
-
-        Ok(BatchedChaumPedersenProof { r0, rjs, z })
+    fn batched_r1cs_transcript(statement: &BatchedEvrfStatement) -> Transcript {
+        let mut t = Transcript::new(PROOF_DOMAIN);
+        append_batched_statement_context(&mut t, statement);
+        t
     }
 
     /// Append a receiver index to a transcript in a fixed encoding.
@@ -1172,65 +1354,18 @@ pub mod secp_secq {
         transcript.append_message(b"idx", &(j as u64).to_le_bytes());
     }
 
-    /// Verify a batched Chaum-Pedersen proof.
-    fn batched_chaum_pedersen_verify(
-        msg: &[u8; MESSAGE_BYTES],
-        g_in: &Gin,
-        pk1: &Gin,
-        receivers: &[BatchedReceiverStatement],
-        proof: &BatchedChaumPedersenProof,
-    ) -> Result<()> {
-        if proof.rjs.len() != receivers.len() {
-            return Err(Error::ProofVerificationFailed);
-        }
-        let mut transcript = batched_cp_transcript(msg, g_in, pk1, receivers);
-        append_point::<Secp256k1Cycle>(
-            &mut transcript,
-            b"R_0",
-            &Secp256k1Cycle::point_compress(&proof.r0),
-        );
-        for (j, rj) in proof.rjs.iter().enumerate() {
-            t_append_idx(&mut transcript, j);
-            append_point::<Secp256k1Cycle>(
-                &mut transcript,
-                b"R_j",
-                &Secp256k1Cycle::point_compress(rj),
-            );
-        }
-        let c = challenge_scalar::<Secp256k1Cycle>(&mut transcript, b"c");
-
-        // g_in^z = R_0 * PK_1^c  (step 0)
-        let lhs0 = *g_in * proof.z;
-        let rhs0 = proof.r0 + *pk1 * c;
-        if lhs0 != rhs0 {
-            return Err(Error::ProofVerificationFailed);
-        }
-
-        // PK_j^z = R_j * S_j^c  (step 1, per receiver)
-        for (j, rec) in receivers.iter().enumerate() {
-            let lhs = rec.pkj * proof.z;
-            let rhs = proof.rjs[j] + rec.sj * c;
-            if lhs != rhs {
-                return Err(Error::ProofVerificationFailed);
-            }
-        }
-
-        Ok(())
-    }
-
     // ------------------------------------------------------------------
     // Batched R1CS relation and prove/verify path.
     // ------------------------------------------------------------------
 
-    /// Bulletproofs generator capacity for the batched relation.  Each
-    /// receiver slot runs the full one-receiver relation, which fits in
-    /// `R1CS_GENS_CAPACITY` (8192) generators.  `allocate` calls also consume
-    /// multiplier slots in this backend, so the per-receiver count is much
-    /// larger than the explicit `multiply` gate count.  Size from the
-    /// one-receiver capacity times the receiver count, rounded up to a power
-    /// of two.
+    /// Bulletproofs generator capacity for the batched DKG relation.
+    ///
+    /// The private DKG relation proves five chord-rule exponentiations per
+    /// receiver (`PK_j^sk`, `H_1^k`, `H_2^k`, `g^pad`, `PK_j^pad`) plus one
+    /// shared `g^sk = PK_1` exponentiation. Round up generously so ignored
+    /// slow tests exercise the real shape without capacity churn.
     fn batched_gens_capacity(num_receivers: usize) -> usize {
-        let total = R1CS_GENS_CAPACITY * num_receivers;
+        let total = R1CS_GENS_CAPACITY * 4 * num_receivers.max(1);
         let mut cap = R1CS_GENS_CAPACITY;
         while cap < total {
             cap *= 2;
@@ -1238,46 +1373,290 @@ pub mod secp_secq {
         cap
     }
 
-    /// Build the R1CS constraints for one receiver slot in the batched
-    /// relation.  Commits to `k_j` and `r_j` (caller-supplied variables) and
-    /// adds the step-2, 3, 4, 5, 8 constraints for that receiver.
-    #[allow(clippy::too_many_arguments)]
-    fn build_one_receiver_slot<CS: ConstraintSystem<R1csCycle>>(
+    fn bit_options(bits: &[bool]) -> Vec<Option<R1csField>> {
+        bits.iter()
+            .map(|&b| {
+                if b {
+                    Some(R1csField::ONE)
+                } else {
+                    Some(R1csField::ZERO)
+                }
+            })
+            .collect()
+    }
+
+    #[derive(Clone, Debug)]
+    struct HiddenReceiverWitness {
+        /// Chord witness for `S_j = PK_j^sk_1`.
+        sk_pkj: ChordWitness,
+        /// Bits of `k_j = int(S_j.x)`.
+        k_bits: Vec<Option<R1csField>>,
+        /// Chord witness for `T_{1,j} = H1(msg)^k_j`.
+        t1: ChordWitness,
+        /// Chord witness for `T_{2,j} = H2(msg)^k_j`.
+        t2: ChordWitness,
+        /// Boolean `reduce_q` selecting whether `r_j` reduced by `q`.
+        reduce_q: R1csField,
+        /// `pad_j = beta * T_{1,j}.x + T_{2,j}.x mod q`.
+        pad: R1csField,
+        /// Bits of `pad_j`.
+        pad_bits: Vec<Option<R1csField>>,
+        /// Private dealer share `s_j`.
+        share: R1csField,
+        /// Bits of `s_j`.
+        share_bits: Vec<Option<R1csField>>,
+        /// Chord witness for `g_in^s_j`.
+        share_commitment: ChordWitness,
+        /// Chord witness for `g_in^pad_j`.
+        pad_commitment: ChordWitness,
+        /// Chord witness for `PK_j^pad_j`.
+        dh_commitment: ChordWitness,
+    }
+
+    fn prove_feldman_coefficients<CS: ConstraintSystem<R1csCycle>>(
         cs: &mut CS,
-        var_k: Variable<R1csField>,
-        var_r: Variable<R1csField>,
-        s_x: R1csField,
+        coefficients: &[Gin],
+        coefficient_scalars: Option<&[GinScalar]>,
+        g_in: &Gin,
+    ) -> core::result::Result<(), R1CSError> {
+        let precomp = precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+
+        for (i, coefficient) in coefficients.iter().enumerate() {
+            let scalar_fp = coefficient_scalars.map(|scalars| fq_to_fp(&scalars[i]));
+            let scalar_bits = if let Some(scalar_fp) = scalar_fp.as_ref() {
+                let mut bits = [false; K_BITS + 1];
+                decompose_k_fp(scalar_fp, &mut bits);
+                bit_options(&bits)
+            } else {
+                vec![None; K_BITS + 1]
+            };
+            let scalar_var = cs.allocate(scalar_fp)?;
+            let scalar_bit_vars = bit_decompose_q(cs, scalar_var, &scalar_bits)?;
+            if is_identity(coefficient) {
+                for &bit_var in &scalar_bit_vars {
+                    cs.constrain(bit_var.into());
+                }
+            } else {
+                let (coefficient_x, coefficient_y) =
+                    affine(coefficient).map_err(|_| R1CSError::VerificationError)?;
+                let witness = if let Some(scalar_fp) = scalar_fp.as_ref() {
+                    let mut bits = [false; K_BITS + 1];
+                    decompose_k_fp(scalar_fp, &mut bits);
+                    Some(
+                        chord_compute_witness(&bits, g_in, K_BITS)
+                            .map_err(|_| R1CSError::VerificationError)?,
+                    )
+                } else {
+                    None
+                };
+                chord_exponentiate_r1cs_with_result(
+                    cs,
+                    &scalar_bit_vars,
+                    &precomp,
+                    Some((coefficient_x, coefficient_y)),
+                    witness.as_ref(),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_feldman_coefficient_openings(
+        coefficients: &[Gin],
+        coefficient_scalars: &[GinScalar],
+    ) -> Result<()> {
+        if coefficients.len() != coefficient_scalars.len() {
+            return Err(Error::ProofVerificationFailed);
+        }
+
+        let g_in = Gin::generator();
+        for (coefficient, scalar) in coefficients.iter().zip(coefficient_scalars.iter()) {
+            let opened = g_in * *scalar;
+            if Secp256k1Cycle::point_compress(&opened).as_ref()
+                != Secp256k1Cycle::point_compress(coefficient).as_ref()
+            {
+                return Err(Error::ProofVerificationFailed);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_hidden_receiver_slot<CS: ConstraintSystem<R1csCycle>>(
+        cs: &mut CS,
+        rec: &BatchedReceiverStatement,
+        sk_bit_vars: &[Variable<R1csField>],
         h1: &Gin,
         h2: &Gin,
-        t1_x: R1csField,
-        t1_y: R1csField,
-        t2_x: R1csField,
-        t2_y: R1csField,
         beta: R1csField,
-        bit_assignments: &[Option<R1csField>],
-        witness1: Option<&ChordWitness>,
-        witness2: Option<&ChordWitness>,
-        g_s: &Gin,
+        g_in: &Gin,
+        witness: Option<&HiddenReceiverWitness>,
     ) -> core::result::Result<(), R1CSError> {
-        // Same as the one-receiver relation: step 2 binds k to S.x, steps 3-5
-        // are bit-decomp + two chord-rules, step 8 is r = beta*r_1 + r_2.
-        build_one_receiver_r1cs(
+        let precomp_s =
+            precompute_chord(&rec.pkj, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let (s_x, _) = chord_exponentiate_r1cs_with_result(
             cs,
-            var_k,
-            var_r,
-            s_x,
-            h1,
-            h2,
-            t1_x,
-            t1_y,
-            t2_x,
-            t2_y,
-            beta,
-            bit_assignments,
-            witness1,
-            witness2,
-            g_s,
-        )
+            sk_bit_vars,
+            &precomp_s,
+            None,
+            witness.map(|w| &w.sk_pkj),
+        )?;
+
+        let verifier_k_bits = vec![None; K_BITS + 1];
+        let k_bits = witness.map_or(verifier_k_bits.as_slice(), |w| w.k_bits.as_slice());
+        let k_bit_vars = bit_decompose(cs, s_x, k_bits)?;
+
+        let precomp1 = precompute_chord(h1, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let precomp2 = precompute_chord(h2, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let (x_t1, _) = chord_exponentiate_r1cs_with_result(
+            cs,
+            &k_bit_vars,
+            &precomp1,
+            None,
+            witness.map(|w| &w.t1),
+        )?;
+        let (x_t2, _) = chord_exponentiate_r1cs_with_result(
+            cs,
+            &k_bit_vars,
+            &precomp2,
+            None,
+            witness.map(|w| &w.t2),
+        )?;
+
+        let r_lc = x_t1 * beta + x_t2;
+        let pad_var = cs.allocate(witness.map(|w| w.pad))?;
+
+        let reduce_assignment = witness.map(|w| w.reduce_q);
+        let (reduce, reduce_right, reduce_out) =
+            cs.allocate_multiplier(reduce_assignment.map(|bit| (bit, R1csField::ONE - bit)))?;
+        cs.constrain(reduce_right - (LinearCombination::from(R1csField::ONE) - reduce));
+        cs.constrain(reduce_out.into());
+        cs.constrain(pad_var - (r_lc - reduce * Q_AS_FP));
+
+        let verifier_pad_bits = vec![None; K_BITS + 1];
+        let pad_bits = witness.map_or(verifier_pad_bits.as_slice(), |w| w.pad_bits.as_slice());
+        let pad_bit_vars = bit_decompose_q(cs, pad_var, pad_bits)?;
+        constrain_bits_lt_bound_when(cs, &pad_bit_vars, pad_bits, &SECP256K1_P_MINUS_Q_LE, reduce)?;
+
+        let (pad_commitment_x, pad_commitment_y) =
+            affine(&rec.pad_commitment).map_err(|_| R1CSError::VerificationError)?;
+        let precomp_pad =
+            precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        chord_exponentiate_r1cs_with_result(
+            cs,
+            &pad_bit_vars,
+            &precomp_pad,
+            Some((pad_commitment_x, pad_commitment_y)),
+            witness.map(|w| &w.pad_commitment),
+        )?;
+
+        let share_var = cs.allocate(witness.map(|w| w.share))?;
+        let verifier_share_bits = vec![None; K_BITS + 1];
+        let share_bits =
+            witness.map_or(verifier_share_bits.as_slice(), |w| w.share_bits.as_slice());
+        let share_bit_vars = bit_decompose_q(cs, share_var, share_bits)?;
+        let (share_commitment_x, share_commitment_y) =
+            affine(&rec.share_commitment).map_err(|_| R1CSError::VerificationError)?;
+        let precomp_share =
+            precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        chord_exponentiate_r1cs_with_result(
+            cs,
+            &share_bit_vars,
+            &precomp_share,
+            Some((share_commitment_x, share_commitment_y)),
+            witness.map(|w| &w.share_commitment),
+        )?;
+
+        let (dh_commitment_x, dh_commitment_y) =
+            affine(&rec.dh_commitment).map_err(|_| R1CSError::VerificationError)?;
+        let precomp_dh =
+            precompute_chord(&rec.pkj, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        chord_exponentiate_r1cs_with_result(
+            cs,
+            &pad_bit_vars,
+            &precomp_dh,
+            Some((dh_commitment_x, dh_commitment_y)),
+            witness.map(|w| &w.dh_commitment),
+        )?;
+
+        Ok(())
+    }
+
+    fn compute_hidden_receiver_witness(
+        msg: &[u8; MESSAGE_BYTES],
+        sk1: &Fq,
+        share: &Fq,
+        rec: &BatchedReceiverStatement,
+        beta: &Fp,
+    ) -> Result<HiddenReceiverWitness> {
+        let g_in = Gin::generator();
+        let h1 = h_gin_1(msg);
+        let h2 = h_gin_2(msg);
+        let sj = rec.pkj * *sk1;
+        let (s_x, _) = affine(&sj)?;
+        let mut k_bool_bits = [false; K_BITS + 1];
+        decompose_k_fp(&s_x, &mut k_bool_bits);
+        let k_bits = bit_options(&k_bool_bits);
+        let t1 = chord_evaluate_point(&k_bool_bits, &h1, K_BITS)?;
+        let t2 = chord_evaluate_point(&k_bool_bits, &h2, K_BITS)?;
+        let (t1_x, _) = affine(&t1)?;
+        let (t2_x, _) = affine(&t2)?;
+        let r = *beta * t1_x + t2_x;
+        let pad_fq = fp_to_fq(&r);
+        let pad = fq_to_fp(&pad_fq);
+        let reduce_q = if pad == r {
+            R1csField::ZERO
+        } else {
+            R1csField::ONE
+        };
+
+        let pad_commitment = g_in * pad_fq;
+        if Secp256k1Cycle::point_compress(&pad_commitment).as_ref()
+            != Secp256k1Cycle::point_compress(&rec.pad_commitment).as_ref()
+        {
+            return Err(Error::ProofVerificationFailed);
+        }
+        let dh_commitment = rec.pkj * pad_fq;
+        if Secp256k1Cycle::point_compress(&dh_commitment).as_ref()
+            != Secp256k1Cycle::point_compress(&rec.dh_commitment).as_ref()
+        {
+            return Err(Error::ProofVerificationFailed);
+        }
+
+        let share_commitment = g_in * *share;
+        if Secp256k1Cycle::point_compress(&share_commitment).as_ref()
+            != Secp256k1Cycle::point_compress(&rec.share_commitment).as_ref()
+        {
+            return Err(Error::ProofVerificationFailed);
+        }
+        if g_in * rec.encrypted_share != share_commitment + pad_commitment {
+            return Err(Error::ProofVerificationFailed);
+        }
+
+        let mut sk_bits = [false; K_BITS + 1];
+        decompose_k_fp(&fq_to_fp(sk1), &mut sk_bits);
+        let mut pad_bool_bits = [false; K_BITS + 1];
+        decompose_k_fp(&pad, &mut pad_bool_bits);
+        let share_fp = fq_to_fp(share);
+        let mut share_bool_bits = [false; K_BITS + 1];
+        decompose_k_fp(&share_fp, &mut share_bool_bits);
+
+        Ok(HiddenReceiverWitness {
+            sk_pkj: chord_compute_witness(&sk_bits, &rec.pkj, K_BITS)?,
+            k_bits,
+            t1: chord_compute_witness(&k_bool_bits, &h1, K_BITS)?,
+            t2: chord_compute_witness(&k_bool_bits, &h2, K_BITS)?,
+            reduce_q,
+            pad,
+            pad_bits: bit_options(&pad_bool_bits),
+            share: share_fp,
+            share_bits: bit_options(&share_bool_bits),
+            share_commitment: chord_compute_witness(&share_bool_bits, &g_in, K_BITS)?,
+            pad_commitment: chord_compute_witness(&pad_bool_bits, &g_in, K_BITS)?,
+            dh_commitment: chord_compute_witness(&pad_bool_bits, &rec.pkj, K_BITS)?,
+        })
     }
 
     /// Generate the batched dealer proof.
@@ -1286,12 +1665,18 @@ pub mod secp_secq {
         witness: &BatchedEvrfWitness,
         rng: &mut impl CryptoRngCore,
     ) -> Result<BatchedEvrfProofEnvelope> {
-        if statement.receivers.is_empty() {
+        validate_batched_public_relations(statement)?;
+        if witness.shares.len() != statement.receivers.len()
+            || witness.coefficient_scalars.len() != statement.commitment_coefficients.len()
+        {
             return Err(Error::ProofVerificationFailed);
         }
         let g_in = Gin::generator();
-        let g_s = g_in;
-        let g_out = Secq256k1::generator();
+
+        ensure_feldman_coefficient_openings(
+            &statement.commitment_coefficients,
+            &witness.coefficient_scalars,
+        )?;
 
         // Verify PK_1 = g_in^sk_1.
         let pk1_computed = g_in * witness.sk1;
@@ -1300,7 +1685,6 @@ pub mod secp_secq {
         {
             return Err(Error::ProofVerificationFailed);
         }
-
         // Derive h1, h2 from msg and reject a statement whose h1/h2 would not
         // match (the statement does not carry h1/h2; the R1CS uses the derived
         // values directly).
@@ -1311,110 +1695,64 @@ pub mod secp_secq {
         let bp_gens =
             BulletproofGens::<R1csCycle>::new(batched_gens_capacity(statement.receivers.len()), 1);
 
-        let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
-        let mut k_commitments = Vec::with_capacity(statement.receivers.len());
-        let mut r_commitments = Vec::with_capacity(statement.receivers.len());
-        let mut dlogs = Vec::with_capacity(statement.receivers.len());
-
-        for rec in &statement.receivers {
-            // Step 1: verify S_j = PK_j^sk_1.
-            let sj_computed = rec.pkj * witness.sk1;
-            if Secp256k1Cycle::point_compress(&sj_computed).as_ref()
-                != Secp256k1Cycle::point_compress(&rec.sj).as_ref()
-            {
-                return Err(Error::ProofVerificationFailed);
-            }
-
-            // Step 2: k_j = int(S_j.x)
-            let (s_x, _) = affine(&rec.sj)?;
-            let k = s_x;
-
-            // Bit-decompose k_j.
-            let mut bits = [false; K_BITS + 1];
-            decompose_k_fp(&k, &mut bits);
-            let bit_assignments: Vec<Option<R1csField>> = bits
-                .iter()
-                .map(|&b| {
-                    if b {
-                        Some(R1csField::ONE)
-                    } else {
-                        Some(R1csField::ZERO)
-                    }
-                })
-                .collect();
-
-            // Steps 4, 5: chord-rule witnesses for T_{1,j}, T_{2,j}.
-            let witness1 = chord_compute_witness(&bits, &h1, &g_s, K_BITS)?;
-            let witness2 = chord_compute_witness(&bits, &h2, &g_s, K_BITS)?;
-
-            // Public T_{1,j}, T_{2,j} coordinates.
-            let (t1_x, t1_y) = affine(&rec.t1j)?;
-            let (t2_x, t2_y) = affine(&rec.t2j)?;
-
-            // Steps 6, 7, 8: r_j = beta * T_{1,j}.x + T_{2,j}.x
-            let r = statement.beta * t1_x + t2_x;
-
-            // Step 9: verify R_j = g_out^{r_j}.
-            let r_computed = g_out * r;
-            if R1csCycle::point_compress(&r_computed).as_ref()
-                != R1csCycle::point_compress(&rec.r_point_j).as_ref()
-            {
-                return Err(Error::ProofVerificationFailed);
-            }
-
-            // Commit to k_j (random blinding) and r_j (fixed blinding 1).
-            let k_blinding = random_scalar::<R1csCycle>(rng);
-            let (v_k, var_k) = prover.commit(k, k_blinding);
-            let (v_r, var_r) = prover.commit(r, R1csField::ONE);
-
-            build_one_receiver_slot(
-                &mut prover,
-                var_k,
-                var_r,
-                s_x,
-                &h1,
-                &h2,
-                t1_x,
-                t1_y,
-                t2_x,
-                t2_y,
-                statement.beta,
-                &bit_assignments,
-                Some(&witness1),
-                Some(&witness2),
-                &g_s,
-            )
+        let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, batched_r1cs_transcript(statement));
+        let sk_fp = fq_to_fp(&witness.sk1);
+        let mut sk_bool_bits = [false; K_BITS + 1];
+        decompose_k_fp(&sk_fp, &mut sk_bool_bits);
+        let sk_bit_assignments = bit_options(&sk_bool_bits);
+        let sk_var = prover
+            .allocate(Some(sk_fp))
+            .map_err(|_| Error::ProofVerificationFailed)?;
+        let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &sk_bit_assignments)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
-            // Step 9: DLOG PoK for this receiver.
-            let dlog = dlog_prove(&g_out, &rec.r_point_j, &v_r, &r, rng)?;
+        let pk1_witness = chord_compute_witness(&sk_bool_bits, &g_in, K_BITS)?;
+        let pk1_precomp =
+            precompute_chord(&g_in, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
+        let (pk1_x, pk1_y) = affine(&statement.pk1)?;
+        chord_exponentiate_r1cs_with_result(
+            &mut prover,
+            &sk_bit_vars,
+            &pk1_precomp,
+            Some((pk1_x, pk1_y)),
+            Some(&pk1_witness),
+        )
+        .map_err(|_| Error::ProofVerificationFailed)?;
 
-            k_commitments.push(v_k);
-            r_commitments.push(v_r);
-            dlogs.push(dlog);
+        prove_feldman_coefficients(
+            &mut prover,
+            &statement.commitment_coefficients,
+            Some(&witness.coefficient_scalars),
+            &g_in,
+        )
+        .map_err(|_| Error::ProofVerificationFailed)?;
+
+        for (rec, share) in statement.receivers.iter().zip(witness.shares.iter()) {
+            let rec_witness = compute_hidden_receiver_witness(
+                &statement.msg,
+                &witness.sk1,
+                share,
+                rec,
+                &statement.beta,
+            )?;
+            build_hidden_receiver_slot(
+                &mut prover,
+                rec,
+                &sk_bit_vars,
+                &h1,
+                &h2,
+                statement.beta,
+                &g_in,
+                Some(&rec_witness),
+            )
+            .map_err(|_| Error::ProofVerificationFailed)?;
         }
 
         let r1cs_proof = prover
             .prove(&bp_gens, rng)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
-        // Steps 0, 1: batched Chaum-Pedersen proof.
-        let cp = batched_chaum_pedersen_prove(
-            &statement.msg,
-            &g_in,
-            &statement.pk1,
-            &statement.receivers,
-            &witness.sk1,
-            rng,
-        )?;
-
-        Ok(BatchedEvrfProofEnvelope {
-            r1cs: r1cs_proof,
-            k_commitments,
-            r_commitments,
-            cp,
-            dlogs,
-        })
+        Ok(BatchedEvrfProofEnvelope { r1cs: r1cs_proof })
     }
 
     /// Verify the batched dealer proof.
@@ -1423,77 +1761,56 @@ pub mod secp_secq {
         proof: &BatchedEvrfProofEnvelope,
         rng: &mut impl CryptoRngCore,
     ) -> Result<()> {
-        if statement.receivers.is_empty()
-            || proof.k_commitments.len() != statement.receivers.len()
-            || proof.r_commitments.len() != statement.receivers.len()
-            || proof.dlogs.len() != statement.receivers.len()
-            || proof.cp.rjs.len() != statement.receivers.len()
-        {
-            return Err(Error::ProofVerificationFailed);
-        }
+        validate_batched_public_relations(statement)?;
         let g_in = Gin::generator();
-        let g_s = g_in;
-        let g_out = Secq256k1::generator();
         let pc_gens = PedersenGens::<R1csCycle>::default();
         let bp_gens =
             BulletproofGens::<R1csCycle>::new(batched_gens_capacity(statement.receivers.len()), 1);
-
-        // Steps 0, 1: verify batched Chaum-Pedersen proof.
-        batched_chaum_pedersen_verify(
-            &statement.msg,
-            &g_in,
-            &statement.pk1,
-            &statement.receivers,
-            &proof.cp,
-        )?;
 
         // Derive h1, h2 from msg.
         let h1 = h_gin_1(&statement.msg);
         let h2 = h_gin_2(&statement.msg);
 
-        let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
-
-        for (j, rec) in statement.receivers.iter().enumerate() {
-            // Step 2: k_j = int(S_j.x) (public).
-            let (s_x, _) = affine(&rec.sj)?;
-
-            // Public T_{1,j}, T_{2,j} coordinates.
-            let (t1_x, t1_y) = affine(&rec.t1j)?;
-            let (t2_x, t2_y) = affine(&rec.t2j)?;
-
-            // Step 9 prefix link: V_{r,j} == R_j + g_out,1.
-            pedersen_prefix_link(&pc_gens.B_blinding, &rec.r_point_j, &proof.r_commitments[j])?;
-
-            // Commit using the proof's compressed commitments.
-            let var_k = verifier.commit(proof.k_commitments[j]);
-            let var_r = verifier.commit(proof.r_commitments[j]);
-            let verifier_bits = vec![None; K_BITS + 1];
-            build_one_receiver_slot(
-                &mut verifier,
-                var_k,
-                var_r,
-                s_x,
-                &h1,
-                &h2,
-                t1_x,
-                t1_y,
-                t2_x,
-                t2_y,
-                statement.beta,
-                &verifier_bits,
-                None,
-                None,
-                &g_s,
-            )
+        let mut verifier = Verifier::<R1csCycle, _>::new(batched_r1cs_transcript(statement));
+        let sk_var = verifier
+            .allocate(None)
+            .map_err(|_| Error::ProofVerificationFailed)?;
+        let verifier_sk_bits = vec![None; K_BITS + 1];
+        let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
-            // Step 9: verify DLOG PoK for this receiver.
-            dlog_verify(
-                &g_out,
-                &rec.r_point_j,
-                &proof.r_commitments[j],
-                &proof.dlogs[j],
-            )?;
+        let pk1_precomp =
+            precompute_chord(&g_in, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
+        let (pk1_x, pk1_y) = affine(&statement.pk1)?;
+        chord_exponentiate_r1cs_with_result(
+            &mut verifier,
+            &sk_bit_vars,
+            &pk1_precomp,
+            Some((pk1_x, pk1_y)),
+            None,
+        )
+        .map_err(|_| Error::ProofVerificationFailed)?;
+
+        prove_feldman_coefficients(
+            &mut verifier,
+            &statement.commitment_coefficients,
+            None,
+            &g_in,
+        )
+        .map_err(|_| Error::ProofVerificationFailed)?;
+
+        for rec in &statement.receivers {
+            build_hidden_receiver_slot(
+                &mut verifier,
+                rec,
+                &sk_bit_vars,
+                &h1,
+                &h2,
+                statement.beta,
+                &g_in,
+                None,
+            )
+            .map_err(|_| Error::ProofVerificationFailed)?;
         }
 
         verifier
@@ -1505,16 +1822,14 @@ pub mod secp_secq {
 
     // ------------------------------------------------------------------
     // DKG bridge: SecpSecqBackend implements EvrfProofBackend over the
-    // halo2curves Secp256k1 GoldenGroup adapter. The proof carries the paper
-    // eVRF envelope plus the per-receiver public inputs (S_j, T_{1,j},
-    // T_{2,j}, R_j) that the verifier needs but EvrfStatement does not hold.
+    // halo2curves Secp256k1 GoldenGroup adapter. The proof carries only the
+    // private-witness R1CS proof; public DKG bindings come from EvrfStatement.
     // ------------------------------------------------------------------
 
-    use golden_core::{DealerMessageNonce, EvrfProofBackend, ParticipantIndex};
+    use golden_core::{DealerMessageNonce, EvrfProofBackend};
     use golden_halo2curves::golden_group::{
         scalar_to_r1cs_field, Secp256k1Element, Secp256k1GoldenGroup, Secp256k1Scalar,
     };
-    use halo2curves::serde::Repr as SerdeRepr;
 
     /// Convert an `Fp` element to `Fq` by reinterpreting its canonical LE bytes
     /// as a raw integer and reducing mod `q`. Needed because `p > q` for
@@ -1562,6 +1877,7 @@ pub mod secp_secq {
     /// iff `a < b` as integers in `[0, p)`. Used to detect whether `pad + q`
     /// wrapped mod `p`, so the `pad + q` case is only accepted when it is a
     /// canonical representative strictly less than `p`.
+    #[cfg(test)]
     fn fp_canonical_lt(a: &Fp, b: &Fp) -> bool {
         let a_repr = a.to_repr();
         let b_repr = b.to_repr();
@@ -1575,266 +1891,63 @@ pub mod secp_secq {
         false
     }
 
-    /// Per-receiver public values carried alongside the proof envelope so the
-    /// verifier can reconstruct the `BatchedEvrfStatement`. The `pad`
-    /// field is the DKG pad scalar (`r_j mod q` as `Fq`); the verifier checks
-    /// it opens the DKG pad/DH commitments and links to the eVRF output `R_j`.
-    #[derive(Clone, Debug)]
-    struct SecpSecqReceiverPublic {
-        receiver: ParticipantIndex,
-        sj: Gin,
-        t1j: Gin,
-        t2j: Gin,
-        r_point_j: Secq256k1,
-        pad: Fq,
-    }
-
     /// Byte-serialized paper eVRF proof for the DKG. The inner bytes encode
-    /// the `BatchedEvrfProofEnvelope` plus per-receiver public inputs.
+    /// only the receiver count and the private-witness R1CS proof.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct SecpSecqProof(pub Vec<u8>);
 
-    const SECP_COMPRESSED: usize = 33;
-    const SECQ_COMPRESSED: usize = 33;
-    const FP_BYTES: usize = 32;
-    const FQ_BYTES: usize = 32;
-
-    /// Encode a `Gin` (Secp256k1) point as its 33-byte compressed form.
-    fn encode_gin(point: &Gin) -> [u8; SECP_COMPRESSED] {
-        let bytes = Secp256k1Cycle::point_compress(point);
-        let mut out = [0u8; SECP_COMPRESSED];
-        out.copy_from_slice(bytes.as_ref());
-        out
-    }
-
-    /// Decode a `Gin` (Secp256k1) point from 33 compressed bytes.
-    fn decode_gin(bytes: &[u8]) -> Result<Gin> {
-        if bytes.len() < SECP_COMPRESSED {
-            return Err(Error::ProofVerificationFailed);
-        }
-        let mut arr = [0u8; SECP_COMPRESSED];
-        arr.copy_from_slice(&bytes[..SECP_COMPRESSED]);
-        let repr = SerdeRepr::<SECP_COMPRESSED>::from(arr);
-        Secp256k1Cycle::compressed_decompress(&repr).ok_or(Error::ProofVerificationFailed)
-    }
-
-    /// Encode a `Secq256k1` point as its 33-byte compressed form.
-    fn encode_gout(point: &Secq256k1) -> [u8; SECQ_COMPRESSED] {
-        let bytes = R1csCycle::point_compress(point);
-        let mut out = [0u8; SECQ_COMPRESSED];
-        out.copy_from_slice(bytes.as_ref());
-        out
-    }
-
-    /// Decode a `Secq256k1` point from 33 compressed bytes.
-    fn decode_gout(bytes: &[u8]) -> Result<Secq256k1> {
-        if bytes.len() < SECQ_COMPRESSED {
-            return Err(Error::ProofVerificationFailed);
-        }
-        let mut arr = [0u8; SECQ_COMPRESSED];
-        arr.copy_from_slice(&bytes[..SECQ_COMPRESSED]);
-        let repr = SerdeRepr::<SECQ_COMPRESSED>::from(arr);
-        R1csCycle::compressed_decompress(&repr).ok_or(Error::ProofVerificationFailed)
-    }
-
-    /// Encode a `GoutCompressed` (Repr<33>) as 33 raw bytes.
-    fn encode_gout_compressed(c: &GoutCompressed) -> [u8; SECQ_COMPRESSED] {
-        let mut out = [0u8; SECQ_COMPRESSED];
-        out.copy_from_slice(c.as_ref());
-        out
-    }
-
-    /// Encode an `Fp` scalar as 32 canonical LE bytes.
-    fn encode_fp(s: &Fp) -> [u8; FP_BYTES] {
-        *s.to_repr().inner()
-    }
-
-    /// Decode an `Fp` scalar from 32 canonical LE bytes.
-    fn decode_fp(bytes: &[u8]) -> Result<Fp> {
-        if bytes.len() < FP_BYTES {
-            return Err(Error::ProofVerificationFailed);
-        }
-        let mut arr = [0u8; FP_BYTES];
-        arr.copy_from_slice(&bytes[..FP_BYTES]);
-        let repr = SerdeRepr::<FP_BYTES>::from(arr);
-        Option::from(Fp::from_repr(repr)).ok_or(Error::ProofVerificationFailed)
-    }
-
-    /// Encode an `Fq` scalar as 32 canonical LE bytes.
-    fn encode_fq(s: &Fq) -> [u8; FQ_BYTES] {
-        *s.to_repr().inner()
-    }
-
-    /// Decode an `Fq` scalar from 32 canonical LE bytes.
-    fn decode_fq(bytes: &[u8]) -> Result<Fq> {
-        if bytes.len() < FQ_BYTES {
-            return Err(Error::ProofVerificationFailed);
-        }
-        let mut arr = [0u8; FQ_BYTES];
-        arr.copy_from_slice(&bytes[..FQ_BYTES]);
-        let repr = SerdeRepr::<FQ_BYTES>::from(arr);
-        Option::from(Fq::from_repr(repr)).ok_or(Error::ProofVerificationFailed)
-    }
-
-    /// Serialize the proof envelope and per-receiver publics into a flat byte
-    /// vector.
-    fn encode_proof(
-        envelope: &BatchedEvrfProofEnvelope,
-        publics: &[SecpSecqReceiverPublic],
-    ) -> Result<Vec<u8>> {
-        let n = publics.len();
-        if envelope.k_commitments.len() != n
-            || envelope.r_commitments.len() != n
-            || envelope.dlogs.len() != n
-            || envelope.cp.rjs.len() != n
-        {
-            return Err(Error::ProofVerificationFailed);
-        }
+    /// Serialize the proof envelope into a flat byte vector.
+    fn encode_proof(envelope: &BatchedEvrfProofEnvelope, num_receivers: usize) -> Result<Vec<u8>> {
+        let n = u32::try_from(num_receivers).map_err(|_| Error::ProofVerificationFailed)?;
         let r1cs_bytes = envelope.r1cs.to_bytes();
+        let r1cs_len =
+            u32::try_from(r1cs_bytes.len()).map_err(|_| Error::ProofVerificationFailed)?;
 
-        let mut out = Vec::with_capacity(
-            8 + r1cs_bytes.len()
-                + SECP_COMPRESSED
-                + FQ_BYTES
-                + n * (4
-                    + 4 * SECP_COMPRESSED
-                    + SECQ_COMPRESSED
-                    + 2 * SECQ_COMPRESSED
-                    + FQ_BYTES
-                    + FQ_BYTES),
-        );
-        out.extend_from_slice(&(n as u32).to_le_bytes());
-        out.extend_from_slice(&(r1cs_bytes.len() as u32).to_le_bytes());
+        let mut out = Vec::with_capacity(8 + r1cs_bytes.len());
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&r1cs_len.to_le_bytes());
         out.extend_from_slice(&r1cs_bytes);
-        out.extend_from_slice(&encode_gin(&envelope.cp.r0));
-        out.extend_from_slice(&encode_fq(&envelope.cp.z));
-        // `j` indexes five parallel slices (publics, k_commitments,
-        // r_commitments, rjs, dlogs); enumerate on one would still need the
-        // others by index.
-        #[allow(clippy::needless_range_loop)]
-        for j in 0..n {
-            out.extend_from_slice(&publics[j].receiver.get().to_le_bytes());
-            out.extend_from_slice(&encode_gin(&publics[j].sj));
-            out.extend_from_slice(&encode_gin(&publics[j].t1j));
-            out.extend_from_slice(&encode_gin(&publics[j].t2j));
-            out.extend_from_slice(&encode_gout(&publics[j].r_point_j));
-            out.extend_from_slice(&encode_fq(&publics[j].pad));
-            out.extend_from_slice(&encode_gout_compressed(&envelope.k_commitments[j]));
-            out.extend_from_slice(&encode_gout_compressed(&envelope.r_commitments[j]));
-            out.extend_from_slice(&encode_gin(&envelope.cp.rjs[j]));
-            out.extend_from_slice(&encode_gout(&envelope.dlogs[j].a));
-            out.extend_from_slice(&encode_fp(&envelope.dlogs[j].t));
-        }
         Ok(out)
     }
 
-    /// Deserialize the proof envelope and per-receiver publics from a flat
-    /// byte vector.
-    fn decode_proof(
-        bytes: &[u8],
-    ) -> Result<(BatchedEvrfProofEnvelope, Vec<SecpSecqReceiverPublic>)> {
+    /// Deserialize the proof envelope from a flat byte vector.
+    fn decode_proof(bytes: &[u8]) -> Result<(usize, BatchedEvrfProofEnvelope)> {
         if bytes.len() < 8 {
             return Err(Error::ProofVerificationFailed);
         }
         let n = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")) as usize;
         let r1cs_len = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")) as usize;
-        if bytes.len() < 8 + r1cs_len {
+        let expected_len = 8usize
+            .checked_add(r1cs_len)
+            .ok_or(Error::ProofVerificationFailed)?;
+        if bytes.len() != expected_len {
             return Err(Error::ProofVerificationFailed);
         }
         let r1cs = R1CSProof::<R1csCycle>::from_bytes(&bytes[8..8 + r1cs_len])
             .map_err(|_| Error::ProofVerificationFailed)?;
+        Ok((n, BatchedEvrfProofEnvelope { r1cs }))
+    }
 
-        let mut cursor = 8 + r1cs_len;
-        if bytes.len() < cursor + SECP_COMPRESSED + FQ_BYTES {
+    fn ensure_same_batch_context(
+        statement: &EvrfStatement<Secp256k1GoldenGroup>,
+        first: &EvrfStatement<Secp256k1GoldenGroup>,
+    ) -> Result<()> {
+        if statement.protocol_version != first.protocol_version
+            || statement.backend_id != first.backend_id
+            || statement.session_id != first.session_id
+            || statement.registry_root != first.registry_root
+            || statement.threshold != first.threshold
+            || statement.dealer != first.dealer
+            || statement.msg_i != first.msg_i
+            || statement.beta != first.beta
+            || statement.dealer_public_key != first.dealer_public_key
+            || statement.commitment_coefficients != first.commitment_coefficients
+            || statement.transcript_root != first.transcript_root
+        {
             return Err(Error::ProofVerificationFailed);
         }
-        let cp_r0 = decode_gin(&bytes[cursor..cursor + SECP_COMPRESSED])?;
-        cursor += SECP_COMPRESSED;
-        let cp_z = decode_fq(&bytes[cursor..cursor + FQ_BYTES])?;
-        cursor += FQ_BYTES;
 
-        let per_receiver_size = 4
-            + 3 * SECP_COMPRESSED
-            + SECQ_COMPRESSED
-            + FQ_BYTES
-            + 2 * SECQ_COMPRESSED
-            + SECP_COMPRESSED
-            + SECQ_COMPRESSED
-            + FQ_BYTES;
-        if bytes.len() < cursor + n * per_receiver_size {
-            return Err(Error::ProofVerificationFailed);
-        }
-
-        let mut k_commitments = Vec::with_capacity(n);
-        let mut r_commitments = Vec::with_capacity(n);
-        let mut rjs = Vec::with_capacity(n);
-        let mut dlogs = Vec::with_capacity(n);
-        let mut publics = Vec::with_capacity(n);
-
-        for _ in 0..n {
-            let receiver = ParticipantIndex::new(u32::from_le_bytes(
-                bytes[cursor..cursor + 4].try_into().expect("4 bytes"),
-            ))
-            .map_err(|_| Error::ProofVerificationFailed)?;
-            cursor += 4;
-            let sj = decode_gin(&bytes[cursor..cursor + SECP_COMPRESSED])?;
-            cursor += SECP_COMPRESSED;
-            let t1j = decode_gin(&bytes[cursor..cursor + SECP_COMPRESSED])?;
-            cursor += SECP_COMPRESSED;
-            let t2j = decode_gin(&bytes[cursor..cursor + SECP_COMPRESSED])?;
-            cursor += SECP_COMPRESSED;
-            let r_point_j = decode_gout(&bytes[cursor..cursor + SECQ_COMPRESSED])?;
-            cursor += SECQ_COMPRESSED;
-            let pad = decode_fq(&bytes[cursor..cursor + FQ_BYTES])?;
-            cursor += FQ_BYTES;
-
-            let mut kc = <GoutCompressed as Default>::default();
-            kc.as_mut()
-                .copy_from_slice(&bytes[cursor..cursor + SECQ_COMPRESSED]);
-            k_commitments.push(kc);
-            cursor += SECQ_COMPRESSED;
-
-            let mut rc = <GoutCompressed as Default>::default();
-            rc.as_mut()
-                .copy_from_slice(&bytes[cursor..cursor + SECQ_COMPRESSED]);
-            r_commitments.push(rc);
-            cursor += SECQ_COMPRESSED;
-
-            let rj = decode_gin(&bytes[cursor..cursor + SECP_COMPRESSED])?;
-            rjs.push(rj);
-            cursor += SECP_COMPRESSED;
-
-            let dlog_a = decode_gout(&bytes[cursor..cursor + SECQ_COMPRESSED])?;
-            cursor += SECQ_COMPRESSED;
-            let dlog_t = decode_fp(&bytes[cursor..cursor + FP_BYTES])?;
-            cursor += FP_BYTES;
-            dlogs.push(DlogProof {
-                a: dlog_a,
-                t: dlog_t,
-            });
-
-            publics.push(SecpSecqReceiverPublic {
-                receiver,
-                sj,
-                t1j,
-                t2j,
-                r_point_j,
-                pad,
-            });
-        }
-
-        let envelope = BatchedEvrfProofEnvelope {
-            r1cs,
-            k_commitments,
-            r_commitments,
-            cp: BatchedChaumPedersenProof {
-                r0: cp_r0,
-                rjs,
-                z: cp_z,
-            },
-            dlogs,
-        };
-        Ok((envelope, publics))
+        Ok(())
     }
 
     /// Compute the paper eVRF pad `r = beta * T_1.x + T_2.x` as an `Fp`
@@ -1851,36 +1964,6 @@ pub mod secp_secq {
         let (t1_x, _) = affine(&t1j)?;
         let (t2_x, _) = affine(&t2j)?;
         Ok(*beta * t1_x + t2_x)
-    }
-
-    /// Compute the per-receiver paper eVRF public values from the dealer
-    /// identity secret and the receiver public key.
-    fn compute_receiver_public(
-        msg: &[u8; MESSAGE_BYTES],
-        sk1: &Fq,
-        pkj: &Gin,
-        receiver: ParticipantIndex,
-        beta: &Fp,
-    ) -> Result<SecpSecqReceiverPublic> {
-        let g_out = Secq256k1::generator();
-        let sj = *pkj * sk1;
-        let (s_x, _) = affine(&sj)?;
-        let k_fq = fp_to_fq(&s_x);
-        let h1 = h_gin_1(msg);
-        let h2 = h_gin_2(msg);
-        let t1j = h1 * k_fq;
-        let t2j = h2 * k_fq;
-        let r = compute_pad_fp(msg, sk1, pkj, beta)?;
-        let r_point_j = g_out * r;
-        let pad = fp_to_fq(&r);
-        Ok(SecpSecqReceiverPublic {
-            receiver,
-            sj,
-            t1j,
-            t2j,
-            r_point_j,
-            pad,
-        })
     }
 
     /// Concrete Secp/Secq paper eVRF backend for the DKG.
@@ -1910,43 +1993,64 @@ pub mod secp_secq {
             if statements.is_empty() || statements.len() != witnesses.len() {
                 return Err(Error::ProofVerificationFailed);
             }
-            let msg = statements[0].msg_i.0;
-            let pk1 = statements[0].dealer_public_key.0;
-            let beta =
-                scalar_to_r1cs_field(&statements[0].beta).ok_or(Error::ProofVerificationFailed)?;
+            let first = &statements[0];
+            let msg = first.msg_i.0;
+            let pk1 = first.dealer_public_key.0;
+            let beta = scalar_to_r1cs_field(&first.beta).ok_or(Error::ProofVerificationFailed)?;
+            let threshold = first.threshold;
+            let commitment_coefficients: Vec<Gin> = first
+                .commitment_coefficients
+                .iter()
+                .map(|coefficient| coefficient.0)
+                .collect();
             let sk1 = witnesses[0].identity_secret.0;
 
-            let pk1_computed = Gin::generator() * sk1;
-            if Secp256k1Cycle::point_compress(&pk1_computed).as_ref()
-                != Secp256k1Cycle::point_compress(&pk1).as_ref()
-            {
-                return Err(Error::ProofVerificationFailed);
-            }
-
             let mut receivers = Vec::with_capacity(statements.len());
-            let mut publics = Vec::with_capacity(statements.len());
-            for statement in statements {
+            let mut statement_roots = Vec::with_capacity(statements.len());
+            let mut shares = Vec::with_capacity(witnesses.len());
+            let coefficient_scalars: Vec<GinScalar> = witnesses[0]
+                .polynomial_coefficients
+                .iter()
+                .map(|coefficient| coefficient.0)
+                .collect();
+            for (statement, witness) in statements.iter().zip(witnesses.iter()) {
+                ensure_same_batch_context(statement, first)?;
+                if witness.identity_secret.0 != sk1 {
+                    return Err(Error::ProofVerificationFailed);
+                }
+                if witness.polynomial_coefficients != witnesses[0].polynomial_coefficients {
+                    return Err(Error::ProofVerificationFailed);
+                }
                 let pkj = statement.receiver_public_key.0;
-                let public = compute_receiver_public(&msg, &sk1, &pkj, statement.receiver, &beta)?;
-                receivers.push(BatchedReceiverStatement {
+                let rec = BatchedReceiverStatement {
+                    receiver: statement.receiver,
                     pkj,
-                    sj: public.sj,
-                    t1j: public.t1j,
-                    t2j: public.t2j,
-                    r_point_j: public.r_point_j,
-                });
-                publics.push(public);
+                    share_commitment: statement.share_commitment.0,
+                    pad_commitment: statement.pad_commitment.0,
+                    dh_commitment: statement.dh_commitment.0,
+                    encrypted_share: statement.encrypted_share.0,
+                };
+                statement_roots.push(statement.root());
+                receivers.push(rec);
+                shares.push(witness.share.0);
             }
 
             let batched_statement = BatchedEvrfStatement {
                 msg,
                 pk1,
                 beta,
+                threshold,
+                commitment_coefficients,
+                statement_roots,
                 receivers,
             };
-            let batched_witness = BatchedEvrfWitness { sk1 };
+            let batched_witness = BatchedEvrfWitness {
+                sk1,
+                coefficient_scalars,
+                shares,
+            };
             let envelope = evrf_batched_prove(&batched_statement, &batched_witness, rng)?;
-            let bytes = encode_proof(&envelope, &publics)?;
+            let bytes = encode_proof(&envelope, statements.len())?;
             Ok(SecpSecqProof(bytes))
         }
 
@@ -1957,70 +2061,33 @@ pub mod secp_secq {
             if statements.is_empty() {
                 return Err(Error::ProofVerificationFailed);
             }
-            let (envelope, publics) = decode_proof(&proof.0)?;
-            if publics.len() != statements.len() {
+            let (num_receivers, envelope) = decode_proof(&proof.0)?;
+            if num_receivers != statements.len() {
                 return Err(Error::ProofVerificationFailed);
             }
-            let msg = statements[0].msg_i.0;
-            let pk1 = statements[0].dealer_public_key.0;
-            let beta =
-                scalar_to_r1cs_field(&statements[0].beta).ok_or(Error::ProofVerificationFailed)?;
-            let g_in = Gin::generator();
-            let g_out = Secq256k1::generator();
+            let first = &statements[0];
+            let msg = first.msg_i.0;
+            let pk1 = first.dealer_public_key.0;
+            let beta = scalar_to_r1cs_field(&first.beta).ok_or(Error::ProofVerificationFailed)?;
+            let threshold = first.threshold;
+            let commitment_coefficients: Vec<Gin> = first
+                .commitment_coefficients
+                .iter()
+                .map(|coefficient| coefficient.0)
+                .collect();
 
             let mut receivers = Vec::with_capacity(statements.len());
-            for (statement, public) in statements.iter().zip(publics.iter()) {
-                if statement.receiver != public.receiver {
-                    return Err(Error::ProofVerificationFailed);
-                }
-
-                // Bind the DKG pad/DH commitments to the eVRF pad. The pad
-                // scalar (Fq) opens pad_commitment = g_in^pad and
-                // dh_commitment = PK_j^pad. This prevents a dealer from
-                // publishing valid eVRF proof for the real pad while using a
-                // different pad for the DKG commitments.
-                let pad_fq = public.pad;
-                let pad_commitment_expected = g_in * pad_fq;
-                if Secp256k1Cycle::point_compress(&pad_commitment_expected).as_ref()
-                    != Secp256k1Cycle::point_compress(&statement.pad_commitment.0).as_ref()
-                {
-                    return Err(Error::ProofVerificationFailed);
-                }
-                let dh_commitment_expected = statement.receiver_public_key.0 * pad_fq;
-                if Secp256k1Cycle::point_compress(&dh_commitment_expected).as_ref()
-                    != Secp256k1Cycle::point_compress(&statement.dh_commitment.0).as_ref()
-                {
-                    return Err(Error::ProofVerificationFailed);
-                }
-
-                // Link the eVRF output R_j to the DKG pad. Since r_j is an Fp
-                // element and pad = r_j mod q, and p < 2q for Secp256k1, r_j is
-                // either pad or pad + q (as integers in [0, p)). When
-                // pad + q >= p, the only canonical Fp representative reducing to
-                // pad mod q is pad itself, so the `pad + q` case is only
-                // accepted when `pad + q` does not wrap mod p. The no-wrap
-                // condition is `(pad + q) mod p > pad`, detected by
-                // `fp_canonical_lt(&pad_fp, &pad_plus_q)`.
-                let pad_fp = fq_to_fp(&pad_fq);
-                let r_case0 = g_out * pad_fp;
-                let pad_plus_q = pad_fp + Q_AS_FP;
-                let case1_canonical = fp_canonical_lt(&pad_fp, &pad_plus_q);
-                let r_case1 = g_out * pad_plus_q;
-                let r_ok = R1csCycle::point_compress(&r_case0).as_ref()
-                    == R1csCycle::point_compress(&public.r_point_j).as_ref()
-                    || (case1_canonical
-                        && R1csCycle::point_compress(&r_case1).as_ref()
-                            == R1csCycle::point_compress(&public.r_point_j).as_ref());
-                if !r_ok {
-                    return Err(Error::ProofVerificationFailed);
-                }
-
+            let mut statement_roots = Vec::with_capacity(statements.len());
+            for statement in statements {
+                ensure_same_batch_context(statement, first)?;
+                statement_roots.push(statement.root());
                 receivers.push(BatchedReceiverStatement {
+                    receiver: statement.receiver,
                     pkj: statement.receiver_public_key.0,
-                    sj: public.sj,
-                    t1j: public.t1j,
-                    t2j: public.t2j,
-                    r_point_j: public.r_point_j,
+                    share_commitment: statement.share_commitment.0,
+                    pad_commitment: statement.pad_commitment.0,
+                    dh_commitment: statement.dh_commitment.0,
+                    encrypted_share: statement.encrypted_share.0,
                 });
             }
 
@@ -2028,6 +2095,9 @@ pub mod secp_secq {
                 msg,
                 pk1,
                 beta,
+                threshold,
+                commitment_coefficients,
+                statement_roots,
                 receivers,
             };
             use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
@@ -2064,8 +2134,8 @@ pub mod secp_secq {
 
             let mut bits = [false; K_BITS + 1];
             decompose_k_fp(&k, &mut bits);
-            let t1 = chord_evaluate_point(&bits, &h1, &g_in, K_BITS).expect("T1");
-            let t2 = chord_evaluate_point(&bits, &h2, &g_in, K_BITS).expect("T2");
+            let t1 = chord_evaluate_point(&bits, &h1, K_BITS).expect("T1");
+            let t2 = chord_evaluate_point(&bits, &h2, K_BITS).expect("T2");
 
             let (t1_x, _) = affine(&t1).expect("T1 affine");
             let (t2_x, _) = affine(&t2).expect("T2 affine");
@@ -2103,27 +2173,38 @@ pub mod secp_secq {
             let pk1 = g_in * sk1;
             let h1 = h_gin_1(msg);
             let h2 = h_gin_2(msg);
-            let g_out = Secq256k1::generator();
+            let coefficient_scalars = vec![GinScalar::from(10u64), GinScalar::ONE];
+            let commitment_coefficients = coefficient_scalars
+                .iter()
+                .map(|coefficient| g_in * *coefficient)
+                .collect::<Vec<_>>();
 
+            let mut shares = Vec::with_capacity(pkjs.len());
             let receivers: Vec<BatchedReceiverStatement> = pkjs
                 .iter()
-                .map(|&pkj| {
+                .enumerate()
+                .map(|(j, &pkj)| {
                     let sj = pkj * sk1;
                     let (k, _) = affine(&sj).expect("S affine");
                     let mut bits = [false; K_BITS + 1];
                     decompose_k_fp(&k, &mut bits);
-                    let t1j = chord_evaluate_point(&bits, &h1, &g_in, K_BITS).expect("T1");
-                    let t2j = chord_evaluate_point(&bits, &h2, &g_in, K_BITS).expect("T2");
+                    let t1j = chord_evaluate_point(&bits, &h1, K_BITS).expect("T1");
+                    let t2j = chord_evaluate_point(&bits, &h2, K_BITS).expect("T2");
                     let (t1_x, _) = affine(&t1j).expect("T1 affine");
                     let (t2_x, _) = affine(&t2j).expect("T2 affine");
                     let r = beta * t1_x + t2_x;
-                    let r_point_j = g_out * r;
+                    let pad = fp_to_fq(&r);
+                    let receiver =
+                        ParticipantIndex::new((j as u32) + 1).expect("nonzero receiver index");
+                    let share = GinScalar::from((j as u64) + 11);
+                    shares.push(share);
                     BatchedReceiverStatement {
+                        receiver,
                         pkj,
-                        sj,
-                        t1j,
-                        t2j,
-                        r_point_j,
+                        share_commitment: g_in * share,
+                        pad_commitment: g_in * pad,
+                        dh_commitment: pkj * pad,
+                        encrypted_share: share + pad,
                     }
                 })
                 .collect();
@@ -2132,9 +2213,22 @@ pub mod secp_secq {
                 msg: *msg,
                 pk1,
                 beta,
+                threshold: commitment_coefficients.len(),
+                commitment_coefficients,
+                statement_roots: (0..receivers.len())
+                    .map(|j| {
+                        let mut root = [0u8; 32];
+                        root[..8].copy_from_slice(&(j as u64).to_le_bytes());
+                        root
+                    })
+                    .collect(),
                 receivers,
             };
-            let witness = BatchedEvrfWitness { sk1 };
+            let witness = BatchedEvrfWitness {
+                sk1,
+                coefficient_scalars,
+                shares,
+            };
             (statement, witness)
         }
 
@@ -2181,8 +2275,7 @@ pub mod secp_secq {
 
         #[test]
         fn chord_evaluate_matches_direct_scalar_mul() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
+            let X = Gin::generator() * Fq::from(42u64);
             let k = Fq::from_raw([
                 0xDEADBEEFCAFEBABE,
                 0x0123456789ABCDEF,
@@ -2192,7 +2285,7 @@ pub mod secp_secq {
             let mut bits = [false; K_BITS + 1];
             decompose(&k, &mut bits);
 
-            let (lx, ly) = chord_evaluate(&bits, &X, &g_s, K_BITS).expect("eval");
+            let (lx, ly) = chord_evaluate(&bits, &X, K_BITS).expect("eval");
             let expected = X * k;
             let (ex, ey) = affine(&expected).expect("affine");
             assert_eq!(lx, ex, "L_λ x-coordinate mismatch");
@@ -2201,13 +2294,12 @@ pub mod secp_secq {
 
         #[test]
         fn chord_evaluate_small_exponent() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(99u64);
+            let X = Gin::generator() * Fq::from(99u64);
             let k = Fq::from(5u64);
             let mut bits = [false; K_BITS + 1];
             decompose(&k, &mut bits);
 
-            let (lx, ly) = chord_evaluate(&bits, &X, &g_s, K_BITS).expect("eval");
+            let (lx, ly) = chord_evaluate(&bits, &X, K_BITS).expect("eval");
             let expected = X * k;
             let (ex, ey) = affine(&expected).expect("affine");
             assert_eq!(lx, ex);
@@ -2216,9 +2308,9 @@ pub mod secp_secq {
 
         #[test]
         fn precompute_chord_coordinates_are_correct() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(123u64);
-            let precomp = precompute_chord(&X, &g_s, K_BITS).expect("precompute");
+            let X = Gin::generator() * Fq::from(123u64);
+            let g_s = chord_correction_generator(&X);
+            let precomp = precompute_chord(&X, K_BITS).expect("precompute");
 
             assert_eq!(precomp.c.len(), K_BITS + 1, "c vector length");
             assert_eq!(precomp.d.len(), K_BITS + 1, "d vector length");
@@ -2240,23 +2332,13 @@ pub mod secp_secq {
         }
 
         #[test]
-        fn chord_compute_witness_rejects_exceptional_addition() {
-            // With X = g_s, k_0 = 1, k_1 = 0:
-            //   L_0 = Delta_0 = 1*g_s + 1*g_s = 2*g_s
-            //   Delta_1 = 0*P_1 + 2*g_s = 2*g_s
-            //   x_{L_0} = x_{Delta_1}  ⟹  dx = 0 (exceptional case)
-            // The witness computation must return an error, not fabricate
-            // a zero slope.
-            let g_s = Gin::generator();
-            let X = g_s;
-            let mut bits = [false; K_BITS + 1];
-            bits[0] = true; // k_0 = 1
-            bits[1] = false; // k_1 = 0
-
-            let result = chord_compute_witness(&bits, &X, &g_s, K_BITS);
-            assert!(
-                result.is_err(),
-                "chord_compute_witness must reject exceptional dx=0 case"
+        fn chord_correction_generator_is_base_bound() {
+            let x1 = Gin::generator() * Fq::from(123u64);
+            let x2 = Gin::generator() * Fq::from(456u64);
+            assert_ne!(
+                Secp256k1Cycle::point_compress(&chord_correction_generator(&x1)).as_ref(),
+                Secp256k1Cycle::point_compress(&chord_correction_generator(&x2)).as_ref(),
+                "different chord bases should derive different correction generators"
             );
         }
     }
@@ -2289,6 +2371,19 @@ pub mod secp_secq {
             }
         }
 
+        fn decompose_le_bytes(bytes: &[u8], bits: &mut [Option<R1csField>]) {
+            for (i, b) in bits.iter_mut().enumerate() {
+                let byte_idx = i / 8;
+                let bit_idx = i % 8;
+                let val = if byte_idx < bytes.len() && (bytes[byte_idx] >> bit_idx) & 1 == 1 {
+                    R1csField::ONE
+                } else {
+                    R1csField::ZERO
+                };
+                *b = Some(val);
+            }
+        }
+
         /// Helper: prove and verify a bit-decomposition of `k` with the given
         /// bit assignments.  Returns `Ok(())` if the verifier accepts.
         fn run_bit_decompose(
@@ -2296,18 +2391,67 @@ pub mod secp_secq {
             bit_assignments: &[Option<R1csField>],
         ) -> core::result::Result<(), R1CSError> {
             let pc_gens = PedersenGens::<R1csCycle>::default();
-            let bp_gens = BulletproofGens::<R1csCycle>::new(512, 1);
+            let bp_gens = BulletproofGens::<R1csCycle>::new(1024, 1);
             let mut rng = ChaCha20Rng::seed_from_u64(0xA1B2C3D4);
 
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
             let (v_k, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
-            bit_decompose(&mut prover, var_k, bit_assignments, K_BITS)?;
+            bit_decompose(&mut prover, var_k, bit_assignments)?;
             let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
 
             let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
             let v_k_var = verifier.commit(v_k);
             let verifier_bits = vec![None; K_BITS + 1];
-            bit_decompose(&mut verifier, v_k_var, &verifier_bits, K_BITS)?;
+            bit_decompose(&mut verifier, v_k_var, &verifier_bits)?;
+            verifier.verify(&proof, &pc_gens, &bp_gens, &mut rng)
+        }
+
+        fn run_conditional_pad_bound(
+            pad: R1csField,
+            reduce: R1csField,
+        ) -> core::result::Result<(), R1CSError> {
+            let pc_gens = PedersenGens::<R1csCycle>::default();
+            let bp_gens = BulletproofGens::<R1csCycle>::new(2048, 1);
+            let mut rng = ChaCha20Rng::seed_from_u64(0xC0DEC0DE);
+            let mut bits = vec![None; K_BITS + 1];
+            decompose_k(&pad, &mut bits);
+
+            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let (v_pad, var_pad) = prover.commit(pad, random_scalar::<R1csCycle>(&mut rng));
+            let (v_reduce, var_reduce) =
+                prover.commit(reduce, random_scalar::<R1csCycle>(&mut rng));
+            let (_, _, reduce_boolean) = prover.multiply(
+                var_reduce.into(),
+                LinearCombination::from(R1csField::ONE) - var_reduce,
+            );
+            prover.constrain(reduce_boolean.into());
+            let bit_vars = bit_decompose_q(&mut prover, var_pad, &bits)?;
+            constrain_bits_lt_bound_when(
+                &mut prover,
+                &bit_vars,
+                &bits,
+                &SECP256K1_P_MINUS_Q_LE,
+                var_reduce,
+            )?;
+            let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
+
+            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
+            let var_pad = verifier.commit(v_pad);
+            let var_reduce = verifier.commit(v_reduce);
+            let (_, _, reduce_boolean) = verifier.multiply(
+                var_reduce.into(),
+                LinearCombination::from(R1csField::ONE) - var_reduce,
+            );
+            verifier.constrain(reduce_boolean.into());
+            let verifier_bits = vec![None; K_BITS + 1];
+            let bit_vars = bit_decompose_q(&mut verifier, var_pad, &verifier_bits)?;
+            constrain_bits_lt_bound_when(
+                &mut verifier,
+                &bit_vars,
+                &verifier_bits,
+                &SECP256K1_P_MINUS_Q_LE,
+                var_reduce,
+            )?;
             verifier.verify(&proof, &pc_gens, &bp_gens, &mut rng)
         }
 
@@ -2355,6 +2499,138 @@ pub mod secp_secq {
         }
 
         #[test]
+        fn bit_decompose_accepts_p_minus_one_boundary() {
+            let k = R1csField::ZERO - R1csField::ONE;
+            let mut p_minus_one = SECP256K1_BASE_MODULUS_LE;
+            p_minus_one[0] -= 1;
+            let mut bits = vec![None; K_BITS + 1];
+            decompose_le_bytes(&p_minus_one, &mut bits);
+
+            run_bit_decompose(k, &bits).expect("p - 1 is canonical");
+        }
+
+        #[test]
+        fn bit_decompose_rejects_p_boundary() {
+            let mut bits = vec![None; K_BITS + 1];
+            decompose_le_bytes(&SECP256K1_BASE_MODULUS_LE, &mut bits);
+
+            assert!(
+                run_bit_decompose(R1csField::ZERO, &bits).is_err(),
+                "canonical range check must reject p itself"
+            );
+        }
+
+        #[test]
+        fn conditional_pad_bound_rejects_reduce_wrap() {
+            let wrapped_pad = R1csField::ZERO - Q_AS_FP;
+            run_conditional_pad_bound(wrapped_pad, R1csField::ZERO)
+                .expect("condition is disabled when reduce is zero");
+            assert!(
+                run_conditional_pad_bound(wrapped_pad, R1csField::ONE).is_err(),
+                "reduce=1 must reject pad values where pad + q wraps modulo p"
+            );
+        }
+
+        #[test]
+        #[ignore = "slow: builds a full batched-dealer R1CS proof"]
+        fn batched_receiver_slot_rejects_share_not_opening_commitment() {
+            let mut rng = ChaCha20Rng::seed_from_u64(0x5A11_0F00);
+            let sk1 = GinScalar::from(3u64);
+            let pkj = Gin::generator() * GinScalar::from(5u64);
+            let msg = [0x42u8; MESSAGE_BYTES];
+            let beta = R1csField::from(7u64);
+            let (statement, witness) = testing::build_batched(&msg, sk1, &[pkj], beta);
+            let rec = &statement.receivers[0];
+            let g_in = Gin::generator();
+            let h1 = h_gin_1(&statement.msg);
+            let h2 = h_gin_2(&statement.msg);
+
+            let mut rec_witness = compute_hidden_receiver_witness(
+                &statement.msg,
+                &witness.sk1,
+                &witness.shares[0],
+                rec,
+                &statement.beta,
+            )
+            .expect("honest hidden receiver witness");
+
+            let wrong_share = witness.shares[0] + GinScalar::ONE;
+            let wrong_share_fp = fq_to_fp(&wrong_share);
+            let mut wrong_share_bits = [false; K_BITS + 1];
+            decompose_k_fp(&wrong_share_fp, &mut wrong_share_bits);
+            rec_witness.share = wrong_share_fp;
+            rec_witness.share_bits = bit_options(&wrong_share_bits);
+            rec_witness.share_commitment = chord_compute_witness(&wrong_share_bits, &g_in, K_BITS)
+                .expect("wrong share commitment witness");
+
+            let pc_gens = PedersenGens::<R1csCycle>::default();
+            let bp_gens = BulletproofGens::<R1csCycle>::new(batched_gens_capacity(1), 1);
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, batched_r1cs_transcript(&statement));
+            let sk_fp = fq_to_fp(&witness.sk1);
+            let mut sk_bits = [false; K_BITS + 1];
+            decompose_k_fp(&sk_fp, &mut sk_bits);
+            let sk_var = prover.allocate(Some(sk_fp)).expect("allocate sk");
+            let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &bit_options(&sk_bits))
+                .expect("sk bit decomposition");
+
+            let pk1_precomp = precompute_chord(&g_in, K_BITS).expect("PK1 precompute");
+            let (pk1_x, pk1_y) = affine(&statement.pk1).expect("PK1 affine");
+            chord_exponentiate_r1cs_with_result(
+                &mut prover,
+                &sk_bit_vars,
+                &pk1_precomp,
+                Some((pk1_x, pk1_y)),
+                Some(&chord_compute_witness(&sk_bits, &g_in, K_BITS).expect("PK1 witness")),
+            )
+            .expect("PK1 constraint");
+            build_hidden_receiver_slot(
+                &mut prover,
+                rec,
+                &sk_bit_vars,
+                &h1,
+                &h2,
+                statement.beta,
+                &g_in,
+                Some(&rec_witness),
+            )
+            .expect("receiver slot");
+
+            let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
+            let mut verifier = Verifier::<R1csCycle, _>::new(batched_r1cs_transcript(&statement));
+            let sk_var = verifier.allocate(None).expect("allocate verifier sk");
+            let verifier_sk_bits = vec![None; K_BITS + 1];
+            let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits)
+                .expect("verifier sk bit decomposition");
+            chord_exponentiate_r1cs_with_result(
+                &mut verifier,
+                &sk_bit_vars,
+                &pk1_precomp,
+                Some((pk1_x, pk1_y)),
+                None,
+            )
+            .expect("verifier PK1 constraint");
+            build_hidden_receiver_slot(
+                &mut verifier,
+                rec,
+                &sk_bit_vars,
+                &h1,
+                &h2,
+                statement.beta,
+                &g_in,
+                None,
+            )
+            .expect("verifier receiver slot");
+
+            assert!(
+                verifier
+                    .verify(&proof, &pc_gens, &bp_gens, &mut rng)
+                    .is_err(),
+                "R1CS must reject a hidden share that does not open share_commitment"
+            );
+        }
+
+        #[test]
         fn bit_decompose_uses_exact_gate_count() {
             let pc_gens = PedersenGens::<R1csCycle>::default();
             let mut rng = ChaCha20Rng::seed_from_u64(0x12345678);
@@ -2363,14 +2639,15 @@ pub mod secp_secq {
             decompose_k(&k, &mut bits);
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
-            let _ = bit_decompose(&mut prover, var_k, &bits, K_BITS).expect("gadget");
+            let _ = bit_decompose(&mut prover, var_k, &bits).expect("gadget");
 
-            // One multiplier gate per bit (λ+1 = 257), no extra allocations.
+            // One multiplier gate per bit for bitness, plus one per bit for
+            // the canonical `< p` range check.
             let metrics = prover.metrics();
             assert_eq!(
                 metrics.multipliers,
-                K_BITS + 1,
-                "expected exactly λ+1 multiplier gates, got {}",
+                2 * (K_BITS + 1),
+                "expected exactly 2*(K_BITS + 1) multiplier gates, got {}",
                 metrics.multipliers
             );
         }
@@ -2382,13 +2659,13 @@ pub mod secp_secq {
             let k = R1csField::from(0xABCDu64);
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
-            // Only λ bits supplied instead of λ+1: gadget must refuse to build
-            // a truncated circuit.
+            // Only K_BITS bits supplied instead of K_BITS + 1: gadget must
+            // refuse to build a truncated circuit.
             let short_bits = vec![None; K_BITS];
-            let result = bit_decompose(&mut prover, var_k, &short_bits, K_BITS);
+            let result = bit_decompose(&mut prover, var_k, &short_bits);
             assert!(
                 result.is_err(),
-                "bit_decompose must reject bit_assignments.len() != lambda + 1"
+                "bit_decompose must reject bit_assignments.len() != K_BITS + 1"
             );
         }
 
@@ -2397,9 +2674,8 @@ pub mod secp_secq {
             let pc_gens = PedersenGens::<R1csCycle>::default();
             let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0002);
 
-            let g_s = Gin::generator();
-            let X = g_s * GinScalar::from(12345u64);
-            let precomp = precompute_chord(&X, &g_s, K_BITS).expect("precompute");
+            let X = Gin::generator() * GinScalar::from(12345u64);
+            let precomp = precompute_chord(&X, K_BITS).expect("precompute");
 
             // bit_vars and precomp agree on λ+1 = 257 entries; build a witness
             // whose l_coords is one short so the length check fires before any
@@ -2407,6 +2683,7 @@ pub mod secp_secq {
             let truncated_witness = ChordWitness {
                 l_coords: vec![(R1csField::ZERO, R1csField::ZERO); K_BITS],
                 slopes: vec![R1csField::ZERO; K_BITS],
+                denom_delta_inverses: vec![R1csField::ZERO; K_BITS],
             };
 
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
@@ -2414,8 +2691,7 @@ pub mod secp_secq {
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
             let mut bit_assignments = vec![None; K_BITS + 1];
             decompose_k(&k, &mut bit_assignments);
-            let bit_vars =
-                bit_decompose(&mut prover, var_k, &bit_assignments, K_BITS).expect("bit_decomp");
+            let bit_vars = bit_decompose(&mut prover, var_k, &bit_assignments).expect("bit_decomp");
             let result = chord_exponentiate_r1cs(
                 &mut prover,
                 &bit_vars,
@@ -2430,19 +2706,15 @@ pub mod secp_secq {
             );
         }
 
-        /// The reconstruction constraint is modular (mod p), so a non-canonical
-        /// bit pattern encoding `k + p` satisfies `Σ 2^j * k_j ≡ k (mod p)`.
-        /// In isolation this proof verifies — the aliasing is caught by the
-        /// chord-rule gadget's final **full-point** constraint (both x and y)
-        /// in the full relation, not by the bit-decomp alone.  An x-only check
-        /// would be insufficient because `(k+p)·X = -k·X` shares the same
-        /// x-coordinate.  This test documents the isolation behavior.
+        /// A non-canonical bit pattern encoding `k + p` satisfies modular
+        /// reconstruction, so the gadget must reject it with an explicit
+        /// integer `< p` range check.
         #[test]
-        fn bit_decompose_modular_alias_passes_in_isolation() {
+        fn bit_decompose_rejects_modular_alias() {
             // 2^256 mod p is a known Fp constant.  We build bits encoding
             // k' = 2^256 (a 257-bit integer) and commit to k = 2^256 mod p.
             // The reconstruction Σ 2^j * k'_j = 2^256 ≡ (2^256 mod p) (mod p),
-            // so the constraint passes despite the non-canonical representation.
+            // so only the canonical range check rejects the witness.
             let two_pow_256_mod_p = {
                 let mut v = R1csField::ONE;
                 for _ in 0..256 {
@@ -2458,8 +2730,10 @@ pub mod secp_secq {
             }
             bits[K_BITS] = Some(R1csField::ONE);
 
-            // The proof verifies because 2^256 ≡ two_pow_256_mod_p (mod p).
-            run_bit_decompose(two_pow_256_mod_p, &bits).expect("modular alias passes in isolation");
+            assert!(
+                run_bit_decompose(two_pow_256_mod_p, &bits).is_err(),
+                "canonical range check must reject 2^256 as a non-canonical alias"
+            );
         }
 
         // ----------------------------------------------------------------
@@ -2473,11 +2747,19 @@ pub mod secp_secq {
         fn run_chord_exp(
             k_val: u64,
             X: &Gin,
-            g_s: &Gin,
             result_override: Option<(Fp, Fp)>,
         ) -> core::result::Result<(), R1CSError> {
+            run_chord_exp_with_witness(k_val, X, result_override, |_| {})
+        }
+
+        fn run_chord_exp_with_witness(
+            k_val: u64,
+            X: &Gin,
+            result_override: Option<(Fp, Fp)>,
+            mutate_witness: impl FnOnce(&mut ChordWitness),
+        ) -> core::result::Result<(), R1CSError> {
             let pc_gens = PedersenGens::<R1csCycle>::default();
-            // bit_decompose: 257 gates, chord_exp: ~768+ gates.  Pad to 4096.
+            // bit_decompose: 257 gates, chord_exp: ~1024+ gates.  Pad to 4096.
             let bp_gens = BulletproofGens::<R1csCycle>::new(4096, 1);
             let mut rng = ChaCha20Rng::seed_from_u64(0x5CA1E000);
 
@@ -2492,10 +2774,11 @@ pub mod secp_secq {
             }
 
             // Precompute C_j/D_j for base X.
-            let precomp = precompute_chord(X, g_s, K_BITS).expect("precompute");
+            let precomp = precompute_chord(X, K_BITS).expect("precompute");
 
             // Compute witness: all intermediate L_i and s_i.
-            let witness = chord_compute_witness(&bits, X, g_s, K_BITS).expect("witness");
+            let mut witness = chord_compute_witness(&bits, X, K_BITS).expect("witness");
+            mutate_witness(&mut witness);
 
             // Expected result: T = k * X.
             let t_point = X * k_fq;
@@ -2517,8 +2800,7 @@ pub mod secp_secq {
             // Prover
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
             let (v_k, var_k) = prover.commit(k_fp, random_scalar::<R1csCycle>(&mut rng));
-            let bit_vars =
-                bit_decompose(&mut prover, var_k, &bit_assignments, K_BITS).expect("bit_decomp");
+            let bit_vars = bit_decompose(&mut prover, var_k, &bit_assignments).expect("bit_decomp");
             chord_exponentiate_r1cs(
                 &mut prover,
                 &bit_vars,
@@ -2528,14 +2810,14 @@ pub mod secp_secq {
                 Some(&witness),
             )
             .expect("chord_exp");
-            let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
+            let proof = prover.prove(&bp_gens, &mut rng)?;
 
             // Verifier
             let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
             let v_k_var = verifier.commit(v_k);
             let verifier_bits = vec![None; K_BITS + 1];
             let bit_vars =
-                bit_decompose(&mut verifier, v_k_var, &verifier_bits, K_BITS).expect("bit_decomp");
+                bit_decompose(&mut verifier, v_k_var, &verifier_bits).expect("bit_decomp");
             chord_exponentiate_r1cs(&mut verifier, &bit_vars, &precomp, result_x, result_y, None)
                 .expect("chord_exp");
             verifier.verify(&proof, &pc_gens, &bp_gens, &mut rng)
@@ -2543,56 +2825,63 @@ pub mod secp_secq {
 
         #[test]
         fn chord_exp_honest_proof_verifies() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
-            run_chord_exp(0xDEADBEEFu64, &X, &g_s, None).expect("honest proof verifies");
+            let X = Gin::generator() * Fq::from(42u64);
+            run_chord_exp(0xDEADBEEFu64, &X, None).expect("honest proof verifies");
         }
 
         #[test]
         fn chord_exp_small_exponent_verifies() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(7u64);
-            run_chord_exp(3u64, &X, &g_s, None).expect("honest proof verifies");
+            let X = Gin::generator() * Fq::from(7u64);
+            run_chord_exp(3u64, &X, None).expect("honest proof verifies");
         }
 
         #[test]
         fn chord_exp_rejects_wrong_result_x() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
+            let X = Gin::generator() * Fq::from(42u64);
             let t = X * Fq::from(0xDEADBEEFu64);
             let (tx, ty) = affine(&t).expect("T affine");
             let wrong_x = tx + R1csField::ONE;
             assert!(
-                run_chord_exp(0xDEADBEEFu64, &X, &g_s, Some((wrong_x, ty))).is_err(),
+                run_chord_exp(0xDEADBEEFu64, &X, Some((wrong_x, ty))).is_err(),
                 "verifier must reject wrong result x"
             );
         }
 
         #[test]
         fn chord_exp_rejects_wrong_result_y() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
+            let X = Gin::generator() * Fq::from(42u64);
             let t = X * Fq::from(0xDEADBEEFu64);
             let (tx, ty) = affine(&t).expect("T affine");
             let wrong_y = ty + R1csField::ONE;
             assert!(
-                run_chord_exp(0xDEADBEEFu64, &X, &g_s, Some((tx, wrong_y))).is_err(),
+                run_chord_exp(0xDEADBEEFu64, &X, Some((tx, wrong_y))).is_err(),
                 "verifier must reject wrong result y"
             );
         }
 
         #[test]
         fn chord_exp_rejects_negated_result_y() {
-            let g_s = Gin::generator();
-            let X = g_s * Fq::from(42u64);
+            let X = Gin::generator() * Fq::from(42u64);
             let t = X * Fq::from(0xDEADBEEFu64);
             let (tx, ty) = affine(&t).expect("T affine");
             // -T has the same x but negated y.  The full-point binding
             // (x AND y) must reject this, unlike an x-only check.
             let neg_y = -ty;
             assert!(
-                run_chord_exp(0xDEADBEEFu64, &X, &g_s, Some((tx, neg_y))).is_err(),
+                run_chord_exp(0xDEADBEEFu64, &X, Some((tx, neg_y))).is_err(),
                 "verifier must reject -T (same x, negated y)"
+            );
+        }
+
+        #[test]
+        fn chord_exp_rejects_wrong_delta_denominator_inverse() {
+            let X = Gin::generator() * Fq::from(42u64);
+            assert!(
+                run_chord_exp_with_witness(0xDEADBEEFu64, &X, None, |w| {
+                    w.denom_delta_inverses[0] += R1csField::ONE;
+                })
+                .is_err(),
+                "verifier must reject a wrong inverse for x_L_prev - x_Delta"
             );
         }
     }
@@ -2777,6 +3066,7 @@ pub mod secp_secq {
     #[allow(clippy::unwrap_used)]
     mod dkg_unit_tests {
         use super::*;
+        use golden_core::GoldenGroup;
         use halo2curves::secp256k1::Fp;
 
         #[test]
@@ -2796,27 +3086,169 @@ pub mod secp_secq {
             assert!(!fp_canonical_lt(&p_minus_1, &wrapped));
         }
 
+        fn context_statement() -> BatchedEvrfStatement {
+            let g_in = Gin::generator();
+            let pk1 = g_in * GinScalar::from(3u64);
+            let pkj = g_in * GinScalar::from(5u64);
+            let share = GinScalar::from(13u64);
+            let pad = GinScalar::from(7u64);
+
+            BatchedEvrfStatement {
+                msg: [9u8; MESSAGE_BYTES],
+                pk1,
+                beta: R1csField::from(17u64),
+                threshold: 1,
+                commitment_coefficients: vec![g_in * share],
+                statement_roots: vec![[1u8; 32]],
+                receivers: vec![BatchedReceiverStatement {
+                    receiver: ParticipantIndex::new(1).unwrap(),
+                    pkj,
+                    share_commitment: g_in * share,
+                    pad_commitment: g_in * pad,
+                    dh_commitment: pkj * pad,
+                    encrypted_share: share + pad,
+                }],
+            }
+        }
+
+        fn evrf_statement() -> EvrfStatement<Secp256k1GoldenGroup> {
+            let statement = context_statement();
+            let rec = &statement.receivers[0];
+            EvrfStatement {
+                protocol_version: golden_core::PROTOCOL_VERSION,
+                backend_id: <Secp256k1GoldenGroup as GoldenGroup>::BACKEND_ID,
+                session_id: golden_core::SessionId([3u8; 32]),
+                registry_root: [4u8; 32],
+                threshold: statement.threshold,
+                dealer: ParticipantIndex::new(2).unwrap(),
+                receiver: rec.receiver,
+                msg_i: DealerMessageNonce(statement.msg),
+                beta: Secp256k1Scalar(GinScalar::from(17u64)),
+                dealer_public_key: Secp256k1Element(statement.pk1),
+                receiver_public_key: Secp256k1Element(rec.pkj),
+                commitment_coefficients: statement
+                    .commitment_coefficients
+                    .iter()
+                    .copied()
+                    .map(Secp256k1Element)
+                    .collect(),
+                share_commitment: Secp256k1Element(rec.share_commitment),
+                pad_commitment: Secp256k1Element(rec.pad_commitment),
+                dh_commitment: Secp256k1Element(rec.dh_commitment),
+                encrypted_share: Secp256k1Scalar(rec.encrypted_share),
+                transcript_root: [5u8; 32],
+            }
+        }
+
         #[test]
-        fn decoders_reject_short_inputs() {
-            use super::{decode_fp, decode_fq, decode_gin, decode_gout};
-            let short_secp = [0u8; SECP_COMPRESSED - 1];
-            let short_secq = [0u8; SECQ_COMPRESSED - 1];
-            let short_fp = [0u8; FP_BYTES - 1];
-            let short_fq = [0u8; FQ_BYTES - 1];
+        fn batched_transcripts_bind_statement_roots() {
+            let statement = context_statement();
+            let mut changed = statement.clone();
+            changed.statement_roots[0][0] ^= 0x80;
+
+            let mut r1cs_a = batched_r1cs_transcript(&statement);
+            let mut r1cs_b = batched_r1cs_transcript(&changed);
+            assert_ne!(
+                challenge_scalar::<R1csCycle>(&mut r1cs_a, b"probe"),
+                challenge_scalar::<R1csCycle>(&mut r1cs_b, b"probe"),
+                "R1CS transcript must bind the ordered DKG statement roots"
+            );
+        }
+
+        #[test]
+        fn batched_statement_rejects_root_count_mismatch() {
+            let mut statement = context_statement();
+            statement.statement_roots.clear();
             assert_eq!(
-                decode_gin(&short_secp).unwrap_err(),
+                validate_batched_public_relations(&statement).unwrap_err(),
                 Error::ProofVerificationFailed
             );
+        }
+
+        #[test]
+        fn batched_statement_rejects_wrong_feldman_commitment() {
+            let g_in = Gin::generator();
+            let mut statement = context_statement();
+            statement.commitment_coefficients[0] += g_in;
             assert_eq!(
-                decode_gout(&short_secq).unwrap_err(),
+                validate_batched_public_relations(&statement).unwrap_err(),
                 Error::ProofVerificationFailed
             );
+        }
+
+        #[test]
+        fn batched_statement_rejects_threshold_commitment_mismatch() {
+            let mut statement = context_statement();
+            statement.threshold += 1;
             assert_eq!(
-                decode_fp(&short_fp).unwrap_err(),
+                validate_batched_public_relations(&statement).unwrap_err(),
                 Error::ProofVerificationFailed
             );
+        }
+
+        #[test]
+        fn batched_statement_rejects_wrong_encrypted_share_relation() {
+            let mut statement = context_statement();
+            statement.receivers[0].encrypted_share += GinScalar::ONE;
             assert_eq!(
-                decode_fq(&short_fq).unwrap_err(),
+                validate_batched_public_relations(&statement).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        fn assert_batched_statement_rejects_identity(
+            mutate: impl FnOnce(&mut BatchedEvrfStatement),
+        ) {
+            let mut statement = context_statement();
+            mutate(&mut statement);
+            assert_eq!(
+                validate_batched_public_relations(&statement).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        #[test]
+        fn batched_statement_rejects_identity_pk1() {
+            assert_batched_statement_rejects_identity(|statement| {
+                statement.pk1 = Gin::identity();
+            });
+        }
+
+        #[test]
+        fn batched_statement_rejects_identity_receiver_pk() {
+            assert_batched_statement_rejects_identity(|statement| {
+                statement.receivers[0].pkj = Gin::identity();
+            });
+        }
+
+        #[test]
+        fn batched_statement_rejects_identity_share_commitment() {
+            assert_batched_statement_rejects_identity(|statement| {
+                statement.receivers[0].share_commitment = Gin::identity();
+            });
+        }
+
+        #[test]
+        fn batched_statement_rejects_identity_pad_commitment() {
+            assert_batched_statement_rejects_identity(|statement| {
+                statement.receivers[0].pad_commitment = Gin::identity();
+            });
+        }
+
+        #[test]
+        fn batched_statement_rejects_identity_dh_commitment() {
+            assert_batched_statement_rejects_identity(|statement| {
+                statement.receivers[0].dh_commitment = Gin::identity();
+            });
+        }
+
+        #[test]
+        fn batch_context_rejects_shared_field_mismatch() {
+            let first = evrf_statement();
+            let mut changed = first.clone();
+            changed.msg_i.0[0] ^= 0x80;
+            assert_eq!(
+                ensure_same_batch_context(&changed, &first).unwrap_err(),
                 Error::ProofVerificationFailed
             );
         }

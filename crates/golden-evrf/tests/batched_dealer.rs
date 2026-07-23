@@ -9,6 +9,7 @@
 
 use ff::Field;
 use golden_evrf::paper::secp_secq::{self as paper, Gin, GinScalar, R1csField};
+use group::Group;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
 fn make_msg(seed: u64) -> [u8; 32] {
@@ -36,6 +37,30 @@ fn evrf_batched_dealer_honest_proof_verifies() {
     let proof = paper::evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_batched_verify(&statement, &proof, &mut verify_rng).expect("verify");
+}
+
+#[test]
+#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+fn evrf_batched_dealer_rejects_identity_share_commitment() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C10);
+    let sk1 = GinScalar::random(&mut rng);
+    let pkjs = make_pkjs(&mut rng, 1);
+    let beta = R1csField::from(7u64);
+    let msg = make_msg(0xABCE);
+    let (mut statement, mut witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+
+    let pad = statement.receivers[0].encrypted_share - witness.shares[0];
+    witness.shares[0] = GinScalar::ZERO;
+    witness.coefficient_scalars = vec![GinScalar::ZERO];
+    statement.threshold = 1;
+    statement.commitment_coefficients = vec![Gin::identity()];
+    statement.receivers[0].share_commitment = Gin::identity();
+    statement.receivers[0].encrypted_share = pad;
+
+    assert!(
+        paper::evrf_batched_prove(&statement, &witness, &mut rng).is_err(),
+        "batched proof should reject identity share commitments before circuit construction"
+    );
 }
 
 #[test]
@@ -73,6 +98,7 @@ fn evrf_batched_dealer_rejects_reordered_receivers() {
 
     let mut bad = statement.clone();
     bad.receivers.reverse();
+    bad.statement_roots.reverse();
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
@@ -94,6 +120,7 @@ fn evrf_batched_dealer_rejects_missing_receiver() {
 
     let mut bad = statement.clone();
     bad.receivers.pop();
+    bad.statement_roots.pop();
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
@@ -124,7 +151,7 @@ fn evrf_batched_dealer_rejects_wrong_beta() {
 
 #[test]
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-fn evrf_batched_dealer_rejects_wrong_r() {
+fn evrf_batched_dealer_rejects_wrong_pad_commitment() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C6);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 2);
@@ -134,13 +161,92 @@ fn evrf_batched_dealer_rejects_wrong_r() {
 
     let proof = paper::evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
 
-    let g_out = paper::Gout::generator();
     let mut bad = statement.clone();
-    bad.receivers[1].r_point_j = g_out * R1csField::random(&mut rng);
+    bad.receivers[1].pad_commitment = Gin::generator() * GinScalar::random(&mut rng);
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
-        "verifier must reject a swapped R_j"
+        "verifier must reject a swapped pad commitment"
+    );
+}
+
+#[test]
+#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+fn evrf_batched_dealer_rejects_wrong_dh_commitment() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C7);
+    let sk1 = GinScalar::random(&mut rng);
+    let pkjs = make_pkjs(&mut rng, 2);
+    let beta = R1csField::from(7u64);
+    let msg = make_msg(5);
+    let (statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+
+    let proof = paper::evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
+
+    let mut bad = statement.clone();
+    bad.receivers[1].dh_commitment = Gin::generator() * GinScalar::random(&mut rng);
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    assert!(
+        paper::evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
+        "verifier must reject a swapped DH commitment"
+    );
+}
+
+#[test]
+#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+fn evrf_batched_dealer_rejects_wrong_share_commitment() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C61);
+    let sk1 = GinScalar::random(&mut rng);
+    let pkjs = make_pkjs(&mut rng, 2);
+    let beta = R1csField::from(7u64);
+    let msg = make_msg(5);
+    let (statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+
+    let proof = paper::evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
+
+    let mut bad = statement.clone();
+    bad.receivers[1].share_commitment = Gin::generator() * GinScalar::random(&mut rng);
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    assert!(
+        paper::evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
+        "verifier must reject a swapped share commitment"
+    );
+}
+
+#[test]
+#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+fn evrf_batched_dealer_rejects_wrong_polynomial_coefficient_witness() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C63);
+    let sk1 = GinScalar::random(&mut rng);
+    let pkjs = make_pkjs(&mut rng, 2);
+    let beta = R1csField::from(7u64);
+    let msg = make_msg(5);
+    let (statement, mut witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+
+    witness.coefficient_scalars[0] += GinScalar::ONE;
+    assert!(
+        paper::evrf_batched_prove(&statement, &witness, &mut rng).is_err(),
+        "prover must reject polynomial coefficients that do not open the public Feldman commitments"
+    );
+}
+
+#[test]
+#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+fn evrf_batched_dealer_rejects_wrong_encrypted_share() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C62);
+    let sk1 = GinScalar::random(&mut rng);
+    let pkjs = make_pkjs(&mut rng, 2);
+    let beta = R1csField::from(7u64);
+    let msg = make_msg(5);
+    let (statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+
+    let proof = paper::evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
+
+    let mut bad = statement.clone();
+    bad.receivers[1].encrypted_share += GinScalar::from(1u64);
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    assert!(
+        paper::evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
+        "verifier must reject a swapped encrypted share"
     );
 }
 
@@ -162,6 +268,27 @@ fn evrf_batched_dealer_rejects_wrong_msg() {
     assert!(
         paper::evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
         "verifier must reject a mutated msg"
+    );
+}
+
+#[test]
+#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+fn evrf_batched_dealer_rejects_wrong_statement_root() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C70);
+    let sk1 = GinScalar::random(&mut rng);
+    let pkjs = make_pkjs(&mut rng, 2);
+    let beta = R1csField::from(7u64);
+    let msg = make_msg(6);
+    let (statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+
+    let proof = paper::evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
+
+    let mut bad = statement.clone();
+    bad.statement_roots[0][0] ^= 0x80;
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    assert!(
+        paper::evrf_batched_verify(&bad, &proof, &mut verify_rng).is_err(),
+        "verifier must reject a proof replayed under a different statement root"
     );
 }
 

@@ -154,6 +154,8 @@ pub struct EvrfStatement<G: GoldenGroup> {
     pub session_id: SessionId,
     /// Registry root.
     pub registry_root: TranscriptRoot,
+    /// DKG threshold.
+    pub threshold: usize,
     /// Dealer.
     pub dealer: ParticipantIndex,
     /// Receiver.
@@ -166,6 +168,8 @@ pub struct EvrfStatement<G: GoldenGroup> {
     pub dealer_public_key: G::Element,
     /// Receiver identity public key.
     pub receiver_public_key: G::Element,
+    /// Ordered Feldman commitment coefficients for the dealer polynomial.
+    pub commitment_coefficients: Vec<G::Element>,
     /// Public commitment to the receiver share.
     pub share_commitment: G::Element,
     /// Public commitment to the pad scalar.
@@ -190,6 +194,8 @@ impl<G: GoldenGroup> EvrfStatement<G> {
 pub struct EvrfWitness<G: GoldenGroup> {
     /// Dealer identity secret opening the dealer identity public key.
     pub identity_secret: G::Scalar,
+    /// Polynomial coefficients in ascending degree order.
+    pub polynomial_coefficients: Vec<G::Scalar>,
     /// Scalar share opening the public share commitment.
     pub share: G::Scalar,
     /// Scalar pad opening the public pad and DH commitments.
@@ -200,6 +206,7 @@ impl<G: GoldenGroup> core::fmt::Debug for EvrfWitness<G> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EvrfWitness")
             .field("identity_secret", &"<redacted>")
+            .field("polynomial_coefficients", &"<redacted>")
             .field("share", &"<redacted>")
             .field("pad", &"<redacted>")
             .finish()
@@ -392,11 +399,13 @@ where
             *receiver,
             msg_i,
             share_commitment,
+            commitment.coefficients().to_vec(),
             encrypted_share,
             transcript_root,
         )?;
         let witness = EvrfWitness {
             identity_secret: dealer_identity_secret.clone(),
+            polynomial_coefficients: polynomial.coefficients().to_vec(),
             share: share_value.clone(),
             // Reuse the authoritative pad we just derived above instead of
             // back-solving it from `encrypted_share - share`. The two are
@@ -505,6 +514,7 @@ where
             receiver,
             message.msg_i,
             share_commitment,
+            message.commitment.coefficients().to_vec(),
             encrypted_share,
             message.transcript_root,
         )?;
@@ -780,12 +790,14 @@ fn completion_root<G: GoldenGroup, P>(
     transcript.root()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn statement_for_receiver<G: GoldenGroup>(
     config: &DkgConfig<G>,
     dealer: ParticipantIndex,
     receiver: ParticipantIndex,
     msg_i: DealerMessageNonce,
     share_commitment: G::Element,
+    commitment_coefficients: Vec<G::Element>,
     encrypted_share: EncryptedShare<G>,
     transcript_root: TranscriptRoot,
 ) -> Result<EvrfStatement<G>> {
@@ -794,12 +806,14 @@ fn statement_for_receiver<G: GoldenGroup>(
         backend_id: G::BACKEND_ID,
         session_id: config.session_id,
         registry_root: config.registry.root(),
+        threshold: config.threshold,
         dealer,
         receiver,
         msg_i,
         beta: config.beta.clone(),
         dealer_public_key: config.registry.public_key(dealer)?.clone(),
         receiver_public_key: config.registry.public_key(receiver)?.clone(),
+        commitment_coefficients,
         share_commitment,
         pad_commitment: encrypted_share.pad_commitment,
         dh_commitment: encrypted_share.dh_commitment,
@@ -814,12 +828,17 @@ fn statement_root<G: GoldenGroup>(statement: &EvrfStatement<G>) -> TranscriptRoo
     transcript.bytes(b"backend", statement.backend_id.as_bytes());
     transcript.bytes(b"session", &statement.session_id.0);
     transcript.bytes(b"registry", &statement.registry_root);
+    transcript.usize(b"threshold", statement.threshold);
     transcript.participant(b"dealer", statement.dealer);
     transcript.participant(b"receiver", statement.receiver);
     transcript.bytes(b"msg-i", &statement.msg_i.0);
     transcript.scalar::<G>(b"beta", &statement.beta);
     transcript.element::<G>(b"dealer-pk", &statement.dealer_public_key);
     transcript.element::<G>(b"receiver-pk", &statement.receiver_public_key);
+    transcript.usize(b"commitment-len", statement.commitment_coefficients.len());
+    for coefficient in &statement.commitment_coefficients {
+        transcript.element::<G>(b"commitment", coefficient);
+    }
     transcript.element::<G>(b"share-commitment", &statement.share_commitment);
     transcript.element::<G>(b"pad-commitment", &statement.pad_commitment);
     transcript.element::<G>(b"dh-commitment", &statement.dh_commitment);
@@ -895,6 +914,7 @@ mod tests {
         ) -> Result<Self::Proof> {
             let mut map = BTreeMap::new();
             for (statement, witness) in statements.iter().zip(witnesses.iter()) {
+                ensure_fake_public_relations(statement)?;
                 if TinyGroup::mul_generator(&witness.identity_secret) != statement.dealer_public_key
                 {
                     return Err(Error::ProofVerificationFailed);
@@ -909,6 +929,7 @@ mod tests {
             proof: &Self::Proof,
         ) -> Result<()> {
             for statement in statements {
+                ensure_fake_public_relations(statement)?;
                 let entry = proof
                     .0
                     .get(&statement.receiver)
@@ -919,6 +940,37 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    fn ensure_fake_public_relations(statement: &EvrfStatement<TinyGroup>) -> Result<()> {
+        if statement.commitment_coefficients.is_empty()
+            || statement.commitment_coefficients.len() != statement.threshold
+        {
+            return Err(Error::ProofVerificationFailed);
+        }
+
+        let x = statement.receiver.to_scalar::<TinyScalar>()?;
+        let mut x_pow = TinyScalar::one();
+        let mut expected_share_commitment = TinyGroup::identity();
+        for coefficient in &statement.commitment_coefficients {
+            expected_share_commitment = TinyGroup::add(
+                &expected_share_commitment,
+                &TinyGroup::mul(coefficient, &x_pow),
+            );
+            x_pow = x_pow.mul(&x);
+        }
+        if expected_share_commitment != statement.share_commitment {
+            return Err(Error::ProofVerificationFailed);
+        }
+
+        let encrypted_share_commitment = TinyGroup::mul_generator(&statement.encrypted_share);
+        let expected_encrypted_share_commitment =
+            TinyGroup::add(&statement.share_commitment, &statement.pad_commitment);
+        if encrypted_share_commitment != expected_encrypted_share_commitment {
+            return Err(Error::ProofVerificationFailed);
+        }
+
+        Ok(())
     }
 
     #[derive(Clone, Debug)]
@@ -1614,6 +1666,7 @@ mod tests {
                         .commitment
                         .public_key_share(receiver)
                         .unwrap(),
+                    dealing.message.commitment.coefficients().to_vec(),
                     encrypted_share.clone(),
                     dealing.message.transcript_root,
                 )
@@ -1708,6 +1761,7 @@ mod tests {
                     .commitment
                     .public_key_share(receiver)
                     .unwrap(),
+                dealing.message.commitment.coefficients().to_vec(),
                 encrypted_share,
                 dealing.message.transcript_root,
             )
@@ -1788,6 +1842,7 @@ mod tests {
                     .commitment
                     .public_key_share(proof_receiver)
                     .unwrap(),
+                dealing.message.commitment.coefficients().to_vec(),
                 encrypted_share,
                 dealing.message.transcript_root,
             )

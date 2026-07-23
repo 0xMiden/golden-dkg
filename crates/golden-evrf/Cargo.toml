@@ -49,5 +49,9 @@ required-features = ["halo2curves-secp256k1"]
 name = "dkg_integration"
 required-features = ["halo2curves-secp256k1"]
 
+[[test]]
+name = "paper_public_api"
+required-features = ["halo2curves-secp256k1"]
+
 [lints]
 workspace = true
