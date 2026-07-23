@@ -1912,12 +1912,15 @@ pub mod secp_secq {
 
     impl wire::WireDecode for SecpSecqProof {
         fn read_wire(reader: &mut wire::WireReader<'_>) -> Result<Self> {
-            Ok(Self(<Vec<u8> as wire::WireDecode>::read_wire(reader)?))
+            let bytes = <Vec<u8> as wire::WireDecode>::read_wire(reader)?;
+            decode_proof(&bytes)?;
+            Ok(Self(bytes))
         }
     }
 
     impl wire::WireMessage for SecpSecqProof {
         const TAG: u8 = wire::TAG_PROOF_BYTES;
+        const CODEC_ID: &'static str = "secp-secq-r1cs-proof-v1";
     }
 
     #[cfg(feature = "miden-serde")]
@@ -3160,6 +3163,7 @@ pub mod secp_secq {
     #[allow(clippy::unwrap_used)]
     mod dkg_unit_tests {
         use super::*;
+        use bulletproofs_cycle::Cycle;
         use golden_core::GoldenGroup;
         use halo2curves::secp256k1::Fp;
 
@@ -3232,6 +3236,25 @@ pub mod secp_secq {
                 encrypted_share: Secp256k1Scalar(rec.encrypted_share),
                 transcript_root: [5u8; 32],
             }
+        }
+
+        fn structurally_valid_proof_bytes() -> Vec<u8> {
+            const ONE_PHASE_COMMITMENTS: u8 = 0;
+
+            let compressed = Secq256k1Cycle::compressed_identity();
+            let mut r1cs = Vec::new();
+            r1cs.push(ONE_PHASE_COMMITMENTS);
+            for _ in 0..8 {
+                r1cs.extend_from_slice(Secq256k1Cycle::compressed_as_bytes(&compressed));
+            }
+            r1cs.extend_from_slice(&[0u8; 32 * 5]);
+
+            let r1cs_len = u32::try_from(r1cs.len()).unwrap();
+            let mut out = Vec::with_capacity(8 + r1cs.len());
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&r1cs_len.to_le_bytes());
+            out.extend_from_slice(&r1cs);
+            out
         }
 
         #[test]
@@ -3349,11 +3372,22 @@ pub mod secp_secq {
 
         #[test]
         fn secp_secq_proof_wire_wraps_complete_proof_bytes() {
-            let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
+            let proof = SecpSecqProof(structurally_valid_proof_bytes());
             let bytes = wire::to_wire_bytes(&proof);
             let decoded = wire::from_wire_bytes::<SecpSecqProof>(&bytes).unwrap();
 
             assert_eq!(decoded, proof);
+        }
+
+        #[test]
+        fn secp_secq_proof_wire_rejects_malformed_proof_bytes() {
+            let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
+            let bytes = wire::to_wire_bytes(&proof);
+
+            assert_eq!(
+                wire::from_wire_bytes::<SecpSecqProof>(&bytes).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
         }
 
         #[cfg(feature = "serde")]
@@ -3361,7 +3395,7 @@ pub mod secp_secq {
         fn secp_secq_proof_serde_uses_canonical_wire_bytes() {
             use serde_test::{assert_de_tokens, assert_tokens, Token};
 
-            let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
+            let proof = SecpSecqProof(structurally_valid_proof_bytes());
             let bytes: &'static [u8] = Box::leak(wire::to_wire_bytes(&proof).into_boxed_slice());
 
             assert_tokens(&proof, &[Token::Bytes(bytes)]);
@@ -3381,7 +3415,7 @@ pub mod secp_secq {
         fn secp_secq_proof_miden_serde_uses_canonical_wire_bytes() {
             use miden_serde_utils::{Deserializable, Serializable, SliceReader};
 
-            let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
+            let proof = SecpSecqProof(structurally_valid_proof_bytes());
             let bytes = proof.to_bytes();
             let wire_bytes = wire::to_wire_bytes(&proof);
 

@@ -62,6 +62,8 @@ impl ConstantTimeEq for Secp256k1Scalar {
 impl GoldenScalar for Secp256k1Scalar {
     type Repr = [u8; 32];
 
+    const REPR_BYTES: usize = 32;
+
     fn zero() -> Self {
         Self(Fq::ZERO)
     }
@@ -156,6 +158,8 @@ impl GoldenGroup for Secp256k1GoldenGroup {
     type Scalar = Secp256k1Scalar;
     type Element = Secp256k1Element;
     type ElementRepr = [u8; 33];
+
+    const ELEMENT_REPR_BYTES: usize = 33;
 
     const BACKEND_ID: &'static str = "halo2curves-secp256k1-v1";
 
