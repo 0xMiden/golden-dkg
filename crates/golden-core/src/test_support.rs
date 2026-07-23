@@ -31,6 +31,8 @@ impl zeroize::Zeroize for TinyScalar {
 impl GoldenScalar for TinyScalar {
     type Repr = [u8; 1];
 
+    const REPR_BYTES: usize = 1;
+
     fn zero() -> Self {
         Self(0)
     }
@@ -100,6 +102,8 @@ impl GoldenGroup for TinyGroup {
     type Scalar = TinyScalar;
     type Element = TinyScalar;
     type ElementRepr = [u8; 1];
+
+    const ELEMENT_REPR_BYTES: usize = 1;
 
     const BACKEND_ID: &'static str = "golden-test-tiny-v1";
 

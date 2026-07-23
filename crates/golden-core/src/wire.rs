@@ -1,8 +1,8 @@
 //! Canonical byte encoding for Golden DKG wire values.
 //!
-//! Standalone wire values start with [`MAGIC`] followed by a one-byte type tag.
-//! Nested fields omit that prefix and are encoded in the order documented by
-//! each type's [`WireEncode`] implementation.
+//! Standalone wire values start with [`MAGIC`], a one-byte type tag, and a
+//! codec context. Nested fields omit that envelope and are encoded in the order
+//! documented by each type's [`WireEncode`] implementation.
 //!
 //! In the DKG protocol, [`DealerMessage`] is the broadcast message. The other
 //! tagged values are standalone encodings for setup artifacts, nested fields,
@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// Magic prefix for every standalone DKG wire value.
-pub const MAGIC: &[u8; 18] = b"golden-dkg-wire-v2";
+pub const MAGIC: &[u8; 18] = b"golden-dkg-wire-v3";
 
 /// Standalone tag for [`SessionId`].
 pub const TAG_SESSION_ID: u8 = 0x01;
@@ -72,6 +72,19 @@ pub trait WireDecode: Sized {
 pub trait WireMessage: WireEncode + WireDecode {
     /// Standalone type tag.
     const TAG: u8;
+
+    /// Stable codec identifier inside the standalone envelope.
+    const CODEC_ID: &'static str;
+
+    /// Write codec context after the top-level tag.
+    fn write_wire_context(out: &mut Vec<u8>) {
+        write_context_field(out, Self::CODEC_ID.as_bytes());
+    }
+
+    /// Read and validate codec context after the top-level tag.
+    fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
+        expect_context_field(reader, Self::CODEC_ID.as_bytes())
+    }
 }
 
 /// Return a standalone canonical wire value.
@@ -79,6 +92,7 @@ pub fn to_wire_bytes<T: WireMessage>(value: &T) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.push(T::TAG);
+    T::write_wire_context(&mut out);
     value.write_wire(&mut out);
     out
 }
@@ -91,6 +105,7 @@ pub fn from_wire_bytes<T: WireMessage>(bytes: &[u8]) -> Result<T> {
     if tag != T::TAG {
         return Err(Error::InvalidEncoding);
     }
+    T::read_wire_context(&mut reader)?;
     let value = T::read_wire(&mut reader)?;
     reader.finish()?;
     Ok(value)
@@ -202,6 +217,7 @@ impl WireDecode for SessionId {
 
 impl WireMessage for SessionId {
     const TAG: u8 = TAG_SESSION_ID;
+    const CODEC_ID: &'static str = "session-id-v1";
 }
 
 impl WireEncode for DealerMessageNonce {
@@ -218,6 +234,7 @@ impl WireDecode for DealerMessageNonce {
 
 impl WireMessage for DealerMessageNonce {
     const TAG: u8 = TAG_DEALER_MESSAGE_NONCE;
+    const CODEC_ID: &'static str = "dealer-message-nonce-v1";
 }
 
 impl WireEncode for ParticipantIndex {
@@ -272,6 +289,17 @@ where
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_ENCRYPTED_SHARE;
+    const CODEC_ID: &'static str = "encrypted-share-v1";
+
+    fn write_wire_context(out: &mut Vec<u8>) {
+        write_context_field(out, Self::CODEC_ID.as_bytes());
+        write_context_field(out, G::BACKEND_ID.as_bytes());
+    }
+
+    fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
+        expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
+        expect_context_field(reader, G::BACKEND_ID.as_bytes())
+    }
 }
 
 impl<G: GoldenGroup> WireEncode for FeldmanCommitment<G> {
@@ -290,7 +318,7 @@ where
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let len = reader.read_len()?;
-        reader.ensure_remaining_items(len, G::encode_element(&G::identity()).as_ref().len())?;
+        reader.ensure_remaining_items(len, G::ELEMENT_REPR_BYTES)?;
         let mut coefficients = Vec::with_capacity(len);
         for _ in 0..len {
             coefficients.push(read_element::<G>(reader)?);
@@ -305,6 +333,17 @@ where
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_FELDMAN_COMMITMENT;
+    const CODEC_ID: &'static str = "feldman-commitment-v1";
+
+    fn write_wire_context(out: &mut Vec<u8>) {
+        write_context_field(out, Self::CODEC_ID.as_bytes());
+        write_context_field(out, G::BACKEND_ID.as_bytes());
+    }
+
+    fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
+        expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
+        expect_context_field(reader, G::BACKEND_ID.as_bytes())
+    }
 }
 
 impl<G: GoldenGroup> WireEncode for ParticipantRegistry<G> {
@@ -324,7 +363,7 @@ where
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let len = reader.read_len()?;
-        let entry_len = 4 + G::encode_element(&G::identity()).as_ref().len();
+        let entry_len = 4 + G::ELEMENT_REPR_BYTES;
         reader.ensure_remaining_items(len, entry_len)?;
         let mut entries = Vec::with_capacity(len);
         let mut last = None;
@@ -343,6 +382,17 @@ where
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_PARTICIPANT_REGISTRY;
+    const CODEC_ID: &'static str = "participant-registry-v1";
+
+    fn write_wire_context(out: &mut Vec<u8>) {
+        write_context_field(out, Self::CODEC_ID.as_bytes());
+        write_context_field(out, G::BACKEND_ID.as_bytes());
+    }
+
+    fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
+        expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
+        expect_context_field(reader, G::BACKEND_ID.as_bytes())
+    }
 }
 
 impl<G: GoldenGroup> WireEncode for DkgConfig<G> {
@@ -374,6 +424,17 @@ where
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_DKG_CONFIG;
+    const CODEC_ID: &'static str = "dkg-config-v1";
+
+    fn write_wire_context(out: &mut Vec<u8>) {
+        write_context_field(out, Self::CODEC_ID.as_bytes());
+        write_context_field(out, G::BACKEND_ID.as_bytes());
+    }
+
+    fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
+        expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
+        expect_context_field(reader, G::BACKEND_ID.as_bytes())
+    }
 }
 
 impl<G, P> WireEncode for DealerMessage<G, P>
@@ -409,9 +470,7 @@ where
         let msg_i = DealerMessageNonce::read_wire(reader)?;
         let commitment = FeldmanCommitment::<G>::read_wire(reader)?;
         let len = reader.read_len()?;
-        let encrypted_share_len = 4
-            + 2 * G::encode_element(&G::identity()).as_ref().len()
-            + G::Scalar::zero().to_repr().as_ref().len();
+        let encrypted_share_len = 4 + 2 * G::ELEMENT_REPR_BYTES + G::Scalar::REPR_BYTES;
         reader.ensure_remaining_items(len, encrypted_share_len)?;
         let mut encrypted_shares = BTreeMap::new();
         let mut last = None;
@@ -440,9 +499,26 @@ impl<G, P> WireMessage for DealerMessage<G, P>
 where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,
-    P: WireEncode + WireDecode,
+    P: WireMessage,
 {
     const TAG: u8 = TAG_DEALER_MESSAGE;
+    const CODEC_ID: &'static str = "dealer-message-v1";
+
+    fn write_wire_context(out: &mut Vec<u8>) {
+        write_context_field(out, Self::CODEC_ID.as_bytes());
+        write_context_field(out, G::BACKEND_ID.as_bytes());
+        out.push(P::TAG);
+        P::write_wire_context(out);
+    }
+
+    fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
+        expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
+        expect_context_field(reader, G::BACKEND_ID.as_bytes())?;
+        if reader.read_u8()? != P::TAG {
+            return Err(Error::InvalidEncoding);
+        }
+        P::read_wire_context(reader)
+    }
 }
 
 impl WireEncode for Vec<u8> {
@@ -461,6 +537,7 @@ impl WireDecode for Vec<u8> {
 
 impl WireMessage for Vec<u8> {
     const TAG: u8 = TAG_PROOF_BYTES;
+    const CODEC_ID: &'static str = "opaque-proof-bytes-v1";
 }
 
 #[cfg(feature = "miden-serde")]
@@ -620,7 +697,7 @@ impl<G, P> Serializable for DealerMessage<G, P>
 where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,
-    P: WireEncode + WireDecode,
+    P: WireMessage,
 {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         write_miden_wire(self, target);
@@ -636,7 +713,7 @@ impl<G, P> Deserializable for DealerMessage<G, P>
 where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,
-    P: WireEncode + WireDecode,
+    P: WireMessage,
 {
     fn read_from<R: ByteReader>(
         source: &mut R,
@@ -678,6 +755,8 @@ where
 #[cfg(feature = "miden-serde")]
 /// Return the serialized size hint for a length-delimited Miden wire value.
 pub fn miden_wire_size_hint<T: WireMessage>(value: &T) -> usize {
+    // Miden asks for a size hint, not a no-allocation bound. Reuse the
+    // canonical encoder here so the hint cannot drift from the written bytes.
     let len = to_wire_bytes(value).len();
     miden_usize_size(len) + len
 }
@@ -810,7 +889,7 @@ impl<G, P> Serialize for DealerMessage<G, P>
 where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,
-    P: WireEncode + WireDecode,
+    P: WireMessage,
 {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
         serialize_wire(self, serializer)
@@ -822,7 +901,7 @@ impl<'de, G, P> Deserialize<'de> for DealerMessage<G, P>
 where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,
-    P: WireEncode + WireDecode,
+    P: WireMessage,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
         deserialize_wire(deserializer)
@@ -891,6 +970,22 @@ pub fn write_len(out: &mut Vec<u8>, value: usize) {
     out.extend_from_slice(&(value as u64).to_be_bytes());
 }
 
+/// Write one length-delimited codec context field.
+pub fn write_context_field(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_len(out, bytes.len());
+    out.extend_from_slice(bytes);
+}
+
+/// Read one length-delimited codec context field and compare it to `expected`.
+pub fn expect_context_field(reader: &mut WireReader<'_>, expected: &[u8]) -> Result<()> {
+    let len = reader.read_len()?;
+    if reader.read_exact(len)? == expected {
+        Ok(())
+    } else {
+        Err(Error::InvalidEncoding)
+    }
+}
+
 /// Write a scalar using its canonical Golden representation.
 pub fn write_scalar<G: GoldenGroup>(out: &mut Vec<u8>, scalar: &G::Scalar) {
     out.extend_from_slice(scalar.to_repr().as_ref());
@@ -898,9 +993,10 @@ pub fn write_scalar<G: GoldenGroup>(out: &mut Vec<u8>, scalar: &G::Scalar) {
 
 /// Read a scalar using its canonical Golden representation.
 pub fn read_scalar<G: GoldenGroup>(reader: &mut WireReader<'_>) -> Result<G::Scalar> {
-    let repr_len = G::Scalar::zero().to_repr().as_ref().len();
-    let repr = <G::Scalar as GoldenScalar>::Repr::try_from(reader.read_exact(repr_len)?.to_vec())
-        .map_err(|_| Error::InvalidEncoding)?;
+    let repr = <G::Scalar as GoldenScalar>::Repr::try_from(
+        reader.read_exact(G::Scalar::REPR_BYTES)?.to_vec(),
+    )
+    .map_err(|_| Error::InvalidEncoding)?;
     G::Scalar::from_repr(&repr)
 }
 
@@ -915,8 +1011,7 @@ where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
-    let repr_len = G::encode_element(&G::identity()).as_ref().len();
-    let repr = G::ElementRepr::try_from(reader.read_exact(repr_len)?.to_vec())
+    let repr = G::ElementRepr::try_from(reader.read_exact(G::ELEMENT_REPR_BYTES)?.to_vec())
         .map_err(|_| Error::InvalidEncoding)?;
     G::decode_element(&repr)
 }
@@ -978,6 +1073,18 @@ mod tests {
     }
 
     #[test]
+    fn wrong_top_level_context_is_rejected() {
+        let session_id = SessionId([7u8; 32]);
+        let mut bytes = to_wire_bytes(&session_id);
+        bytes[MAGIC.len() + 1 + 8] ^= 1;
+
+        assert_eq!(
+            from_wire_bytes::<SessionId>(&bytes).unwrap_err(),
+            Error::InvalidEncoding
+        );
+    }
+
+    #[test]
     fn encrypted_share_round_trips() {
         let share = EncryptedShare::<TinyGroup> {
             pad_commitment: TinyScalar::from_u64(2).unwrap(),
@@ -1027,6 +1134,7 @@ mod tests {
         let mut top_level = Vec::new();
         top_level.extend_from_slice(MAGIC);
         top_level.push(TAG_PARTICIPANT_REGISTRY);
+        <ParticipantRegistry<TinyGroup> as WireMessage>::write_wire_context(&mut top_level);
         top_level.extend_from_slice(&nested);
 
         assert_eq!(
@@ -1072,6 +1180,45 @@ mod tests {
         assert_ne!(decoded.transcript_root, message.transcript_root);
         assert_eq!(decoded.transcript_root, expected_root);
         assert_eq!(decoded.transcript_root, decoded.recompute_transcript_root());
+    }
+
+    #[test]
+    fn dealer_message_wire_binds_nested_proof_codec() {
+        let commitment = FeldmanCommitment::<TinyGroup>::from_coefficients(vec![
+            TinyScalar::from_u64(10).unwrap(),
+            TinyScalar::from_u64(20).unwrap(),
+        ])
+        .unwrap();
+        let encrypted_share = EncryptedShare::<TinyGroup> {
+            pad_commitment: TinyScalar::from_u64(2).unwrap(),
+            dh_commitment: TinyScalar::from_u64(3).unwrap(),
+            encrypted_share: TinyScalar::from_u64(4).unwrap(),
+        };
+        let message = DealerMessage::<TinyGroup, Vec<u8>> {
+            session_id: SessionId([1u8; 32]),
+            registry_root: [2u8; 32],
+            dealer: idx(1),
+            msg_i: DealerMessageNonce([3u8; 32]),
+            commitment,
+            encrypted_shares: BTreeMap::from([(idx(2), encrypted_share)]),
+            proof: vec![4, 5, 6],
+            transcript_root: [7u8; 32],
+        };
+        let mut bytes = to_wire_bytes(&message);
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(MAGIC);
+        prefix.push(TAG_DEALER_MESSAGE);
+        write_context_field(
+            &mut prefix,
+            <DealerMessage<TinyGroup, Vec<u8>> as WireMessage>::CODEC_ID.as_bytes(),
+        );
+        write_context_field(&mut prefix, TinyGroup::BACKEND_ID.as_bytes());
+        bytes[prefix.len()] = TAG_SESSION_ID;
+
+        assert_eq!(
+            from_wire_bytes::<DealerMessage<TinyGroup, Vec<u8>>>(&bytes).unwrap_err(),
+            Error::InvalidEncoding
+        );
     }
 
     #[test]
