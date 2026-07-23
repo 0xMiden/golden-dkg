@@ -529,8 +529,6 @@ pub mod secp_secq {
         slopes: Vec<R1csField>,
         /// `(x_{L_{i-1}} - x_{Δ_i})^{-1}` for `i = 1..=lambda`.
         denom_delta_inverses: Vec<R1csField>,
-        /// `(x_{L_{i-1}} - x_{L_i})^{-1}` for `i = 1..=lambda`.
-        denom_result_inverses: Vec<R1csField>,
     }
 
     /// Compute the full chord-rule witness: all intermediate `L_i` points and
@@ -544,7 +542,6 @@ pub mod secp_secq {
         let mut l_coords = Vec::with_capacity(lambda + 1);
         let mut slopes = Vec::with_capacity(lambda);
         let mut denom_delta_inverses = Vec::with_capacity(lambda);
-        let mut denom_result_inverses = Vec::with_capacity(lambda);
 
         let g_s = chord_correction_generator(X);
         let mut p_j = *X;
@@ -573,13 +570,6 @@ pub mod secp_secq {
                 denom_delta_inverses.push(dx_inv);
 
                 l += delta;
-                let (x_l, _) = affine(&l)?;
-                let result_dx: R1csField = x_prev - x_l;
-                let result_dx_inv = match Option::from(result_dx.invert()) {
-                    Some(inv) => inv,
-                    None => return Err(Error::ProofVerificationFailed),
-                };
-                denom_result_inverses.push(result_dx_inv);
             }
 
             let coords = affine(&l)?;
@@ -591,7 +581,6 @@ pub mod secp_secq {
             l_coords,
             slopes,
             denom_delta_inverses,
-            denom_result_inverses,
         })
     }
 
@@ -656,7 +645,6 @@ pub mod secp_secq {
             if w.l_coords.len() != lambda_plus_one
                 || w.slopes.len() != lambda_plus_one - 1
                 || w.denom_delta_inverses.len() != lambda_plus_one - 1
-                || w.denom_result_inverses.len() != lambda_plus_one - 1
             {
                 return Err(R1CSError::FormatError);
             }
@@ -678,12 +666,10 @@ pub mod secp_secq {
             // Slope s_i and L_i coordinates (witness values).
             let s_assign = witness.map(|w| w.slopes[i - 1]);
             let denom_delta_inv_assign = witness.map(|w| w.denom_delta_inverses[i - 1]);
-            let denom_result_inv_assign = witness.map(|w| w.denom_result_inverses[i - 1]);
             let (x_l_assign, y_l_assign) = witness.map(|w| w.l_coords[i]).unzip();
 
             let s_var = cs.allocate(s_assign)?;
             let denom_delta_inv = cs.allocate(denom_delta_inv_assign)?;
-            let denom_result_inv = cs.allocate(denom_result_inv_assign)?;
             let x_l = cs.allocate(x_l_assign)?;
             let y_l = cs.allocate(y_l_assign)?;
 
@@ -695,9 +681,6 @@ pub mod secp_secq {
 
             let (_, _, delta_nonzero) = cs.multiply(denom_delta_inv.into(), denom_delta.clone());
             cs.constrain(delta_nonzero - R1csField::ONE);
-
-            let (_, _, result_nonzero) = cs.multiply(denom_result_inv.into(), denom_result.clone());
-            cs.constrain(result_nonzero - R1csField::ONE);
 
             // Constraint 1: s_i * (x_{L_{i-1}} - x_{Δ_i}) = y_{L_{i-1}} - y_{Δ_i}
             let (_, _, out1) = cs.multiply(s_var.into(), denom_delta);
@@ -949,8 +932,8 @@ pub mod secp_secq {
     // ------------------------------------------------------------------
 
     /// Bulletproofs generator capacity for the one-receiver relation.
-    /// Bit-decomp uses 257 multiplier gates; each chord-rule uses 3*256 = 768.
-    /// Total 1793, padded to 8192 for the inner-product layer.
+    /// Bit-decomp uses 257 multiplier gates; each chord-rule uses 4*256 = 1024.
+    /// Total 2305, padded to 8192 for the inner-product layer.
     const R1CS_GENS_CAPACITY: usize = 8192;
 
     /// Process-wide cache for the single-receiver `BulletproofGens`.
@@ -2701,7 +2684,6 @@ pub mod secp_secq {
                 l_coords: vec![(R1csField::ZERO, R1csField::ZERO); K_BITS],
                 slopes: vec![R1csField::ZERO; K_BITS],
                 denom_delta_inverses: vec![R1csField::ZERO; K_BITS],
-                denom_result_inverses: vec![R1csField::ZERO; K_BITS],
             };
 
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
@@ -2777,7 +2759,7 @@ pub mod secp_secq {
             mutate_witness: impl FnOnce(&mut ChordWitness),
         ) -> core::result::Result<(), R1CSError> {
             let pc_gens = PedersenGens::<R1csCycle>::default();
-            // bit_decompose: 257 gates, chord_exp: ~768+ gates.  Pad to 4096.
+            // bit_decompose: 257 gates, chord_exp: ~1024+ gates.  Pad to 4096.
             let bp_gens = BulletproofGens::<R1csCycle>::new(4096, 1);
             let mut rng = ChaCha20Rng::seed_from_u64(0x5CA1E000);
 
@@ -2900,18 +2882,6 @@ pub mod secp_secq {
                 })
                 .is_err(),
                 "verifier must reject a wrong inverse for x_L_prev - x_Delta"
-            );
-        }
-
-        #[test]
-        fn chord_exp_rejects_wrong_result_denominator_inverse() {
-            let X = Gin::generator() * Fq::from(42u64);
-            assert!(
-                run_chord_exp_with_witness(0xDEADBEEFu64, &X, None, |w| {
-                    w.denom_result_inverses[0] += R1csField::ONE;
-                })
-                .is_err(),
-                "verifier must reject a wrong inverse for x_L_prev - x_L"
             );
         }
     }
