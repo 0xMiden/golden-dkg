@@ -9,6 +9,7 @@ mod tests {
     use ff::Field;
     use golden_halo2curves::{Secp256k1Cycle, Secq256k1Cycle};
     use group::{Curve, Group};
+    use rand_chacha::rand_core::RngCore;
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -48,6 +49,17 @@ mod tests {
                     C::point_hash_from_uniform(&bytes)
                 }
 
+                fn random_point(rng: &mut ChaCha20Rng) -> <C as Cycle>::Point {
+                    loop {
+                        let mut bytes = [0u8; 64];
+                        rng.fill_bytes(&mut bytes);
+                        let point = C::point_hash_from_uniform(&bytes);
+                        if point != <$point as Group>::identity() {
+                            return point;
+                        }
+                    }
+                }
+
                 fn assert_msm_matches_reference(
                     label: &str,
                     scalars: &[<C as Cycle>::Scalar],
@@ -76,6 +88,15 @@ mod tests {
                     &[scalars[3], scalars[2]],
                     &points[..2],
                 );
+                for _ in 0..32 {
+                    let a = random_scalar::<C>(&mut rng);
+                    let b = random_scalar::<C>(&mut rng);
+                    let p = random_point(&mut rng);
+                    let q = random_point(&mut rng);
+
+                    assert_msm_matches_reference("random two-point msm", &[a, b], &[p, q]);
+                    assert_msm_matches_reference("random two-point msm reversed", &[b, a], &[q, p]);
+                }
                 assert_msm_matches_reference(
                     "identity is filtered",
                     &scalars[..2],
