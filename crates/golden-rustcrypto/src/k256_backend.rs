@@ -68,6 +68,8 @@ impl Drop for K256Scalar {
 impl GoldenScalar for K256Scalar {
     type Repr = [u8; 32];
 
+    const REPR_BYTES: usize = 32;
+
     fn zero() -> Self {
         Self(Scalar::ZERO)
     }
@@ -169,6 +171,8 @@ impl GoldenGroup for K256Backend {
     type Scalar = K256Scalar;
     type Element = K256Element;
     type ElementRepr = [u8; 33];
+
+    const ELEMENT_REPR_BYTES: usize = 33;
 
     const BACKEND_ID: &'static str = "rustcrypto-k256-v1";
 

@@ -91,6 +91,8 @@ jobs:
           tool: cargo-nextest
       - name: Test golden-core
         run: cargo nextest run -p golden-core
+      - name: Test golden-core wire serialization adapters
+        run: cargo nextest run -p golden-core --features serde,miden-serde
       - name: Test P-256 backend
         run: cargo nextest run -p golden-rustcrypto --features p256
       - name: Test K-256 backend
@@ -105,6 +107,8 @@ jobs:
         run: cargo nextest run -p bulletproofs-cycle --no-default-features --features bulletproofs-compat
       - name: Test golden-evrf Secp/Secq backend
         run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1
+      - name: Test golden-evrf wire serialization adapters
+        run: cargo nextest run -p golden-evrf --features serde,miden-serde,halo2curves-secp256k1
       - name: Doctests
         run: cargo test --workspace --doc
 

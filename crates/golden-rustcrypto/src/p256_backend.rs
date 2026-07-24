@@ -70,6 +70,8 @@ impl Drop for P256Scalar {
 impl GoldenScalar for P256Scalar {
     type Repr = [u8; 32];
 
+    const REPR_BYTES: usize = 32;
+
     fn zero() -> Self {
         Self(Scalar::ZERO)
     }
@@ -171,6 +173,8 @@ impl GoldenGroup for P256Backend {
     type Scalar = P256Scalar;
     type Element = P256Element;
     type ElementRepr = [u8; 33];
+
+    const ELEMENT_REPR_BYTES: usize = 33;
 
     const BACKEND_ID: &'static str = "rustcrypto-p256-v1";
 

@@ -362,7 +362,7 @@ impl<C: Cycle> InnerProductProof<C> {
             return Err(ProofError::FormatError);
         }
         let body_len = slice.len() - 64;
-        if body_len % unit != 0 {
+        if !body_len.is_multiple_of(unit) {
             return Err(ProofError::FormatError);
         }
         let pairs = body_len / unit;

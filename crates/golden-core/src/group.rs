@@ -22,6 +22,9 @@ pub trait GoldenScalar: Clone + Debug + Eq + ConstantTimeEq + Sized {
     /// Canonical scalar byte representation.
     type Repr: AsRef<[u8]> + Clone + Debug + Eq + TryFrom<Vec<u8>>;
 
+    /// Length in bytes of [`Self::Repr`].
+    const REPR_BYTES: usize;
+
     /// Return the additive identity.
     fn zero() -> Self;
 
@@ -80,13 +83,11 @@ pub trait GoldenScalar: Clone + Debug + Eq + ConstantTimeEq + Sized {
 
     /// Derive a nonzero scalar by rejection sampling SHA-256 output.
     fn hash_to_scalar(domain: &[u8], message: &[u8]) -> Result<Self> {
-        let repr_len = Self::zero().to_repr().as_ref().len();
-
         for counter in 0u32..u32::MAX {
-            let mut bytes = Vec::with_capacity(repr_len);
+            let mut bytes = Vec::with_capacity(Self::REPR_BYTES);
             let mut block = 0u32;
 
-            while bytes.len() < repr_len {
+            while bytes.len() < Self::REPR_BYTES {
                 let mut hasher = Sha256::new();
                 hasher.update(b"golden-scalar-v1");
                 hasher.update((domain.len() as u64).to_be_bytes());
@@ -99,7 +100,7 @@ pub trait GoldenScalar: Clone + Debug + Eq + ConstantTimeEq + Sized {
                 block += 1;
             }
 
-            bytes.truncate(repr_len);
+            bytes.truncate(Self::REPR_BYTES);
             let repr = Self::Repr::try_from(bytes).map_err(|_| Error::InvalidEncoding)?;
             if let Ok(scalar) = Self::from_repr(&repr) {
                 if !bool::from(scalar.is_zero()) {
@@ -122,6 +123,9 @@ pub trait GoldenGroup: Clone + Debug + Sized {
 
     /// Canonical group element byte representation.
     type ElementRepr: AsRef<[u8]> + Clone + Debug + Eq;
+
+    /// Length in bytes of [`Self::ElementRepr`].
+    const ELEMENT_REPR_BYTES: usize;
 
     /// Stable backend identifier for transcript binding.
     const BACKEND_ID: &'static str;

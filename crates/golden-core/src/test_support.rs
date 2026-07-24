@@ -31,6 +31,8 @@ impl zeroize::Zeroize for TinyScalar {
 impl GoldenScalar for TinyScalar {
     type Repr = [u8; 1];
 
+    const REPR_BYTES: usize = 1;
+
     fn zero() -> Self {
         Self(0)
     }
@@ -93,13 +95,15 @@ impl GoldenScalar for TinyScalar {
 }
 
 /// Tiny additive group over the scalar field.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TinyGroup {}
 
 impl GoldenGroup for TinyGroup {
     type Scalar = TinyScalar;
     type Element = TinyScalar;
     type ElementRepr = [u8; 1];
+
+    const ELEMENT_REPR_BYTES: usize = 1;
 
     const BACKEND_ID: &'static str = "golden-test-tiny-v1";
 

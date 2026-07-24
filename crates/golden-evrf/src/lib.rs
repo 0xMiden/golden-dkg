@@ -17,10 +17,16 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use golden_core::{
-    Error, EvrfProofBackend, EvrfStatement, EvrfWitness, GoldenGroup, GoldenScalar,
+    wire, Error, EvrfProofBackend, EvrfStatement, EvrfWitness, GoldenGroup, GoldenScalar,
     ParticipantIndex, Result, TranscriptRoot,
 };
+#[cfg(feature = "miden-serde")]
+use miden_serde_utils::{
+    ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
+};
 use rand_core::CryptoRngCore;
+#[cfg(feature = "serde")]
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 pub mod paper;
@@ -59,6 +65,32 @@ pub mod prototype {
 
     impl<G: GoldenGroup> Eq for ShareOpeningProof<G> {}
 
+    impl<G: GoldenGroup> wire::WireEncode for ShareOpeningProof<G> {
+        fn write_wire(&self, out: &mut Vec<u8>) {
+            wire::write_element::<G>(out, &self.nonce_commitment);
+            wire::write_scalar::<G>(out, &self.response);
+            wire::write_element::<G>(out, &self.pad_nonce_commitment);
+            wire::write_element::<G>(out, &self.dh_nonce_commitment);
+            wire::write_scalar::<G>(out, &self.pad_response);
+        }
+    }
+
+    impl<G> wire::WireDecode for ShareOpeningProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn read_wire(reader: &mut wire::WireReader<'_>) -> Result<Self> {
+            Ok(Self {
+                nonce_commitment: wire::read_element::<G>(reader)?,
+                response: wire::read_scalar::<G>(reader)?,
+                pad_nonce_commitment: wire::read_element::<G>(reader)?,
+                dh_nonce_commitment: wire::read_element::<G>(reader)?,
+                pad_response: wire::read_scalar::<G>(reader)?,
+            })
+        }
+    }
+
     /// Batched proof: one [`ShareOpeningProof`] per receiver, keyed by receiver.
     #[derive(Clone, Debug)]
     pub struct ShareOpeningBatchedProof<G: GoldenGroup>(
@@ -72,6 +104,148 @@ pub mod prototype {
     }
 
     impl<G: GoldenGroup> Eq for ShareOpeningBatchedProof<G> {}
+
+    impl<G: GoldenGroup> wire::WireEncode for ShareOpeningBatchedProof<G> {
+        fn write_wire(&self, out: &mut Vec<u8>) {
+            wire::write_len(out, self.0.len());
+            for (receiver, proof) in &self.0 {
+                wire::WireEncode::write_wire(receiver, out);
+                wire::WireEncode::write_wire(proof, out);
+            }
+        }
+    }
+
+    impl<G> wire::WireDecode for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn read_wire(reader: &mut wire::WireReader<'_>) -> Result<Self> {
+            let len = reader.read_len()?;
+            let item_len = 4 + 3 * G::ELEMENT_REPR_BYTES + 2 * G::Scalar::REPR_BYTES;
+            reader.ensure_remaining_items(len, item_len)?;
+            let mut map = std::collections::BTreeMap::new();
+            let mut last = None;
+            for _ in 0..len {
+                let receiver = <ParticipantIndex as wire::WireDecode>::read_wire(reader)?;
+                if last.is_some_and(|previous| previous >= receiver) {
+                    return Err(Error::DuplicateParticipantIndex(receiver.get()));
+                }
+                last = Some(receiver);
+                map.insert(receiver, ShareOpeningProof::<G>::read_wire(reader)?);
+            }
+            Ok(Self(map))
+        }
+    }
+
+    impl<G> wire::WireMessage for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        const TAG: u8 = wire::TAG_SHARE_OPENING_BATCHED_PROOF;
+        const CODEC_ID: &'static str = "share-opening-batched-proof-v1";
+
+        fn write_wire_context(out: &mut Vec<u8>) {
+            wire::write_context_field(out, Self::CODEC_ID.as_bytes());
+            wire::write_context_field(out, G::BACKEND_ID.as_bytes());
+        }
+
+        fn read_wire_context(reader: &mut wire::WireReader<'_>) -> Result<()> {
+            wire::expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
+            wire::expect_context_field(reader, G::BACKEND_ID.as_bytes())
+        }
+    }
+
+    #[cfg(feature = "miden-serde")]
+    impl<G> Serializable for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn write_into<W: ByteWriter>(&self, target: &mut W) {
+            wire::write_miden_wire(self, target);
+        }
+
+        fn get_size_hint(&self) -> usize {
+            wire::miden_wire_size_hint(self)
+        }
+    }
+
+    #[cfg(feature = "miden-serde")]
+    impl<G> Deserializable for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn read_from<R: ByteReader>(
+            source: &mut R,
+        ) -> core::result::Result<Self, DeserializationError> {
+            wire::read_miden_wire(source)
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    impl<G> Serialize for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(&wire::to_wire_bytes(self))
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    impl<'de, G> Deserialize<'de> for ShareOpeningBatchedProof<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        fn deserialize<D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> core::result::Result<Self, D::Error> {
+            deserializer.deserialize_bytes(ShareOpeningProofBytes::<G>(core::marker::PhantomData))
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    struct ShareOpeningProofBytes<G>(core::marker::PhantomData<G>);
+
+    #[cfg(feature = "serde")]
+    impl<'de, G> de::Visitor<'de> for ShareOpeningProofBytes<G>
+    where
+        G: GoldenGroup,
+        G::ElementRepr: TryFrom<Vec<u8>>,
+    {
+        type Value = ShareOpeningBatchedProof<G>;
+
+        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("canonical Golden share-opening proof bytes")
+        }
+
+        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> core::result::Result<Self::Value, E> {
+            wire::from_wire_bytes(value).map_err(|err| E::custom(err.to_string()))
+        }
+
+        fn visit_byte_buf<E: de::Error>(
+            self,
+            value: Vec<u8>,
+        ) -> core::result::Result<Self::Value, E> {
+            wire::from_wire_bytes(&value).map_err(|err| E::custom(err.to_string()))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(byte) = seq.next_element()? {
+                bytes.push(byte);
+            }
+            wire::from_wire_bytes(&bytes).map_err(|err| de::Error::custom(err.to_string()))
+        }
+    }
 
     /// Generic proof backend for DKG share, pad, and DH commitments.
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -291,9 +465,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use golden_core::{
-        complete, create_dealing, verify_dealing, DealerMessage, DealerMessageNonce, DkgConfig,
-        DkgDealing, FeldmanCommitment, ParticipantIndex, ParticipantRegistry, Polynomial,
-        SessionId, Share,
+        complete, create_dealing, verify_dealing,
+        wire::{from_wire_bytes, to_wire_bytes},
+        DealerMessage, DealerMessageNonce, DkgConfig, DkgDealing, FeldmanCommitment, GoldenGroup,
+        ParticipantIndex, ParticipantRegistry, Polynomial, SessionId, Share,
     };
     use golden_rustcrypto::{P256Backend, P256Scalar};
     use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
@@ -306,6 +481,116 @@ mod tests {
 
     fn idx(value: u32) -> ParticipantIndex {
         ParticipantIndex::new(value).unwrap()
+    }
+
+    #[test]
+    fn share_opening_batched_proof_wire_round_trips() {
+        let response = P256Scalar::from_u64(11).unwrap();
+        let pad_response = P256Scalar::from_u64(13).unwrap();
+        let proof = ShareOpeningProof::<P256Backend> {
+            nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(2).unwrap()),
+            response,
+            pad_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(3).unwrap()),
+            dh_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(5).unwrap()),
+            pad_response,
+        };
+        let proof = ShareOpeningBatchedProof(BTreeMap::from([(idx(2), proof)]));
+
+        let decoded =
+            from_wire_bytes::<ShareOpeningBatchedProof<P256Backend>>(&to_wire_bytes(&proof))
+                .unwrap();
+
+        assert_eq!(decoded, proof);
+    }
+
+    #[test]
+    fn share_opening_batched_proof_wire_rejects_malformed_point() {
+        let proof = ShareOpeningProof::<P256Backend> {
+            nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(2).unwrap()),
+            response: P256Scalar::from_u64(11).unwrap(),
+            pad_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(3).unwrap()),
+            dh_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(5).unwrap()),
+            pad_response: P256Scalar::from_u64(13).unwrap(),
+        };
+        let proof = ShareOpeningBatchedProof(BTreeMap::from([(idx(2), proof)]));
+        let mut bytes = to_wire_bytes(&proof);
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(golden_core::wire::MAGIC);
+        prefix.push(<ShareOpeningBatchedProof<P256Backend> as golden_core::wire::WireMessage>::TAG);
+        <ShareOpeningBatchedProof<P256Backend> as golden_core::wire::WireMessage>::write_wire_context(
+            &mut prefix,
+        );
+        let first_point = prefix.len() + 8 + 4;
+        bytes[first_point] = 0xff;
+
+        assert_eq!(
+            from_wire_bytes::<ShareOpeningBatchedProof<P256Backend>>(&bytes).unwrap_err(),
+            Error::InvalidEncoding
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn share_opening_batched_proof_serde_uses_canonical_wire_bytes() {
+        use serde_test::{assert_de_tokens, assert_tokens, Token};
+
+        let proof = ShareOpeningProof::<P256Backend> {
+            nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(2).unwrap()),
+            response: P256Scalar::from_u64(11).unwrap(),
+            pad_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(3).unwrap()),
+            dh_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(5).unwrap()),
+            pad_response: P256Scalar::from_u64(13).unwrap(),
+        };
+        let proof = ShareOpeningBatchedProof(BTreeMap::from([(idx(2), proof)]));
+        let bytes: &'static [u8] = Box::leak(to_wire_bytes(&proof).into_boxed_slice());
+
+        assert_tokens(&proof, &[Token::Bytes(bytes)]);
+
+        let mut seq = Vec::with_capacity(bytes.len() + 2);
+        seq.push(Token::Seq {
+            len: Some(bytes.len()),
+        });
+        seq.extend(bytes.iter().copied().map(Token::U8));
+        seq.push(Token::SeqEnd);
+
+        assert_de_tokens(&proof, &seq);
+    }
+
+    #[cfg(feature = "miden-serde")]
+    #[test]
+    fn share_opening_batched_proof_miden_serde_uses_canonical_wire_bytes() {
+        use miden_serde_utils::{Deserializable, Serializable, SliceReader};
+
+        let proof = ShareOpeningProof::<P256Backend> {
+            nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(2).unwrap()),
+            response: P256Scalar::from_u64(11).unwrap(),
+            pad_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(3).unwrap()),
+            dh_nonce_commitment: P256Backend::mul_generator(&P256Scalar::from_u64(5).unwrap()),
+            pad_response: P256Scalar::from_u64(13).unwrap(),
+        };
+        let proof = ShareOpeningBatchedProof(BTreeMap::from([(idx(2), proof)]));
+        let bytes = proof.to_bytes();
+        let wire_bytes = to_wire_bytes(&proof);
+
+        assert!(bytes.ends_with(&wire_bytes));
+        assert_eq!(
+            ShareOpeningBatchedProof::<P256Backend>::read_from_bytes(&bytes).unwrap(),
+            proof
+        );
+
+        let mut adjacent = Vec::new();
+        proof.write_into(&mut adjacent);
+        proof.write_into(&mut adjacent);
+        let mut reader = SliceReader::new(&adjacent);
+
+        assert_eq!(
+            ShareOpeningBatchedProof::<P256Backend>::read_from(&mut reader).unwrap(),
+            proof
+        );
+        assert_eq!(
+            ShareOpeningBatchedProof::<P256Backend>::read_from(&mut reader).unwrap(),
+            proof
+        );
     }
 
     fn prove_one<G: GoldenGroup>(
@@ -360,6 +645,55 @@ mod tests {
             registry,
         )
         .unwrap()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    #[test]
+    fn dealer_message_wire_has_stable_bytes_and_verifies_after_decode() {
+        const OLD_V2_EXPECTED_HEX: &str = "676f6c64656e2d646b672d776972652d7632072a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2abd3ea74dcb0d6c7529c788ae20a9603ebd83a82d450e84c706434a29eb5005b60000000174ea11d9d2a465383b5cdfee9ec7b26102782d30e7d6193bcceb62570445bd9600000000000000030231936276d8c3a66f63bf0cc4a4a069a0140ac2392642df979342613bcdf399f803f6d3672847f100b3b53740f680b52dd3c58d36f5863a01e050540a1c3b41c7f002ea9269b0062f078b450874118cb9d859e9eac06f71f695dbfc09773d47764923000000000000000300000002021aef5bfc98c458824b127b2f97f0bdf0812fb6fe8c552cc06f6cc646d0ea747602a8c7de6d057cc12151a9b08fa68acaec635c2a422408b89d0397971ef5bc34438e536d481518746abf2f025596dff7773d7e526572e02b3535a62b265b2c4a210000000302d180f57bcaa0e35ca3509e2689b66905567279dc8f471313402eac07ac70c9cd03a4c139b9f8cb0459f8a6be4821782a830762668527ac17e4fe31ef8dc7aa27ffcb9a0951da59388f95f6b67e1fb081ab95e4e2f5600908d7c33504b09dd9804e00000004025b71753cc7f4346a7e32b6db80faafe1622a2f8a7baee27be14c774afbee9653020cfbc9af9c380c73df8434f1b2af85af4f136f43950ed7e230010cc1e8326406a834485f266b7e78dd1530cd674323630801d0699e61eb1355059706de233d1d00000000000000030000000203952f467353f561f381e9f6c6d43480c3595ec5fef6154f1746c33d0c320ab86ce0504c869d84d25d9c41f9c1fff89e6b160edda31fa7dccddf0690f53c0552f602b165c95caa1a00e3697a657592183a4d780677f09ba342d048c58312267b92be02abb9a248f837fff38f58121bd69d27f3bbca9063dd2524f65010b5f0ac5cb1630c27349e4dc261b94a92554382b354eb17e279c3c785f2d9ab7f0178e6df6d8d000000030307ecc5aba728c7b17deba246041c22c143a50ea69de5e989af0f71c4cc57bb49327665d304da41613fff8e41079a0db6f71b34fe07d08780d607f3ee14fa44e702988f44a249a7953d9739ee0b5a2420a949e0262b47dfdb148aa30ad674e34fb003b0c11584ba8cc2b61eed838fdabba19ffa5f2fbd861e51cf35d9a1de6e236b74ecddfd96008b4fd9a13bc62816c435d26deaa4838e594e9e39ea96dbc932f2e200000004038ee782e24b9dd7a5eb0cf1ed03c6ff44f88d144edfa67d5a8fd9b3242466476de0d68e8a0e7c032fe682fafa1d230bfa19b65aa8bc5a1512ba864078e83c591d036ca323b99624d714790407b4ad11d7fc67011c6dde15cae3d35e1aa20cf153cb02c6dacbbcb77d1e2d386a3302b1fa13cf49db38465270d9bf7ada1768e999490f8462821a0b72037ff4882052426a3b9a872d1fd104768dbf6c4e042ce7c5f183";
+
+        let mut rng = ChaCha20Rng::from_seed([55u8; 32]);
+        let config = config();
+        let dealer = idx(1);
+        let dealing = create_dealing::<P256Backend, ShareOpeningBackend>(
+            dealer,
+            &identity_secret(dealer),
+            &config,
+            &mut rng,
+        )
+        .unwrap();
+        verify_dealing::<P256Backend, ShareOpeningBackend>(&dealing.message, &config).unwrap();
+
+        let bytes = to_wire_bytes(&dealing.message);
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(golden_core::wire::MAGIC);
+        prefix.push(
+            <DealerMessage<P256Backend, ShareOpeningBatchedProof<P256Backend>> as golden_core::wire::WireMessage>::TAG,
+        );
+        <DealerMessage<P256Backend, ShareOpeningBatchedProof<P256Backend>> as golden_core::wire::WireMessage>::write_wire_context(&mut prefix);
+        assert_eq!(&bytes[..prefix.len()], prefix.as_slice());
+        assert_eq!(
+            hex(&bytes[prefix.len()..]),
+            OLD_V2_EXPECTED_HEX
+                .strip_prefix("676f6c64656e2d646b672d776972652d763207")
+                .unwrap()
+        );
+
+        let decoded = from_wire_bytes::<
+            DealerMessage<P256Backend, ShareOpeningBatchedProof<P256Backend>>,
+        >(&bytes)
+        .unwrap();
+        assert_eq!(decoded.transcript_root, dealing.message.transcript_root);
+        verify_dealing::<P256Backend, ShareOpeningBackend>(&decoded, &config).unwrap();
     }
 
     fn dealings(
