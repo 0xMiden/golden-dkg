@@ -11,7 +11,9 @@ publish = false
 chacha20 = { workspace = true }
 golden-core = { workspace = true }
 hkdf = { workspace = true }
+miden-serde-utils = { workspace = true, optional = true }
 rand_core = { workspace = true }
+serde = { workspace = true, optional = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
@@ -21,11 +23,14 @@ golden-evrf = { workspace = true, features = ["halo2curves-secp256k1"] }
 golden-halo2curves = { workspace = true, features = ["halo2curves-secp256k1"] }
 golden-rustcrypto = { path = "../golden-rustcrypto", features = ["p256"] }
 rand_chacha = { workspace = true }
+serde_test = { workspace = true }
 
 [features]
 default = []
+miden-serde = ["dep:miden-serde-utils", "golden-core/miden-serde"]
 prototype-bridge = []
 halo2curves-secp256k1 = []
+serde = ["dep:serde", "golden-core/serde"]
 
 [lints]
 workspace = true
