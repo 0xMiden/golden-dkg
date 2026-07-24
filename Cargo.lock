@@ -460,7 +460,7 @@ dependencies = [
  "golden-rustcrypto",
  "hkdf",
  "rand_chacha",
- "rand_core",
+ "rand_core 0.6.4",
  "sha2",
  "thiserror",
  "zeroize",
