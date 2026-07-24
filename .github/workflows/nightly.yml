@@ -29,3 +29,5 @@ jobs:
           tool: cargo-nextest
       - name: Run ignored golden-evrf Secp/Secq tests
         run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1 --run-ignored only
+      - name: Run ignored golden-ehtdh1 Secp/Secq bridge test
+        run: cargo nextest run -p golden-ehtdh1 --features halo2curves-secp256k1 --run-ignored only

@@ -384,7 +384,9 @@ mod secp_secq {
                 .collect(),
         )
         .unwrap();
-        DkgConfig::new(1, session_id, scalar(77), registry).unwrap()
+        // A threshold-one zero sharing is the constant-zero polynomial, whose
+        // identity share commitments are rejected by the paper backend.
+        DkgConfig::new(2, session_id, scalar(77), registry).unwrap()
     }
 
     fn dealings(
@@ -488,7 +490,7 @@ mod secp_secq {
 
         let opened = Combiner::new(first.public_key_set.clone(), first.setup_context.clone())
             .unwrap()
-            .combine_exact(&message, b"dc", &shares[..1])
+            .combine_exact(&message, b"dc", &shares)
             .unwrap();
 
         assert_eq!(opened, b"paper");
