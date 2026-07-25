@@ -72,6 +72,8 @@ jobs:
             --each-feature \
             --exclude-features default,bulletproofs-compat \
             --all-targets
+      - name: Compile EHTDH1 threshold record example
+        run: cargo check -p golden-ehtdh1 --example threshold_records --features prototype-bridge
       - name: golden-core dependency boundary
         run: |
           cargo tree -p golden-core > /tmp/golden-core-tree.txt
