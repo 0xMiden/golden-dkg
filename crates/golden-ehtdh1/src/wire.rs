@@ -3,6 +3,7 @@
 //! Standalone values use the Golden wire envelope from [`golden_core::wire`].
 //! Generic group values bind the Golden backend id in that envelope.
 //! [`SecretShare`] is the encoded validator secret held by [`crate::UnsealingShare`].
+//! EHTDH1 tags start at `0x20` to stay disjoint from Golden core tags under the shared magic.
 
 use std::collections::BTreeMap;
 
@@ -21,8 +22,8 @@ use miden_serde_utils::{
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    Ciphertext, DecryptionShare, Error, PublicKeySet, PublicShare, SealingKey, SecretShare,
-    SetupContext,
+    derive_context_session_id, Ciphertext, DecryptionShare, Error, PublicKeySet, PublicShare,
+    SealingKey, SecretShare, SetupContext,
 };
 
 pub use golden_core::wire::{WireDecode, WireEncode, WireMessage};
@@ -55,6 +56,8 @@ pub fn to_wire_bytes<T: WireMessage>(value: &T) -> Vec<u8> {
 }
 
 /// Decode a standalone canonical EHTDH1 wire value.
+///
+/// All decoding failures are reported as [`Error::InvalidEncoding`].
 pub fn from_wire_bytes<T: WireMessage>(bytes: &[u8]) -> Result<T, Error> {
     wire::from_wire_bytes(bytes).map_err(|_| Error::InvalidEncoding)
 }
@@ -97,13 +100,18 @@ impl WireDecode for SetupContext {
         if threshold == 0 || threshold > participants.len() {
             return Err(CoreError::InvalidEncoding);
         }
+        let decryption_session_id = SessionId::read_wire(reader)?;
+        let context_session_id = SessionId::read_wire(reader)?;
+        if context_session_id != derive_context_session_id(decryption_session_id) {
+            return Err(CoreError::InvalidEncoding);
+        }
         Ok(Self {
             backend_id,
             threshold,
             registry_root,
             participants,
-            decryption_session_id: SessionId::read_wire(reader)?,
-            context_session_id: SessionId::read_wire(reader)?,
+            decryption_session_id,
+            context_session_id,
             decryption_transcript_root: TranscriptRoot::read_wire(reader)?,
             context_transcript_root: TranscriptRoot::read_wire(reader)?,
             epoch: reader.read_array()?,
@@ -712,6 +720,14 @@ mod tests {
         prefix.len()
     }
 
+    fn group_backend_offset<T: WireMessage>() -> usize {
+        MAGIC.len() + 1 + 8 + T::CODEC_ID.len() + 8
+    }
+
+    fn setup_participants_offset(setup_context: &SetupContext) -> usize {
+        payload_offset::<SetupContext>() + 8 + setup_context.backend_id.len() + 8 + 32 + 8
+    }
+
     #[test]
     fn scoped_values_round_trip() {
         let values = fixtures();
@@ -790,11 +806,30 @@ mod tests {
     }
 
     #[test]
+    fn sealing_key_rejects_identity_element() {
+        let sealing_key = fixtures().sealing_key;
+        let mut bytes = to_wire_bytes(&sealing_key);
+        let element_offset = payload_offset::<SealingKey<G>>();
+        bytes[element_offset..element_offset + G::ELEMENT_REPR_BYTES]
+            .copy_from_slice(G::encode_element(&G::identity()).as_ref());
+
+        assert!(from_wire_bytes::<SealingKey<G>>(&bytes).is_err());
+    }
+
+    #[test]
+    fn group_context_rejects_wrong_backend_id() {
+        let sealing_key = fixtures().sealing_key;
+        let mut bytes = to_wire_bytes(&sealing_key);
+        bytes[group_backend_offset::<SealingKey<G>>()] ^= 1;
+
+        assert!(from_wire_bytes::<SealingKey<G>>(&bytes).is_err());
+    }
+
+    #[test]
     fn setup_context_rejects_noncanonical_participant_order() {
         let setup_context = fixtures().setup_context;
         let mut bytes = to_wire_bytes(&setup_context);
-        let participants_offset =
-            payload_offset::<SetupContext>() + 8 + setup_context.backend_id.len() + 8 + 32 + 8;
+        let participants_offset = setup_participants_offset(&setup_context);
         let first: [u8; 4] = bytes[participants_offset..participants_offset + 4]
             .try_into()
             .unwrap();
@@ -803,6 +838,17 @@ mod tests {
             .unwrap();
         bytes[participants_offset..participants_offset + 4].copy_from_slice(&second);
         bytes[participants_offset + 4..participants_offset + 8].copy_from_slice(&first);
+
+        assert!(from_wire_bytes::<SetupContext>(&bytes).is_err());
+    }
+
+    #[test]
+    fn setup_context_rejects_inconsistent_session_ids() {
+        let setup_context = fixtures().setup_context;
+        let mut bytes = to_wire_bytes(&setup_context);
+        let context_session_offset =
+            setup_participants_offset(&setup_context) + 4 * setup_context.participants.len() + 32;
+        bytes[context_session_offset] ^= 1;
 
         assert!(from_wire_bytes::<SetupContext>(&bytes).is_err());
     }
