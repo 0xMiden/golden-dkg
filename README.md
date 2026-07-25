@@ -7,8 +7,8 @@ generic group abstraction. The long-term goal is a paper-aligned Golden DKG
 and eVRF; the current tree implements the core DKG, a Secp256k1/Secq256k1
 curve-cycle eVRF backend, and the Bulletproofs R1CS layer it relies on.
 
-The workspace has five crates. All are `publish = false` and expect
-`rust-version = "1.86"`.
+The workspace has six crates. All crates are published together and require
+Rust 1.93 or later.
 
 * `golden-core`: Shamir secret sharing, Feldman commitments, DKG messages,
   transcript binding, and the curve-agnostic `EvrfProofBackend` trait that
@@ -19,6 +19,8 @@ The workspace has five crates. All are `publish = false` and expect
   plumbing tests.
 * `golden-rustcrypto`: P-256 and secp256k1 `GoldenGroup` adapters backed by
   the RustCrypto crates, used by the prototype backend and tests.
+* `golden-ehtdh1`: context-bound threshold encryption over Golden DKG output.
+  It binds each decryption share to the setup, ciphertext, and caller context.
 * `bulletproofs-cycle`: a minimal fork of `zkcrypto/bulletproofs` 5.0.1
   with the Ristretto backend replaced by a `Cycle` trait over zkcrypto
   `group`/`ff`. Range-proof, MPC, and serialization paths were stripped;

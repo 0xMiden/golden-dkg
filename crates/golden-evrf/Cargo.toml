@@ -1,11 +1,14 @@
 [package]
 name = "golden-evrf"
 version = "0.1.0"
+description = "Verifiable random function proof backends for Golden distributed key generation"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 golden-core = { workspace = true }
@@ -23,7 +26,7 @@ serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 ff = { workspace = true }
-golden-rustcrypto = { path = "../golden-rustcrypto", features = ["p256"] }
+golden-rustcrypto = { workspace = true, features = ["p256"] }
 rand_chacha = { workspace = true }
 serde_test = { workspace = true }
 

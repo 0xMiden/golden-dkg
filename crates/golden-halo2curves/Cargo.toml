@@ -1,11 +1,14 @@
 [package]
 name = "golden-halo2curves"
 version = "0.1.0"
+description = "Halo2 curve adapters for Golden distributed key generation"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 bulletproofs-cycle = { workspace = true }
