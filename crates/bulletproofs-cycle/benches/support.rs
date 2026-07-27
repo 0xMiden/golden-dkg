@@ -156,7 +156,7 @@ macro_rules! impl_cycle {
                     return acc;
                 }
 
-                if !points.iter().any(|p| *p == identity) {
+                if points.iter().all(|p| *p != identity) {
                     let mut bases = vec![Affine::default(); points.len()];
                     <Self::Point as Curve>::batch_normalize(points, &mut bases);
                     return msm_best::<Affine>(scalars, &bases);
