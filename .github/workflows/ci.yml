@@ -99,6 +99,8 @@ jobs:
         run: cargo nextest run -p golden-rustcrypto --features k256
       - name: Test eVRF proof backend
         run: cargo nextest run -p golden-evrf --features golden-rustcrypto/p256
+      - name: Test EHTDH1 prototype bridge
+        run: cargo nextest run -p golden-ehtdh1 --features prototype-bridge
       - name: Test Secp/Secq R1CS cycle
         run: cargo nextest run -p golden-halo2curves --features halo2curves-secp256k1
       - name: Test Ristretto Cycle impl and upstream byte parity
