@@ -122,20 +122,67 @@ macro_rules! impl_cycle {
             }
 
             fn vartime_msm(scalars: &[Self::Scalar], points: &[Self::Point]) -> Self::Point {
-                // Use halo2curves' Pippenger MSM (msm_best) instead of a naive
-                // acc += p*s loop. The conversion to affine is O(n) inversions
-                // but pays for itself many times over on every Bulletproofs
-                // prove/verify, where each MSM is over thousands of points.
+                // Use a two-point path for IPA folds, and Pippenger for
+                // larger MSMs.
                 //
-                // Drop (scalar, point) pairs whose point is the identity before
-                // handing to msm_best: Pippenger's bucket logic doesn't handle
-                // the point-at-infinity affine representation, and an identity
-                // point contributes nothing to the sum anyway.
+                // Drop identity points before Pippenger: its bucket logic does
+                // not handle the point-at-infinity affine representation.
+                use group::Curve;
                 use group::Group;
                 use halo2curves::msm::msm_best;
 
                 type Affine = <$curve as halo2curves::CurveExt>::AffineExt;
                 let identity = <Self::Point as Group>::identity();
+
+                if points.len() == 2 && points[0] != identity && points[1] != identity {
+                    let p = points[0];
+                    let q = points[1];
+
+                    let mut table = [identity; 15];
+                    table[3] = p; // P
+                    table[0] = q; // Q
+                    table[7] = table[3].double(); // 2P
+                    table[1] = table[0].double(); // 2Q
+                    table[11] = table[7] + p; // 3P
+                    table[2] = table[1] + q; // 3Q
+
+                    // table[i * 4 + j - 1] = i*P + j*Q for 0 <= i,j <= 3.
+                    table[4] = table[3] + q;
+                    table[5] = table[4] + q;
+                    table[6] = table[5] + q;
+                    table[8] = table[7] + q;
+                    table[9] = table[8] + q;
+                    table[10] = table[9] + q;
+                    table[12] = table[11] + q;
+                    table[13] = table[12] + q;
+                    table[14] = table[13] + q;
+
+                    let mut affine_table = [Affine::default(); 15];
+                    <Self::Point as Curve>::batch_normalize(&table, &mut affine_table);
+
+                    let s1 = scalars[0].to_repr();
+                    let s2 = scalars[1].to_repr();
+                    let mut acc = identity;
+                    for (b1, b2) in s1.as_ref().iter().rev().zip(s2.as_ref().iter().rev()) {
+                        for i in (0..8u32).rev().step_by(2) {
+                            acc = acc.double().double();
+                            let w1 = (((b1 >> i) & 1) << 1) | ((b1 >> (i - 1)) & 1);
+                            let w2 = (((b2 >> i) & 1) << 1) | ((b2 >> (i - 1)) & 1);
+                            let idx = (w1 as usize) * 4 + (w2 as usize);
+                            if idx != 0 {
+                                acc += affine_table[idx - 1];
+                            }
+                        }
+                    }
+                    return acc;
+                }
+
+                if !points.iter().any(|p| *p == identity) {
+                    let mut bases = vec![Affine::default(); points.len()];
+                    <Self::Point as Curve>::batch_normalize(points, &mut bases);
+                    return msm_best::<Affine>(scalars, &bases);
+                }
+
                 let filtered: Vec<_> = scalars
                     .iter()
                     .zip(points.iter())
@@ -145,7 +192,9 @@ macro_rules! impl_cycle {
                     return identity;
                 }
                 let scalars: Vec<_> = filtered.iter().map(|(s, _)| **s).collect();
-                let bases: Vec<Affine> = filtered.iter().map(|(_, p)| (**p).into()).collect();
+                let filtered_points: Vec<Self::Point> = filtered.iter().map(|(_, p)| **p).collect();
+                let mut bases = vec![Affine::default(); filtered_points.len()];
+                <Self::Point as Curve>::batch_normalize(&filtered_points, &mut bases);
                 msm_best::<Affine>(&scalars, &bases)
             }
 
@@ -153,6 +202,7 @@ macro_rules! impl_cycle {
                 scalars: &[Self::Scalar],
                 points: &[Option<Self::Point>],
             ) -> Option<Self::Point> {
+                use group::Curve;
                 use group::Group;
                 use halo2curves::msm::msm_best;
 
@@ -167,10 +217,12 @@ macro_rules! impl_cycle {
                     return Some(identity);
                 }
                 let scalars: Vec<_> = filtered.iter().map(|(s, _)| **s).collect();
-                let bases: Vec<Affine> = filtered
+                let filtered_points: Vec<Self::Point> = filtered
                     .iter()
-                    .map(|(_, p)| (*p).map(|proj| proj.into()))
+                    .map(|(_, p)| **p)
                     .collect::<Option<Vec<_>>>()?;
+                let mut bases = vec![Affine::default(); filtered_points.len()];
+                <Self::Point as Curve>::batch_normalize(&filtered_points, &mut bases);
                 Some(msm_best::<Affine>(&scalars, &bases))
             }
         }
