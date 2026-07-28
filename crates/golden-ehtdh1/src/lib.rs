@@ -107,6 +107,12 @@
 //! This crate provides client sealing, validator decryption shares, exact
 //! combining, quorum search, and a bridge from two Golden DKG runs.
 //!
+//! Run the full three party threshold record example with:
+//!
+//! ```text
+//! cargo run -p golden-ehtdh1 --example threshold_records --features prototype-bridge
+//! ```
+//!
 //! # Example
 //!
 //! This example builds a two of three EHTDH1 setup without running Golden DKG.
