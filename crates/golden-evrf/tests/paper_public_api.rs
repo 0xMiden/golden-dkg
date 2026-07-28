@@ -12,6 +12,9 @@ use golden_core::{
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
 
+const PROOF_ID_LEN_BYTES: usize = 4;
+const NESTED_LEN_BYTES: usize = 8;
+
 fn idx(value: u32) -> ParticipantIndex {
     ParticipantIndex::new(value).unwrap()
 }
@@ -47,15 +50,40 @@ fn minimal_evrf_statement() -> EvrfStatement<Secp256k1GoldenGroup> {
 }
 
 #[test]
-fn backend_rejects_malformed_proof_bytes() {
-    let statement = minimal_evrf_statement();
-    let malformed = [vec![0u8; 7], vec![0u8; 8], {
-        let mut bytes = vec![0u8; 8];
-        bytes.push(0);
-        bytes
-    }];
+fn batched_backend_uses_v2_proof_protocol_identifier() {
+    assert_eq!(
+        <SecpSecqBackend as EvrfProofBackend<Secp256k1GoldenGroup>>::PROOF_ID,
+        b"golden-paper-evrf-batched-v2"
+    );
+}
 
-    for bytes in malformed {
+#[test]
+fn backend_rejects_malformed_proof_stream_framing() {
+    let statement = minimal_evrf_statement();
+    let proof_id = <SecpSecqBackend as EvrfProofBackend<Secp256k1GoldenGroup>>::PROOF_ID;
+    let mut prefix = u32::try_from(proof_id.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    prefix.extend_from_slice(proof_id);
+
+    let mut wrong_id = prefix.clone();
+    wrong_id[PROOF_ID_LEN_BYTES] ^= 0x01;
+    let missing_nested_length = prefix.clone();
+    let mut truncated_nested_length = prefix.clone();
+    truncated_nested_length.extend_from_slice(&[0u8; NESTED_LEN_BYTES - 1]);
+    let mut overflowing_nested_length = prefix.clone();
+    overflowing_nested_length.extend_from_slice(&u64::MAX.to_be_bytes());
+    let mut truncated_nested_payload = prefix;
+    truncated_nested_payload.extend_from_slice(&1u64.to_be_bytes());
+
+    for bytes in [
+        wrong_id,
+        missing_nested_length,
+        truncated_nested_length,
+        overflowing_nested_length,
+        truncated_nested_payload,
+    ] {
         assert_eq!(
             SecpSecqBackend::verify_batch(core::slice::from_ref(&statement), &bytes).unwrap_err(),
             Error::ProofVerificationFailed

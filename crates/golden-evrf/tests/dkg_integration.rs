@@ -19,6 +19,9 @@ use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
+const PROOF_ID_LEN_BYTES: usize = 4;
+const NESTED_LEN_BYTES: usize = 8;
+
 fn idx(value: u32) -> ParticipantIndex {
     ParticipantIndex::new(value).unwrap()
 }
@@ -237,14 +240,96 @@ fn dkg_rejects_tampered_transcript_root() {
 }
 
 #[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-fn dkg_rejects_tampered_proof_bytes() {
-    assert_dealing_rejected(|msg| {
-        if msg.proof.is_empty() {
-            msg.proof.push(0);
-        }
-        msg.proof[0] ^= 0x01;
-    });
+#[ignore = "slow: builds and verifies the full batched dealer proof"]
+fn dkg_accepts_the_deterministic_dealing_and_rejects_malformed_or_replayed_proofs() {
+    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+    let participants = [idx(1), idx(2)];
+    let registry = ParticipantRegistry::new(
+        participants
+            .iter()
+            .map(|participant| {
+                (
+                    *participant,
+                    Secp256k1GoldenGroup::mul_generator(&identity_secret(*participant)),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let config = DkgConfig::new(
+        1,
+        SessionId([42u8; 32]),
+        Secp256k1Scalar::from_u64(77).unwrap(),
+        registry,
+    )
+    .unwrap();
+    let dealer = idx(1);
+    let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
+        dealer,
+        &identity_secret(dealer),
+        &config,
+        &mut rng,
+    )
+    .unwrap();
+    verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config).unwrap();
+
+    let proof_id_len = u32::from_be_bytes(
+        dealing.message.proof[..PROOF_ID_LEN_BYTES]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let nested_len_offset = PROOF_ID_LEN_BYTES + proof_id_len;
+    let payload_start = nested_len_offset + NESTED_LEN_BYTES;
+    let payload_len = u64::from_be_bytes(
+        dealing.message.proof[nested_len_offset..payload_start]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    assert_eq!(payload_start + payload_len, dealing.message.proof.len());
+
+    let mut wrong_id = dealing.message.clone();
+    wrong_id.proof[PROOF_ID_LEN_BYTES] ^= 0x01;
+
+    let mut malformed_length = dealing.message.clone();
+    malformed_length.proof[nested_len_offset..payload_start]
+        .copy_from_slice(&u64::MAX.to_be_bytes());
+
+    let mut truncated = dealing.message.clone();
+    truncated.proof.pop();
+
+    let mut trailing = dealing.message.clone();
+    trailing.proof.push(0);
+
+    let mut corrupted_nested_payload = dealing.message.clone();
+    corrupted_nested_payload.proof[payload_start + payload_len / 2] ^= 0x01;
+
+    let mut noncanonical_nested = dealing.message.clone();
+    noncanonical_nested.proof[nested_len_offset..payload_start]
+        .copy_from_slice(&u64::try_from(payload_len + 1).unwrap().to_be_bytes());
+    noncanonical_nested.proof.push(0);
+
+    for message in [
+        wrong_id,
+        malformed_length,
+        truncated,
+        trailing,
+        corrupted_nested_payload,
+        noncanonical_nested,
+    ] {
+        assert!(
+            verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&message, &config).is_err(),
+            "invalid proof stream must be rejected"
+        );
+    }
+
+    let mut replayed_statement = dealing.message.clone();
+    replayed_statement.msg_i.0[0] ^= 0x01;
+    replayed_statement.transcript_root = replayed_statement.recompute_transcript_root();
+    assert!(
+        verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&replayed_statement, &config,)
+            .is_err(),
+        "proof replay under a different dealer statement must be rejected"
+    );
 }
 
 #[test]
