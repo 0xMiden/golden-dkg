@@ -7,6 +7,9 @@ on:
     paths:
       - "**/Cargo.toml"
       - Cargo.lock
+      - LICENSE-*
+      - "crates/*/LICENSE-*"
+      - "crates/*/README.md"
       - .github/workflows/workspace-dry-run.yml
       - .github/workflows/workspace-publish.yml
   workflow_dispatch:
@@ -184,6 +187,19 @@ jobs:
             version="$(package_version "$package")"
             package_dir="target/package/${package}-${version}"
             echo "  $package v$version"
+
+            for required_file in Cargo.toml README.md LICENSE-MIT LICENSE-APACHE; do
+              if [[ ! -f "$package_dir/$required_file" ]]; then
+                echo "error: $package package is missing $required_file" >&2
+                exit 1
+              fi
+            done
+
+            if grep -Eq 'workspace = true|path = "\.\./' "$package_dir/Cargo.toml"; then
+              echo "error: $package package contains a workspace dependency or parent path" >&2
+              exit 1
+            fi
+
             (
               cd "$package_dir"
               find . -type f | sort
