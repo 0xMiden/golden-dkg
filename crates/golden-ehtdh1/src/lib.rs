@@ -96,10 +96,11 @@
 //!
 //! This crate does not provide AEAD authentication of plaintext, validator
 //! networking, accountable decryption, refresh, resharing, TEE custody, replay
-//! prevention, or a canonical wire format.
+//! prevention.
 //!
-//! The `serde` feature is absent until Golden has a versioned encoding for
-//! ciphertexts, shares, setup contexts, and group elements.
+//! [`wire`] defines canonical bytes for setup material, keys, ciphertexts, and
+//! decryption shares. The `miden-serde` and `serde` features adapt those same
+//! bytes to their respective serialization traits.
 //!
 //! # Provided APIs
 //!
@@ -168,7 +169,7 @@
 //! let public_key_set = PublicKeySet::<G>::new(2, joint_public_key, public_shares)?;
 //! let sealing_key = SealingKey::<G>::new(joint_public_key)?;
 //! let setup_context = SetupContext {
-//!     backend_id: G::BACKEND_ID,
+//!     backend_id: G::BACKEND_ID.to_owned(),
 //!     threshold: 2,
 //!     registry_root: [1u8; 32],
 //!     participants: participants.to_vec(),
@@ -214,6 +215,7 @@ pub mod context;
 pub mod decrypt;
 pub mod dkg_bridge;
 pub mod encrypt;
+pub mod wire;
 
 pub use context::{
     derive_context_session_id, CombineError, Error, PublicKeySet, PublicShare, SecretShare,
@@ -254,7 +256,7 @@ mod tests {
 
     fn setup_context() -> SetupContext {
         SetupContext {
-            backend_id: G::BACKEND_ID,
+            backend_id: G::BACKEND_ID.to_owned(),
             threshold: 2,
             registry_root: [1u8; 32],
             participants: participants().to_vec(),

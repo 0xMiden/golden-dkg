@@ -111,6 +111,8 @@ jobs:
         run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1
       - name: Test golden-evrf wire serialization adapters
         run: cargo nextest run -p golden-evrf --features serde,miden-serde,halo2curves-secp256k1
+      - name: Test EHTDH1 wire serialization adapters
+        run: cargo nextest run -p golden-ehtdh1 --features serde,miden-serde
       - name: Doctests
         run: cargo test --workspace --doc
 
