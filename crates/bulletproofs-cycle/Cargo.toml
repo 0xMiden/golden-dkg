@@ -1,11 +1,14 @@
 [package]
 name = "bulletproofs-cycle"
 version = "0.1.0"
+description = "Bulletproofs R1CS over configurable curve cycles"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 curve25519-dalek = { workspace = true, optional = true }

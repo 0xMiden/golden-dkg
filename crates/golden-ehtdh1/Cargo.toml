@@ -1,11 +1,14 @@
 [package]
 name = "golden-ehtdh1"
 version = "0.1.0"
+description = "Context bound threshold encryption for Golden distributed key generation"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 chacha20 = { workspace = true }
@@ -21,7 +24,7 @@ zeroize = { workspace = true }
 [dev-dependencies]
 golden-evrf = { workspace = true, features = ["halo2curves-secp256k1"] }
 golden-halo2curves = { workspace = true, features = ["halo2curves-secp256k1"] }
-golden-rustcrypto = { path = "../golden-rustcrypto", features = ["p256"] }
+golden-rustcrypto = { workspace = true, features = ["p256"] }
 rand_chacha = { workspace = true }
 serde_test = { workspace = true }
 
