@@ -90,7 +90,7 @@ impl<G: GoldenGroup> PublicKeySet<G> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupContext {
     /// Stable Golden backend id.
-    pub backend_id: &'static str,
+    pub backend_id: String,
     /// Threshold.
     pub threshold: usize,
     /// Golden participant registry root.

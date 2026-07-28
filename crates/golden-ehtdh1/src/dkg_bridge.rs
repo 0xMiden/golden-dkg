@@ -114,7 +114,7 @@ pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
         context: context_output.secret_share.value.clone(),
     };
     let setup_context = SetupContext {
-        backend_id: G::BACKEND_ID,
+        backend_id: G::BACKEND_ID.to_owned(),
         threshold: decryption_config.threshold,
         registry_root: decryption_config.registry.root(),
         participants,
