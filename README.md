@@ -2,10 +2,10 @@
 
 [![CI](https://github.com/0xMiden/golden-dkg/actions/workflows/ci.yml/badge.svg)](https://github.com/0xMiden/golden-dkg/actions/workflows/ci.yml)
 
-Rust workspace for distributed key generation and verifiable randomness over a
-generic group abstraction. The long-term goal is a paper-aligned Golden DKG
-and eVRF; the current tree implements the core DKG, a Secp256k1/Secq256k1
-curve-cycle eVRF backend, and the Bulletproofs R1CS layer it relies on.
+Rust workspace for distributed key generation, verifiable randomness, and
+context bound threshold encryption over a generic group abstraction. The
+current tree implements Golden DKG, EHTDH1, a Secp256k1/Secq256k1 eVRF
+backend, and the Bulletproofs R1CS layer used by that backend.
 
 The workspace has six crates. All crates are published together and require
 Rust 1.93 or later.
@@ -36,7 +36,7 @@ Rust 1.93 or later.
 ```bash
 cargo fmt --all --check
 cargo clippy --all --benches --tests --examples --all-features --exclude bulletproofs-cycle -- -D warnings
-cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1
+cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-ehtdh1/prototype-bridge,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1
 cargo test --workspace --doc
 ```
 
