@@ -16,7 +16,7 @@ golden-halo2curves = { workspace = true, optional = true }
 ff = { workspace = true, optional = true }
 group = { workspace = true, optional = true }
 halo2curves = { workspace = true, optional = true }
-merlin = { workspace = true, optional = true }
+merlin = { workspace = true }
 miden-serde-utils = { workspace = true, optional = true }
 rand_chacha = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
@@ -37,7 +37,6 @@ halo2curves-secp256k1 = [
     "dep:ff",
     "dep:group",
     "dep:halo2curves",
-    "dep:merlin",
     "dep:rand_chacha",
     "golden-halo2curves/halo2curves-secp256k1",
 ]

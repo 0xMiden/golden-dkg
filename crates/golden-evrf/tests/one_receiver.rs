@@ -5,10 +5,12 @@
 
 #![allow(clippy::unwrap_used)]
 
+use bulletproofs_cycle::Cycle;
 use ff::Field;
 use golden_evrf::paper::secp_secq::{
     self as paper, Gin, GinScalar, R1csField, SecpSecqEvrfStatement, SecpSecqEvrfWitness,
 };
+use golden_halo2curves::Secp256k1Cycle;
 use halo2curves::secq256k1::Secq256k1;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
@@ -95,7 +97,7 @@ fn evrf_one_receiver_rejects_wrong_r() {
 }
 
 #[test]
-fn evrf_one_receiver_rejects_wrong_transcript_domain() {
+fn evrf_one_receiver_rejects_wrong_proof_id() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0003);
     let sk1 = GinScalar::random(&mut rng);
     let pk2 = Gin::generator() * GinScalar::random(&mut rng);
@@ -103,17 +105,54 @@ fn evrf_one_receiver_rejects_wrong_transcript_domain() {
     let msg = make_msg(4);
     let (statement, witness) = paper::testing::build_statement_witness(&msg, sk1, pk2, beta);
 
-    let proof = paper::evrf_prove(&statement, &witness, &mut rng).expect("prove");
+    let mut proof = paper::evrf_prove(&statement, &witness, &mut rng).expect("prove");
+    proof[4] ^= 0x01;
 
-    // Swap the prover's Pedersen commitment to `k` so the verifier's
-    // recomputed commitment can't match what the R1CS proof carries.
-    let mut bad_proof = proof.clone();
-    let wrong_k = R1csField::random(&mut rng);
-    bad_proof.k_commitment = paper::testing::commit_k_for_test(wrong_k);
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
-        paper::evrf_verify(&statement, &bad_proof, &mut verify_rng).is_err(),
-        "verifier must reject a proof whose k_commitment is swapped"
+        paper::evrf_verify(&statement, &proof, &mut verify_rng).is_err(),
+        "verifier must reject a mismatched proof ID"
+    );
+}
+
+#[test]
+fn evrf_one_receiver_rejects_malformed_nested_frame() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0007);
+    let sk1 = GinScalar::random(&mut rng);
+    let pk2 = Gin::generator() * GinScalar::random(&mut rng);
+    let beta = R1csField::from(19u64);
+    let msg = make_msg(8);
+    let (statement, witness) = paper::testing::build_statement_witness(&msg, sk1, pk2, beta);
+
+    let mut proof = paper::evrf_prove(&statement, &witness, &mut rng).expect("prove");
+    let proof_id_len = u32::from_be_bytes(proof[..4].try_into().expect("proof ID length")) as usize;
+    let cp_bytes = 2 * Secp256k1Cycle::COMPRESSED_BYTES + 32;
+    let nested_len_offset = 4 + proof_id_len + cp_bytes;
+    proof[nested_len_offset..nested_len_offset + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    assert!(
+        paper::evrf_verify(&statement, &proof, &mut verify_rng).is_err(),
+        "verifier must reject an overflowing nested-frame length"
+    );
+}
+
+#[test]
+fn evrf_one_receiver_rejects_trailing_bytes() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0008);
+    let sk1 = GinScalar::random(&mut rng);
+    let pk2 = Gin::generator() * GinScalar::random(&mut rng);
+    let beta = R1csField::from(23u64);
+    let msg = make_msg(9);
+    let (statement, witness) = paper::testing::build_statement_witness(&msg, sk1, pk2, beta);
+
+    let mut proof = paper::evrf_prove(&statement, &witness, &mut rng).expect("prove");
+    proof.push(0);
+
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    assert!(
+        paper::evrf_verify(&statement, &proof, &mut verify_rng).is_err(),
+        "verifier must reject bytes after the final DLOG response"
     );
 }
 

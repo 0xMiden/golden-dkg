@@ -31,6 +31,8 @@ use sha2::{Digest, Sha256};
 
 pub mod paper;
 
+mod proof_stream;
+
 /// Curve-agnostic Schnorr/Chaum-Pedersen backend for DKG share/pad/DH
 /// openings. Not the Golden eVRF proof; see [`paper`] for that.
 pub mod prototype {
