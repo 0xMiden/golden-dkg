@@ -16,17 +16,9 @@
 #![allow(non_snake_case)]
 
 #[cfg(feature = "halo2curves-secp256k1")]
-use golden_core::{
-    wire, Error, EvrfStatement, EvrfWitness, ParticipantIndex, Result, TranscriptRoot,
-};
-#[cfg(all(feature = "halo2curves-secp256k1", feature = "miden-serde"))]
-use miden_serde_utils::{
-    ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
-};
+use golden_core::{Error, EvrfStatement, EvrfWitness, ParticipantIndex, Result, TranscriptRoot};
 #[cfg(feature = "halo2curves-secp256k1")]
 use rand_core::CryptoRngCore;
-#[cfg(all(feature = "halo2curves-secp256k1", feature = "serde"))]
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 /// Byte length of the paper `msg_i` nonce (256-bit security parameter).
 pub const MESSAGE_BYTES: usize = 256 / 8;
@@ -1926,100 +1918,6 @@ pub mod secp_secq {
         false
     }
 
-    /// Byte-serialized paper eVRF proof for the DKG. The inner bytes encode
-    /// only the receiver count and the private-witness R1CS proof.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct SecpSecqProof(pub Vec<u8>);
-
-    impl wire::WireEncode for SecpSecqProof {
-        fn write_wire(&self, out: &mut Vec<u8>) {
-            wire::WireEncode::write_wire(&self.0, out);
-        }
-    }
-
-    impl wire::WireDecode for SecpSecqProof {
-        fn read_wire(reader: &mut wire::WireReader<'_>) -> Result<Self> {
-            let bytes = <Vec<u8> as wire::WireDecode>::read_wire(reader)?;
-            decode_proof(&bytes)?;
-            Ok(Self(bytes))
-        }
-    }
-
-    impl wire::WireMessage for SecpSecqProof {
-        const TAG: u8 = wire::TAG_PROOF_BYTES;
-        const CODEC_ID: &'static str = "secp-secq-r1cs-proof-v1";
-    }
-
-    #[cfg(feature = "miden-serde")]
-    impl Serializable for SecpSecqProof {
-        fn write_into<W: ByteWriter>(&self, target: &mut W) {
-            wire::write_miden_wire(self, target);
-        }
-
-        fn get_size_hint(&self) -> usize {
-            wire::miden_wire_size_hint(self)
-        }
-    }
-
-    #[cfg(feature = "miden-serde")]
-    impl Deserializable for SecpSecqProof {
-        fn read_from<R: ByteReader>(
-            source: &mut R,
-        ) -> core::result::Result<Self, DeserializationError> {
-            wire::read_miden_wire(source)
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    impl Serialize for SecpSecqProof {
-        fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
-            serializer.serialize_bytes(&wire::to_wire_bytes(self))
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    impl<'de> Deserialize<'de> for SecpSecqProof {
-        fn deserialize<D: Deserializer<'de>>(
-            deserializer: D,
-        ) -> core::result::Result<Self, D::Error> {
-            deserializer.deserialize_bytes(SecpSecqProofBytes)
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    struct SecpSecqProofBytes;
-
-    #[cfg(feature = "serde")]
-    impl<'de> de::Visitor<'de> for SecpSecqProofBytes {
-        type Value = SecpSecqProof;
-
-        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            formatter.write_str("canonical Golden Secp/Secq proof bytes")
-        }
-
-        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> core::result::Result<Self::Value, E> {
-            wire::from_wire_bytes(value).map_err(|err| E::custom(err.to_string()))
-        }
-
-        fn visit_byte_buf<E: de::Error>(
-            self,
-            value: Vec<u8>,
-        ) -> core::result::Result<Self::Value, E> {
-            wire::from_wire_bytes(&value).map_err(|err| E::custom(err.to_string()))
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
-        where
-            A: de::SeqAccess<'de>,
-        {
-            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-            while let Some(byte) = seq.next_element()? {
-                bytes.push(byte);
-            }
-            wire::from_wire_bytes(&bytes).map_err(|err| de::Error::custom(err.to_string()))
-        }
-    }
-
     /// Serialize the proof envelope into a flat byte vector.
     fn encode_proof(envelope: &BatchedEvrfProofEnvelope, num_receivers: usize) -> Result<Vec<u8>> {
         let n = u32::try_from(num_receivers).map_err(|_| Error::ProofVerificationFailed)?;
@@ -2095,7 +1993,7 @@ pub mod secp_secq {
     pub struct SecpSecqBackend;
 
     impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
-        type Proof = SecpSecqProof;
+        const PROOF_ID: &'static [u8] = b"golden-evrf/paper-secp-secq-batched-legacy/v1";
 
         fn derive_pad(
             msg_i: DealerMessageNonce,
@@ -2113,7 +2011,7 @@ pub mod secp_secq {
             statements: &[EvrfStatement<Secp256k1GoldenGroup>],
             witnesses: &[EvrfWitness<Secp256k1GoldenGroup>],
             rng: &mut impl CryptoRngCore,
-        ) -> Result<Self::Proof> {
+        ) -> Result<Vec<u8>> {
             if statements.is_empty() || statements.len() != witnesses.len() {
                 return Err(Error::ProofVerificationFailed);
             }
@@ -2174,18 +2072,27 @@ pub mod secp_secq {
                 shares,
             };
             let envelope = evrf_batched_prove(&batched_statement, &batched_witness, rng)?;
-            let bytes = encode_proof(&envelope, statements.len())?;
-            Ok(SecpSecqProof(bytes))
+            let payload = encode_proof(&envelope, statements.len())?;
+            let mut stream =
+                ProverProofStream::new(<Self as EvrfProofBackend<Secp256k1GoldenGroup>>::PROOF_ID)?;
+            stream.send_bytes(b"legacy-batched-proof", &payload);
+            Ok(stream.finish())
         }
 
         fn verify_batch(
             statements: &[EvrfStatement<Secp256k1GoldenGroup>],
-            proof: &Self::Proof,
+            proof: &[u8],
         ) -> Result<()> {
             if statements.is_empty() {
                 return Err(Error::ProofVerificationFailed);
             }
-            let (num_receivers, envelope) = decode_proof(&proof.0)?;
+            let mut stream = VerifierProofStream::new(
+                <Self as EvrfProofBackend<Secp256k1GoldenGroup>>::PROOF_ID,
+                proof,
+            )?;
+            let payload = stream.receive_remaining_bytes(b"legacy-batched-proof")?;
+            let (num_receivers, envelope) = decode_proof(payload)?;
+            stream.finish()?;
             if num_receivers != statements.len() {
                 return Err(Error::ProofVerificationFailed);
             }
@@ -3236,7 +3143,7 @@ pub mod secp_secq {
     #[allow(clippy::unwrap_used)]
     mod dkg_unit_tests {
         use super::*;
-        use bulletproofs_cycle::Cycle;
+
         use golden_core::GoldenGroup;
         use halo2curves::secp256k1::Fp;
 
@@ -3309,25 +3216,6 @@ pub mod secp_secq {
                 encrypted_share: Secp256k1Scalar(rec.encrypted_share),
                 transcript_root: [5u8; 32],
             }
-        }
-
-        fn structurally_valid_proof_bytes() -> Vec<u8> {
-            const ONE_PHASE_COMMITMENTS: u8 = 0;
-
-            let compressed = Secq256k1Cycle::compressed_identity();
-            let mut r1cs = Vec::new();
-            r1cs.push(ONE_PHASE_COMMITMENTS);
-            for _ in 0..8 {
-                r1cs.extend_from_slice(Secq256k1Cycle::compressed_as_bytes(&compressed));
-            }
-            r1cs.extend_from_slice(&[0u8; 32 * 5]);
-
-            let r1cs_len = u32::try_from(r1cs.len()).unwrap();
-            let mut out = Vec::with_capacity(8 + r1cs.len());
-            out.extend_from_slice(&1u32.to_le_bytes());
-            out.extend_from_slice(&r1cs_len.to_le_bytes());
-            out.extend_from_slice(&r1cs);
-            out
         }
 
         #[test]
@@ -3441,67 +3329,6 @@ pub mod secp_secq {
                 ensure_same_batch_context(&changed, &first).unwrap_err(),
                 Error::ProofVerificationFailed
             );
-        }
-
-        #[test]
-        fn secp_secq_proof_wire_wraps_complete_proof_bytes() {
-            let proof = SecpSecqProof(structurally_valid_proof_bytes());
-            let bytes = wire::to_wire_bytes(&proof);
-            let decoded = wire::from_wire_bytes::<SecpSecqProof>(&bytes).unwrap();
-
-            assert_eq!(decoded, proof);
-        }
-
-        #[test]
-        fn secp_secq_proof_wire_rejects_malformed_proof_bytes() {
-            let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
-            let bytes = wire::to_wire_bytes(&proof);
-
-            assert_eq!(
-                wire::from_wire_bytes::<SecpSecqProof>(&bytes).unwrap_err(),
-                Error::ProofVerificationFailed
-            );
-        }
-
-        #[cfg(feature = "serde")]
-        #[test]
-        fn secp_secq_proof_serde_uses_canonical_wire_bytes() {
-            use serde_test::{assert_de_tokens, assert_tokens, Token};
-
-            let proof = SecpSecqProof(structurally_valid_proof_bytes());
-            let bytes: &'static [u8] = Box::leak(wire::to_wire_bytes(&proof).into_boxed_slice());
-
-            assert_tokens(&proof, &[Token::Bytes(bytes)]);
-
-            let mut seq = Vec::with_capacity(bytes.len() + 2);
-            seq.push(Token::Seq {
-                len: Some(bytes.len()),
-            });
-            seq.extend(bytes.iter().copied().map(Token::U8));
-            seq.push(Token::SeqEnd);
-
-            assert_de_tokens(&proof, &seq);
-        }
-
-        #[cfg(feature = "miden-serde")]
-        #[test]
-        fn secp_secq_proof_miden_serde_uses_canonical_wire_bytes() {
-            use miden_serde_utils::{Deserializable, Serializable, SliceReader};
-
-            let proof = SecpSecqProof(structurally_valid_proof_bytes());
-            let bytes = proof.to_bytes();
-            let wire_bytes = wire::to_wire_bytes(&proof);
-
-            assert!(bytes.ends_with(&wire_bytes));
-            assert_eq!(SecpSecqProof::read_from_bytes(&bytes).unwrap(), proof);
-
-            let mut adjacent = Vec::new();
-            proof.write_into(&mut adjacent);
-            proof.write_into(&mut adjacent);
-            let mut reader = SliceReader::new(&adjacent);
-
-            assert_eq!(SecpSecqProof::read_from(&mut reader).unwrap(), proof);
-            assert_eq!(SecpSecqProof::read_from(&mut reader).unwrap(), proof);
         }
     }
 }

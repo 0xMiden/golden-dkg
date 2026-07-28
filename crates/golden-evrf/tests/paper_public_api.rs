@@ -9,7 +9,7 @@ use golden_core::{
     DealerMessageNonce, Error, EvrfProofBackend, EvrfStatement, GoldenGroup, GoldenScalar,
     ParticipantIndex, SessionId, PROTOCOL_VERSION,
 };
-use golden_evrf::paper::secp_secq::{SecpSecqBackend, SecpSecqProof};
+use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
 
 fn idx(value: u32) -> ParticipantIndex {
@@ -57,8 +57,7 @@ fn backend_rejects_malformed_proof_bytes() {
 
     for bytes in malformed {
         assert_eq!(
-            SecpSecqBackend::verify_batch(core::slice::from_ref(&statement), &SecpSecqProof(bytes))
-                .unwrap_err(),
+            SecpSecqBackend::verify_batch(core::slice::from_ref(&statement), &bytes).unwrap_err(),
             Error::ProofVerificationFailed
         );
     }

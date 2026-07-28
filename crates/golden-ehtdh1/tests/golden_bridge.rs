@@ -12,12 +12,11 @@ use golden_core::{
 use golden_ehtdh1::{
     derive_context_session_id, material_from_dkg_outputs, Combiner, Error, UnsealingShare,
 };
-use golden_evrf::prototype::{ShareOpeningBackend, ShareOpeningBatchedProof};
+use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
 type G = P256Backend;
-type Proof = ShareOpeningBatchedProof<G>;
 
 fn idx(value: u32) -> ParticipantIndex {
     ParticipantIndex::new(value).unwrap()
@@ -59,7 +58,7 @@ fn dealings(
     config: &DkgConfig<G>,
     rng: &mut ChaCha20Rng,
     secret_for_dealer: impl Fn(ParticipantIndex) -> P256Scalar,
-) -> BTreeMap<ParticipantIndex, DkgDealing<G, Proof>> {
+) -> BTreeMap<ParticipantIndex, DkgDealing<G>> {
     config
         .registry
         .indexes()
@@ -79,8 +78,8 @@ fn dealings(
 
 fn peer_dealings(
     receiver: ParticipantIndex,
-    dealings: &BTreeMap<ParticipantIndex, DkgDealing<G, Proof>>,
-) -> BTreeMap<ParticipantIndex, DealerMessage<G, Proof>> {
+    dealings: &BTreeMap<ParticipantIndex, DkgDealing<G>>,
+) -> BTreeMap<ParticipantIndex, DealerMessage<G>> {
     dealings
         .iter()
         .filter_map(|(dealer, dealing)| {
@@ -349,7 +348,7 @@ mod secp_secq {
     use golden_ehtdh1::{
         derive_context_session_id, material_from_dkg_outputs, Combiner, UnsealingShare,
     };
-    use golden_evrf::paper::secp_secq::{SecpSecqBackend, SecpSecqProof};
+    use golden_evrf::paper::secp_secq::SecpSecqBackend;
     use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
     use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
@@ -393,7 +392,7 @@ mod secp_secq {
         config: &DkgConfig<PaperGroup>,
         rng: &mut ChaCha20Rng,
         secret_for_dealer: impl Fn(ParticipantIndex) -> Secp256k1Scalar,
-    ) -> BTreeMap<ParticipantIndex, DkgDealing<PaperGroup, SecpSecqProof>> {
+    ) -> BTreeMap<ParticipantIndex, DkgDealing<PaperGroup>> {
         config
             .registry
             .indexes()
@@ -413,8 +412,8 @@ mod secp_secq {
 
     fn peer_dealings(
         receiver: ParticipantIndex,
-        dealings: &BTreeMap<ParticipantIndex, DkgDealing<PaperGroup, SecpSecqProof>>,
-    ) -> BTreeMap<ParticipantIndex, DealerMessage<PaperGroup, SecpSecqProof>> {
+        dealings: &BTreeMap<ParticipantIndex, DkgDealing<PaperGroup>>,
+    ) -> BTreeMap<ParticipantIndex, DealerMessage<PaperGroup>> {
         dealings
             .iter()
             .filter_map(|(dealer, dealing)| {

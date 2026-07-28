@@ -15,7 +15,7 @@ use golden_core::{
     EvrfStatement, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
     PROTOCOL_VERSION,
 };
-use golden_evrf::paper::secp_secq::{SecpSecqBackend, SecpSecqProof};
+use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
@@ -64,7 +64,7 @@ fn tamper_scalar(s: &Secp256k1Scalar) -> Secp256k1Scalar {
 /// `tamper` to the freshly built dealer message.
 fn assert_dealing_rejected<F>(tamper: F)
 where
-    F: FnOnce(&mut DealerMessage<Secp256k1GoldenGroup, SecpSecqProof>),
+    F: FnOnce(&mut DealerMessage<Secp256k1GoldenGroup>),
 {
     let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
     let config = config();
@@ -89,7 +89,7 @@ where
 /// backend's `verify_batch` can be invoked directly with a tampered
 /// statement.
 fn build_statements(
-    dealing: &golden_core::DkgDealing<Secp256k1GoldenGroup, SecpSecqProof>,
+    dealing: &golden_core::DkgDealing<Secp256k1GoldenGroup>,
     config: &DkgConfig<Secp256k1GoldenGroup>,
     dealer: ParticipantIndex,
 ) -> Vec<EvrfStatement<Secp256k1GoldenGroup>> {
@@ -240,10 +240,10 @@ fn dkg_rejects_tampered_transcript_root() {
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn dkg_rejects_tampered_proof_bytes() {
     assert_dealing_rejected(|msg| {
-        if msg.proof.0.is_empty() {
-            msg.proof.0.push(0);
+        if msg.proof.is_empty() {
+            msg.proof.push(0);
         }
-        msg.proof.0[0] ^= 0x01;
+        msg.proof[0] ^= 0x01;
     });
 }
 

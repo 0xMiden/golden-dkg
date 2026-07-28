@@ -386,6 +386,11 @@ impl<'proof> VerifierProofStream<'proof> {
         }
     }
 
+    /// Receives and observes every unread proof byte.
+    pub(crate) fn receive_remaining_bytes(&mut self, label: &'static [u8]) -> Result<&'proof [u8]> {
+        self.receive_bytes(label, self.proof.len() - self.cursor)
+    }
+
     /// Finishes verification, rejecting any trailing proof bytes.
     pub(crate) fn finish(self) -> Result<()> {
         if self.cursor == self.proof.len() {
