@@ -1,59 +1,37 @@
 # Publishing Golden crates
 
-All Golden crates are published together from the current `main` commit.
+Publish all Golden crates together from the current `main` commit.
 
-## First publication
+## Prepare the release
 
-The first version of a crate cannot use trusted publishing. A release admin
-must publish version `0.1.0` with a temporary crates.io token.
+Update each publishable crate to the new release version. Merge the changes
+into `main`.
 
-Before the release window, confirm that every crate name is available:
+Run `Workspace release dry-run` and `Nightly slow tests` on the commit to be
+released. Both workflows must pass.
 
-```bash
-for crate in \
-  bulletproofs-cycle \
-  golden-core \
-  golden-ehtdh1 \
-  golden-evrf \
-  golden-halo2curves \
-  golden-rustcrypto
-do
-  curl --silent --show-error \
-    --user-agent "0xMiden/golden-dkg release check" \
-    --output /dev/null \
-    --write-out "$crate %{http_code}\n" \
-    "https://crates.io/api/v1/crates/$crate"
-done
-```
+## Publish
 
-Each name must return `404`. Stop if any name returns another status.
+Run `Publish workspace to crates.io` with these inputs:
 
-From a clean checkout of the exact `origin/main` commit, authenticate Cargo
-with the temporary token and run:
+- Set `ref` to `main`.
+- Leave `packages` empty.
+- Leave `allow_existing` set to `false`.
 
-```bash
-cargo publish --workspace --locked
-```
+The workflow uses crates.io trusted publishing. It also checks that the release
+commit is the current `main` commit and that none of the selected versions
+already exist.
 
-If only some crates are published, rerun the command with one `--exclude`
-argument for each published crate. Never reuse or change a version that reached
-crates.io.
+After publication:
 
-After all six crates are public, verify their owners and build consumers for
-the P256 and Secp/Secq paths. Add the trusted publisher to each crate:
+- Verify the crate versions and owners on crates.io.
+- Build downstream consumers against the published crates.
+- Tag the published commit with the release version.
 
-- owner: `0xMiden`
-- repository: `golden-dkg`
-- workflow: `workspace-publish.yml`
-- environment: `release`
+## Resume a partial release
 
-Revoke the temporary token after trusted publishing is configured.
+If a run stops after publishing some crates, check which versions reached
+crates.io. Run the workflow again with `allow_existing` set to `true`. The
+workflow skips those versions and publishes the rest.
 
-## Later publications
-
-Prepare new crate versions on `main`, then run the
-`Publish workspace to crates.io` workflow. Leave `packages` empty to publish
-every new workspace version.
-
-Use `allow_existing` only to resume a partial publication. The default remains
-strict so an existing crate version stops the workflow.
+Never change or reuse a version that reached crates.io.

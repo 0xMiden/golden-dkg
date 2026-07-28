@@ -1,0 +1,46 @@
+# cargo-deny configuration for the Golden workspace
+
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+  # paste is unmaintained but still functional and is used transitively.
+  "RUSTSEC-2024-0436",
+]
+yanked = "warn"
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "MIT",
+  "Unicode-3.0",
+]
+exceptions = []
+
+[bans]
+allow = []
+deny = []
+highlight = "all"
+multiple-versions = "deny"
+skip = [
+  # halo2derive still depends on syn 1.
+  { name = "syn", version = "=1.0.109" },
+]
+skip-tree = []
+wildcards = "allow"
+
+[sources]
+allow-git = []
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+unknown-git = "deny"
+unknown-registry = "deny"
