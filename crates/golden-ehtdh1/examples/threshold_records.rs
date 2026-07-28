@@ -6,17 +6,39 @@
 //!    They agree on one public sealing key with a threshold of two. Each
 //!    participant also receives its own secret share.
 //! 2. A separate writer creates three `(key, value)` pairs. Each key is the
-//!    context for its value.
+//!    record ID for its value.
 //! 3. The writer encrypts each large value with XChaCha20Poly1305 under a fresh
 //!    content key. EHTDH1 encrypts only that 32 byte content key.
-//! 4. The participants choose one context. Each participant uses its secret
-//!    share to make a decryption share for that context and ciphertext.
+//! 4. The participants choose one record. Each participant uses its secret
+//!    share to make a decryption share for that record and ciphertext.
 //! 5. A combiner checks the decryption shares. Any two valid shares recover the
 //!    content key, which then decrypts the value.
 //!
 //! The example uses a fast prototype proof backend so it can run as a normal
 //! example. It uses the same Golden DKG and EHTDH1 public APIs as the full
 //! proof backend.
+//!
+//! # Context policy
+//!
+//! Four values in this flow are easy to conflate:
+//!
+//! * The **record ID** identifies the stored record.
+//! * **Associated data** binds that ID into the record AEAD and the EHTDH1
+//!   ciphertext.
+//! * The **EHTDH1 decryption context** binds each participant's approval to a
+//!   decryption request.
+//! * The [`SetupContext`](golden_ehtdh1::SetupContext) identifies the Golden
+//!   setup that produced the keys and shares.
+//!
+//! The record ID, both associated-data inputs, and the decryption context
+//! happen to contain the same bytes in this example, but they remain separate
+//! inputs.
+//!
+//! # Why setup runs DKG twice
+//!
+//! The first DKG shares the joint decryption secret. The second shares zero so
+//! its contributions cancel for one decryption context, but not when contexts
+//! are mixed.
 //!
 //! # Glossary
 //!
@@ -46,18 +68,18 @@
 //!   never exchange these secret shares.
 //! * An **unsealing share** wraps one secret share. A participant uses it to
 //!   create a decryption share without exposing the stored secret.
-//! * A **record context** is the application key for one record. The same
-//!   context is bound to the record cipher and EHTDH1 ciphertext. It also binds
-//!   each decryption share.
-//! * A **record** is the stored context and record cipher nonce. It also
+//! * A **record ID** is the application key for one record. It is bound to the
+//!   record cipher, EHTDH1 ciphertext, and each decryption share.
+//! * A **record** is the stored record ID and record cipher nonce. It also
 //!   includes the encrypted value and canonical bytes for the EHTDH1
 //!   ciphertext.
 //! * A **content key** is a fresh 32 byte secret used to encrypt one record
 //!   value with XChaCha20Poly1305.
 //! * An **EHTDH1 ciphertext** is the encrypted content key and its proof. The
-//!   record context is public associated data in this ciphertext.
+//!   record ID is public associated data in this ciphertext.
 //! * A **decryption share** is a message made for one EHTDH1 ciphertext and one
-//!   context. It is safe to exchange. It is not the participant's secret share.
+//!   decryption context. It is safe to exchange. It is not the participant's
+//!   secret share.
 //! * A **combiner** checks decryption shares against the public setup. It
 //!   returns the content key only after it receives enough valid shares.
 //! * A **quorum** is any set of participants that meets the threshold. All
@@ -66,7 +88,7 @@
 //!   The writer and participants decode the same bytes. The combiner does the
 //!   same.
 //! * With **authenticated symmetric encryption**, the large record value is
-//!   hidden and any change to its ciphertext or context is rejected.
+//!   hidden and any change to its ciphertext or record ID is rejected.
 //! * The **HPKE style split** means symmetric encryption handles each large
 //!   value while EHTDH1 handles only its small content key. Record size does
 //!   not change the EHTDH1 payload size.
@@ -108,10 +130,10 @@ const NONCE_BYTES: usize = 24;
 /// Size of each example value.
 const RECORD_BYTES: usize = 512 * 1024;
 
-/// Stored form of one context and its encrypted value.
+/// Stored form of one record ID and its encrypted value.
 struct StoredRecord {
-    /// Application key bound into both encryption layers.
-    context: Vec<u8>,
+    /// Public application identifier bound into both encryption layers.
+    record_id: Vec<u8>,
     /// Public nonce used by the record cipher.
     nonce: [u8; NONCE_BYTES],
     /// Large value encrypted by XChaCha20Poly1305.
@@ -137,7 +159,7 @@ fn main() -> AppResult<()> {
     let writer_key = from_wire_bytes::<SealingKey<G>>(&public_key_bytes)?;
 
     // Step 3. The writer makes three key and value pairs. Each application key
-    // is the context bound into both encryption layers.
+    // is the record ID bound into both encryption layers.
     let inputs = [
         (b"private-record/A".as_slice(), vec![b'A'; RECORD_BYTES]),
         (b"private-record/B".as_slice(), vec![b'B'; RECORD_BYTES]),
@@ -145,16 +167,30 @@ fn main() -> AppResult<()> {
     ];
     let mut writer_rng = ChaCha20Rng::from_seed([2u8; 32]);
     let mut records = Vec::new();
-    for (context, value) in inputs {
-        records.push(seal_record(&writer_key, context, &value, &mut writer_rng)?);
+    for (record_id, value) in inputs {
+        records.push(seal_record(
+            &writer_key,
+            record_id,
+            &value,
+            &mut writer_rng,
+        )?);
     }
 
-    // Step 4. The participants choose context B. Each participant makes and
-    // exchanges a canonical decryption share for that exact record.
+    // Step 4. The participants choose record B. This example deliberately uses
+    // its record ID for both EHTDH1 inputs.
     let chosen = &records[1];
+    let other = &records[0];
     let wrapped_key = from_wire_bytes::<Ciphertext<G>>(&chosen.wrapped_content_key)?;
+    let expected_associated_data = chosen.record_id.as_slice();
+    let decryption_context = chosen.record_id.as_slice();
     let mut share_rng = ChaCha20Rng::from_seed([3u8; 32]);
-    let shares = make_shares(&materials, &wrapped_key, &chosen.context, &mut share_rng)?;
+    let shares = make_shares(
+        &materials,
+        &wrapped_key,
+        decryption_context,
+        expected_associated_data,
+        &mut share_rng,
+    )?;
     let combiner = Combiner::new(first.public_key_set.clone(), first.setup_context.clone())?;
 
     // Step 5. One share is below the threshold and cannot open the content key.
@@ -162,8 +198,8 @@ fn main() -> AppResult<()> {
         combiner
             .combine_exact_with_associated_data(
                 &wrapped_key,
-                &chosen.context,
-                &chosen.context,
+                decryption_context,
+                expected_associated_data,
                 &shares[..1],
             )
             .is_err(),
@@ -175,8 +211,8 @@ fn main() -> AppResult<()> {
         let selected = [shares[pair[0]].clone(), shares[pair[1]].clone()];
         let content_key = Zeroizing::new(combiner.combine_exact_with_associated_data(
             &wrapped_key,
-            &chosen.context,
-            &chosen.context,
+            decryption_context,
+            expected_associated_data,
             &selected,
         )?);
         let opened = open_record(chosen, &content_key)?;
@@ -186,26 +222,54 @@ fn main() -> AppResult<()> {
         )?;
     }
 
-    // Shares are bound to context B and cannot open the record under context A.
-    let other = &records[0];
+    // A share made for the same ciphertext and associated data under another
+    // decryption context cannot combine with a share for the intended context.
+    let second = get(&materials, participants[1], "missing second participant")?;
+    let different_decryption_context = other.record_id.as_slice();
+    let mixed_context_share = UnsealingShare::new(second.secret_share.clone())
+        .decrypt_share_with_associated_data(
+            &mut share_rng,
+            &second.setup_context,
+            &wrapped_key,
+            different_decryption_context,
+            expected_associated_data,
+        )?;
+    let mixed_context_share =
+        from_wire_bytes::<DecryptionShare<G>>(&to_wire_bytes(&mixed_context_share))?;
+    let mixed_context_shares = [shares[0].clone(), mixed_context_share];
+    require(
+        combiner
+            .combine_exact_with_associated_data(
+                &wrapped_key,
+                decryption_context,
+                expected_associated_data,
+                &mixed_context_shares,
+            )
+            .is_err(),
+        "shares from different decryption contexts were combined",
+    )?;
+
+    // Shares are also bound to ciphertext B and cannot open record A.
     let other_wrapped_key = from_wire_bytes::<Ciphertext<G>>(&other.wrapped_content_key)?;
+    let other_expected_associated_data = other.record_id.as_slice();
+    let other_decryption_context = other.record_id.as_slice();
     require(
         combiner
             .combine_exact_with_associated_data(
                 &other_wrapped_key,
-                &other.context,
-                &other.context,
+                other_decryption_context,
+                other_expected_associated_data,
                 &shares[..2],
             )
             .is_err(),
-        "shares for one context opened another record",
+        "shares for one record opened another record",
     )?;
 
     let record_bytes = records.len() * RECORD_BYTES;
     let wrapped_bytes = records.len() * CONTENT_KEY_BYTES;
     println!("Golden setup has 3 participants and a threshold of 2.");
     println!(
-        "The writer stored {} records keyed by context.",
+        "The writer stored {} records keyed by record ID.",
         records.len()
     );
     println!(
@@ -216,6 +280,7 @@ fn main() -> AppResult<()> {
     println!("The parties chose private-record/B and exchanged canonical shares.");
     println!("All three pairs of two opened private-record/B.");
     println!("One share and shares from another context were rejected.");
+    println!("Shares made under mixed decryption contexts were rejected.");
 
     Ok(())
 }
@@ -310,7 +375,7 @@ fn run_golden_setup(
     )?;
     // The first DKG creates the joint decryption key.
     let decryption_outputs = run_dkg(participants, &decryption_config, rng, false)?;
-    // The second DKG shares zero so later shares can bind a record context.
+    // The second DKG shares zero so later shares can bind a decryption context.
     let context_outputs = run_dkg(participants, &context_config, rng, true)?;
 
     let mut materials = BTreeMap::new();
@@ -353,7 +418,7 @@ fn check_shared_setup(materials: &BTreeMap<ParticipantIndex, Ehtdh1Material<G>>)
 /// Encrypts one large value and wraps only its fresh content key with EHTDH1.
 fn seal_record(
     sealing_key: &SealingKey<G>,
-    context: &[u8],
+    record_id: &[u8],
     value: &[u8],
     rng: &mut ChaCha20Rng,
 ) -> AppResult<StoredRecord> {
@@ -362,7 +427,8 @@ fn seal_record(
     rng.fill_bytes(&mut *content_key);
     rng.fill_bytes(&mut nonce);
 
-    // The record cipher handles the large value and binds its public context.
+    // The record cipher handles the large value and binds its public record ID.
+    let aead_associated_data = record_id;
     let cipher = XChaCha20Poly1305::new_from_slice(content_key.as_ref())
         .map_err(|_| io::Error::other("invalid content key"))?;
     let encrypted_value = cipher
@@ -370,20 +436,25 @@ fn seal_record(
             &XNonce::from(nonce),
             Payload {
                 msg: value,
-                aad: context,
+                aad: aead_associated_data,
             },
         )
         .map_err(|_| io::Error::other("record encryption failed"))?;
-    // EHTDH1 handles only the fixed size content key and the same context.
-    let wrapped_content_key =
-        sealing_key.seal_bytes_with_associated_data(rng, content_key.as_ref(), context)?;
+    // EHTDH1 handles only the fixed size content key and independently binds
+    // its expected associated data.
+    let expected_associated_data = record_id;
+    let wrapped_content_key = sealing_key.seal_bytes_with_associated_data(
+        rng,
+        content_key.as_ref(),
+        expected_associated_data,
+    )?;
     require(
         wrapped_content_key.encrypted_payload.len() == CONTENT_KEY_BYTES,
         "EHTDH1 wrapped more than the content key",
     )?;
 
     Ok(StoredRecord {
-        context: context.to_vec(),
+        record_id: record_id.to_vec(),
         nonce,
         encrypted_value,
         wrapped_content_key: to_wire_bytes(&wrapped_content_key),
@@ -394,7 +465,8 @@ fn seal_record(
 fn make_shares(
     materials: &BTreeMap<ParticipantIndex, Ehtdh1Material<G>>,
     wrapped_key: &Ciphertext<G>,
-    context: &[u8],
+    decryption_context: &[u8],
+    expected_associated_data: &[u8],
     rng: &mut ChaCha20Rng,
 ) -> AppResult<Vec<DecryptionShare<G>>> {
     let mut shares = Vec::new();
@@ -404,8 +476,8 @@ fn make_shares(
                 rng,
                 &material.setup_context,
                 wrapped_key,
-                context,
-                context,
+                decryption_context,
+                expected_associated_data,
             )?;
         // The example serializes each share before the combiner receives it.
         shares.push(from_wire_bytes(&to_wire_bytes(&share))?);
@@ -421,13 +493,14 @@ fn open_record(record: &StoredRecord, content_key: &[u8]) -> AppResult<Vec<u8>> 
     )?;
     let cipher = XChaCha20Poly1305::new_from_slice(content_key)
         .map_err(|_| io::Error::other("invalid opened content key"))?;
-    // The record cipher checks the stored context before it returns plaintext.
+    // The record cipher checks the stored record ID before returning plaintext.
+    let aead_associated_data = record.record_id.as_slice();
     cipher
         .decrypt(
             &XNonce::from(record.nonce),
             Payload {
                 msg: &record.encrypted_value,
-                aad: &record.context,
+                aad: aead_associated_data,
             },
         )
         .map_err(|_| io::Error::other("record decryption failed").into())
