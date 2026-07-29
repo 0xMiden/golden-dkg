@@ -414,6 +414,35 @@ mod tests {
     }
 
     #[test]
+    fn shares_are_bound_to_ciphertext_with_same_context() {
+        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
+        let mut first_rng = ChaCha20Rng::from_seed([7u8; 32]);
+        let mut second_rng = ChaCha20Rng::from_seed([8u8; 32]);
+        let plaintext = b"payload";
+        let associated_data = b"ad";
+        let decryption_context = b"context";
+        let first = sealing_key
+            .seal_bytes_with_associated_data(&mut first_rng, plaintext, associated_data)
+            .unwrap();
+        let second = sealing_key
+            .seal_bytes_with_associated_data(&mut second_rng, plaintext, associated_data)
+            .unwrap();
+        assert_ne!(first, second);
+
+        let shares = shares_for(&secret_shares, &setup_context, &first, decryption_context);
+        let combiner = Combiner::new(public_key_set, setup_context).unwrap();
+        assert_eq!(
+            combiner
+                .combine_exact(&first, decryption_context, &shares[..2])
+                .unwrap(),
+            plaintext
+        );
+
+        let result = combiner.combine_exact(&second, decryption_context, &shares[..2]);
+        assert!(matches!(result, Err(CombineError::MalformedShares(ids)) if ids == vec![1, 2]));
+    }
+
+    #[test]
     fn quorum_search_ignores_surplus_malformed_share() {
         let (sealing_key, public_key_set, secret_shares, setup_context) = material();
         let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
