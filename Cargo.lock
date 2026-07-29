@@ -478,11 +478,8 @@ dependencies = [
  "group",
  "halo2curves",
  "merlin",
- "miden-serde-utils",
  "rand_chacha",
  "rand_core 0.6.4",
- "serde",
- "serde_test",
  "sha2",
 ]
 

@@ -1,7 +1,5 @@
 //! Paired prover and verifier roles for Golden proof streams.
 
-#![allow(dead_code)]
-
 use core::marker::PhantomData;
 
 use golden_core::{Error, GoldenGroup, GoldenScalar, Result};
@@ -310,6 +308,7 @@ impl<'proof> VerifierProofStream<'proof> {
     }
 
     /// Receives fixed-width bytes and observes them exactly once.
+    #[cfg(test)]
     pub(crate) fn receive_bytes(
         &mut self,
         label: &'static [u8],
@@ -384,11 +383,6 @@ impl<'proof> VerifierProofStream<'proof> {
                 Err(err)
             }
         }
-    }
-
-    /// Receives and observes every unread proof byte.
-    pub(crate) fn receive_remaining_bytes(&mut self, label: &'static [u8]) -> Result<&'proof [u8]> {
-        self.receive_bytes(label, self.proof.len() - self.cursor)
     }
 
     /// Finishes verification, rejecting any trailing proof bytes.

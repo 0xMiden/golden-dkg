@@ -6,7 +6,7 @@
 //!
 //! In the DKG protocol, [`DealerMessage`] is the broadcast message. The other
 //! tagged values are standalone encodings for setup artifacts, nested fields,
-//! tests, persistence, or proof payload adapters.
+//! tests, or persistence.
 
 use std::collections::BTreeMap;
 
@@ -443,7 +443,8 @@ impl<G: GoldenGroup> WireEncode for DealerMessage<G> {
             receiver.write_wire(out);
             encrypted_share.write_wire(out);
         }
-        self.proof.write_wire(out);
+        write_len(out, self.proof.len());
+        out.extend_from_slice(&self.proof);
     }
 }
 
@@ -468,7 +469,8 @@ where
             ensure_increasing(&mut last, receiver)?;
             encrypted_shares.insert(receiver, EncryptedShare::<G>::read_wire(reader)?);
         }
-        let proof = Vec::<u8>::read_wire(reader)?;
+        let proof_len = reader.read_len()?;
+        let proof = reader.read_exact(proof_len)?.to_vec();
         let mut message = Self {
             session_id,
             registry_root,
@@ -500,20 +502,6 @@ where
     fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
         expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
         expect_context_field(reader, G::BACKEND_ID.as_bytes())
-    }
-}
-
-impl WireEncode for Vec<u8> {
-    fn write_wire(&self, out: &mut Vec<u8>) {
-        write_len(out, self.len());
-        out.extend_from_slice(self);
-    }
-}
-
-impl WireDecode for Vec<u8> {
-    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
-        let len = reader.read_len()?;
-        Ok(reader.read_exact(len)?.to_vec())
     }
 }
 
@@ -1007,6 +995,31 @@ mod tests {
         ParticipantIndex::new(value).unwrap()
     }
 
+    fn dealer_message() -> DealerMessage<TinyGroup> {
+        let commitment = FeldmanCommitment::<TinyGroup>::from_coefficients(vec![
+            TinyScalar::from_u64(10).unwrap(),
+            TinyScalar::from_u64(20).unwrap(),
+        ])
+        .unwrap();
+        let encrypted_share = EncryptedShare::<TinyGroup> {
+            pad_commitment: TinyScalar::from_u64(2).unwrap(),
+            dh_commitment: TinyScalar::from_u64(3).unwrap(),
+            encrypted_share: TinyScalar::from_u64(4).unwrap(),
+        };
+        let mut message = DealerMessage::<TinyGroup> {
+            session_id: SessionId([1u8; 32]),
+            registry_root: [2u8; 32],
+            dealer: idx(1),
+            msg_i: DealerMessageNonce([3u8; 32]),
+            commitment,
+            encrypted_shares: BTreeMap::from([(idx(2), encrypted_share)]),
+            proof: vec![4, 5, 6],
+            transcript_root: [0u8; 32],
+        };
+        message.transcript_root = message.recompute_transcript_root();
+        message
+    }
+
     #[test]
     fn session_id_top_level_round_trips_and_rejects_trailing_bytes() {
         let session_id = SessionId([7u8; 32]);
@@ -1207,6 +1220,24 @@ mod tests {
     }
 
     #[test]
+    fn dealer_message_rejects_malformed_outer_proof_length() {
+        let message = dealer_message();
+        let mut without_proof = message.clone();
+        without_proof.proof.clear();
+        let proof_len_offset = to_wire_bytes(&without_proof).len() - 8;
+
+        for declared_len in [4u64, u64::MAX] {
+            let mut bytes = to_wire_bytes(&message);
+            bytes[proof_len_offset..proof_len_offset + 8]
+                .copy_from_slice(&declared_len.to_be_bytes());
+            assert_eq!(
+                from_wire_bytes::<DealerMessage<TinyGroup>>(&bytes).unwrap_err(),
+                Error::InvalidEncoding
+            );
+        }
+    }
+
+    #[test]
     fn dealer_message_rejects_trailing_transcript_root() {
         let commitment = FeldmanCommitment::<TinyGroup>::from_coefficients(vec![
             TinyScalar::from_u64(10).unwrap(),
@@ -1239,13 +1270,13 @@ mod tests {
 
     #[cfg(feature = "serde")]
     #[test]
-    fn serde_uses_canonical_wire_bytes() {
+    fn dealer_message_serde_uses_canonical_wire_bytes() {
         use serde_test::{assert_de_tokens, assert_tokens, Token};
 
-        let session_id = SessionId([11u8; 32]);
-        let bytes: &'static [u8] = Box::leak(to_wire_bytes(&session_id).into_boxed_slice());
+        let message = dealer_message();
+        let bytes: &'static [u8] = Box::leak(to_wire_bytes(&message).into_boxed_slice());
 
-        assert_tokens(&session_id, &[Token::Bytes(bytes)]);
+        assert_tokens(&message, &[Token::Bytes(bytes)]);
 
         let mut seq = Vec::with_capacity(bytes.len() + 2);
         seq.push(Token::Seq {
@@ -1254,38 +1285,48 @@ mod tests {
         seq.extend(bytes.iter().copied().map(Token::U8));
         seq.push(Token::SeqEnd);
 
-        assert_de_tokens(&session_id, &seq);
+        assert_de_tokens(&message, &seq);
     }
 
     #[cfg(feature = "miden-serde")]
     #[test]
-    fn miden_serde_uses_canonical_wire_bytes() {
+    fn dealer_message_miden_serde_uses_canonical_wire_bytes() {
         use miden_serde_utils::{BudgetedReader, Deserializable, Serializable, SliceReader};
 
-        let session_id = SessionId([12u8; 32]);
-        let bytes = session_id.to_bytes();
-        let wire_bytes = to_wire_bytes(&session_id);
+        let message = dealer_message();
+        let bytes = message.to_bytes();
+        let wire_bytes = to_wire_bytes(&message);
 
         assert!(bytes.ends_with(&wire_bytes));
-        assert_eq!(SessionId::read_from_bytes(&bytes).unwrap(), session_id);
+        assert_eq!(
+            DealerMessage::<TinyGroup>::read_from_bytes(&bytes).unwrap(),
+            message
+        );
 
-        let other = SessionId([13u8; 32]);
+        let mut other = dealer_message();
+        other.proof = vec![7, 8, 9];
         let mut adjacent = Vec::new();
-        session_id.write_into(&mut adjacent);
+        message.write_into(&mut adjacent);
         other.write_into(&mut adjacent);
         let mut reader = SliceReader::new(&adjacent);
 
-        assert_eq!(SessionId::read_from(&mut reader).unwrap(), session_id);
-        assert_eq!(SessionId::read_from(&mut reader).unwrap(), other);
+        assert_eq!(
+            DealerMessage::<TinyGroup>::read_from(&mut reader).unwrap(),
+            message
+        );
+        assert_eq!(
+            DealerMessage::<TinyGroup>::read_from(&mut reader).unwrap(),
+            other
+        );
 
         let mut oversized = usize::MAX.to_bytes();
         oversized.push(0);
-        assert!(SessionId::read_from_bytes(&oversized).is_err());
+        assert!(DealerMessage::<TinyGroup>::read_from_bytes(&oversized).is_err());
 
         let mut budgeted = SliceReader::new(&bytes);
         let declared_len = budgeted.read_usize().unwrap();
         assert!(declared_len > 8);
         let mut budgeted = BudgetedReader::new(SliceReader::new(&bytes), 8);
-        assert!(read_miden_wire::<SessionId, _>(&mut budgeted).is_err());
+        assert!(read_miden_wire::<DealerMessage<TinyGroup>, _>(&mut budgeted).is_err());
     }
 }

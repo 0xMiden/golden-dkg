@@ -7,11 +7,12 @@ use std::collections::BTreeMap;
 use golden_core::{
     complete, create_dealing, verify_dealing,
     wire::{from_wire_bytes, to_wire_bytes},
-    DealerMessage, DkgConfig, DkgDealing, Error, EvrfProofBackend, GoldenGroup, GoldenScalar,
-    ParticipantIndex, ParticipantRegistry, SessionId,
+    DealerMessage, DkgConfig, DkgDealing, Error, EvrfProofBackend, EvrfStatement, GoldenGroup,
+    GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId, PROTOCOL_VERSION,
 };
 use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
+use merlin::Transcript;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
 fn idx(value: u32) -> ParticipantIndex {
@@ -74,13 +75,123 @@ fn proof_record_len() -> usize {
     3 * P256Backend::ELEMENT_REPR_BYTES + 2 * P256Scalar::REPR_BYTES
 }
 
+fn proof_statements(
+    dealing: &DkgDealing<P256Backend>,
+    config: &DkgConfig<P256Backend>,
+) -> Vec<EvrfStatement<P256Backend>> {
+    let dealer = dealing.message.dealer;
+    config
+        .registry
+        .indexes()
+        .filter(|receiver| *receiver != dealer)
+        .map(|receiver| {
+            let encrypted_share = dealing.message.encrypted_shares[&receiver].clone();
+            EvrfStatement {
+                protocol_version: PROTOCOL_VERSION,
+                backend_id: P256Backend::BACKEND_ID,
+                session_id: config.session_id,
+                registry_root: config.registry.root(),
+                threshold: config.threshold,
+                dealer,
+                receiver,
+                msg_i: dealing.message.msg_i,
+                beta: config.beta.clone(),
+                dealer_public_key: *config.registry.public_key(dealer).unwrap(),
+                receiver_public_key: *config.registry.public_key(receiver).unwrap(),
+                commitment_coefficients: dealing.message.commitment.coefficients().to_vec(),
+                share_commitment: dealing
+                    .message
+                    .commitment
+                    .public_key_share(receiver)
+                    .unwrap(),
+                pad_commitment: encrypted_share.pad_commitment,
+                dh_commitment: encrypted_share.dh_commitment,
+                encrypted_share: encrypted_share.encrypted_share,
+                transcript_root: dealing.message.transcript_root,
+            }
+        })
+        .collect()
+}
+
+fn prototype_challenge_checkpoints(
+    statements: &[EvrfStatement<P256Backend>],
+    proof: &[u8],
+) -> Vec<[u8; 32]> {
+    let proof_id = <ShareOpeningBackend as EvrfProofBackend<P256Backend>>::PROOF_ID;
+    let mut transcript = Transcript::new(proof_id);
+    transcript.append_message(b"group-backend", P256Backend::BACKEND_ID.as_bytes());
+    transcript.append_message(
+        b"statement-count",
+        &u64::try_from(statements.len()).unwrap().to_be_bytes(),
+    );
+    for statement in statements {
+        transcript.append_message(b"statement-root", &statement.root());
+    }
+
+    let mut cursor = proof_header_len(proof);
+    let mut checkpoints = Vec::with_capacity(statements.len());
+    for _ in statements {
+        for label in [
+            b"share-nonce-point".as_slice(),
+            b"pad-nonce-point",
+            b"dh-nonce-point",
+        ] {
+            let end = cursor + P256Backend::ELEMENT_REPR_BYTES;
+            transcript.append_message(label, &proof[cursor..end]);
+            cursor = end;
+        }
+        let mut challenge = [0u8; 32];
+        transcript.challenge_bytes(b"opening-challenge", &mut challenge);
+        checkpoints.push(challenge);
+        for label in [b"share-response".as_slice(), b"pad-response"] {
+            let end = cursor + P256Scalar::REPR_BYTES;
+            transcript.append_message(label, &proof[cursor..end]);
+            cursor = end;
+        }
+    }
+    assert_eq!(cursor, proof.len());
+    checkpoints
+}
+
 fn assert_proof_rejected(seed: u8, mutate: impl FnOnce(&mut Vec<u8>)) {
     let (config, mut dealing) = create_dealing_fixture(seed);
     verify_dealing::<P256Backend, ShareOpeningBackend>(&dealing.message, &config).unwrap();
+    let transcript_root = dealing.message.transcript_root;
     mutate(&mut dealing.message.proof);
+    assert_eq!(dealing.message.transcript_root, transcript_root);
+    assert_eq!(dealing.message.recompute_transcript_root(), transcript_root);
     assert_eq!(
         verify_dealing::<P256Backend, ShareOpeningBackend>(&dealing.message, &config).unwrap_err(),
         Error::ProofVerificationFailed
+    );
+}
+
+#[test]
+fn deterministic_prototype_proof_stream_matches_v2_vector() {
+    let (config, dealing) = create_dealing_fixture(10);
+    assert_eq!(
+        dealing.message.proof.as_slice(),
+        include_bytes!("vectors/prototype-share-opening-v2.bin")
+    );
+    assert_eq!(
+        prototype_challenge_checkpoints(
+            &proof_statements(&dealing, &config),
+            &dealing.message.proof
+        ),
+        vec![
+            [
+                142, 252, 171, 24, 105, 249, 248, 176, 173, 23, 255, 203, 18, 222, 71, 127, 178,
+                54, 206, 5, 88, 232, 120, 19, 2, 70, 233, 160, 224, 145, 40, 72,
+            ],
+            [
+                219, 194, 100, 9, 205, 72, 142, 140, 30, 249, 59, 90, 49, 249, 184, 91, 102, 46,
+                74, 235, 178, 234, 52, 101, 182, 191, 33, 4, 209, 143, 235, 202,
+            ],
+            [
+                149, 20, 3, 176, 39, 198, 129, 62, 112, 196, 221, 165, 178, 90, 18, 67, 185, 246,
+                100, 212, 189, 187, 167, 77, 62, 126, 202, 218, 40, 162, 206, 241,
+            ],
+        ]
     );
 }
 

@@ -11,9 +11,10 @@
 use std::collections::BTreeMap;
 
 use golden_core::{
-    complete, create_dealing, verify_dealing, DealerMessage, DkgConfig, EvrfProofBackend,
-    EvrfStatement, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
-    PROTOCOL_VERSION,
+    complete, create_dealing, verify_dealing,
+    wire::{from_wire_bytes, to_wire_bytes},
+    DealerMessage, DkgConfig, EvrfProofBackend, EvrfStatement, GoldenGroup, GoldenScalar,
+    ParticipantIndex, ParticipantRegistry, SessionId, PROTOCOL_VERSION,
 };
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
@@ -46,6 +47,28 @@ fn config() -> DkgConfig<Secp256k1GoldenGroup> {
     .unwrap();
     DkgConfig::new(
         2,
+        SessionId([42u8; 32]),
+        Secp256k1Scalar::from_u64(77).unwrap(),
+        registry,
+    )
+    .unwrap()
+}
+
+fn two_participant_config() -> DkgConfig<Secp256k1GoldenGroup> {
+    let registry = ParticipantRegistry::new(
+        [idx(1), idx(2)]
+            .into_iter()
+            .map(|participant| {
+                (
+                    participant,
+                    Secp256k1GoldenGroup::mul_generator(&identity_secret(participant)),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    DkgConfig::new(
+        1,
         SessionId([42u8; 32]),
         Secp256k1Scalar::from_u64(77).unwrap(),
         registry,
@@ -135,13 +158,9 @@ fn build_statements(
     statements
 }
 
-#[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-fn dkg_completes_with_batched_evrf_backend() {
+fn assert_dkg_completes(config: DkgConfig<Secp256k1GoldenGroup>, decode_messages: bool) {
     let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-    let config = config();
-
-    let dealings: BTreeMap<_, _> = config
+    let mut dealings: BTreeMap<_, _> = config
         .registry
         .indexes()
         .map(|dealer| {
@@ -158,10 +177,17 @@ fn dkg_completes_with_batched_evrf_backend() {
         })
         .collect();
 
-    for dealing in dealings.values() {
+    for dealing in dealings.values_mut() {
+        if decode_messages {
+            let encoded = to_wire_bytes(&dealing.message);
+            let decoded = from_wire_bytes::<DealerMessage<Secp256k1GoldenGroup>>(&encoded).unwrap();
+            assert_eq!(to_wire_bytes(&decoded), encoded);
+            dealing.message = decoded;
+        }
         verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config).unwrap();
     }
 
+    let participant_count = config.registry.indexes().count();
     let receiver = idx(2);
     let own_dealing = dealings.get(&receiver).unwrap();
     let peer_dealings = dealings
@@ -187,7 +213,19 @@ fn dkg_completes_with_batched_evrf_backend() {
         output.public_key_shares[&receiver],
         Secp256k1GoldenGroup::mul_generator(&output.secret_share.value)
     );
-    assert_eq!(output.public_key_shares.len(), 3);
+    assert_eq!(output.public_key_shares.len(), participant_count);
+}
+
+#[test]
+#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+fn dkg_completes_with_batched_evrf_backend() {
+    assert_dkg_completes(config(), false);
+}
+
+#[test]
+#[ignore = "slow: completes the real paper DKG from decoded peer messages"]
+fn dkg_completes_with_decoded_peer_messages() {
+    assert_dkg_completes(two_participant_config(), true);
 }
 
 #[test]

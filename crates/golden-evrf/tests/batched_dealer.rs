@@ -25,6 +25,25 @@ fn make_pkjs(rng: &mut ChaCha20Rng, n: usize) -> Vec<Gin> {
 }
 
 #[test]
+#[ignore = "slow: pins the complete batched dealer proof stream"]
+fn evrf_batched_dealer_matches_v2_vector() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0002);
+    let sk1 = GinScalar::random(&mut rng);
+    let pkjs = make_pkjs(&mut rng, 1);
+    let beta = R1csField::from(7u64);
+    let msg = make_msg(0xABCD);
+    let (statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+
+    let proof = paper::evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
+    assert_eq!(
+        proof.as_slice(),
+        include_bytes!("vectors/paper-batched-dealer-v2.bin")
+    );
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    paper::evrf_batched_verify(&statement, &proof, &mut verify_rng).expect("verify");
+}
+
+#[test]
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn evrf_batched_dealer_honest_proof_verifies() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C1);

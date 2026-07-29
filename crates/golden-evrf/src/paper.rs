@@ -47,9 +47,6 @@ pub mod secp_secq {
     use halo2curves::{Coordinates, CurveAffine, CurveExt};
     use merlin::Transcript;
 
-    #[cfg(test)]
-    use bulletproofs_cycle::transcript::challenge_scalar;
-
     /// R1CS field: `Fp` (Secp256k1 base field = Secq256k1 scalar field).
     pub type R1csField = Fp;
     /// R1CS commitment group: `Secq256k1` (`G_out`).
@@ -63,9 +60,6 @@ pub mod secp_secq {
     pub type Gout = Secq256k1;
     /// `G_out` compressed point.
     pub type GoutCompressed = <R1csCycle as Cycle>::Compressed;
-
-    /// Transcript domain label for the paper eVRF proof.
-    pub const PROOF_DOMAIN: &[u8] = b"golden-paper-evrf-v1";
 
     /// Public statement for the one-receiver paper eVRF relation.
     #[derive(Clone, Debug)]
@@ -2335,6 +2329,8 @@ pub mod secp_secq {
         use rand_chacha::rand_core::SeedableRng;
         use rand_chacha::ChaCha20Rng;
 
+        const R1CS_TEST_DOMAIN: &[u8] = b"golden-paper-evrf-r1cs-test";
+
         /// Build a canonical bit decomposition of `k` (little-endian).
         fn decompose_k(k: &R1csField, bits: &mut [Option<R1csField>]) {
             let repr = k.to_repr();
@@ -2374,12 +2370,13 @@ pub mod secp_secq {
             let bp_gens = BulletproofGens::<R1csCycle>::new(1024, 1);
             let mut rng = ChaCha20Rng::seed_from_u64(0xA1B2C3D4);
 
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (v_k, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
             bit_decompose(&mut prover, var_k, bit_assignments)?;
             let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
 
-            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
+            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(R1CS_TEST_DOMAIN));
             let v_k_var = verifier.commit(v_k);
             let verifier_bits = vec![None; K_BITS + 1];
             bit_decompose(&mut verifier, v_k_var, &verifier_bits)?;
@@ -2396,7 +2393,8 @@ pub mod secp_secq {
             let mut bits = vec![None; K_BITS + 1];
             decompose_k(&pad, &mut bits);
 
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (v_pad, var_pad) = prover.commit(pad, random_scalar::<R1csCycle>(&mut rng));
             let (v_reduce, var_reduce) =
                 prover.commit(reduce, random_scalar::<R1csCycle>(&mut rng));
@@ -2415,7 +2413,7 @@ pub mod secp_secq {
             )?;
             let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
 
-            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
+            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(R1CS_TEST_DOMAIN));
             let var_pad = verifier.commit(v_pad);
             let var_reduce = verifier.commit(v_reduce);
             let (_, _, reduce_boolean) = verifier.multiply(
@@ -2620,7 +2618,8 @@ pub mod secp_secq {
             let k = R1csField::from(0xABCDu64);
             let mut bits = vec![None; K_BITS + 1];
             decompose_k(&k, &mut bits);
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
             let _ = bit_decompose(&mut prover, var_k, &bits).expect("gadget");
 
@@ -2640,7 +2639,8 @@ pub mod secp_secq {
             let pc_gens = PedersenGens::<R1csCycle>::default();
             let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0001);
             let k = R1csField::from(0xABCDu64);
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
             // Only K_BITS bits supplied instead of K_BITS + 1: gadget must
             // refuse to build a truncated circuit.
@@ -2669,7 +2669,8 @@ pub mod secp_secq {
                 denom_delta_inverses: vec![R1csField::ZERO; K_BITS],
             };
 
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let k = R1csField::ZERO;
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
             let mut bit_assignments = vec![None; K_BITS + 1];
@@ -2781,7 +2782,8 @@ pub mod secp_secq {
                 .collect();
 
             // Prover
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (v_k, var_k) = prover.commit(k_fp, random_scalar::<R1csCycle>(&mut rng));
             let bit_vars = bit_decompose(&mut prover, var_k, &bit_assignments).expect("bit_decomp");
             chord_exponentiate_r1cs(
@@ -2796,7 +2798,7 @@ pub mod secp_secq {
             let proof = prover.prove(&bp_gens, &mut rng)?;
 
             // Verifier
-            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
+            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(R1CS_TEST_DOMAIN));
             let v_k_var = verifier.commit(v_k);
             let verifier_bits = vec![None; K_BITS + 1];
             let bit_vars =
@@ -3180,20 +3182,30 @@ pub mod secp_secq {
         }
 
         #[test]
-        fn batched_transcripts_bind_statement_roots() {
+        fn batched_stream_pins_statement_boundary_checkpoint() {
             let statement = context_statement();
             let mut changed = statement.clone();
             changed.statement_roots[0][0] ^= 0x80;
 
-            let mut stream_a = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
-            observe_batched_statement(&mut stream_a, &statement).expect("statement");
-            let mut stream_b = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
-            observe_batched_statement(&mut stream_b, &changed).expect("statement");
-            assert_ne!(
-                challenge_scalar::<R1csCycle>(stream_a.transcript_mut(), b"probe"),
-                challenge_scalar::<R1csCycle>(stream_b.transcript_mut(), b"probe"),
-                "R1CS transcript must bind the ordered DKG statement roots"
+            let mut stream = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
+            observe_batched_statement(&mut stream, &statement).expect("statement");
+            let mut checkpoint = [0u8; 64];
+            stream.challenge(b"r1cs-boundary", &mut checkpoint);
+            assert_eq!(
+                checkpoint,
+                [
+                    247, 25, 213, 42, 121, 243, 204, 120, 70, 68, 75, 51, 206, 117, 113, 102, 226,
+                    129, 74, 188, 184, 249, 56, 36, 91, 132, 27, 123, 113, 156, 110, 121, 116, 185,
+                    133, 17, 40, 166, 105, 171, 8, 145, 175, 175, 189, 164, 99, 107, 127, 11, 148,
+                    198, 242, 109, 210, 14, 250, 163, 209, 209, 85, 22, 50, 20,
+                ]
             );
+
+            let mut changed_stream = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
+            observe_batched_statement(&mut changed_stream, &changed).expect("statement");
+            let mut changed_checkpoint = [0u8; 64];
+            changed_stream.challenge(b"r1cs-boundary", &mut changed_checkpoint);
+            assert_ne!(changed_checkpoint, checkpoint);
         }
 
         #[test]

@@ -8,11 +8,62 @@
 use bulletproofs_cycle::Cycle;
 use ff::Field;
 use golden_evrf::paper::secp_secq::{
-    self as paper, Gin, GinScalar, R1csField, SecpSecqEvrfStatement, SecpSecqEvrfWitness,
+    self as paper, Gin, GinScalar, R1csCycle, R1csField, SecpSecqEvrfStatement, SecpSecqEvrfWitness,
 };
 use golden_halo2curves::Secp256k1Cycle;
 use halo2curves::secq256k1::Secq256k1;
+use merlin::Transcript;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v2";
+
+fn append_point<C: Cycle>(transcript: &mut Transcript, label: &'static [u8], point: &C::Point) {
+    let compressed = C::point_compress(point);
+    transcript.append_message(label, C::compressed_as_bytes(&compressed));
+}
+
+fn cp_challenge_checkpoint(
+    proof_id: &'static [u8],
+    statement: &SecpSecqEvrfStatement,
+    proof: &[u8],
+    first_label: &'static [u8],
+    reverse_nonce_order: bool,
+) -> [u8; 64] {
+    let mut transcript = Transcript::new(proof_id);
+    transcript.append_message(b"statement.msg", &statement.msg);
+    for (label, point) in [
+        (b"statement.pk1".as_slice(), &statement.pk1),
+        (b"statement.pk2".as_slice(), &statement.pk2),
+        (b"statement.s".as_slice(), &statement.s),
+        (b"statement.h1".as_slice(), &statement.h1),
+        (b"statement.h2".as_slice(), &statement.h2),
+        (b"statement.t1".as_slice(), &statement.t1),
+        (b"statement.t2".as_slice(), &statement.t2),
+    ] {
+        append_point::<Secp256k1Cycle>(&mut transcript, label, point);
+    }
+    append_point::<R1csCycle>(&mut transcript, b"statement.r", &statement.r_point);
+    transcript.append_message(
+        b"statement.beta",
+        &R1csCycle::scalar_to_canonical(&statement.beta),
+    );
+
+    let proof_id_len = u32::from_be_bytes(proof[..4].try_into().unwrap()) as usize;
+    let cursor = 4 + proof_id_len;
+    let point_bytes = Secp256k1Cycle::COMPRESSED_BYTES;
+    let r1 = &proof[cursor..cursor + point_bytes];
+    let r2 = &proof[cursor + point_bytes..cursor + 2 * point_bytes];
+    if reverse_nonce_order {
+        transcript.append_message(b"cp.r2", r2);
+        transcript.append_message(first_label, r1);
+    } else {
+        transcript.append_message(first_label, r1);
+        transcript.append_message(b"cp.r2", r2);
+    }
+    let mut checkpoint = [0u8; 64];
+    transcript.challenge_bytes(b"cp.challenge", &mut checkpoint);
+    checkpoint
+}
 
 fn make_msg(seed: u64) -> [u8; 32] {
     let mut msg = [0u8; 32];
@@ -30,6 +81,61 @@ fn evrf_one_receiver_honest_proof_verifies() {
     let (statement, witness) = paper::testing::build_statement_witness(&msg, sk1, pk2, beta);
 
     let proof = paper::evrf_prove(&statement, &witness, &mut rng).expect("prove");
+    assert_eq!(
+        proof.as_slice(),
+        include_bytes!("vectors/paper-one-receiver-v2.bin")
+    );
+    let checkpoint =
+        cp_challenge_checkpoint(ONE_RECEIVER_PROOF_ID, &statement, &proof, b"cp.r1", false);
+    assert_eq!(
+        checkpoint,
+        [
+            222, 248, 232, 123, 15, 152, 48, 49, 16, 48, 125, 227, 238, 69, 86, 18, 249, 213, 255,
+            207, 58, 51, 71, 90, 116, 29, 79, 102, 31, 168, 121, 73, 138, 143, 118, 234, 226, 12,
+            174, 245, 14, 217, 107, 107, 151, 117, 225, 235, 149, 63, 10, 186, 85, 21, 220, 208,
+            70, 220, 42, 83, 94, 104, 79, 107,
+        ]
+    );
+
+    let mut changed_statement = statement.clone();
+    changed_statement.msg[0] ^= 1;
+    let mut changed_message = proof.clone();
+    let header_len = 4 + ONE_RECEIVER_PROOF_ID.len();
+    changed_message[header_len] ^= 1;
+    for variant in [
+        cp_challenge_checkpoint(
+            b"golden-paper-evrf-one-receiver-v2-alternate",
+            &statement,
+            &proof,
+            b"cp.r1",
+            false,
+        ),
+        cp_challenge_checkpoint(
+            ONE_RECEIVER_PROOF_ID,
+            &changed_statement,
+            &proof,
+            b"cp.r1",
+            false,
+        ),
+        cp_challenge_checkpoint(
+            ONE_RECEIVER_PROOF_ID,
+            &statement,
+            &changed_message,
+            b"cp.r1",
+            false,
+        ),
+        cp_challenge_checkpoint(
+            ONE_RECEIVER_PROOF_ID,
+            &statement,
+            &proof,
+            b"cp.renamed-r1",
+            false,
+        ),
+        cp_challenge_checkpoint(ONE_RECEIVER_PROOF_ID, &statement, &proof, b"cp.r1", true),
+    ] {
+        assert_ne!(variant, checkpoint);
+    }
+
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_verify(&statement, &proof, &mut verify_rng).expect("verify");
 }
