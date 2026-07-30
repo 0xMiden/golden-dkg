@@ -20,6 +20,11 @@ on:
         required: false
         default: false
         type: boolean
+      skip_package_version_gate:
+        description: "Skip the package version gate. Use only for manual release recovery after maintainers verify the release plan."
+        required: false
+        default: false
+        type: boolean
 
 permissions: {}
 
@@ -28,9 +33,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  package-version-gate:
+    name: Check package versions
+    if: ${{ github.repository_owner == '0xMiden' && !inputs.skip_package_version_gate }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/package-version-gate.yml
+    with:
+      ref: ${{ inputs.ref }}
+      packages: ${{ inputs.packages || '' }}
+
   publish:
     name: Publish workspace crates
-    if: ${{ github.repository_owner == '0xMiden' }}
+    needs: package-version-gate
+    if: ${{ always() && github.repository_owner == '0xMiden' && (needs.package-version-gate.result == 'success' || (inputs.skip_package_version_gate && needs.package-version-gate.result == 'skipped')) }}
     runs-on: ubuntu-latest
     environment: release
     env:
