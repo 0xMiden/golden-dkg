@@ -7,6 +7,15 @@ context bound threshold encryption over a generic group abstraction. The
 current tree implements Golden DKG, EHTDH1, a Secp256k1/Secq256k1 eVRF
 backend, and the Bulletproofs R1CS layer used by that backend.
 
+The two protocol implementations follow these papers.
+
+* **Golden DKG.** Benedikt Bünz, Kevin Choi, and Chelsea Komlo,
+  “[Golden: Lightweight Non-Interactive Distributed Key Generation](https://eprint.iacr.org/2025/1924),”
+  Cryptology ePrint Archive, Paper 2025/1924, 2025.
+* **EHTDH1.** Dan Boneh, Benedikt Bünz, Kartik Nayak, Lior Rotem, and Victor
+  Shoup, “[Context-Dependent Threshold Decryption and its Applications](https://eprint.iacr.org/2025/279),”
+  Cryptology ePrint Archive, Paper 2025/279, 2025.
+
 The workspace has six crates. All crates are published together and require
 Rust 1.93 or later.
 
