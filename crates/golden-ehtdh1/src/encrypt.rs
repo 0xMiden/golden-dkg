@@ -8,7 +8,8 @@ use chacha20::{
 };
 use golden_core::{GoldenGroup, GoldenHashToGroup, GoldenScalar, TranscriptBuilder};
 use hkdf::Hkdf;
-use rand_core::{CryptoRng, RngCore};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{CryptoRng, RngCore, SeedableRng};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -52,10 +53,39 @@ impl<G: GoldenHashToGroup> SealingKey<G> {
         plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<Ciphertext<G>, Error> {
-        // Paper scalars `r, r' in Zq`.
         let r = random_nonzero_scalar::<G, _>(rng);
         let r_prime = random_nonzero_scalar::<G, _>(rng);
+        self.seal_bytes_with_scalars(plaintext, associated_data, r, r_prime)
+    }
 
+    /// Seal bytes with associated data, deriving `r` from a 32-byte seed.
+    ///
+    /// For a given sealing key, the seed determines `R` independently of the
+    /// plaintext, associated data, and caller RNG. Reusing the same seed and key
+    /// reuses both `R` and the payload mask, so callers must provide sufficient
+    /// entropy and domain separation to prevent unintended reuse.
+    ///
+    /// The caller RNG must provide a fresh `r'` for every encryption. Reusing this
+    /// Schnorr nonce across ciphertexts can reveal `r` and break proof security.
+    pub fn seal_bytes_with_associated_data_and_seed<R: RngCore + CryptoRng>(
+        &self,
+        rng: &mut R,
+        plaintext: &[u8],
+        associated_data: &[u8],
+        seed: &[u8; 32],
+    ) -> Result<Ciphertext<G>, Error> {
+        let r = seeded_ephemeral_scalar::<G>(&self.joint_public_key, seed)?;
+        let r_prime = random_nonzero_scalar::<G, _>(rng);
+        self.seal_bytes_with_scalars(plaintext, associated_data, r, r_prime)
+    }
+
+    fn seal_bytes_with_scalars(
+        &self,
+        plaintext: &[u8],
+        associated_data: &[u8],
+        r: G::Scalar,
+        r_prime: G::Scalar,
+    ) -> Result<Ciphertext<G>, Error> {
         // `R = rG`, `U = rX`, `k = Hkd(R, U)`, and `c = Es(k, m)`.
         let ephemeral_public = G::mul_generator(&r);
         let dh_point = G::mul(&self.joint_public_key, &r);
@@ -247,6 +277,22 @@ fn derive_payload_mask_material<G: GoldenGroup, const N: usize>(
     hkdf.expand(b"golden-ehtdh1-xchacha20-mask-v1", material.as_mut())
         .map_err(|_| Error::InvalidEncoding)?;
     Ok(material)
+}
+
+fn seeded_ephemeral_scalar<G: GoldenGroup>(
+    joint_public_key: &G::Element,
+    seed: &[u8; 32],
+) -> Result<G::Scalar, Error> {
+    let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"seeded-r");
+    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
+    transcript.element::<G>(b"X", joint_public_key);
+
+    let hkdf = Hkdf::<Sha256>::new(Some(b"golden-ehtdh1-r-seed-v1"), seed);
+    let mut rng_seed = Zeroizing::new([0u8; 32]);
+    hkdf.expand(&transcript.root(), rng_seed.as_mut())
+        .map_err(|_| Error::InvalidEncoding)?;
+    let mut rng = ChaCha20Rng::from_seed(*rng_seed);
+    Ok(random_nonzero_scalar::<G, _>(&mut rng))
 }
 
 /// Samples paper scalars such as `r, r' in Zq`, resampling to avoid zero.

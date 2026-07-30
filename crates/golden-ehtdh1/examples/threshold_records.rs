@@ -5,14 +5,17 @@
 //! 1. Three participants run the two Golden DKG sessions needed by EHTDH1.
 //!    They agree on one public sealing key with a threshold of two. Each
 //!    participant also receives its own secret share.
-//! 2. A separate writer creates three `(key, value)` pairs. Each key is the
-//!    record ID for its value.
-//! 3. The writer encrypts each large value with XChaCha20Poly1305 under a fresh
-//!    content key. EHTDH1 encrypts only that 32 byte content key.
-//! 4. The participants choose one record. Each participant uses its secret
-//!    share to make a decryption share for that record and ciphertext.
-//! 5. A combiner checks the decryption shares. Any two valid shares recover the
-//!    content key, which then decrypts the value.
+//! 2. A client supplies one private value and a uniformly random 256-bit nonce.
+//!    The application derives a shared sealing seed from
+//!    `client_nonce || SHA256(canonical private plaintext)` with domain-separated
+//!    HKDF-SHA256.
+//! 3. Three independent writers encrypt the same value with fresh content keys,
+//!    AEAD nonces, and proof randomness. The shared seed makes their EHTDH1
+//!    ciphertexts share `R` while remaining distinct.
+//! 4. The participants choose one writer's record. Each participant uses its
+//!    secret share to make a decryption share for that record and ciphertext.
+//! 5. A combiner checks the ciphertext-bound shares. Any two valid shares recover
+//!    the chosen content key, which then decrypts the common private value.
 //!
 //! The example uses a fast prototype proof backend so it can run as a normal
 //! example. It uses the same Golden DKG and EHTDH1 public APIs as the full
@@ -44,8 +47,8 @@
 //!
 //! * A **participant** is one of the three parties in Golden setup. Each
 //!   participant has an identity key and later holds one secret share.
-//! * The **writer** is a separate party. It receives only the sealing key and
-//!   does not take part in DKG or hold a secret share.
+//! * A **writer** receives only the sealing key and does not need to take part
+//!   in DKG or hold a secret share.
 //! * The **threshold** is the number of decryption shares needed to open a
 //!   content key. This example uses two out of three.
 //! * **Golden DKG** lets the participants create a joint public key without one
@@ -55,8 +58,8 @@
 //!   shares for the other participants and a proof that they are valid.
 //! * A **DKG output** is one participant's result after all dealings pass. It
 //!   contains public setup data and that participant's local DKG share.
-//! * A **sealing key** is the joint public key. The writer can use it without
-//!   learning any participant secret.
+//! * A **sealing key** is the joint public key. Writers use it without learning
+//!   any participant secret.
 //! * A **public key set** has the threshold and joint public key. There is also
 //!   one public share for each participant. The combiner reads this set when it
 //!   checks shares.
@@ -85,8 +88,7 @@
 //! * A **quorum** is any set of participants that meets the threshold. All
 //!   three possible pairs are valid quorums in this example.
 //! * Each public value has one **canonical byte** form for storage or exchange.
-//!   The writer and participants decode the same bytes. The combiner does the
-//!   same.
+//!   Writers, participants, and the combiner decode the same bytes.
 //! * With **authenticated symmetric encryption**, the large record value is
 //!   hidden and any change to its ciphertext or record ID is rejected.
 //! * The **HPKE style split** means symmetric encryption handles each large
@@ -110,10 +112,12 @@ use golden_ehtdh1::{
 };
 use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
+use hkdf::Hkdf;
 use rand_chacha::{
     rand_core::{RngCore, SeedableRng},
     ChaCha20Rng,
 };
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 /// Concrete group used by this fast example.
@@ -151,38 +155,65 @@ fn main() -> AppResult<()> {
     let materials = run_golden_setup(&participants, &mut setup_rng)?;
     check_shared_setup(&materials)?;
 
-    // Step 2. The writer receives only canonical bytes for the public sealing
-    // key. The writer has no participant secret.
+    // Step 2. The writers receive only canonical bytes for the public sealing
+    // key. They have no participant secret.
     let first = get(&materials, participants[0], "missing first participant")?;
     let public_key_bytes = to_wire_bytes(&first.sealing_key);
     let writer_key = from_wire_bytes::<SealingKey<G>>(&public_key_bytes)?;
 
-    // Step 3. The writer makes three key and value pairs. Each application key
-    // is the record ID bound into both encryption layers.
-    let inputs = [
-        (b"private-record/A".as_slice(), vec![b'A'; RECORD_BYTES]),
-        (b"private-record/B".as_slice(), vec![b'B'; RECORD_BYTES]),
-        (b"private-record/C".as_slice(), vec![b'C'; RECORD_BYTES]),
+    // Step 3. Derive the shared sealing seed and create one independently
+    // randomized record per writer.
+    let record_ids = [
+        b"private-record/A".as_slice(),
+        b"private-record/B".as_slice(),
+        b"private-record/C".as_slice(),
     ];
-    let mut writer_rng = ChaCha20Rng::from_seed([2u8; 32]);
+    let canonical_private_plaintext = vec![b'T'; RECORD_BYTES];
+    // Fixed only to keep the example repeatable. Production clients sample a
+    // uniformly random 256-bit client nonce.
+    let client_nonce = Zeroizing::new([5u8; 32]);
+    let transaction_sealing_seed =
+        derive_transaction_sealing_seed(&client_nonce, &canonical_private_plaintext)?;
     let mut records = Vec::new();
-    for (record_id, value) in inputs {
+    for (writer_index, record_id) in record_ids.into_iter().enumerate() {
+        let mut writer_rng = ChaCha20Rng::from_seed([2 + writer_index as u8; 32]);
         records.push(seal_record(
             &writer_key,
             record_id,
-            &value,
+            &canonical_private_plaintext,
+            &transaction_sealing_seed,
             &mut writer_rng,
         )?);
     }
 
-    // Step 4. The participants choose record B. This example deliberately uses
-    // its record ID for both EHTDH1 inputs.
+    let wrapped_keys = records
+        .iter()
+        .map(|record| from_wire_bytes::<Ciphertext<G>>(&record.wrapped_content_key))
+        .collect::<Result<Vec<_>, _>>()?;
+    require(
+        wrapped_keys
+            .iter()
+            .all(|ciphertext| ciphertext.ephemeral_public == wrapped_keys[0].ephemeral_public),
+        "writers derived different R values",
+    )?;
+    require(
+        wrapped_keys[0].encrypted_payload != wrapped_keys[1].encrypted_payload
+            && wrapped_keys[0].encrypted_payload != wrapped_keys[2].encrypted_payload
+            && wrapped_keys[1].encrypted_payload != wrapped_keys[2].encrypted_payload
+            && wrapped_keys[0] != wrapped_keys[1]
+            && wrapped_keys[0] != wrapped_keys[2]
+            && wrapped_keys[1] != wrapped_keys[2],
+        "writers produced identical ciphertexts",
+    )?;
+
+    // Step 4. The participants choose record B. Its record ID is supplied
+    // separately as associated data and the decryption context.
     let chosen = &records[1];
     let other = &records[0];
-    let wrapped_key = from_wire_bytes::<Ciphertext<G>>(&chosen.wrapped_content_key)?;
+    let wrapped_key = wrapped_keys[1].clone();
     let expected_associated_data = chosen.record_id.as_slice();
     let decryption_context = chosen.record_id.as_slice();
-    let mut share_rng = ChaCha20Rng::from_seed([3u8; 32]);
+    let mut share_rng = ChaCha20Rng::from_seed([6u8; 32]);
     let shares = make_shares(
         &materials,
         &wrapped_key,
@@ -216,8 +247,8 @@ fn main() -> AppResult<()> {
         )?);
         let opened = open_record(chosen, &content_key)?;
         require(
-            opened.len() == RECORD_BYTES && opened.iter().all(|byte| *byte == b'B'),
-            "a valid quorum opened the wrong value",
+            opened == canonical_private_plaintext,
+            "a valid quorum opened the wrong private value",
         )?;
     }
 
@@ -248,27 +279,27 @@ fn main() -> AppResult<()> {
         "shares from different decryption contexts were combined",
     )?;
 
-    // Shares are also bound to ciphertext B and cannot open record A.
-    let other_wrapped_key = from_wire_bytes::<Ciphertext<G>>(&other.wrapped_content_key)?;
+    // Sharing `R` does not make decryption shares interchangeable: shares for
+    // ciphertext B cannot open ciphertext A under the same decryption context.
+    let other_wrapped_key = wrapped_keys[0].clone();
     let other_expected_associated_data = other.record_id.as_slice();
-    let other_decryption_context = other.record_id.as_slice();
     require(
         combiner
             .combine_exact_with_associated_data(
                 &other_wrapped_key,
-                other_decryption_context,
+                decryption_context,
                 other_expected_associated_data,
                 &shares[..2],
             )
             .is_err(),
-        "shares for one record opened another record",
+        "shares for one ciphertext opened another ciphertext",
     )?;
 
     let record_bytes = records.len() * RECORD_BYTES;
     let wrapped_bytes = records.len() * CONTENT_KEY_BYTES;
     println!("Golden setup has 3 participants and a threshold of 2.");
     println!(
-        "The writer stored {} records keyed by record ID.",
+        "Three writers encrypted one private value into {} records.",
         records.len()
     );
     println!(
@@ -276,10 +307,11 @@ fn main() -> AppResult<()> {
          {wrapped_bytes} bytes total."
     );
     println!("Each EHTDH1 ciphertext wraps 32 bytes, independent of record size.");
+    println!("All EHTDH1 ciphertexts shared R and remained distinct.");
     println!("The parties chose private-record/B and exchanged canonical shares.");
     println!("All three pairs of two opened private-record/B.");
     println!("One share and shares from another context were rejected.");
-    println!("Shares made under mixed decryption contexts were rejected.");
+    println!("Shares for ciphertext B were rejected against ciphertext A.");
 
     Ok(())
 }
@@ -414,11 +446,35 @@ fn check_shared_setup(materials: &BTreeMap<ParticipantIndex, Ehtdh1Material<G>>)
     Ok(())
 }
 
+/// Derives the shared sealing seed from a client nonce and canonical plaintext.
+fn derive_transaction_sealing_seed(
+    client_nonce: &[u8; 32],
+    canonical_private_plaintext: &[u8],
+) -> AppResult<Zeroizing<[u8; 32]>> {
+    let private_plaintext_digest = Sha256::digest(canonical_private_plaintext);
+    let mut input_key_material = Zeroizing::new([0u8; 64]);
+    input_key_material[..32].copy_from_slice(client_nonce);
+    input_key_material[32..].copy_from_slice(&private_plaintext_digest);
+
+    let hkdf = Hkdf::<Sha256>::new(
+        Some(b"threshold-record-transaction-seed-v1"),
+        input_key_material.as_ref(),
+    );
+    let mut transaction_sealing_seed = Zeroizing::new([0u8; 32]);
+    hkdf.expand(
+        b"transaction-sealing-seed",
+        transaction_sealing_seed.as_mut(),
+    )
+    .map_err(|_| io::Error::other("transaction sealing seed derivation failed"))?;
+    Ok(transaction_sealing_seed)
+}
+
 /// Encrypts one large value and wraps only its fresh content key with EHTDH1.
 fn seal_record(
     sealing_key: &SealingKey<G>,
     record_id: &[u8],
     value: &[u8],
+    transaction_sealing_seed: &[u8; 32],
     rng: &mut ChaCha20Rng,
 ) -> AppResult<StoredRecord> {
     let mut content_key = Zeroizing::new([0u8; CONTENT_KEY_BYTES]);
@@ -442,10 +498,11 @@ fn seal_record(
     // EHTDH1 handles only the fixed size content key and independently binds
     // its expected associated data.
     let expected_associated_data = record_id;
-    let wrapped_content_key = sealing_key.seal_bytes_with_associated_data(
+    let wrapped_content_key = sealing_key.seal_bytes_with_associated_data_and_seed(
         rng,
         content_key.as_ref(),
         expected_associated_data,
+        transaction_sealing_seed,
     )?;
     require(
         wrapped_content_key.encrypted_payload.len() == CONTENT_KEY_BYTES,

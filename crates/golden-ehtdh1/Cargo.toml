@@ -15,6 +15,7 @@ chacha20 = { workspace = true }
 golden-core = { workspace = true }
 hkdf = { workspace = true }
 miden-serde-utils = { workspace = true, optional = true }
+rand_chacha = { workspace = true }
 rand_core = { workspace = true }
 serde = { workspace = true, optional = true }
 sha2 = { workspace = true }
@@ -26,7 +27,6 @@ chacha20poly1305 = { workspace = true }
 golden-evrf = { workspace = true, features = ["halo2curves-secp256k1"] }
 golden-halo2curves = { workspace = true, features = ["halo2curves-secp256k1"] }
 golden-rustcrypto = { workspace = true, features = ["p256"] }
-rand_chacha = { workspace = true }
 serde_test = { workspace = true }
 
 [features]

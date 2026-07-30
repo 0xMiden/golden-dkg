@@ -443,6 +443,56 @@ mod tests {
     }
 
     #[test]
+    fn seed_determines_r_independently_of_encryption_inputs() {
+        let (sealing_key, _, _, _) = material();
+        let mut first_rng = ChaCha20Rng::from_seed([7u8; 32]);
+        let mut second_rng = ChaCha20Rng::from_seed([8u8; 32]);
+        let seed = [42u8; 32];
+
+        let first = sealing_key
+            .seal_bytes_with_associated_data_and_seed(
+                &mut first_rng,
+                &[1u8; 32],
+                b"first associated data",
+                &seed,
+            )
+            .unwrap();
+        let second = sealing_key
+            .seal_bytes_with_associated_data_and_seed(
+                &mut second_rng,
+                &[2u8; 32],
+                b"second associated data",
+                &seed,
+            )
+            .unwrap();
+
+        assert_eq!(first.ephemeral_public, second.ephemeral_public);
+    }
+
+    #[test]
+    fn seeded_encryption_opens_with_threshold_shares() {
+        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
+        let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+        let content_key = [3u8; 32];
+        let message = sealing_key
+            .seal_bytes_with_associated_data_and_seed(
+                &mut rng,
+                &content_key,
+                b"transaction context",
+                &[42u8; 32],
+            )
+            .unwrap();
+        let shares = shares_for(&secret_shares, &setup_context, &message, b"request");
+
+        let opened = Combiner::new(public_key_set, setup_context)
+            .unwrap()
+            .combine_exact(&message, b"request", &shares[..2])
+            .unwrap();
+
+        assert_eq!(opened, content_key);
+    }
+
+    #[test]
     fn quorum_search_ignores_surplus_malformed_share() {
         let (sealing_key, public_key_set, secret_shares, setup_context) = material();
         let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
