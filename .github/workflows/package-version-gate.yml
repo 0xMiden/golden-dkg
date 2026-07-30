@@ -33,6 +33,7 @@ concurrency:
 
 jobs:
   package-versions:
+    name: Check package versions
     if: ${{ github.repository_owner == '0xMiden' }}
     runs-on: warp-ubuntu-latest-x64-8x
     env:
