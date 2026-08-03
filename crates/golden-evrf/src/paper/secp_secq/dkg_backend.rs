@@ -7,6 +7,7 @@ use golden_halo2curves::golden_group::{
     scalar_to_r1cs_field, Secp256k1Element, Secp256k1GoldenGroup, Secp256k1Scalar,
 };
 use halo2curves::secp256k1::{Fp, Fq};
+use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use rand_core::CryptoRngCore;
 
 use super::{
@@ -181,7 +182,6 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
             statement_roots,
             receivers,
         };
-        use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
         let mut rng = ChaCha20Rng::seed_from_u64(0xDEAD_BEEF);
         evrf_batched_verify(&batched_statement, proof, &mut rng)
     }

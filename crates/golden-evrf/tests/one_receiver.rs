@@ -11,7 +11,8 @@ use golden_evrf::paper::secp_secq::{
     self as paper, Gin, GinScalar, R1csCycle, R1csField, SecpSecqEvrfStatement, SecpSecqEvrfWitness,
 };
 use golden_halo2curves::Secp256k1Cycle;
-use halo2curves::secq256k1::Secq256k1;
+use group::{Curve, Group};
+use halo2curves::{secq256k1::Secq256k1, CurveAffine};
 use merlin::Transcript;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
@@ -138,6 +139,27 @@ fn evrf_one_receiver_honest_proof_verifies() {
 
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_verify(&statement, &proof, &mut verify_rng).expect("verify");
+}
+
+#[test]
+fn evrf_one_receiver_zero_output_proof_verifies() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0x0);
+    let sk1 = GinScalar::random(&mut rng);
+    let pk2 = Gin::generator() * GinScalar::random(&mut rng);
+    let msg = make_msg(0);
+    let (zero_beta_statement, _) =
+        paper::testing::build_statement_witness(&msg, sk1, pk2, R1csField::ZERO);
+    let t1 = zero_beta_statement.t1.to_affine();
+    let t2 = zero_beta_statement.t2.to_affine();
+    let t1_x = *t1.coordinates().expect("T1 coordinates").x();
+    let t2_x = *t2.coordinates().expect("T2 coordinates").x();
+    let beta = -t2_x * t1_x.invert().expect("nonzero T1 x-coordinate");
+    let (statement, witness) = paper::testing::build_statement_witness(&msg, sk1, pk2, beta);
+    assert!(bool::from(statement.r_point.is_identity()));
+
+    let proof = paper::evrf_prove(&statement, &witness, &mut rng).expect("prove zero output");
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    paper::evrf_verify(&statement, &proof, &mut verify_rng).expect("verify zero output");
 }
 
 #[test]

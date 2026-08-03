@@ -161,7 +161,7 @@ pub mod secp_secq {
         stream.observe_point::<GoutStreamCurve>(
             b"statement.r",
             &statement.r_point,
-            IdentityPolicy::Reject,
+            IdentityPolicy::Allow,
         )?;
         stream.observe_scalar::<GoutStreamCurve>(b"statement.beta", &statement.beta)
     }
@@ -894,6 +894,16 @@ pub mod secp_secq {
         Ok(())
     }
 
+    /// Parse a canonical R1CS proof with no trailing or non-canonical bytes.
+    fn parse_canonical_r1cs_proof(bytes: &[u8]) -> Result<R1CSProof<R1csCycle>> {
+        let proof = R1CSProof::<R1csCycle>::from_bytes(bytes)
+            .map_err(|_| Error::ProofVerificationFailed)?;
+        if proof.to_bytes() != bytes {
+            return Err(Error::ProofVerificationFailed);
+        }
+        Ok(proof)
+    }
+
     /// Parse one canonical commitment prefix from the nested R1CS payload.
     fn parse_nested_commitment(
         payload: &[u8],
@@ -1219,11 +1229,7 @@ pub mod secp_secq {
             let r1cs_bytes = payload
                 .get(cursor..)
                 .ok_or(Error::ProofVerificationFailed)?;
-            let r1cs_proof = R1CSProof::<R1csCycle>::from_bytes(r1cs_bytes)
-                .map_err(|_| Error::ProofVerificationFailed)?;
-            if r1cs_proof.to_bytes() != r1cs_bytes {
-                return Err(Error::ProofVerificationFailed);
-            }
+            let r1cs_proof = parse_canonical_r1cs_proof(r1cs_bytes)?;
 
             // Step 9 prefix link: V_r == R + g_out,1.
             pedersen_prefix_link(&pc_gens.B_blinding, &statement.r_point, &v_r)?;
@@ -1843,11 +1849,7 @@ pub mod secp_secq {
         let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
         observe_batched_statement(&mut stream, statement)?;
         stream.receive_nested(|transcript, payload| {
-            let r1cs_proof = R1CSProof::<R1csCycle>::from_bytes(payload)
-                .map_err(|_| Error::ProofVerificationFailed)?;
-            if r1cs_proof.to_bytes() != payload {
-                return Err(Error::ProofVerificationFailed);
-            }
+            let r1cs_proof = parse_canonical_r1cs_proof(payload)?;
             verify_batched_r1cs(statement, &r1cs_proof, rng, transcript)
         })?;
         stream.finish()

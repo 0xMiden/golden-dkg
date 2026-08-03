@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "golden-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "miden-serde-utils",
  "rand_chacha",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "golden-evrf"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bulletproofs-cycle",
  "ff",

@@ -6,12 +6,14 @@ use golden_core::{Error, GoldenGroup, GoldenScalar, Result};
 use merlin::Transcript;
 
 const PROOF_ID_LEN_BYTES: usize = 4;
+#[cfg(any(test, feature = "halo2curves-secp256k1"))]
 const NESTED_LEN_BYTES: usize = 8;
 
 /// Whether a point operation permits the group identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IdentityPolicy {
     /// Permit the identity.
+    #[cfg(any(test, feature = "halo2curves-secp256k1"))]
     Allow,
     /// Reject the identity.
     Reject,
@@ -154,6 +156,7 @@ pub(crate) trait Observe {
     }
 
     /// Validates and observes a public point without including it in proof bytes.
+    #[cfg(any(test, feature = "halo2curves-secp256k1"))]
     fn observe_point<C: ProofStreamCurve>(
         &mut self,
         label: &'static [u8],
@@ -166,6 +169,7 @@ pub(crate) trait Observe {
     }
 
     /// Validates and observes a public scalar without including it in proof bytes.
+    #[cfg(any(test, feature = "halo2curves-secp256k1"))]
     fn observe_scalar<C: ProofStreamCurve>(
         &mut self,
         label: &'static [u8],
@@ -235,6 +239,7 @@ impl ProverProofStream {
     }
 
     /// Runs a nested child protocol against the shared transcript and frames its bytes.
+    #[cfg(any(test, feature = "halo2curves-secp256k1"))]
     pub(crate) fn send_nested(
         &mut self,
         build: impl FnOnce(&mut Transcript) -> Result<Vec<u8>>,
@@ -352,6 +357,7 @@ impl<'proof> VerifierProofStream<'proof> {
     }
 
     /// Borrows a checked nested payload and runs its child protocol on the shared transcript.
+    #[cfg(any(test, feature = "halo2curves-secp256k1"))]
     pub(crate) fn receive_nested<T>(
         &mut self,
         consume: impl FnOnce(&mut Transcript, &'proof [u8]) -> Result<T>,

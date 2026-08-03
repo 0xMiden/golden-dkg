@@ -1,6 +1,6 @@
 # Proof Stream v2 migration
 
-This change replaces Golden-level proof containers with one versioned, ordered proof stream and makes complete dealer messages the only persisted proof transport. The workspace is unpublished, so the migration is atomic and intentionally has no v1 compatibility decoder.
+This change replaces Golden-level proof containers with one versioned, ordered proof stream and makes complete dealer messages the only persisted proof transport. Because `golden-core` and `golden-evrf` were published at 0.1.0, their breaking proof API migration is released as 0.2.0. The migration is atomic and intentionally has no v1 compatibility decoder.
 
 ## Interoperability vectors
 
