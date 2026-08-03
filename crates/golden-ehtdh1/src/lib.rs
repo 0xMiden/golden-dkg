@@ -96,15 +96,22 @@
 //!
 //! This crate does not provide AEAD authentication of plaintext, validator
 //! networking, accountable decryption, refresh, resharing, TEE custody, replay
-//! prevention, or a canonical wire format.
+//! prevention.
 //!
-//! The `serde` feature is absent until Golden has a versioned encoding for
-//! ciphertexts, shares, setup contexts, and group elements.
+//! [`wire`] defines canonical bytes for setup material, keys, ciphertexts, and
+//! decryption shares. The `miden-serde` and `serde` features adapt those same
+//! bytes to their respective serialization traits.
 //!
 //! # Provided APIs
 //!
 //! This crate provides client sealing, validator decryption shares, exact
 //! combining, quorum search, and a bridge from two Golden DKG runs.
+//!
+//! Run the full three party threshold record example with:
+//!
+//! ```text
+//! cargo run -p golden-ehtdh1 --example threshold_records --features prototype-bridge
+//! ```
 //!
 //! # Example
 //!
@@ -168,7 +175,7 @@
 //! let public_key_set = PublicKeySet::<G>::new(2, joint_public_key, public_shares)?;
 //! let sealing_key = SealingKey::<G>::new(joint_public_key)?;
 //! let setup_context = SetupContext {
-//!     backend_id: G::BACKEND_ID,
+//!     backend_id: G::BACKEND_ID.to_owned(),
 //!     threshold: 2,
 //!     registry_root: [1u8; 32],
 //!     participants: participants.to_vec(),
@@ -214,6 +221,7 @@ pub mod context;
 pub mod decrypt;
 pub mod dkg_bridge;
 pub mod encrypt;
+pub mod wire;
 
 pub use context::{
     derive_context_session_id, CombineError, Error, PublicKeySet, PublicShare, SecretShare,
@@ -254,7 +262,7 @@ mod tests {
 
     fn setup_context() -> SetupContext {
         SetupContext {
-            backend_id: G::BACKEND_ID,
+            backend_id: G::BACKEND_ID.to_owned(),
             threshold: 2,
             registry_root: [1u8; 32],
             participants: participants().to_vec(),
@@ -403,6 +411,35 @@ mod tests {
 
         assert_eq!(first, second);
         first.verify().unwrap();
+    }
+
+    #[test]
+    fn shares_are_bound_to_ciphertext_with_same_context() {
+        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
+        let mut first_rng = ChaCha20Rng::from_seed([7u8; 32]);
+        let mut second_rng = ChaCha20Rng::from_seed([8u8; 32]);
+        let plaintext = b"payload";
+        let associated_data = b"ad";
+        let decryption_context = b"context";
+        let first = sealing_key
+            .seal_bytes_with_associated_data(&mut first_rng, plaintext, associated_data)
+            .unwrap();
+        let second = sealing_key
+            .seal_bytes_with_associated_data(&mut second_rng, plaintext, associated_data)
+            .unwrap();
+        assert_ne!(first, second);
+
+        let shares = shares_for(&secret_shares, &setup_context, &first, decryption_context);
+        let combiner = Combiner::new(public_key_set, setup_context).unwrap();
+        assert_eq!(
+            combiner
+                .combine_exact(&first, decryption_context, &shares[..2])
+                .unwrap(),
+            plaintext
+        );
+
+        let result = combiner.combine_exact(&second, decryption_context, &shares[..2]);
+        assert!(matches!(result, Err(CombineError::MalformedShares(ids)) if ids == vec![1, 2]));
     }
 
     #[test]

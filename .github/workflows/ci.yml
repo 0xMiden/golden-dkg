@@ -21,7 +21,7 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -34,7 +34,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -52,12 +52,14 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
         with:
           tool: cargo-hack
       - name: Check workspace (default features)
@@ -72,21 +74,45 @@ jobs:
             --each-feature \
             --exclude-features default,bulletproofs-compat \
             --all-targets
+      - name: Compile EHTDH1 threshold record example
+        run: cargo check -p golden-ehtdh1 --example threshold_records --features prototype-bridge
+      - name: Check browser recovery crates
+        run: |
+          cargo check \
+            --target wasm32-unknown-unknown \
+            -p golden-core \
+            -p golden-ehtdh1 \
+            -p golden-halo2curves \
+            --features golden-halo2curves/halo2curves-secp256k1
       - name: golden-core dependency boundary
         run: |
           cargo tree -p golden-core > /tmp/golden-core-tree.txt
           ! grep -E '(^|[[:space:]])(p256|k256|ark-|bls|frost|pairing)' /tmp/golden-core-tree.txt
 
-  test:
-    name: Test
+  cargo-deny:
+    name: Check dependencies with cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
+        with:
+          tool: cargo-deny@0.19.6
+          fallback: none
+      - name: Check dependencies
+        run: cargo deny check
+
+  test:
+    name: Test
+    runs-on: warp-ubuntu-latest-x64-8x
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
         with:
           tool: cargo-nextest
       - name: Test golden-core
@@ -111,6 +137,8 @@ jobs:
         run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1
       - name: Test golden-evrf wire serialization adapters
         run: cargo nextest run -p golden-evrf --features serde,miden-serde,halo2curves-secp256k1
+      - name: Test EHTDH1 wire serialization adapters
+        run: cargo nextest run -p golden-ehtdh1 --features serde,miden-serde
       - name: Doctests
         run: cargo test --workspace --doc
 
@@ -120,7 +148,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

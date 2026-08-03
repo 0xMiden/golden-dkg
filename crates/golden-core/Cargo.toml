@@ -1,11 +1,14 @@
 [package]
 name = "golden-core"
-version = "0.1.0"
+version = "0.1.1"
+description = "Core traits and protocols for Golden distributed key generation"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+publish = ["crates-io"]
 
 [dependencies]
 miden-serde-utils = { workspace = true, optional = true }

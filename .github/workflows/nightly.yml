@@ -15,19 +15,21 @@ concurrency:
 jobs:
   slow-test:
     name: Run #[ignore] slow tests
-    runs-on: ubuntu-latest
+    runs-on: warp-ubuntu-latest-x64-8x
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: slow-test
-      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
         with:
           tool: cargo-nextest
       - name: Run ignored golden-evrf Secp/Secq tests
         run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1 --run-ignored only
       - name: Run ignored golden-ehtdh1 Secp/Secq bridge test
         run: cargo nextest run -p golden-ehtdh1 --features halo2curves-secp256k1 --run-ignored only
+      - name: Run EHTDH1 threshold record example
+        run: cargo run -p golden-ehtdh1 --example threshold_records --features prototype-bridge

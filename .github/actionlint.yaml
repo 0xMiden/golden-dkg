@@ -1,0 +1,4 @@
+# Allow actionlint to recognize the custom WarpBuild runner label.
+self-hosted-runner:
+  labels:
+    - warp-ubuntu-latest-x64-8x
