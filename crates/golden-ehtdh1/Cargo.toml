@@ -1,6 +1,6 @@
 [package]
 name = "golden-ehtdh1"
-version = "0.1.0"
+version = "0.1.1"
 description = "Context bound threshold encryption for Golden distributed key generation"
 edition.workspace = true
 homepage.workspace = true
