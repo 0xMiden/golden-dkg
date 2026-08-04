@@ -63,10 +63,17 @@ impl<G: GoldenHashToGroup> SealingKey<G> {
     /// For a given sealing key, the seed determines `R` independently of the
     /// plaintext, associated data, and caller RNG. Reusing the same seed and key
     /// reuses both `R` and the payload mask, so callers must provide sufficient
-    /// entropy and domain separation to prevent unintended reuse.
+    /// entropy and domain separation to prevent unintended reuse. Anyone who
+    /// learns or guesses the seed can derive `r` and open the payload without
+    /// threshold shares. Likewise, a party that knows one plaintext and its
+    /// wrapped payload can recover the common mask and open every same-seed
+    /// sibling. Use seed reuse only within one intentional disclosure scope.
     ///
     /// The caller RNG must provide a fresh `r'` for every encryption. Reusing this
-    /// Schnorr nonce across ciphertexts can reveal `r` and break proof security.
+    /// Schnorr nonce across distinct proof statements reveals `r` when their
+    /// challenges differ. Anyone learning `r` can compute `rX` from the public key
+    /// and open every payload using that seeded `r`; nonce reuse is therefore a
+    /// confidentiality failure, not merely a proof failure.
     pub fn seal_bytes_with_associated_data_and_seed<R: RngCore + CryptoRng>(
         &self,
         rng: &mut R,

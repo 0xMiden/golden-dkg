@@ -1,99 +1,101 @@
-//! Threshold encryption for stored records with three participants.
+//! Threshold disclosure-group decryption for stored records with three participants.
 //!
-//! This example follows the node Phase 2 flow.
+//! This example follows a two-of-three disclosure-group flow.
 //!
 //! 1. Three participants run the two Golden DKG sessions needed by EHTDH1.
-//!    They agree on one public sealing key with a threshold of two. Each
-//!    participant also receives its own secret share.
+//!    They agree on one public sealing key, and each receives its own secret share.
 //! 2. A client supplies one private value and a uniformly random 256-bit nonce.
 //!    The application derives a shared sealing seed from
 //!    `client_nonce || SHA256(canonical private plaintext)` with domain-separated
 //!    HKDF-SHA256.
-//! 3. Three independent writers encrypt the same value with fresh content keys,
-//!    AEAD nonces, and proof randomness. The shared seed makes their EHTDH1
-//!    ciphertexts share `R` while remaining distinct.
-//! 4. The participants choose one writer's record. Each participant uses its
-//!    secret share to make a decryption share for that record and ciphertext.
-//! 5. A combiner checks the ciphertext-bound shares. Any two valid shares recover
-//!    the chosen content key, which then decrypts the common private value.
+//! 3. Three independent writers encrypt the same logical private payload. Every
+//!    writer uses the same application-level associated data and seeded `r`, so
+//!    the EHTDH1 ciphertexts share `R`. Each writer independently samples a fresh
+//!    content key, outer XChaCha20Poly1305 nonce, and encryption-proof nonce `r'`,
+//!    so the complete ciphertexts, encrypted payloads, and proof fields differ.
+//! 4. Before any request-specific context or disclosure group exists, each
+//!    participant precomputes its secret-bearing contribution for the common `R`.
+//!    The unsealing share and opaque precomputation remain protected in TEE storage.
+//! 5. Later, the application authenticates the intended record membership and
+//!    creates one disclosure group from the common `R`, common associated data,
+//!    one request-specific decryption context, and an opaque application group ID.
+//! 6. Each participant issues a disclosure-group share with fresh proof randomness
+//!    and sends its canonical wire form. One threshold set reconstructs one opaque
+//!    group key, which opens all three wrapped content keys and therefore all three
+//!    outer records.
+//!
+//! # Security warning
+//!
+//! A disclosure-group key opens **any valid ciphertext with the same `R` and
+//! associated data**, not only ciphertexts the application intended to place in
+//! the group. The application **must authenticate disclosure-group membership**
+//! separately before participants release shares. This example uses a trusted
+//! manifest of complete record-envelope digests.
+//!
+//! Seeded sealing also reuses one payload mask: a writer that knows its own
+//! content key and wrapped payload can recover the mask and open every sibling.
+//! Anyone learning or guessing the seed can derive `r` and do the same without a
+//! threshold. Reusing encryption-proof nonce `r'` can reveal `r`, while reusing
+//! disclosure-share proof nonces can reveal a participant's long-lived shares.
+//! Both are confidentiality failures, not merely proof failures.
 //!
 //! The example uses a fast prototype proof backend so it can run as a normal
-//! example. It uses the same Golden DKG and EHTDH1 public APIs as the full
-//! proof backend.
+//! example. It uses the same Golden DKG and EHTDH1 public APIs as the full proof
+//! backend.
 //!
 //! # Context policy
 //!
-//! Four values in this flow are easy to conflate:
-//!
-//! * The **record ID** identifies the stored record.
-//! * **Associated data** binds that ID into the record AEAD and the EHTDH1
-//!   ciphertext.
-//! * The **EHTDH1 decryption context** binds each participant's approval to a
-//!   decryption request.
-//! * The [`SetupContext`](golden_ehtdh1::SetupContext) identifies the Golden
-//!   setup that produced the keys and shares.
-//!
-//! The record ID, both associated-data inputs, and the decryption context
-//! happen to contain the same bytes in this example, but they remain separate
-//! inputs.
+//! * The **record ID** is storage metadata only. Distinct record IDs are not used
+//!   as EHTDH1 associated data or outer AEAD associated data.
+//! * The common **application associated data** describes the logical payload and
+//!   is bound into every EHTDH1 ciphertext and every outer record encryption.
+//! * The **request-specific decryption context** binds participant approval to one
+//!   release request.
+//! * The opaque **disclosure-group ID** is supplied by the application and binds
+//!   the released shares to that application group.
+//! * The [`SetupContext`](golden_ehtdh1::SetupContext) identifies the Golden setup
+//!   that produced the keys and shares.
 //!
 //! # Why setup runs DKG twice
 //!
 //! The first DKG shares the joint decryption secret. The second shares zero so
-//! its contributions cancel for one decryption context, but not when contexts
-//! are mixed.
+//! its contributions cancel for one decryption context and disclosure group, but
+//! not when contexts or groups are mixed.
 //!
 //! # Glossary
 //!
-//! * A **participant** is one of the three parties in Golden setup. Each
-//!   participant has an identity key and later holds one secret share.
-//! * A **writer** receives only the sealing key and does not need to take part
-//!   in DKG or hold a secret share.
-//! * The **threshold** is the number of decryption shares needed to open a
-//!   content key. This example uses two out of three.
-//! * **Golden DKG** lets the participants create a joint public key without one
-//!   party choosing the final private key. EHTDH1 setup uses one DKG session
-//!   for the decryption key and one zero sharing session for context binding.
-//! * A **dealing** is one participant's DKG message. It contains encrypted
-//!   shares for the other participants and a proof that they are valid.
-//! * A **DKG output** is one participant's result after all dealings pass. It
-//!   contains public setup data and that participant's local DKG share.
-//! * A **sealing key** is the joint public key. Writers use it without learning
-//!   any participant secret.
-//! * A **public key set** has the threshold and joint public key. There is also
-//!   one public share for each participant. The combiner reads this set when it
-//!   checks shares.
-//! * A **setup context** is the identity of the Golden setup. The backend and
-//!   participant list are part of it. Both DKG sessions and their transcript
-//!   roots are also part of it. The epoch names the version of this setup.
-//! * A **secret share** is the long lived private EHTDH1 material held by one
-//!   participant. There is one scalar from each DKG session in it. Participants
-//!   never exchange these secret shares.
-//! * An **unsealing share** wraps one secret share. A participant uses it to
-//!   create a decryption share without exposing the stored secret.
-//! * A **record ID** is the application key for one record. It is bound to the
-//!   record cipher, EHTDH1 ciphertext, and each decryption share.
-//! * A **record** is the stored record ID and record cipher nonce. It also
-//!   includes the encrypted value and canonical bytes for the EHTDH1
-//!   ciphertext.
-//! * A **content key** is a fresh 32 byte secret used to encrypt one record
-//!   value with XChaCha20Poly1305.
-//! * An **EHTDH1 ciphertext** is the encrypted content key and its proof. The
-//!   record ID is public associated data in this ciphertext.
-//! * A **decryption share** is a message made for one EHTDH1 ciphertext and one
-//!   decryption context. It is safe to exchange. It is not the participant's
-//!   secret share.
-//! * A **combiner** checks decryption shares against the public setup. It
-//!   returns the content key only after it receives enough valid shares.
-//! * A **quorum** is any set of participants that meets the threshold. All
-//!   three possible pairs are valid quorums in this example.
-//! * Each public value has one **canonical byte** form for storage or exchange.
-//!   Writers, participants, and the combiner decode the same bytes.
-//! * With **authenticated symmetric encryption**, the large record value is
-//!   hidden and any change to its ciphertext or record ID is rejected.
-//! * The **HPKE style split** means symmetric encryption handles each large
-//!   value while EHTDH1 handles only its small content key. Record size does
-//!   not change the EHTDH1 payload size.
+//! * A **participant** is one of the three parties in Golden setup. Each holds a
+//!   long-lived secret EHTDH1 share in protected participant storage.
+//! * A **writer role** uses only the sealing key. In this deployment the same
+//!   three TEEs also act as threshold participants, but the writer path never uses
+//!   their participant secrets.
+//! * The **threshold** is the number of valid disclosure-group shares needed to
+//!   construct a group key. This example uses two out of three.
+//! * **Golden DKG** creates the joint public key without one party choosing the
+//!   final private key. EHTDH1 setup runs one decryption-key DKG and one zero-sharing
+//!   DKG for context binding.
+//! * A **sealing key** is the joint public key used by writers.
+//! * An **unsealing share** wraps one participant's long-lived secret share.
+//! * A **decryption precomputation** is the opaque, secret-bearing `x_i R` value a
+//!   participant caches for a common `R`. It stays local and is never serialized.
+//! * A **record ID** identifies storage but does not establish cryptographic
+//!   disclosure-group membership. A trusted manifest authenticates the complete
+//!   record envelope, including its ID and wrapped content key.
+//! * A **content key** is a fresh 32-byte secret used to encrypt one record with
+//!   XChaCha20Poly1305.
+//! * An **EHTDH1 ciphertext** wraps one content key. Its proof uses fresh nonce
+//!   `r'`; reuse of `r'` is a confidentiality failure.
+//! * A **disclosure group** binds common `R` and associated data to a request
+//!   context and opaque group ID. The application authenticates its members.
+//! * A **disclosure-group decryption share** is a public, proof-bearing message
+//!   issued with fresh share-proof randomness. It has canonical wire bytes.
+//! * A **disclosure-group key** is reconstructed from a threshold set and opens
+//!   any valid same-`R`/same-associated-data ciphertext. It is secret-bearing,
+//!   remains in memory, and is never serialized.
+//! * A **combiner** verifies disclosure-group shares against the public setup and
+//!   constructs the group key only from a threshold set.
+//! * The **HPKE-style split** means outer authenticated encryption handles each
+//!   large value while EHTDH1 handles only its fixed-size content key.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -107,8 +109,9 @@ use golden_core::{
 };
 use golden_ehtdh1::wire::{from_wire_bytes, to_wire_bytes};
 use golden_ehtdh1::{
-    derive_context_session_id, material_from_dkg_outputs, Ciphertext, Combiner, DecryptionShare,
-    Ehtdh1Material, SealingKey, UnsealingShare,
+    derive_context_session_id, material_from_dkg_outputs, Ciphertext, Combiner,
+    DecryptionPrecomputation, DisclosureGroup, DisclosureGroupDecryptionShare, Ehtdh1Material,
+    SealingKey, UnsealingShare,
 };
 use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
@@ -133,9 +136,9 @@ const NONCE_BYTES: usize = 24;
 /// Size of each example value.
 const RECORD_BYTES: usize = 512 * 1024;
 
-/// Stored form of one record ID and its encrypted value.
+/// Stored form of one storage record ID and its encrypted value.
 struct StoredRecord {
-    /// Public application identifier bound into both encryption layers.
+    /// Public storage identifier; deliberately not used as cryptographic AD.
     record_id: Vec<u8>,
     /// Public nonce used by the record cipher.
     nonce: [u8; NONCE_BYTES],
@@ -155,19 +158,22 @@ fn main() -> AppResult<()> {
     let materials = run_golden_setup(&participants, &mut setup_rng)?;
     check_shared_setup(&materials)?;
 
-    // Step 2. The writers receive only canonical bytes for the public sealing
-    // key. They have no participant secret.
+    // Step 2. The writer role receives only canonical bytes for the public
+    // sealing key. The same three TEEs later act as threshold participants, but
+    // their participant secrets are not used on this writer path.
     let first = get(&materials, participants[0], "missing first participant")?;
     let public_key_bytes = to_wire_bytes(&first.sealing_key);
     let writer_key = from_wire_bytes::<SealingKey<G>>(&public_key_bytes)?;
 
     // Step 3. Derive the shared sealing seed and create one independently
-    // randomized record per writer.
+    // randomized record per writer. Record IDs are storage metadata, while every
+    // EHTDH1 ciphertext and outer AEAD uses the same application-level AD.
     let record_ids = [
         b"private-record/A".as_slice(),
         b"private-record/B".as_slice(),
         b"private-record/C".as_slice(),
     ];
+    let application_associated_data = b"threshold-records/logical-private-payload/v1";
     let canonical_private_plaintext = vec![b'T'; RECORD_BYTES];
     // Fixed only to keep the example repeatable. Production clients sample a
     // uniformly random 256-bit client nonce.
@@ -175,143 +181,199 @@ fn main() -> AppResult<()> {
     let transaction_sealing_seed =
         derive_transaction_sealing_seed(&client_nonce, &canonical_private_plaintext)?;
     let mut records = Vec::new();
-    for (writer_index, record_id) in record_ids.into_iter().enumerate() {
+    for (writer_index, record_id) in record_ids.iter().copied().enumerate() {
+        // A separate writer RNG independently samples the content key, outer
+        // XChaCha20Poly1305 nonce, and fresh EHTDH1 proof nonce r'. Reusing r'
+        // across distinct proof statements would reveal seeded r and destroy
+        // confidentiality for every ciphertext sharing it.
         let mut writer_rng = ChaCha20Rng::from_seed([2 + writer_index as u8; 32]);
         records.push(seal_record(
             &writer_key,
             record_id,
+            application_associated_data,
             &canonical_private_plaintext,
             &transaction_sealing_seed,
             &mut writer_rng,
         )?);
     }
 
+    // Trusted writer/storage infrastructure records a digest of each complete
+    // envelope in an authenticated manifest. Production can use signed manifests
+    // or authenticated storage; record IDs alone are not membership evidence.
+    let authenticated_record_manifest = records
+        .iter()
+        .map(|record| {
+            (
+                record.record_id.clone(),
+                authenticated_record_digest(record),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // Decode the three canonical ciphertexts as their eventual readers would.
     let wrapped_keys = records
         .iter()
         .map(|record| from_wire_bytes::<Ciphertext<G>>(&record.wrapped_content_key))
         .collect::<Result<Vec<_>, _>>()?;
     require(
-        wrapped_keys
-            .iter()
-            .all(|ciphertext| ciphertext.ephemeral_public == wrapped_keys[0].ephemeral_public),
-        "writers derived different R values",
+        wrapped_keys.iter().all(|ciphertext| {
+            ciphertext.ephemeral_public == wrapped_keys[0].ephemeral_public
+                && ciphertext.associated_data() == application_associated_data
+        }),
+        "writers did not use common R and common associated data",
     )?;
     require(
-        wrapped_keys[0].encrypted_payload != wrapped_keys[1].encrypted_payload
-            && wrapped_keys[0].encrypted_payload != wrapped_keys[2].encrypted_payload
-            && wrapped_keys[1].encrypted_payload != wrapped_keys[2].encrypted_payload
-            && wrapped_keys[0] != wrapped_keys[1]
-            && wrapped_keys[0] != wrapped_keys[2]
-            && wrapped_keys[1] != wrapped_keys[2],
-        "writers produced identical ciphertexts",
+        three_distinct(&wrapped_keys[0], &wrapped_keys[1], &wrapped_keys[2]),
+        "complete EHTDH1 ciphertexts were not distinct",
     )?;
-
-    // Step 4. The participants choose record B. Its record ID is supplied
-    // separately as associated data and the decryption context.
-    let chosen = &records[1];
-    let other = &records[0];
-    let wrapped_key = wrapped_keys[1].clone();
-    let expected_associated_data = chosen.record_id.as_slice();
-    let decryption_context = chosen.record_id.as_slice();
-    let mut share_rng = ChaCha20Rng::from_seed([6u8; 32]);
-    let shares = make_shares(
-        &materials,
-        &wrapped_key,
-        decryption_context,
-        expected_associated_data,
-        &mut share_rng,
-    )?;
-    let combiner = Combiner::new(first.public_key_set.clone(), first.setup_context.clone())?;
-
-    // Step 5. One share is below the threshold and cannot open the content key.
     require(
-        combiner
-            .combine_exact_with_associated_data(
-                &wrapped_key,
-                decryption_context,
-                expected_associated_data,
-                &shares[..1],
-            )
-            .is_err(),
-        "one share unexpectedly opened the content key",
+        three_distinct(
+            &wrapped_keys[0].encrypted_payload,
+            &wrapped_keys[1].encrypted_payload,
+            &wrapped_keys[2].encrypted_payload,
+        ),
+        "wrapped content-key payloads were not distinct",
+    )?;
+    require(
+        three_distinct(
+            &wrapped_keys[0].encryption_point,
+            &wrapped_keys[1].encryption_point,
+            &wrapped_keys[2].encryption_point,
+        ) && three_distinct(
+            &wrapped_keys[0].challenge,
+            &wrapped_keys[1].challenge,
+            &wrapped_keys[2].challenge,
+        ) && three_distinct(
+            &wrapped_keys[0].response,
+            &wrapped_keys[1].response,
+            &wrapped_keys[2].response,
+        ),
+        "EHTDH1 proof fields were not distinct",
+    )?;
+    require(
+        three_distinct(
+            &records[0].encrypted_value,
+            &records[1].encrypted_value,
+            &records[2].encrypted_value,
+        ) && three_distinct(&records[0].nonce, &records[1].nonce, &records[2].nonce),
+        "outer ciphertexts or XChaCha20Poly1305 nonces were not distinct",
     )?;
 
-    // Each possible pair meets the threshold and opens the chosen value.
-    for pair in [[0, 1], [0, 2], [1, 2]] {
-        let selected = [shares[pair[0]].clone(), shares[pair[1]].clone()];
-        let content_key = Zeroizing::new(combiner.combine_exact_with_associated_data(
-            &wrapped_key,
-            decryption_context,
-            expected_associated_data,
-            &selected,
-        )?);
-        let opened = open_record(chosen, &content_key)?;
-        require(
-            opened == canonical_private_plaintext,
-            "a valid quorum opened the wrong private value",
-        )?;
+    // Step 4. Ciphertexts now exist, but no request-specific context or group has
+    // been formed. Each participant calls precompute exactly once for common R.
+    let common_ephemeral_public = wrapped_keys[0].ephemeral_public;
+    let mut local_precomputations = Vec::<(UnsealingShare<G>, DecryptionPrecomputation<G>)>::new();
+    for material in materials.values() {
+        let unsealing_share = UnsealingShare::new(material.secret_share.clone());
+        let precomputation =
+            unsealing_share.precompute_for_ephemeral_public(&common_ephemeral_public)?;
+        // This secret-bearing (UnsealingShare, DecryptionPrecomputation) tuple
+        // remains sealed/protected in TEE storage. It is never serialized.
+        local_precomputations.push((unsealing_share, precomputation));
     }
 
-    // A share made for the same ciphertext and associated data under another
-    // decryption context cannot combine with a share for the intended context.
-    let second = get(&materials, participants[1], "missing second participant")?;
-    let different_decryption_context = other.record_id.as_slice();
-    let mixed_context_share = UnsealingShare::new(second.secret_share.clone())
-        .decrypt_share_with_associated_data(
-            &mut share_rng,
-            &second.setup_context,
-            &wrapped_key,
-            different_decryption_context,
-            expected_associated_data,
-        )?;
-    let mixed_context_share =
-        from_wire_bytes::<DecryptionShare<G>>(&to_wire_bytes(&mixed_context_share))?;
-    let mixed_context_shares = [shares[0].clone(), mixed_context_share];
+    // Step 5. Later, the application authenticates every complete record envelope
+    // against trusted storage before treating it as an intended member.
+    // DisclosureGroup itself does not authenticate membership.
     require(
-        combiner
-            .combine_exact_with_associated_data(
-                &wrapped_key,
-                decryption_context,
-                expected_associated_data,
-                &mixed_context_shares,
-            )
-            .is_err(),
-        "shares from different decryption contexts were combined",
+        records.iter().zip(&authenticated_record_manifest).all(
+            |(record, (authenticated_id, authenticated_digest))| {
+                record.record_id == *authenticated_id
+                    && authenticated_record_digest(record) == *authenticated_digest
+            },
+        ),
+        "application disclosure-group membership authentication failed",
+    )?;
+    // These values are deliberately defined only when this release is requested.
+    let opaque_disclosure_group_id = b"app-group:7f49b28d6a1c";
+    let request_decryption_context = b"request:2026-08-03T12:00:00Z:4e91";
+    let disclosure_group = DisclosureGroup::new(
+        common_ephemeral_public,
+        application_associated_data,
+        request_decryption_context,
+        opaque_disclosure_group_id,
     )?;
 
-    // Sharing `R` does not make decryption shares interchangeable: shares for
-    // ciphertext B cannot open ciphertext A under the same decryption context.
-    let other_wrapped_key = wrapped_keys[0].clone();
-    let other_expected_associated_data = other.record_id.as_slice();
+    // Each participant uses fresh share-proof randomness, then exchanges only a
+    // canonical DisclosureGroupDecryptionShare. Reusing the two proof nonces
+    // across distinct challenges would reveal that participant's x_i and z_i.
+    // Local precomputations stay in TEE storage and are not part of the wire
+    // message. Fixed seeds below exist only to keep this one release repeatable.
+    let mut disclosure_shares = Vec::<DisclosureGroupDecryptionShare<G>>::new();
+    for (participant_offset, (unsealing_share, precomputation)) in
+        local_precomputations.iter().enumerate()
+    {
+        let mut share_proof_rng = ChaCha20Rng::from_seed([6 + participant_offset as u8; 32]);
+        let share = unsealing_share.issue_disclosure_group_share(
+            &mut share_proof_rng,
+            &first.setup_context,
+            precomputation,
+            &disclosure_group,
+        )?;
+        disclosure_shares.push(from_wire_bytes::<DisclosureGroupDecryptionShare<G>>(
+            &to_wire_bytes(&share),
+        )?);
+    }
+
+    let combiner = Combiner::new(first.public_key_set.clone(), first.setup_context.clone())?;
+
+    // Step 6. One disclosure-group share is below the two-of-three threshold.
     require(
         combiner
-            .combine_exact_with_associated_data(
-                &other_wrapped_key,
-                decryption_context,
-                other_expected_associated_data,
-                &shares[..2],
-            )
+            .combine_disclosure_group_exact(&disclosure_group, &disclosure_shares[..1])
             .is_err(),
-        "shares for one ciphertext opened another ciphertext",
+        "one disclosure-group share unexpectedly constructed a group key",
     )?;
+
+    // One exact threshold set reconstructs one secret-bearing group key. The key
+    // remains in local memory and is intentionally never serialized.
+    let threshold_shares = [disclosure_shares[0].clone(), disclosure_shares[1].clone()];
+    let disclosure_group_key =
+        combiner.combine_disclosure_group_exact(&disclosure_group, &threshold_shares)?;
+
+    // The same group key opens every valid same-R/same-AD EHTDH1 ciphertext.
+    // Application membership authentication above is therefore mandatory.
+    for (record, wrapped_key) in records.iter().zip(&wrapped_keys) {
+        let content_key = Zeroizing::new(disclosure_group_key.open(wrapped_key)?);
+        let opened = open_record(record, &content_key, application_associated_data)?;
+        require(
+            opened == canonical_private_plaintext,
+            "a disclosure-group member opened to the wrong private payload",
+        )?;
+    }
 
     let record_bytes = records.len() * RECORD_BYTES;
     let wrapped_bytes = records.len() * CONTENT_KEY_BYTES;
     println!("Golden setup has 3 participants and a threshold of 2.");
     println!(
-        "Three writers encrypted one private value into {} records.",
+        "Three writers encrypted the same logical private payload into {} storage records.",
         records.len()
     );
+    println!("All records used common application AD and common seeded r/R.");
+    println!("Each writer used an independent content key, outer nonce, and fresh proof nonce r'.");
     println!(
-        "In the HPKE style split, AEAD encrypted {record_bytes} record bytes. EHTDH1 wrapped \
+        "All three complete EHTDH1 ciphertexts, encrypted payloads, and proof fields were distinct."
+    );
+    println!(
+        "In the HPKE-style split, AEAD encrypted {record_bytes} record bytes and EHTDH1 wrapped \
          {wrapped_bytes} bytes total."
     );
-    println!("Each EHTDH1 ciphertext wraps 32 bytes, independent of record size.");
-    println!("All EHTDH1 ciphertexts shared R and remained distinct.");
-    println!("The parties chose private-record/B and exchanged canonical shares.");
-    println!("All three pairs of two opened private-record/B.");
-    println!("One share and shares from another context were rejected.");
-    println!("Shares for ciphertext B were rejected against ciphertext A.");
+    println!("Participants precomputed once before the request-specific group existed.");
+    println!("All three disclosure shares completed canonical wire round-trips.");
+    println!("One share was rejected; one exact threshold set constructed the group key.");
+    println!("The same non-serialized group key opened all three records to the same payload.");
+    println!("WARNING: a disclosure-group key opens ANY valid ciphertext with the same R and AD.");
+    println!(
+        "APPLICATION REQUIREMENT: authenticate complete record envelopes before releasing shares."
+    );
+    println!(
+        "CONFIDENTIALITY WARNING: seed or shared-mask exposure opens every sibling without a \
+         threshold."
+    );
+    println!(
+        "CONFIDENTIALITY WARNING: reusing encryption or share-proof nonces reveals secret \
+         scalars."
+    );
 
     Ok(())
 }
@@ -473,6 +535,7 @@ fn derive_transaction_sealing_seed(
 fn seal_record(
     sealing_key: &SealingKey<G>,
     record_id: &[u8],
+    application_associated_data: &[u8],
     value: &[u8],
     transaction_sealing_seed: &[u8; 32],
     rng: &mut ChaCha20Rng,
@@ -482,8 +545,8 @@ fn seal_record(
     rng.fill_bytes(&mut *content_key);
     rng.fill_bytes(&mut nonce);
 
-    // The record cipher handles the large value and binds its public record ID.
-    let aead_associated_data = record_id;
+    // The outer cipher handles the large value. All writers bind the same
+    // application-level AD; the distinct storage record ID is not AEAD AD.
     let cipher = XChaCha20Poly1305::new_from_slice(content_key.as_ref())
         .map_err(|_| io::Error::other("invalid content key"))?;
     let encrypted_value = cipher
@@ -491,17 +554,16 @@ fn seal_record(
             &XNonce::from(nonce),
             Payload {
                 msg: value,
-                aad: aead_associated_data,
+                aad: application_associated_data,
             },
         )
         .map_err(|_| io::Error::other("record encryption failed"))?;
-    // EHTDH1 handles only the fixed size content key and independently binds
-    // its expected associated data.
-    let expected_associated_data = record_id;
+    // EHTDH1 handles only the fixed-size content key and binds the same common
+    // application-level AD. The seeded r fixes R; this RNG supplies fresh r'.
     let wrapped_content_key = sealing_key.seal_bytes_with_associated_data_and_seed(
         rng,
         content_key.as_ref(),
-        expected_associated_data,
+        application_associated_data,
         transaction_sealing_seed,
     )?;
     require(
@@ -517,49 +579,50 @@ fn seal_record(
     })
 }
 
-/// Makes one decryption share per participant and serializes it.
-fn make_shares(
-    materials: &BTreeMap<ParticipantIndex, Ehtdh1Material<G>>,
-    wrapped_key: &Ciphertext<G>,
-    decryption_context: &[u8],
-    expected_associated_data: &[u8],
-    rng: &mut ChaCha20Rng,
-) -> AppResult<Vec<DecryptionShare<G>>> {
-    let mut shares = Vec::new();
-    for material in materials.values() {
-        let share = UnsealingShare::new(material.secret_share.clone())
-            .decrypt_share_with_associated_data(
-                rng,
-                &material.setup_context,
-                wrapped_key,
-                decryption_context,
-                expected_associated_data,
-            )?;
-        // The example serializes each share before the combiner receives it.
-        shares.push(from_wire_bytes(&to_wire_bytes(&share))?);
-    }
-    Ok(shares)
-}
-
-/// Decrypts one stored value with a content key recovered by the combiner.
-fn open_record(record: &StoredRecord, content_key: &[u8]) -> AppResult<Vec<u8>> {
+/// Decrypts one stored value with a content key opened by the disclosure-group key.
+fn open_record(
+    record: &StoredRecord,
+    content_key: &[u8],
+    application_associated_data: &[u8],
+) -> AppResult<Vec<u8>> {
     require(
         content_key.len() == CONTENT_KEY_BYTES,
         "opened content key has the wrong length",
     )?;
     let cipher = XChaCha20Poly1305::new_from_slice(content_key)
         .map_err(|_| io::Error::other("invalid opened content key"))?;
-    // The record cipher checks the stored record ID before returning plaintext.
-    let aead_associated_data = record.record_id.as_slice();
+    // The outer cipher checks the same application-level AD used by every writer.
+    // The record ID remains separate storage metadata.
     cipher
         .decrypt(
             &XNonce::from(record.nonce),
             Payload {
                 msg: &record.encrypted_value,
-                aad: aead_associated_data,
+                aad: application_associated_data,
             },
         )
         .map_err(|_| io::Error::other("record decryption failed").into())
+}
+
+/// Hashes the complete stored envelope for an authenticated membership manifest.
+fn authenticated_record_digest(record: &StoredRecord) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"threshold-record-envelope-v1");
+    for field in [
+        record.record_id.as_slice(),
+        record.nonce.as_slice(),
+        record.encrypted_value.as_slice(),
+        record.wrapped_content_key.as_slice(),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    digest.finalize().into()
+}
+
+/// Reports whether three values are pairwise distinct.
+fn three_distinct<T: PartialEq>(first: &T, second: &T, third: &T) -> bool {
+    first != second && first != third && second != third
 }
 
 /// Returns one required map value or a plain example error.

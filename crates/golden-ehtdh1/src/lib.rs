@@ -6,14 +6,34 @@
 //! joint public key `X`, public shares `(X_i, Z_i)`, secret shares `(x_i, z_i)`,
 //! and a setup context.
 //!
-//! # Protocol shape
+//! # Exact-ciphertext EHTDH1
 //!
-//! EHTDH1 uses two independent threshold sharings. The first sharing has
-//! decryption secret `x`. The second sharing has secret zero and binds shares
-//! to context. A validator returns `W_i = x_i R + z_i S`. Here, `R` comes from
-//! the ciphertext, and `S` comes from the setup context and decryption context.
-//! The combiner checks each share against `(X_i, Z_i)` and combines a threshold
-//! set to recover `xR`. It then uses `xR` to unmask the payload.
+//! The paper scheme uses two independent threshold sharings. The first sharing
+//! has decryption secret `x`. The second sharing has secret zero and binds shares
+//! to context. A validator returns `W_i = x_i R + z_i S`, where `R` comes from
+//! the ciphertext and `S = Hdgd(ad, dc, ctxt)` binds the complete ciphertext.
+//! The combiner checks each share against `(X_i, Z_i)`, combines a threshold set
+//! to recover `xR`, and opens that exact ciphertext. Existing [`DecryptionShare`]
+//! and [`Combiner::combine_exact`] / [`Combiner::combine_quorum`] APIs retain
+//! these exact-ciphertext semantics.
+//!
+//! # Disclosure-group EHTDH1 extension
+//!
+//! [`DisclosureGroup`] is a separate extension, not the exact paper scheme. It
+//! deliberately changes share binding from one complete ciphertext to a setup,
+//! common `R`, application-defined group id, associated data, and decryption
+//! context. Participants may cache secret-bearing `x_iR` in a
+//! [`DecryptionPrecomputation`], then issue a fresh
+//! [`DisclosureGroupDecryptionShare`] with
+//! `W_i = x_iR + z_iS_group` and fresh proof nonces for each request.
+//!
+//! Combining a threshold returns an opaque [`DisclosureGroupKey`] containing
+//! `xR`. That key opens every valid ciphertext with the same `R` and associated
+//! data, including a ciphertext Golden cannot know was intended as a group
+//! member. **Disclosure-group membership and authorization are application-layer
+//! responsibilities.** Authenticate or retrieve ciphertexts from trusted storage
+//! and verify membership before releasing shares. Keep precomputed `x_iR` inside
+//! protected participant storage; a threshold of those values reconstructs `xR`.
 //!
 //! # Golden setup bridge
 //!
@@ -51,15 +71,21 @@
 //! | `S = Hdgd(ad, dc, ctxt)` | internal `decryption_group` over [`SetupContext::root`] |
 //! | `W_i = x_i R + z_i S` | [`DecryptionShare::share`] |
 //!
+//! The disclosure-group types are an explicitly separate extension and are not
+//! part of this paper mapping.
+//!
 //! This crate also binds [`SetupContext::root`] into `Hdgd`. That root commits
 //! to the Golden backend id, participant registry root, both DKG session ids,
 //! both DKG transcript roots, and the caller provided epoch.
 //!
 //! # Security goals
 //!
-//! A payload stays hidden unless the combiner receives a threshold of valid
-//! EHTDH1 decryption shares. This assumes sound Golden DKG outputs, group
-//! operations, hash to group, and randomness.
+//! A normally randomized exact-mode payload stays hidden unless the combiner
+//! receives a threshold of valid EHTDH1 decryption shares. This assumes sound
+//! Golden DKG outputs, group operations, hash to group, and randomness. Seeded
+//! sealing additionally assumes the seed and common payload mask stay unknown:
+//! anyone who derives `r`, or learns the mask from one known wrapped plaintext,
+//! can open every sibling payload using that seeded `r` without threshold shares.
 //!
 //! Ciphertext checks reject malformed EHTDH1 encryption proofs. Share checks
 //! reject malformed shares and shares made for the wrong context.
@@ -75,6 +101,13 @@
 //! - checking [`Ciphertext::associated_data`] or using the `*_with_associated_data`
 //!   methods when the application expects a specific associated data value;
 //! - supplying the intended decryption context to validators and combiners;
+//! - using a fresh encryption proof nonce `r'` for every encryption, including
+//!   encryptions sharing a seeded `r`; repeating `r'` can reveal `r` and bypass
+//!   threshold decryption for every payload sharing it;
+//! - using fresh disclosure-share proof nonces for every release; repeating them
+//!   across distinct challenges reveals the participant's `x_i` and `z_i`;
+//! - authenticating disclosure-group membership before releasing group shares;
+//! - keeping [`DecryptionPrecomputation`] values in protected participant storage;
 //! - handling replay, validator identity, transport authentication, and
 //!   malformed share reporting outside this crate.
 //!
@@ -98,9 +131,11 @@
 //! networking, accountable decryption, refresh, resharing, TEE custody, replay
 //! prevention.
 //!
-//! [`wire`] defines canonical bytes for setup material, keys, ciphertexts, and
-//! decryption shares. The `miden-serde` and `serde` features adapt those same
-//! bytes to their respective serialization traits.
+//! [`wire`] defines canonical bytes for setup material, keys, ciphertexts, exact
+//! decryption shares, and released disclosure-group shares. The `miden-serde`
+//! and `serde` features adapt those same bytes to their respective serialization
+//! traits. Secret-bearing [`DecryptionPrecomputation`] and [`DisclosureGroupKey`]
+//! values intentionally have no public wire encoding.
 //!
 //! # Provided APIs
 //!
@@ -219,6 +254,7 @@
 
 pub mod context;
 pub mod decrypt;
+pub mod disclosure;
 pub mod dkg_bridge;
 pub mod encrypt;
 pub mod wire;
@@ -228,6 +264,10 @@ pub use context::{
     SetupContext,
 };
 pub use decrypt::{Combiner, DecryptionShare, UnsealingShare};
+pub use disclosure::{
+    DecryptionPrecomputation, DisclosureError, DisclosureGroup, DisclosureGroupDecryptionShare,
+    DisclosureGroupKey,
+};
 pub use dkg_bridge::{material_from_dkg_outputs, Ehtdh1Material};
 pub use encrypt::{Ciphertext, SealingKey};
 

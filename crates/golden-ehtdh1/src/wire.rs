@@ -22,8 +22,8 @@ use miden_serde_utils::{
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    derive_context_session_id, Ciphertext, DecryptionShare, Error, PublicKeySet, PublicShare,
-    SealingKey, SecretShare, SetupContext,
+    derive_context_session_id, Ciphertext, DecryptionShare, DisclosureGroupDecryptionShare, Error,
+    PublicKeySet, PublicShare, SealingKey, SecretShare, SetupContext,
 };
 
 pub use golden_core::wire::{WireDecode, WireEncode, WireMessage};
@@ -42,6 +42,8 @@ pub const TAG_SEALING_KEY: u8 = 0x24;
 pub const TAG_CIPHERTEXT: u8 = 0x25;
 /// Standalone tag for [`DecryptionShare`].
 pub const TAG_DECRYPTION_SHARE: u8 = 0x26;
+/// Standalone tag for [`DisclosureGroupDecryptionShare`].
+pub const TAG_DISCLOSURE_GROUP_DECRYPTION_SHARE: u8 = 0x27;
 
 /// Maximum encoded backend id length.
 pub const MAX_BACKEND_ID_BYTES: usize = 255;
@@ -368,6 +370,49 @@ where
     }
 }
 
+impl<G: GoldenHashToGroup> WireEncode for DisclosureGroupDecryptionShare<G> {
+    fn write_wire(&self, out: &mut Vec<u8>) {
+        self.participant.write_wire(out);
+        wire::write_element::<G>(out, &self.share);
+        wire::write_scalar::<G>(out, &self.challenge);
+        wire::write_scalar::<G>(out, &self.decryption_response);
+        wire::write_scalar::<G>(out, &self.context_response);
+    }
+}
+
+impl<G> WireDecode for DisclosureGroupDecryptionShare<G>
+where
+    G: GoldenHashToGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn read_wire(reader: &mut WireReader<'_>) -> golden_core::Result<Self> {
+        Ok(Self {
+            participant: ParticipantIndex::read_wire(reader)?,
+            share: wire::read_element::<G>(reader)?,
+            challenge: wire::read_scalar::<G>(reader)?,
+            decryption_response: wire::read_scalar::<G>(reader)?,
+            context_response: wire::read_scalar::<G>(reader)?,
+        })
+    }
+}
+
+impl<G> WireMessage for DisclosureGroupDecryptionShare<G>
+where
+    G: GoldenHashToGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    const TAG: u8 = TAG_DISCLOSURE_GROUP_DECRYPTION_SHARE;
+    const CODEC_ID: &'static str = "ehtdh1-disclosure-group-decryption-share-v1";
+
+    fn write_wire_context(out: &mut Vec<u8>) {
+        write_group_context::<G, Self>(out);
+    }
+
+    fn read_wire_context(reader: &mut WireReader<'_>) -> golden_core::Result<()> {
+        read_group_context::<G, Self>(reader)
+    }
+}
+
 fn write_group_context<G: GoldenGroup, T: WireMessage>(out: &mut Vec<u8>) {
     wire::write_context_field(out, T::CODEC_ID.as_bytes());
     wire::write_context_field(out, G::BACKEND_ID.as_bytes());
@@ -499,6 +544,8 @@ impl_miden_group_wire!(SealingKey, GoldenHashToGroup);
 impl_miden_group_wire!(Ciphertext, GoldenHashToGroup);
 #[cfg(feature = "miden-serde")]
 impl_miden_group_wire!(DecryptionShare, GoldenHashToGroup);
+#[cfg(feature = "miden-serde")]
+impl_miden_group_wire!(DisclosureGroupDecryptionShare, GoldenHashToGroup);
 
 #[cfg(feature = "serde")]
 impl Serialize for SetupContext {
@@ -568,6 +615,8 @@ impl_serde_group_wire!(SealingKey, GoldenHashToGroup);
 impl_serde_group_wire!(Ciphertext, GoldenHashToGroup);
 #[cfg(feature = "serde")]
 impl_serde_group_wire!(DecryptionShare, GoldenHashToGroup);
+#[cfg(feature = "serde")]
+impl_serde_group_wire!(DisclosureGroupDecryptionShare, GoldenHashToGroup);
 
 #[cfg(feature = "serde")]
 fn serialize_wire<T, S>(value: &T, serializer: S) -> core::result::Result<S::Ok, S::Error>
@@ -625,7 +674,7 @@ mod tests {
     use golden_rustcrypto::{P256Backend, P256Scalar};
     use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
-    use crate::{derive_context_session_id, UnsealingShare};
+    use crate::{derive_context_session_id, DisclosureGroup, UnsealingShare};
 
     type G = P256Backend;
 
@@ -637,6 +686,7 @@ mod tests {
         sealing_key: SealingKey<G>,
         ciphertext: Ciphertext<G>,
         decryption_share: DecryptionShare<G>,
+        disclosure_group_decryption_share: DisclosureGroupDecryptionShare<G>,
     }
 
     fn idx(value: u32) -> ParticipantIndex {
@@ -690,12 +740,31 @@ mod tests {
             epoch: [5u8; 32],
         };
         let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
-        let ciphertext = sealing_key
+        let ciphertext: Ciphertext<G> = sealing_key
             .seal_bytes_with_associated_data(&mut rng, b"payload", b"associated")
             .unwrap();
         let secret_share = secret_shares.remove(0);
-        let decryption_share = UnsealingShare::new(secret_share.clone())
+        let unsealing_share = UnsealingShare::new(secret_share.clone());
+        let decryption_share = unsealing_share
             .decrypt_share(&mut rng, &setup_context, &ciphertext, b"request")
+            .unwrap();
+        let disclosure_group = DisclosureGroup::new(
+            ciphertext.ephemeral_public,
+            ciphertext.associated_data(),
+            b"request",
+            b"group-1",
+        )
+        .unwrap();
+        let precomputation = unsealing_share
+            .precompute_for_ephemeral_public(disclosure_group.ephemeral_public())
+            .unwrap();
+        let disclosure_group_decryption_share = unsealing_share
+            .issue_disclosure_group_share(
+                &mut rng,
+                &setup_context,
+                &precomputation,
+                &disclosure_group,
+            )
             .unwrap();
         let public_share = public_key_set
             .public_share(secret_share.participant)
@@ -710,6 +779,7 @@ mod tests {
             sealing_key,
             ciphertext,
             decryption_share,
+            disclosure_group_decryption_share,
         }
     }
 
@@ -761,6 +831,37 @@ mod tests {
             from_wire_bytes::<DecryptionShare<G>>(&to_wire_bytes(&values.decryption_share))
                 .unwrap(),
             values.decryption_share
+        );
+        assert_eq!(
+            from_wire_bytes::<DisclosureGroupDecryptionShare<G>>(&to_wire_bytes(
+                &values.disclosure_group_decryption_share,
+            ))
+            .unwrap(),
+            values.disclosure_group_decryption_share
+        );
+    }
+
+    #[test]
+    fn exact_and_disclosure_group_shares_reject_each_others_bytes() {
+        let values = fixtures();
+
+        assert_ne!(
+            DecryptionShare::<G>::TAG,
+            DisclosureGroupDecryptionShare::<G>::TAG
+        );
+        assert_ne!(
+            DecryptionShare::<G>::CODEC_ID,
+            DisclosureGroupDecryptionShare::<G>::CODEC_ID
+        );
+        assert!(from_wire_bytes::<DecryptionShare<G>>(&to_wire_bytes(
+            &values.disclosure_group_decryption_share,
+        ))
+        .is_err());
+        assert!(
+            from_wire_bytes::<DisclosureGroupDecryptionShare<G>>(&to_wire_bytes(
+                &values.decryption_share,
+            ))
+            .is_err()
         );
     }
 
@@ -887,6 +988,14 @@ mod tests {
         assert_eq!(secret.participant, values.secret_share.participant);
         assert_eq!(secret.decryption, values.secret_share.decryption);
         assert_eq!(secret.context, values.secret_share.context);
+
+        let disclosure_share_bytes = values.disclosure_group_decryption_share.to_bytes();
+        assert!(disclosure_share_bytes
+            .ends_with(&to_wire_bytes(&values.disclosure_group_decryption_share)));
+        assert_eq!(
+            DisclosureGroupDecryptionShare::<G>::read_from_bytes(&disclosure_share_bytes).unwrap(),
+            values.disclosure_group_decryption_share
+        );
     }
 
     #[cfg(feature = "serde")]
@@ -894,9 +1003,16 @@ mod tests {
     fn serde_uses_canonical_wire_bytes() {
         use serde_test::{assert_tokens, Token};
 
-        let setup_context = fixtures().setup_context;
-        let bytes: &'static [u8] = Box::leak(to_wire_bytes(&setup_context).into_boxed_slice());
+        let values = fixtures();
+        let setup_bytes: &'static [u8] =
+            Box::leak(to_wire_bytes(&values.setup_context).into_boxed_slice());
+        let disclosure_share_bytes: &'static [u8] =
+            Box::leak(to_wire_bytes(&values.disclosure_group_decryption_share).into_boxed_slice());
 
-        assert_tokens(&setup_context, &[Token::Bytes(bytes)]);
+        assert_tokens(&values.setup_context, &[Token::Bytes(setup_bytes)]);
+        assert_tokens(
+            &values.disclosure_group_decryption_share,
+            &[Token::Bytes(disclosure_share_bytes)],
+        );
     }
 }

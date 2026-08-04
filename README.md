@@ -29,7 +29,9 @@ Rust 1.93 or later.
 * `golden-rustcrypto`: P-256 and secp256k1 `GoldenGroup` adapters backed by
   the RustCrypto crates, used by the prototype backend and tests.
 * `golden-ehtdh1`: context-bound threshold encryption over Golden DKG output.
-  It binds each decryption share to the setup, ciphertext, and caller context.
+  Exact EHTDH1 binds each share to the setup, ciphertext, and caller context; a
+  separate disclosure-group extension supports explicitly authorized same-`R`
+  ciphertext groups.
 * `bulletproofs-cycle`: a minimal fork of `zkcrypto/bulletproofs` 5.0.1
   with the Ristretto backend replaced by a `Cycle` trait over zkcrypto
   `group`/`ff`. Range-proof, MPC, and serialization paths were stripped;
