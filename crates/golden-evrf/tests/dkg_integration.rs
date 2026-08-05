@@ -11,13 +11,17 @@
 use std::collections::BTreeMap;
 
 use golden_core::{
-    complete, create_dealing, verify_dealing, DealerMessage, DkgConfig, EvrfProofBackend,
-    EvrfStatement, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
-    PROTOCOL_VERSION,
+    complete, create_dealing, verify_dealing,
+    wire::{from_wire_bytes, to_wire_bytes},
+    DealerMessage, DkgConfig, EvrfProofBackend, EvrfStatement, GoldenGroup, GoldenScalar,
+    ParticipantIndex, ParticipantRegistry, SessionId, PROTOCOL_VERSION,
 };
-use golden_evrf::paper::secp_secq::{SecpSecqBackend, SecpSecqProof};
+use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+const PROOF_ID_LEN_BYTES: usize = 4;
+const NESTED_LEN_BYTES: usize = 8;
 
 fn idx(value: u32) -> ParticipantIndex {
     ParticipantIndex::new(value).unwrap()
@@ -50,6 +54,28 @@ fn config() -> DkgConfig<Secp256k1GoldenGroup> {
     .unwrap()
 }
 
+fn two_participant_config() -> DkgConfig<Secp256k1GoldenGroup> {
+    let registry = ParticipantRegistry::new(
+        [idx(1), idx(2)]
+            .into_iter()
+            .map(|participant| {
+                (
+                    participant,
+                    Secp256k1GoldenGroup::mul_generator(&identity_secret(participant)),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    DkgConfig::new(
+        1,
+        SessionId([42u8; 32]),
+        Secp256k1Scalar::from_u64(77).unwrap(),
+        registry,
+    )
+    .unwrap()
+}
+
 fn tamper_element(
     point: &<Secp256k1GoldenGroup as GoldenGroup>::Element,
 ) -> <Secp256k1GoldenGroup as GoldenGroup>::Element {
@@ -64,7 +90,7 @@ fn tamper_scalar(s: &Secp256k1Scalar) -> Secp256k1Scalar {
 /// `tamper` to the freshly built dealer message.
 fn assert_dealing_rejected<F>(tamper: F)
 where
-    F: FnOnce(&mut DealerMessage<Secp256k1GoldenGroup, SecpSecqProof>),
+    F: FnOnce(&mut DealerMessage<Secp256k1GoldenGroup>),
 {
     let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
     let config = config();
@@ -89,7 +115,7 @@ where
 /// backend's `verify_batch` can be invoked directly with a tampered
 /// statement.
 fn build_statements(
-    dealing: &golden_core::DkgDealing<Secp256k1GoldenGroup, SecpSecqProof>,
+    dealing: &golden_core::DkgDealing<Secp256k1GoldenGroup>,
     config: &DkgConfig<Secp256k1GoldenGroup>,
     dealer: ParticipantIndex,
 ) -> Vec<EvrfStatement<Secp256k1GoldenGroup>> {
@@ -132,13 +158,9 @@ fn build_statements(
     statements
 }
 
-#[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-fn dkg_completes_with_batched_evrf_backend() {
+fn assert_dkg_completes(config: DkgConfig<Secp256k1GoldenGroup>, decode_messages: bool) {
     let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-    let config = config();
-
-    let dealings: BTreeMap<_, _> = config
+    let mut dealings: BTreeMap<_, _> = config
         .registry
         .indexes()
         .map(|dealer| {
@@ -155,10 +177,17 @@ fn dkg_completes_with_batched_evrf_backend() {
         })
         .collect();
 
-    for dealing in dealings.values() {
+    for dealing in dealings.values_mut() {
+        if decode_messages {
+            let encoded = to_wire_bytes(&dealing.message);
+            let decoded = from_wire_bytes::<DealerMessage<Secp256k1GoldenGroup>>(&encoded).unwrap();
+            assert_eq!(to_wire_bytes(&decoded), encoded);
+            dealing.message = decoded;
+        }
         verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config).unwrap();
     }
 
+    let participant_count = config.registry.indexes().count();
     let receiver = idx(2);
     let own_dealing = dealings.get(&receiver).unwrap();
     let peer_dealings = dealings
@@ -184,7 +213,19 @@ fn dkg_completes_with_batched_evrf_backend() {
         output.public_key_shares[&receiver],
         Secp256k1GoldenGroup::mul_generator(&output.secret_share.value)
     );
-    assert_eq!(output.public_key_shares.len(), 3);
+    assert_eq!(output.public_key_shares.len(), participant_count);
+}
+
+#[test]
+#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+fn dkg_completes_with_batched_evrf_backend() {
+    assert_dkg_completes(config(), false);
+}
+
+#[test]
+#[ignore = "slow: completes the real paper DKG from decoded peer messages"]
+fn dkg_completes_with_decoded_peer_messages() {
+    assert_dkg_completes(two_participant_config(), true);
 }
 
 #[test]
@@ -237,14 +278,96 @@ fn dkg_rejects_tampered_transcript_root() {
 }
 
 #[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-fn dkg_rejects_tampered_proof_bytes() {
-    assert_dealing_rejected(|msg| {
-        if msg.proof.0.is_empty() {
-            msg.proof.0.push(0);
-        }
-        msg.proof.0[0] ^= 0x01;
-    });
+#[ignore = "slow: builds and verifies the full batched dealer proof"]
+fn dkg_accepts_the_deterministic_dealing_and_rejects_malformed_or_replayed_proofs() {
+    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+    let participants = [idx(1), idx(2)];
+    let registry = ParticipantRegistry::new(
+        participants
+            .iter()
+            .map(|participant| {
+                (
+                    *participant,
+                    Secp256k1GoldenGroup::mul_generator(&identity_secret(*participant)),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let config = DkgConfig::new(
+        1,
+        SessionId([42u8; 32]),
+        Secp256k1Scalar::from_u64(77).unwrap(),
+        registry,
+    )
+    .unwrap();
+    let dealer = idx(1);
+    let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
+        dealer,
+        &identity_secret(dealer),
+        &config,
+        &mut rng,
+    )
+    .unwrap();
+    verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config).unwrap();
+
+    let proof_id_len = u32::from_be_bytes(
+        dealing.message.proof[..PROOF_ID_LEN_BYTES]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let nested_len_offset = PROOF_ID_LEN_BYTES + proof_id_len;
+    let payload_start = nested_len_offset + NESTED_LEN_BYTES;
+    let payload_len = u64::from_be_bytes(
+        dealing.message.proof[nested_len_offset..payload_start]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    assert_eq!(payload_start + payload_len, dealing.message.proof.len());
+
+    let mut wrong_id = dealing.message.clone();
+    wrong_id.proof[PROOF_ID_LEN_BYTES] ^= 0x01;
+
+    let mut malformed_length = dealing.message.clone();
+    malformed_length.proof[nested_len_offset..payload_start]
+        .copy_from_slice(&u64::MAX.to_be_bytes());
+
+    let mut truncated = dealing.message.clone();
+    truncated.proof.pop();
+
+    let mut trailing = dealing.message.clone();
+    trailing.proof.push(0);
+
+    let mut corrupted_nested_payload = dealing.message.clone();
+    corrupted_nested_payload.proof[payload_start + payload_len / 2] ^= 0x01;
+
+    let mut noncanonical_nested = dealing.message.clone();
+    noncanonical_nested.proof[nested_len_offset..payload_start]
+        .copy_from_slice(&u64::try_from(payload_len + 1).unwrap().to_be_bytes());
+    noncanonical_nested.proof.push(0);
+
+    for message in [
+        wrong_id,
+        malformed_length,
+        truncated,
+        trailing,
+        corrupted_nested_payload,
+        noncanonical_nested,
+    ] {
+        assert!(
+            verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&message, &config).is_err(),
+            "invalid proof stream must be rejected"
+        );
+    }
+
+    let mut replayed_statement = dealing.message.clone();
+    replayed_statement.msg_i.0[0] ^= 0x01;
+    replayed_statement.transcript_root = replayed_statement.recompute_transcript_root();
+    assert!(
+        verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&replayed_statement, &config,)
+            .is_err(),
+        "proof replay under a different dealer statement must be rejected"
+    );
 }
 
 #[test]

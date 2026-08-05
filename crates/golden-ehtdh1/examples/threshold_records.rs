@@ -108,7 +108,7 @@ use golden_ehtdh1::{
     derive_context_session_id, material_from_dkg_outputs, Ciphertext, Combiner, DecryptionShare,
     Ehtdh1Material, SealingKey, UnsealingShare,
 };
-use golden_evrf::prototype::{ShareOpeningBackend, ShareOpeningBatchedProof};
+use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
 use rand_chacha::{
     rand_core::{RngCore, SeedableRng},
@@ -118,8 +118,7 @@ use zeroize::Zeroizing;
 
 /// Concrete group used by this fast example.
 type G = P256Backend;
-/// Proof attached to each prototype DKG dealing.
-type Proof = ShareOpeningBatchedProof<G>;
+
 /// Error type used by the example helpers.
 type AppResult<T> = Result<T, Box<dyn Error>>;
 
@@ -323,7 +322,7 @@ fn run_dkg(
     rng: &mut ChaCha20Rng,
     zero_sharing: bool,
 ) -> AppResult<BTreeMap<ParticipantIndex, DkgOutput<G>>> {
-    let mut dealings = BTreeMap::<ParticipantIndex, DkgDealing<G, Proof>>::new();
+    let mut dealings = BTreeMap::<ParticipantIndex, DkgDealing<G>>::new();
     // Every participant acts as a dealer and sends one dealing to its peers.
     for dealer in participants {
         let secret = if zero_sharing {
@@ -350,7 +349,7 @@ fn run_dkg(
             .filter_map(|(dealer, dealing)| {
                 (*dealer != *receiver).then_some((*dealer, dealing.message.clone()))
             })
-            .collect::<BTreeMap<ParticipantIndex, DealerMessage<G, Proof>>>();
+            .collect::<BTreeMap<ParticipantIndex, DealerMessage<G>>>();
         let output = complete::<G, ShareOpeningBackend>(
             *receiver,
             &identity_secret(*receiver)?,

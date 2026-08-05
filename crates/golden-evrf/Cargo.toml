@@ -1,6 +1,6 @@
 [package]
 name = "golden-evrf"
-version = "0.1.1"
+version = "0.2.0"
 description = "Verifiable random function proof backends for Golden distributed key generation"
 edition.workspace = true
 homepage.workspace = true
@@ -19,28 +19,24 @@ golden-halo2curves = { workspace = true, optional = true }
 ff = { workspace = true, optional = true }
 group = { workspace = true, optional = true }
 halo2curves = { workspace = true, optional = true }
-merlin = { workspace = true, optional = true }
-miden-serde-utils = { workspace = true, optional = true }
+merlin = { workspace = true }
 rand_chacha = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 ff = { workspace = true }
 golden-rustcrypto = { workspace = true, features = ["p256"] }
 rand_chacha = { workspace = true }
-serde_test = { workspace = true }
 
 [features]
 default = []
-miden-serde = ["dep:miden-serde-utils", "golden-core/miden-serde"]
-serde = ["dep:serde", "golden-core/serde"]
+miden-serde = ["golden-core/miden-serde"]
+serde = ["golden-core/serde"]
 halo2curves-secp256k1 = [
     "dep:bulletproofs-cycle",
     "dep:golden-halo2curves",
     "dep:ff",
     "dep:group",
     "dep:halo2curves",
-    "dep:merlin",
     "dep:rand_chacha",
     "golden-halo2curves/halo2curves-secp256k1",
 ]

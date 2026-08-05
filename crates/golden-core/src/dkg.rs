@@ -229,8 +229,8 @@ impl<G: GoldenGroup> core::fmt::Debug for EvrfWitness<G> {
 /// derivation stays a separate method because the dealer computes pads while
 /// building encrypted shares, before the batched statement list exists.
 pub trait EvrfProofBackend<G: GoldenGroup> {
-    /// Proof type covering every non-self receiver in one dealer message.
-    type Proof: Clone + core::fmt::Debug + Eq + PartialEq;
+    /// Stable, versioned identity of this proof protocol and byte grammar.
+    const PROOF_ID: &'static [u8];
 
     /// Evaluate the per-recipient pad scalar for the paper eVRF input shape.
     ///
@@ -265,7 +265,7 @@ pub trait EvrfProofBackend<G: GoldenGroup> {
         statements: &[EvrfStatement<G>],
         witnesses: &[EvrfWitness<G>],
         rng: &mut impl CryptoRngCore,
-    ) -> Result<Self::Proof>;
+    ) -> Result<Vec<u8>>;
 
     /// Verify one batched proof against the full ordered receiver statement
     /// list. Implementations may use verifier-side randomness for multiexp
@@ -274,7 +274,7 @@ pub trait EvrfProofBackend<G: GoldenGroup> {
     /// long as the per-statement challenge is derived from the transcript
     /// independent of that batching randomness. Verifier randomness affects
     /// only the amortized cost, not whether a bad proof is accepted.
-    fn verify_batch(statements: &[EvrfStatement<G>], proof: &Self::Proof) -> Result<()>;
+    fn verify_batch(statements: &[EvrfStatement<G>], proof: &[u8]) -> Result<()>;
 }
 
 /// Public encrypted share data for one receiver.
@@ -290,7 +290,7 @@ pub struct EncryptedShare<G: GoldenGroup> {
 
 /// Dealer broadcast message.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DealerMessage<G: GoldenGroup, P> {
+pub struct DealerMessage<G: GoldenGroup> {
     /// Session ID.
     pub session_id: SessionId,
     /// Registry root.
@@ -304,16 +304,16 @@ pub struct DealerMessage<G: GoldenGroup, P> {
     /// Public encrypted-share data, keyed by receiver.
     pub encrypted_shares: BTreeMap<ParticipantIndex, EncryptedShare<G>>,
     /// Batched proof covering every non-self receiver in this message.
-    pub proof: P,
+    pub proof: Vec<u8>,
     /// Transcript root for the dealing.
     pub transcript_root: TranscriptRoot,
 }
 
 /// Local output from creating a dealing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DkgDealing<G: GoldenGroup, P> {
+pub struct DkgDealing<G: GoldenGroup> {
     /// Broadcast message.
-    pub message: DealerMessage<G, P>,
+    pub message: DealerMessage<G>,
     /// Dealer private share for itself.
     pub private_share: Share<G::Scalar>,
 }
@@ -337,7 +337,7 @@ pub fn create_dealing<G, B>(
     dealer_identity_secret: &G::Scalar,
     config: &DkgConfig<G>,
     rng: &mut impl CryptoRngCore,
-) -> Result<DkgDealing<G, B::Proof>>
+) -> Result<DkgDealing<G>>
 where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
@@ -367,7 +367,7 @@ pub fn create_dealing_with_secret<G, B>(
     polynomial_secret: G::Scalar,
     config: &DkgConfig<G>,
     rng: &mut impl CryptoRngCore,
-) -> Result<DkgDealing<G, B::Proof>>
+) -> Result<DkgDealing<G>>
 where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
@@ -494,10 +494,7 @@ where
 }
 
 /// Verify one dealer message.
-pub fn verify_dealing<G, B>(
-    message: &DealerMessage<G, B::Proof>,
-    config: &DkgConfig<G>,
-) -> Result<()>
+pub fn verify_dealing<G, B>(message: &DealerMessage<G>, config: &DkgConfig<G>) -> Result<()>
 where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
@@ -569,7 +566,7 @@ where
 pub fn verify_dealing_for_receiver<G, B>(
     receiver: ParticipantIndex,
     receiver_identity_secret: &G::Scalar,
-    message: &DealerMessage<G, B::Proof>,
+    message: &DealerMessage<G>,
     config: &DkgConfig<G>,
 ) -> Result<()>
 where
@@ -594,8 +591,8 @@ where
 pub fn complete<G, B>(
     receiver: ParticipantIndex,
     receiver_identity_secret: &G::Scalar,
-    own_dealing: &DkgDealing<G, B::Proof>,
-    peer_dealings: &BTreeMap<ParticipantIndex, DealerMessage<G, B::Proof>>,
+    own_dealing: &DkgDealing<G>,
+    peer_dealings: &BTreeMap<ParticipantIndex, DealerMessage<G>>,
     config: &DkgConfig<G>,
 ) -> Result<DkgOutput<G>>
 where
@@ -680,7 +677,7 @@ where
             value: secret_share_value,
         },
         public_key_shares,
-        transcript_root: completion_root::<G, B::Proof>(&all_dealings),
+        transcript_root: completion_root::<G>(&all_dealings),
     })
 }
 
@@ -697,7 +694,7 @@ fn registry_root<G: GoldenGroup>(
     transcript.root()
 }
 
-impl<G: GoldenGroup, P> DealerMessage<G, P> {
+impl<G: GoldenGroup> DealerMessage<G> {
     /// Recompute the dealing transcript root from the current message fields.
     ///
     /// This is the same root `create_dealing` embedded at construction. It
@@ -759,10 +756,7 @@ fn public_share_receivers<G: GoldenGroup>(
         .filter(move |receiver| *receiver != dealer)
 }
 
-fn ensure_public_share_keys<G, P>(
-    message: &DealerMessage<G, P>,
-    config: &DkgConfig<G>,
-) -> Result<()>
+fn ensure_public_share_keys<G>(message: &DealerMessage<G>, config: &DkgConfig<G>) -> Result<()>
 where
     G: GoldenGroup,
 {
@@ -782,7 +776,7 @@ where
 fn decrypt_share_for_receiver<G, B>(
     receiver: ParticipantIndex,
     receiver_identity_secret: &G::Scalar,
-    message: &DealerMessage<G, B::Proof>,
+    message: &DealerMessage<G>,
     config: &DkgConfig<G>,
 ) -> Result<Share<G::Scalar>>
 where
@@ -812,8 +806,8 @@ where
     Ok(share)
 }
 
-fn completion_root<G: GoldenGroup, P>(
-    dealings: &BTreeMap<ParticipantIndex, DealerMessage<G, P>>,
+fn completion_root<G: GoldenGroup>(
+    dealings: &BTreeMap<ParticipantIndex, DealerMessage<G>>,
 ) -> TranscriptRoot {
     let mut transcript = TranscriptBuilder::new(b"completion");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
@@ -929,52 +923,59 @@ mod tests {
     use crate::test_support::{TinyGroup, TinyScalar};
     use crate::GoldenScalar;
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct FakeProof(TranscriptRoot);
-
-    /// Batched fake proof: per-receiver transcript roots keyed by receiver.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct FakeBatchedProof(pub BTreeMap<ParticipantIndex, FakeProof>);
+    const FAKE_PROOF_ID: &[u8] = b"golden-core/fake-evrf-proof/v1";
 
     #[derive(Clone, Debug)]
     enum FakeEvrfBackend {}
 
     impl EvrfProofBackend<TinyGroup> for FakeEvrfBackend {
-        type Proof = FakeBatchedProof;
+        const PROOF_ID: &'static [u8] = FAKE_PROOF_ID;
 
         fn prove_batch(
             statements: &[EvrfStatement<TinyGroup>],
             witnesses: &[EvrfWitness<TinyGroup>],
             _rng: &mut impl CryptoRngCore,
-        ) -> Result<Self::Proof> {
-            let mut map = BTreeMap::new();
+        ) -> Result<Vec<u8>> {
+            if statements.len() != witnesses.len() {
+                return Err(Error::ProofVerificationFailed);
+            }
+            let mut last_receiver = None;
             for (statement, witness) in statements.iter().zip(witnesses.iter()) {
+                if last_receiver.is_some_and(|receiver| receiver >= statement.receiver) {
+                    return Err(Error::ProofVerificationFailed);
+                }
+                last_receiver = Some(statement.receiver);
                 ensure_fake_public_relations(statement)?;
                 if TinyGroup::mul_generator(&witness.identity_secret) != statement.dealer_public_key
                 {
                     return Err(Error::ProofVerificationFailed);
                 }
-                map.insert(statement.receiver, FakeProof(statement.root()));
             }
-            Ok(FakeBatchedProof(map))
+            fake_proof_bytes(statements)
         }
 
-        fn verify_batch(
-            statements: &[EvrfStatement<TinyGroup>],
-            proof: &Self::Proof,
-        ) -> Result<()> {
+        fn verify_batch(statements: &[EvrfStatement<TinyGroup>], proof: &[u8]) -> Result<()> {
+            let expected = fake_proof_bytes(statements)?;
             for statement in statements {
                 ensure_fake_public_relations(statement)?;
-                let entry = proof
-                    .0
-                    .get(&statement.receiver)
-                    .ok_or(Error::ProofVerificationFailed)?;
-                if entry.0 != statement.root() {
-                    return Err(Error::ProofVerificationFailed);
-                }
             }
-            Ok(())
+            if proof == expected {
+                Ok(())
+            } else {
+                Err(Error::ProofVerificationFailed)
+            }
         }
+    }
+
+    fn fake_proof_bytes(statements: &[EvrfStatement<TinyGroup>]) -> Result<Vec<u8>> {
+        let id_len =
+            u32::try_from(FAKE_PROOF_ID.len()).map_err(|_| Error::ProofVerificationFailed)?;
+        let mut proof = id_len.to_be_bytes().to_vec();
+        proof.extend_from_slice(FAKE_PROOF_ID);
+        for statement in statements {
+            proof.extend_from_slice(&statement.root());
+        }
+        Ok(proof)
     }
 
     fn ensure_fake_public_relations(statement: &EvrfStatement<TinyGroup>) -> Result<()> {
@@ -1012,7 +1013,7 @@ mod tests {
     enum OffsetPadBackend {}
 
     impl EvrfProofBackend<TinyGroup> for OffsetPadBackend {
-        type Proof = FakeBatchedProof;
+        const PROOF_ID: &'static [u8] = FAKE_PROOF_ID;
 
         fn derive_pad(
             msg_i: DealerMessageNonce,
@@ -1030,14 +1031,11 @@ mod tests {
             statements: &[EvrfStatement<TinyGroup>],
             witnesses: &[EvrfWitness<TinyGroup>],
             _rng: &mut impl CryptoRngCore,
-        ) -> Result<Self::Proof> {
+        ) -> Result<Vec<u8>> {
             FakeEvrfBackend::prove_batch(statements, witnesses, _rng)
         }
 
-        fn verify_batch(
-            statements: &[EvrfStatement<TinyGroup>],
-            proof: &Self::Proof,
-        ) -> Result<()> {
+        fn verify_batch(statements: &[EvrfStatement<TinyGroup>], proof: &[u8]) -> Result<()> {
             FakeEvrfBackend::verify_batch(statements, proof)
         }
     }
@@ -1076,7 +1074,7 @@ mod tests {
 
     fn all_dealings(
         config: &DkgConfig<TinyGroup>,
-    ) -> BTreeMap<ParticipantIndex, DkgDealing<TinyGroup, FakeBatchedProof>> {
+    ) -> BTreeMap<ParticipantIndex, DkgDealing<TinyGroup>> {
         let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
         config
             .registry
@@ -1516,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn dealer_message_excludes_self_encrypted_share_and_proof() {
+    fn dealer_message_excludes_self_encrypted_share() {
         let config = config();
         let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
         let dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
@@ -1528,12 +1526,10 @@ mod tests {
         .unwrap();
 
         assert!(!dealing.message.encrypted_shares.contains_key(&idx(1)));
-        assert!(!dealing.message.proof.0.contains_key(&idx(1)));
         assert_eq!(
             dealing.message.encrypted_shares.len(),
             config.registry.len() - 1
         );
-        assert_eq!(dealing.message.proof.0.len(), config.registry.len() - 1);
         assert_eq!(dealing.private_share.participant, idx(1));
         assert!(dealing
             .message
@@ -1710,8 +1706,9 @@ mod tests {
             &mut rng,
         )
         .unwrap();
-        let proof_for_2 = dealing.message.proof.0[&idx(2)].clone();
-        dealing.message.proof.0.insert(idx(3), proof_for_2);
+        let header_len = 4 + FAKE_PROOF_ID.len();
+        let proof_for_2 = dealing.message.proof[header_len..header_len + 32].to_vec();
+        dealing.message.proof[header_len + 32..header_len + 64].copy_from_slice(&proof_for_2);
 
         assert_eq!(
             verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
@@ -1758,30 +1755,6 @@ mod tests {
             &dealing.message.commitment,
             &dealing.message.encrypted_shares,
         );
-        for receiver in config.registry.indexes() {
-            if let Some(encrypted_share) = dealing.message.encrypted_shares.get(&receiver) {
-                let statement = statement_for_receiver::<TinyGroup>(
-                    &config,
-                    dealing.message.dealer,
-                    receiver,
-                    dealing.message.msg_i,
-                    dealing
-                        .message
-                        .commitment
-                        .public_key_share(receiver)
-                        .unwrap(),
-                    dealing.message.commitment.coefficients().to_vec(),
-                    encrypted_share.clone(),
-                    dealing.message.transcript_root,
-                )
-                .unwrap();
-                dealing
-                    .message
-                    .proof
-                    .0
-                    .insert(receiver, FakeProof(statement.root()));
-            }
-        }
 
         assert_eq!(
             verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
@@ -1800,7 +1773,10 @@ mod tests {
             &mut rng,
         )
         .unwrap();
-        dealing.message.proof.0.remove(&idx(2));
+        dealing
+            .message
+            .proof
+            .truncate(dealing.message.proof.len() - 32);
 
         assert_eq!(
             verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
@@ -1853,29 +1829,6 @@ mod tests {
             &dealing.message.commitment,
             &dealing.message.encrypted_shares,
         );
-        for receiver in public_share_receivers(&config, dealing.message.dealer) {
-            let encrypted_share = dealing.message.encrypted_shares[&receiver].clone();
-            let statement = statement_for_receiver::<TinyGroup>(
-                &config,
-                dealing.message.dealer,
-                receiver,
-                dealing.message.msg_i,
-                dealing
-                    .message
-                    .commitment
-                    .public_key_share(receiver)
-                    .unwrap(),
-                dealing.message.commitment.coefficients().to_vec(),
-                encrypted_share,
-                dealing.message.transcript_root,
-            )
-            .unwrap();
-            dealing
-                .message
-                .proof
-                .0
-                .insert(receiver, FakeProof(statement.root()));
-        }
 
         assert_eq!(
             verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
@@ -1934,29 +1887,27 @@ mod tests {
             &dealing.message.commitment,
             &dealing.message.encrypted_shares,
         );
-        for proof_receiver in public_share_receivers(&config, dealing.message.dealer) {
-            let encrypted_share = dealing.message.encrypted_shares[&proof_receiver].clone();
-            let statement = statement_for_receiver::<TinyGroup>(
-                &config,
-                dealing.message.dealer,
-                proof_receiver,
-                dealing.message.msg_i,
-                dealing
-                    .message
-                    .commitment
-                    .public_key_share(proof_receiver)
-                    .unwrap(),
-                dealing.message.commitment.coefficients().to_vec(),
-                encrypted_share,
-                dealing.message.transcript_root,
-            )
-            .unwrap();
-            dealing
-                .message
-                .proof
-                .0
-                .insert(proof_receiver, FakeProof(statement.root()));
-        }
+        let statements = public_share_receivers(&config, dealing.message.dealer)
+            .map(|proof_receiver| {
+                let encrypted_share = dealing.message.encrypted_shares[&proof_receiver].clone();
+                statement_for_receiver::<TinyGroup>(
+                    &config,
+                    dealing.message.dealer,
+                    proof_receiver,
+                    dealing.message.msg_i,
+                    dealing
+                        .message
+                        .commitment
+                        .public_key_share(proof_receiver)
+                        .unwrap(),
+                    dealing.message.commitment.coefficients().to_vec(),
+                    encrypted_share,
+                    dealing.message.transcript_root,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        dealing.message.proof = fake_proof_bytes(&statements).unwrap();
 
         verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config)
             .expect("public verification");

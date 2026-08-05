@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "golden-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "miden-serde-utils",
  "rand_chacha",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "golden-ehtdh1"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "chacha20",
  "chacha20poly1305",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "golden-evrf"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bulletproofs-cycle",
  "ff",
@@ -506,17 +506,14 @@ dependencies = [
  "group",
  "halo2curves",
  "merlin",
- "miden-serde-utils",
  "rand_chacha",
  "rand_core 0.6.4",
- "serde",
- "serde_test",
  "sha2",
 ]
 
 [[package]]
 name = "golden-halo2curves"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bulletproofs-cycle",
  "ff",
@@ -531,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "golden-rustcrypto"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "golden-core",
  "hex",

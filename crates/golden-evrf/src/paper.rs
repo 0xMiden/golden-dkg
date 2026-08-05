@@ -16,17 +16,9 @@
 #![allow(non_snake_case)]
 
 #[cfg(feature = "halo2curves-secp256k1")]
-use golden_core::{
-    wire, Error, EvrfStatement, EvrfWitness, ParticipantIndex, Result, TranscriptRoot,
-};
-#[cfg(all(feature = "halo2curves-secp256k1", feature = "miden-serde"))]
-use miden_serde_utils::{
-    ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
-};
+use golden_core::{Error, ParticipantIndex, Result, TranscriptRoot};
 #[cfg(feature = "halo2curves-secp256k1")]
 use rand_core::CryptoRngCore;
-#[cfg(all(feature = "halo2curves-secp256k1", feature = "serde"))]
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 /// Byte length of the paper `msg_i` nonce (256-bit security parameter).
 pub const MESSAGE_BYTES: usize = 256 / 8;
@@ -37,11 +29,14 @@ pub const MESSAGE_BYTES: usize = 256 / 8;
 pub mod secp_secq {
     use super::*;
 
+    use crate::proof_stream::{
+        decode_point, CycleCurve, IdentityPolicy, Observe, ProofStreamCurve, ProverProofStream,
+        VerifierProofStream,
+    };
     use bulletproofs_cycle::{
         cycle::random_scalar,
         generators::{BulletproofGens, PedersenGens},
         r1cs::{Prover, Verifier},
-        transcript::{append_point, append_scalar, challenge_scalar},
         ConstraintSystem, Cycle, LinearCombination, R1CSError, R1CSProof, Variable,
     };
     use ff::{Field, PrimeField};
@@ -51,6 +46,13 @@ pub mod secp_secq {
     use halo2curves::secq256k1::Secq256k1;
     use halo2curves::{Coordinates, CurveAffine, CurveExt};
     use merlin::Transcript;
+
+    #[cfg(test)]
+    use golden_core::{DealerMessageNonce, EvrfStatement};
+    #[cfg(test)]
+    use golden_halo2curves::golden_group::{
+        Secp256k1Element, Secp256k1GoldenGroup, Secp256k1Scalar,
+    };
 
     /// R1CS field: `Fp` (Secp256k1 base field = Secq256k1 scalar field).
     pub type R1csField = Fp;
@@ -65,9 +67,6 @@ pub mod secp_secq {
     pub type Gout = Secq256k1;
     /// `G_out` compressed point.
     pub type GoutCompressed = <R1csCycle as Cycle>::Compressed;
-
-    /// Transcript domain label for the paper eVRF proof.
-    pub const PROOF_DOMAIN: &[u8] = b"golden-paper-evrf-v1";
 
     /// Public statement for the one-receiver paper eVRF relation.
     #[derive(Clone, Debug)]
@@ -110,39 +109,61 @@ pub mod secp_secq {
         }
     }
 
-    /// Chaum-Pedersen proof of `log_{g_in}(PK_1) = log_{PK_2}(S) = sk_1`.
-    #[derive(Clone, Copy, Debug)]
-    pub struct ChaumPedersenProof {
-        /// Nonce commitment `R_1 = g_in^r`.
-        pub r1: Gin,
-        /// Nonce commitment `R_2 = PK_2^r`.
-        pub r2: Gin,
-        /// Response `z = r + c * sk_1`.
-        pub z: GinScalar,
-    }
+    /// Versioned proof-stream grammar for the standalone one-receiver relation.
+    const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v2";
+    /// Proof protocol identifier for the batched dealer relation and v2 stream grammar.
+    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v2";
 
-    /// Discrete-log proof of knowledge for `R = g_out^r`.
-    #[derive(Clone, Copy, Debug)]
-    pub struct DlogProof {
-        /// Nonce commitment `A = g_out^rho`.
-        pub a: Secq256k1,
-        /// Response `t = rho + c * r`.
-        pub t: R1csField,
-    }
+    type GinStreamCurve = CycleCurve<Secp256k1Cycle>;
+    type GoutStreamCurve = CycleCurve<R1csCycle>;
 
-    /// Proof envelope carrying the R1CS proof and the two outside-R1CS proofs.
-    #[derive(Clone, Debug)]
-    pub struct EvrfProofEnvelope {
-        /// Bulletproofs R1CS proof for steps 3, 4, 5, 8.
-        pub r1cs: R1CSProof<R1csCycle>,
-        /// Pedersen commitment to `k = int(S.x)` in `G_out` (random blinding).
-        pub k_commitment: GoutCompressed,
-        /// Pedersen commitment to `r` in `G_out` (the R1CS prefix `theta`).
-        pub r_commitment: GoutCompressed,
-        /// Chaum-Pedersen proof for steps 0 and 1.
-        pub cp: ChaumPedersenProof,
-        /// Discrete-log proof for step 9.
-        pub dlog: DlogProof,
+    /// Observe the complete standalone public statement in one canonical order.
+    fn observe_one_receiver_statement(
+        stream: &mut impl Observe,
+        statement: &SecpSecqEvrfStatement,
+    ) -> Result<()> {
+        stream.observe_bytes(b"statement.msg", &statement.msg);
+        stream.observe_point::<GinStreamCurve>(
+            b"statement.pk1",
+            &statement.pk1,
+            IdentityPolicy::Reject,
+        )?;
+        stream.observe_point::<GinStreamCurve>(
+            b"statement.pk2",
+            &statement.pk2,
+            IdentityPolicy::Reject,
+        )?;
+        stream.observe_point::<GinStreamCurve>(
+            b"statement.s",
+            &statement.s,
+            IdentityPolicy::Reject,
+        )?;
+        stream.observe_point::<GinStreamCurve>(
+            b"statement.h1",
+            &statement.h1,
+            IdentityPolicy::Reject,
+        )?;
+        stream.observe_point::<GinStreamCurve>(
+            b"statement.h2",
+            &statement.h2,
+            IdentityPolicy::Reject,
+        )?;
+        stream.observe_point::<GinStreamCurve>(
+            b"statement.t1",
+            &statement.t1,
+            IdentityPolicy::Reject,
+        )?;
+        stream.observe_point::<GinStreamCurve>(
+            b"statement.t2",
+            &statement.t2,
+            IdentityPolicy::Reject,
+        )?;
+        stream.observe_point::<GoutStreamCurve>(
+            b"statement.r",
+            &statement.r_point,
+            IdentityPolicy::Allow,
+        )?;
+        stream.observe_scalar::<GoutStreamCurve>(b"statement.beta", &statement.beta)
     }
 
     // ------------------------------------------------------------------
@@ -210,15 +231,6 @@ pub mod secp_secq {
                 .field("shares", &"<redacted>")
                 .finish()
         }
-    }
-
-    /// Batched proof envelope carrying the combined R1CS proof. Per-receiver
-    /// eVRF internals are hidden witnesses and are not serialized as public
-    /// proof payload.
-    #[derive(Clone, Debug)]
-    pub struct BatchedEvrfProofEnvelope {
-        /// Combined Bulletproofs R1CS proof for all receivers.
-        pub r1cs: R1CSProof<R1csCycle>,
     }
 
     /// Extract affine `(x, y)` coordinates of a non-identity `G_in` point.
@@ -739,91 +751,69 @@ pub mod secp_secq {
     // Schnorr-style proof of equal discrete logs.
     // ------------------------------------------------------------------
 
-    /// Transcript domain label for the Chaum-Pedersen sub-proof.
-    const CP_DOMAIN: &[u8] = b"golden-paper-evrf-cp-v1";
-
-    /// Build a Merlin transcript for the Chaum-Pedersen proof, binding all
-    /// public inputs.
-    fn cp_transcript(g_in: &Gin, pk1: &Gin, pk2: &Gin, s: &Gin) -> Transcript {
-        let mut t = Transcript::new(CP_DOMAIN);
-        append_point::<Secp256k1Cycle>(&mut t, b"g_in", &Secp256k1Cycle::point_compress(g_in));
-        append_point::<Secp256k1Cycle>(&mut t, b"PK_1", &Secp256k1Cycle::point_compress(pk1));
-        append_point::<Secp256k1Cycle>(&mut t, b"PK_2", &Secp256k1Cycle::point_compress(pk2));
-        append_point::<Secp256k1Cycle>(&mut t, b"S", &Secp256k1Cycle::point_compress(s));
-        t
+    fn random_nonzero_scalar<C: Cycle>(rng: &mut impl CryptoRngCore) -> C::Scalar {
+        loop {
+            let scalar = random_scalar::<C>(rng);
+            if !bool::from(scalar.is_zero()) {
+                return scalar;
+            }
+        }
     }
 
-    /// Generate a Chaum-Pedersen proof of `log_{g_in}(PK_1) = log_{PK_2}(S)`.
+    fn stream_challenge_scalar<C: Cycle>(
+        stream: &mut impl Observe,
+        label: &'static [u8],
+    ) -> C::Scalar {
+        let mut bytes = [0u8; 64];
+        stream.challenge(label, &mut bytes);
+        C::scalar_from_wide(&bytes)
+    }
+
+    /// Send a Chaum-Pedersen proof of `log_{g_in}(PK_1) = log_{PK_2}(S)`.
     ///
-    /// Prover chooses nonce `r`, commits `R_1 = g_in^r`, `R_2 = PK_2^r`,
-    /// extracts challenge `c` from the transcript, and responds
-    /// `z = r + c * sk_1`.
+    /// The prover chooses a nonce `r`, commits `R_1 = g_in^r` and
+    /// `R_2 = PK_2^r`, extracts challenge `c` from the shared proof stream,
+    /// and responds with `z = r + c * sk_1`.
     fn chaum_pedersen_prove(
+        stream: &mut ProverProofStream,
         g_in: &Gin,
-        pk1: &Gin,
         pk2: &Gin,
-        s: &Gin,
         sk1: &GinScalar,
         rng: &mut impl CryptoRngCore,
-    ) -> Result<ChaumPedersenProof> {
-        let r = GinScalar::random(rng);
-        let r1 = *g_in * r;
-        let r2 = *pk2 * r;
-
-        let mut transcript = cp_transcript(g_in, pk1, pk2, s);
-        append_point::<Secp256k1Cycle>(
-            &mut transcript,
-            b"R_1",
-            &Secp256k1Cycle::point_compress(&r1),
-        );
-        append_point::<Secp256k1Cycle>(
-            &mut transcript,
-            b"R_2",
-            &Secp256k1Cycle::point_compress(&r2),
-        );
-        let c = challenge_scalar::<Secp256k1Cycle>(&mut transcript, b"c");
-
-        let z = r + c * *sk1;
-
-        Ok(ChaumPedersenProof { r1, r2, z })
+    ) -> Result<()> {
+        let nonce = random_nonzero_scalar::<Secp256k1Cycle>(rng);
+        let r1 = *g_in * nonce;
+        let r2 = *pk2 * nonce;
+        stream.send_point::<GinStreamCurve>(b"cp.r1", &r1, IdentityPolicy::Reject)?;
+        stream.send_point::<GinStreamCurve>(b"cp.r2", &r2, IdentityPolicy::Reject)?;
+        let challenge = stream_challenge_scalar::<Secp256k1Cycle>(stream, b"cp.challenge");
+        let response = nonce + challenge * *sk1;
+        stream.send_scalar::<GinStreamCurve>(b"cp.z", &response)
     }
 
-    /// Verify a Chaum-Pedersen proof of `log_{g_in}(PK_1) = log_{PK_2}(S)`.
+    /// Receive and verify a Chaum-Pedersen proof of
+    /// `log_{g_in}(PK_1) = log_{PK_2}(S)`.
     ///
-    /// Recomputes the challenge and checks:
+    /// Recomputes the shared-stream challenge and checks:
     /// - `g_in^z = R_1 * PK_1^c`
     /// - `PK_2^z = R_2 * S^c`
     fn chaum_pedersen_verify(
+        stream: &mut VerifierProofStream<'_>,
         g_in: &Gin,
         pk1: &Gin,
         pk2: &Gin,
         s: &Gin,
-        proof: &ChaumPedersenProof,
     ) -> Result<()> {
-        let mut transcript = cp_transcript(g_in, pk1, pk2, s);
-        append_point::<Secp256k1Cycle>(
-            &mut transcript,
-            b"R_1",
-            &Secp256k1Cycle::point_compress(&proof.r1),
-        );
-        append_point::<Secp256k1Cycle>(
-            &mut transcript,
-            b"R_2",
-            &Secp256k1Cycle::point_compress(&proof.r2),
-        );
-        let c = challenge_scalar::<Secp256k1Cycle>(&mut transcript, b"c");
+        let r1 = stream.receive_point::<GinStreamCurve>(b"cp.r1", IdentityPolicy::Reject)?;
+        let r2 = stream.receive_point::<GinStreamCurve>(b"cp.r2", IdentityPolicy::Reject)?;
+        let challenge = stream_challenge_scalar::<Secp256k1Cycle>(stream, b"cp.challenge");
+        let response = stream.receive_scalar::<GinStreamCurve>(b"cp.z")?;
 
         // g_in^z = R_1 * PK_1^c
-        let lhs1 = *g_in * proof.z;
-        let rhs1 = proof.r1 + *pk1 * c;
-        if lhs1 != rhs1 {
-            return Err(Error::ProofVerificationFailed);
-        }
-
+        let first_equation_holds = *g_in * response == r1 + *pk1 * challenge;
         // PK_2^z = R_2 * S^c
-        let lhs2 = *pk2 * proof.z;
-        let rhs2 = proof.r2 + *s * c;
-        if lhs2 != rhs2 {
+        let second_equation_holds = *pk2 * response == r2 + *s * challenge;
+        if !first_equation_holds || !second_equation_holds {
             return Err(Error::ProofVerificationFailed);
         }
 
@@ -846,61 +836,41 @@ pub mod secp_secq {
     // instance.
     // ------------------------------------------------------------------
 
-    /// Transcript domain label for the step-9 discrete-log sub-proof.
-    const DLOG_DOMAIN: &[u8] = b"golden-paper-evrf-dlog-v1";
-
-    /// Build a Merlin transcript for the step-9 DLOG proof, binding `g_out`,
-    /// the public `R`, and the R1CS commitment `V_r` so the proof is tied to the
-    /// same R1CS instance.
-    fn dlog_transcript(g_out: &Secq256k1, r_point: &Secq256k1, v_r: &GoutCompressed) -> Transcript {
-        let mut t = Transcript::new(DLOG_DOMAIN);
-        append_point::<R1csCycle>(&mut t, b"g_out", &R1csCycle::point_compress(g_out));
-        append_point::<R1csCycle>(&mut t, b"R", &R1csCycle::point_compress(r_point));
-        append_point::<R1csCycle>(&mut t, b"V_r", v_r);
-        t
-    }
-
-    /// Generate a Schnorr proof of knowledge of `r` such that `R = r * g_out`.
+    /// Send a Schnorr proof of knowledge of `r` such that `R = r * g_out`.
     ///
-    /// Prover chooses nonce `rho`, commits `A = rho * g_out`, extracts challenge
-    /// `c` from the transcript, and responds `t = rho + c * r`.
+    /// The prover chooses nonce `rho`, commits `A = rho * g_out`, extracts
+    /// challenge `c` from the shared transcript, and responds
+    /// `t = rho + c * r`.
     fn dlog_prove(
+        stream: &mut ProverProofStream,
         g_out: &Secq256k1,
-        r_point: &Secq256k1,
-        v_r: &GoutCompressed,
         r: &R1csField,
         rng: &mut impl CryptoRngCore,
-    ) -> Result<DlogProof> {
-        let rho = R1csField::random(rng);
-        let a = *g_out * rho;
-
-        let mut transcript = dlog_transcript(g_out, r_point, v_r);
-        append_point::<R1csCycle>(&mut transcript, b"A", &R1csCycle::point_compress(&a));
-        let c = challenge_scalar::<R1csCycle>(&mut transcript, b"c");
-
-        let t = rho + c * *r;
-
-        Ok(DlogProof { a, t })
+    ) -> Result<()> {
+        let nonce = random_nonzero_scalar::<R1csCycle>(rng);
+        let a = *g_out * nonce;
+        stream.send_point::<GoutStreamCurve>(b"dlog.a", &a, IdentityPolicy::Reject)?;
+        let challenge = stream_challenge_scalar::<R1csCycle>(stream, b"dlog.challenge");
+        let response = nonce + challenge * *r;
+        stream.send_scalar::<GoutStreamCurve>(b"dlog.t", &response)
     }
 
-    /// Verify a Schnorr proof of knowledge of `r` such that `R = r * g_out`.
+    /// Receive a Schnorr proof of knowledge of `r` and recompute its challenge.
     ///
-    /// Recomputes the challenge and checks `t * g_out = A + c * R`.  The caller
-    /// must separately check the Pedersen prefix link `V_r == R + g_out,1`.
+    /// Checks `t * g_out = A + c * R`. The caller separately checks the
+    /// Pedersen prefix link `V_r == R + g_out,1` while consuming the preceding
+    /// nested R1CS phase.
     fn dlog_verify(
+        stream: &mut VerifierProofStream<'_>,
         g_out: &Secq256k1,
         r_point: &Secq256k1,
-        v_r: &GoutCompressed,
-        proof: &DlogProof,
     ) -> Result<()> {
-        let mut transcript = dlog_transcript(g_out, r_point, v_r);
-        append_point::<R1csCycle>(&mut transcript, b"A", &R1csCycle::point_compress(&proof.a));
-        let c = challenge_scalar::<R1csCycle>(&mut transcript, b"c");
+        let a = stream.receive_point::<GoutStreamCurve>(b"dlog.a", IdentityPolicy::Reject)?;
+        let challenge = stream_challenge_scalar::<R1csCycle>(stream, b"dlog.challenge");
+        let response = stream.receive_scalar::<GoutStreamCurve>(b"dlog.t")?;
 
         // t * g_out = A + c * R
-        let lhs = *g_out * proof.t;
-        let rhs = proof.a + *r_point * c;
-        if lhs != rhs {
+        if *g_out * response != a + *r_point * challenge {
             return Err(Error::ProofVerificationFailed);
         }
 
@@ -922,6 +892,32 @@ pub mod secp_secq {
             return Err(Error::ProofVerificationFailed);
         }
         Ok(())
+    }
+
+    /// Parse a canonical R1CS proof with no trailing or non-canonical bytes.
+    fn parse_canonical_r1cs_proof(bytes: &[u8]) -> Result<R1CSProof<R1csCycle>> {
+        let proof = R1CSProof::<R1csCycle>::from_bytes(bytes)
+            .map_err(|_| Error::ProofVerificationFailed)?;
+        if proof.to_bytes() != bytes {
+            return Err(Error::ProofVerificationFailed);
+        }
+        Ok(proof)
+    }
+
+    /// Parse one canonical commitment prefix from the nested R1CS payload.
+    fn parse_nested_commitment(
+        payload: &[u8],
+        cursor: usize,
+        identity: IdentityPolicy,
+    ) -> Result<(GoutCompressed, usize)> {
+        let end = cursor
+            .checked_add(GoutStreamCurve::POINT_BYTES)
+            .ok_or(Error::ProofVerificationFailed)?;
+        let encoded = payload
+            .get(cursor..end)
+            .ok_or(Error::ProofVerificationFailed)?;
+        let point = decode_point::<GoutStreamCurve>(encoded, identity)?;
+        Ok((R1csCycle::point_compress(&point), end))
     }
 
     // ------------------------------------------------------------------
@@ -1058,8 +1054,10 @@ pub mod secp_secq {
         statement: &SecpSecqEvrfStatement,
         witness: &SecpSecqEvrfWitness,
         rng: &mut impl CryptoRngCore,
-    ) -> Result<EvrfProofEnvelope> {
+    ) -> Result<Vec<u8>> {
         let g_in = Gin::generator();
+        let mut stream = ProverProofStream::new(ONE_RECEIVER_PROOF_ID)?;
+        observe_one_receiver_statement(&mut stream, statement)?;
 
         // Step 1: S = PK_2^sk_1.  Verify the witness is consistent with the
         // public S before proving.
@@ -1121,76 +1119,82 @@ pub mod secp_secq {
             return Err(Error::ProofVerificationFailed);
         }
 
-        // Build the R1CS proof.
+        // Steps 0, 1: stream the Chaum-Pedersen proof first, so every later
+        // challenge binds both nonce commitments and the CP challenge/response.
+        chaum_pedersen_prove(&mut stream, &g_in, &statement.pk2, &witness.sk1, rng)?;
+
+        // Build the current typed R1CS proof as one nested child over the same
+        // transcript. The commitment prefixes are framed in the child payload
+        // for verifier reconstruction, but are observed only by R1CS commit.
         let pc_gens = shared_pc_gens();
         let bp_gens = shared_bp_gens();
-        let k_blinding = random_scalar::<R1csCycle>(rng);
-        let r_blinding = R1csField::ONE; // fixed for prefix link
-
-        let mut prover = Prover::<R1csCycle, _>::new(pc_gens, Transcript::new(PROOF_DOMAIN));
-        let (v_k, var_k) = prover.commit(k, k_blinding);
-        let (v_r, var_r) = prover.commit(r, r_blinding);
-        build_one_receiver_r1cs(
-            &mut prover,
-            var_k,
-            var_r,
-            s_x,
-            &h1,
-            &h2,
-            t1_x,
-            t1_y,
-            t2_x,
-            t2_y,
-            statement.beta,
-            &bit_assignments,
-            Some(&witness1),
-            Some(&witness2),
-        )
-        .map_err(|_| Error::ProofVerificationFailed)?;
-        let r1cs_proof = prover
-            .prove(bp_gens, rng)
+        stream.send_nested(|transcript| {
+            let k_blinding = random_scalar::<R1csCycle>(rng);
+            let r_blinding = R1csField::ONE; // fixed for prefix link
+            let mut prover = Prover::<R1csCycle, _>::new(pc_gens, transcript);
+            let (v_k, var_k) = prover.commit(k, k_blinding);
+            let (v_r, var_r) = prover.commit(r, r_blinding);
+            build_one_receiver_r1cs(
+                &mut prover,
+                var_k,
+                var_r,
+                s_x,
+                &h1,
+                &h2,
+                t1_x,
+                t1_y,
+                t2_x,
+                t2_y,
+                statement.beta,
+                &bit_assignments,
+                Some(&witness1),
+                Some(&witness2),
+            )
             .map_err(|_| Error::ProofVerificationFailed)?;
+            let r1cs_proof = prover
+                .prove(bp_gens, rng)
+                .map_err(|_| Error::ProofVerificationFailed)?;
 
-        // Step 0, 1: Chaum-Pedersen proof.
-        let cp = chaum_pedersen_prove(
-            &g_in,
-            &statement.pk1,
-            &statement.pk2,
-            &statement.s,
-            &witness.sk1,
-            rng,
-        )?;
+            let r1cs_bytes = r1cs_proof.to_bytes();
+            let prefix_bytes = 2usize
+                .checked_mul(R1csCycle::COMPRESSED_BYTES)
+                .ok_or(Error::ProofVerificationFailed)?;
+            let capacity = prefix_bytes
+                .checked_add(r1cs_bytes.len())
+                .ok_or(Error::ProofVerificationFailed)?;
+            let mut payload = Vec::with_capacity(capacity);
+            payload.extend_from_slice(R1csCycle::compressed_as_bytes(&v_k));
+            payload.extend_from_slice(R1csCycle::compressed_as_bytes(&v_r));
+            payload.extend_from_slice(&r1cs_bytes);
+            Ok(payload)
+        })?;
 
-        // Step 9: DLOG PoK.
-        let dlog = dlog_prove(&g_out, &statement.r_point, &v_r, &r, rng)?;
+        // Step 9: the DLOG PoK continues from the complete CP + R1CS prefix.
+        dlog_prove(&mut stream, &g_out, &r, rng)?;
 
-        Ok(EvrfProofEnvelope {
-            r1cs: r1cs_proof,
-            k_commitment: v_k,
-            r_commitment: v_r,
-            cp,
-            dlog,
-        })
+        Ok(stream.finish())
     }
 
     /// Verify the full one-receiver paper eVRF proof.
     pub fn evrf_verify(
         statement: &SecpSecqEvrfStatement,
-        proof: &EvrfProofEnvelope,
+        proof: &[u8],
         rng: &mut impl CryptoRngCore,
     ) -> Result<()> {
         let g_in = Gin::generator();
         let g_out = Secq256k1::generator();
         let pc_gens = shared_pc_gens();
         let bp_gens = shared_bp_gens();
+        let mut stream = VerifierProofStream::new(ONE_RECEIVER_PROOF_ID, proof)?;
+        observe_one_receiver_statement(&mut stream, statement)?;
 
-        // Step 0, 1: verify Chaum-Pedersen proof.
+        // Steps 0, 1: verify the Chaum-Pedersen proof before entering R1CS.
         chaum_pedersen_verify(
+            &mut stream,
             &g_in,
             &statement.pk1,
             &statement.pk2,
             &statement.s,
-            &proof.cp,
         )?;
 
         // Step 2: k = int(S.x) is public.  The R1CS constrains the committed k
@@ -1214,41 +1218,55 @@ pub mod secp_secq {
         let (t1_x, t1_y) = affine(&statement.t1)?;
         let (t2_x, t2_y) = affine(&statement.t2)?;
 
-        // Step 9 prefix link: V_r == R + g_out,1.
-        pedersen_prefix_link(&pc_gens.B_blinding, &statement.r_point, &proof.r_commitment)?;
+        // Parse the commitment prefixes and current typed R1CS proof from one
+        // borrowed child frame. The R1CS verifier receives the same transcript;
+        // the parent does not observe the raw child length or payload.
+        stream.receive_nested(|transcript, payload| {
+            // R1CS commitments can be identity encodings in the current engine;
+            // their relation-specific policy is therefore explicitly `Allow`.
+            let (v_k, cursor) = parse_nested_commitment(payload, 0, IdentityPolicy::Allow)?;
+            let (v_r, cursor) = parse_nested_commitment(payload, cursor, IdentityPolicy::Allow)?;
+            let r1cs_bytes = payload
+                .get(cursor..)
+                .ok_or(Error::ProofVerificationFailed)?;
+            let r1cs_proof = parse_canonical_r1cs_proof(r1cs_bytes)?;
 
-        // Build the verifier-side R1CS and verify.  The verifier commits using
-        // the proof's compressed commitments.
-        let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
-        let var_k = verifier.commit(proof.k_commitment);
-        let var_r = verifier.commit(proof.r_commitment);
-        let verifier_bits = vec![None; K_BITS + 1];
-        build_one_receiver_r1cs(
-            &mut verifier,
-            var_k,
-            var_r,
-            s_x,
-            &h1,
-            &h2,
-            t1_x,
-            t1_y,
-            t2_x,
-            t2_y,
-            statement.beta,
-            &verifier_bits,
-            None,
-            None,
-        )
-        .map_err(|_| Error::ProofVerificationFailed)?;
+            // Step 9 prefix link: V_r == R + g_out,1.
+            pedersen_prefix_link(&pc_gens.B_blinding, &statement.r_point, &v_r)?;
 
-        verifier
-            .verify(&proof.r1cs, pc_gens, bp_gens, rng)
+            // Build the verifier-side R1CS and verify. The verifier commits
+            // using the nested proof's canonical compressed commitments.
+            let mut verifier = Verifier::<R1csCycle, _>::new(transcript);
+            let var_k = verifier.commit(v_k);
+            let var_r = verifier.commit(v_r);
+            let verifier_bits = vec![None; K_BITS + 1];
+            build_one_receiver_r1cs(
+                &mut verifier,
+                var_k,
+                var_r,
+                s_x,
+                &h1,
+                &h2,
+                t1_x,
+                t1_y,
+                t2_x,
+                t2_y,
+                statement.beta,
+                &verifier_bits,
+                None,
+                None,
+            )
             .map_err(|_| Error::ProofVerificationFailed)?;
 
-        // Step 9: verify DLOG PoK.
-        dlog_verify(&g_out, &statement.r_point, &proof.r_commitment, &proof.dlog)?;
+            verifier
+                .verify(&r1cs_proof, pc_gens, bp_gens, rng)
+                .map_err(|_| Error::ProofVerificationFailed)
+        })?;
 
-        Ok(())
+        // Step 9: verify the DLOG PoK after the complete CP + R1CS prefix.
+        dlog_verify(&mut stream, &g_out, &statement.r_point)?;
+
+        stream.finish()
     }
 
     // ------------------------------------------------------------------
@@ -1295,71 +1313,53 @@ pub mod secp_secq {
         result
     }
 
-    fn append_batched_statement_context(
-        transcript: &mut Transcript,
+    /// Observe the complete batched dealer statement in its existing canonical order.
+    fn observe_batched_statement(
+        stream: &mut impl Observe,
         statement: &BatchedEvrfStatement,
-    ) {
-        transcript.append_message(b"msg", &statement.msg);
-        let beta_repr = statement.beta.to_repr();
-        transcript.append_message(b"beta", beta_repr.as_ref());
-        transcript.append_message(b"threshold", &(statement.threshold as u64).to_le_bytes());
-        append_point::<Secp256k1Cycle>(
-            transcript,
-            b"PK_1",
-            &Secp256k1Cycle::point_compress(&statement.pk1),
-        );
-        transcript.append_message(
+    ) -> Result<()> {
+        stream.observe_bytes(b"msg", &statement.msg);
+        stream.observe_scalar::<GoutStreamCurve>(b"beta", &statement.beta)?;
+        stream.observe_bytes(b"threshold", &(statement.threshold as u64).to_le_bytes());
+        stream.observe_point::<GinStreamCurve>(b"PK_1", &statement.pk1, IdentityPolicy::Reject)?;
+        stream.observe_bytes(
             b"commitment-len",
             &(statement.commitment_coefficients.len() as u64).to_le_bytes(),
         );
         for coefficient in &statement.commitment_coefficients {
-            append_point::<Secp256k1Cycle>(
-                transcript,
+            stream.observe_point::<GinStreamCurve>(
                 b"commitment",
-                &Secp256k1Cycle::point_compress(coefficient),
-            );
+                coefficient,
+                IdentityPolicy::Allow,
+            )?;
         }
-        transcript.append_message(
+        stream.observe_bytes(
             b"num-receivers",
             &(statement.receivers.len() as u64).to_le_bytes(),
         );
         for (j, rec) in statement.receivers.iter().enumerate() {
-            t_append_idx(transcript, j);
-            transcript.append_message(b"statement-root", &statement.statement_roots[j]);
-            transcript.append_message(b"receiver", &u64::from(rec.receiver.get()).to_le_bytes());
-            append_point::<Secp256k1Cycle>(
-                transcript,
-                b"PK_j",
-                &Secp256k1Cycle::point_compress(&rec.pkj),
-            );
-            append_point::<Secp256k1Cycle>(
-                transcript,
+            stream.observe_bytes(b"idx", &(j as u64).to_le_bytes());
+            stream.observe_bytes(b"statement-root", &statement.statement_roots[j]);
+            stream.observe_bytes(b"receiver", &u64::from(rec.receiver.get()).to_le_bytes());
+            stream.observe_point::<GinStreamCurve>(b"PK_j", &rec.pkj, IdentityPolicy::Reject)?;
+            stream.observe_point::<GinStreamCurve>(
                 b"share-commitment",
-                &Secp256k1Cycle::point_compress(&rec.share_commitment),
-            );
-            append_point::<Secp256k1Cycle>(
-                transcript,
+                &rec.share_commitment,
+                IdentityPolicy::Reject,
+            )?;
+            stream.observe_point::<GinStreamCurve>(
                 b"pad-commitment",
-                &Secp256k1Cycle::point_compress(&rec.pad_commitment),
-            );
-            append_point::<Secp256k1Cycle>(
-                transcript,
+                &rec.pad_commitment,
+                IdentityPolicy::Reject,
+            )?;
+            stream.observe_point::<GinStreamCurve>(
                 b"dh-commitment",
-                &Secp256k1Cycle::point_compress(&rec.dh_commitment),
-            );
-            append_scalar::<Secp256k1Cycle>(transcript, b"encrypted-share", &rec.encrypted_share);
+                &rec.dh_commitment,
+                IdentityPolicy::Reject,
+            )?;
+            stream.observe_scalar::<GinStreamCurve>(b"encrypted-share", &rec.encrypted_share)?;
         }
-    }
-
-    fn batched_r1cs_transcript(statement: &BatchedEvrfStatement) -> Transcript {
-        let mut t = Transcript::new(PROOF_DOMAIN);
-        append_batched_statement_context(&mut t, statement);
-        t
-    }
-
-    /// Append a receiver index to a transcript in a fixed encoding.
-    fn t_append_idx(transcript: &mut Transcript, j: usize) {
-        transcript.append_message(b"idx", &(j as u64).to_le_bytes());
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1667,13 +1667,12 @@ pub mod secp_secq {
         })
     }
 
-    /// Generate the batched dealer proof.
-    pub fn evrf_batched_prove(
+    fn prove_batched_r1cs(
         statement: &BatchedEvrfStatement,
         witness: &BatchedEvrfWitness,
         rng: &mut impl CryptoRngCore,
-    ) -> Result<BatchedEvrfProofEnvelope> {
-        validate_batched_public_relations(statement)?;
+        transcript: &mut Transcript,
+    ) -> Result<Vec<u8>> {
         if witness.shares.len() != statement.receivers.len()
             || witness.coefficient_scalars.len() != statement.commitment_coefficients.len()
         {
@@ -1703,7 +1702,7 @@ pub mod secp_secq {
         let bp_gens =
             BulletproofGens::<R1csCycle>::new(batched_gens_capacity(statement.receivers.len()), 1);
 
-        let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, batched_r1cs_transcript(statement));
+        let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, transcript);
         let sk_fp = fq_to_fp(&witness.sk1);
         let mut sk_bool_bits = [false; K_BITS + 1];
         decompose_k_fp(&sk_fp, &mut sk_bool_bits);
@@ -1760,16 +1759,28 @@ pub mod secp_secq {
             .prove(&bp_gens, rng)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
-        Ok(BatchedEvrfProofEnvelope { r1cs: r1cs_proof })
+        Ok(r1cs_proof.to_bytes())
     }
 
-    /// Verify the batched dealer proof.
-    pub fn evrf_batched_verify(
+    /// Generate a Batched Dealer Proof as a Proof Stream containing one nested R1CS proof.
+    pub fn evrf_batched_prove(
         statement: &BatchedEvrfStatement,
-        proof: &BatchedEvrfProofEnvelope,
+        witness: &BatchedEvrfWitness,
         rng: &mut impl CryptoRngCore,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         validate_batched_public_relations(statement)?;
+        let mut stream = ProverProofStream::new(BATCHED_PROOF_ID)?;
+        observe_batched_statement(&mut stream, statement)?;
+        stream.send_nested(|transcript| prove_batched_r1cs(statement, witness, rng, transcript))?;
+        Ok(stream.finish())
+    }
+
+    fn verify_batched_r1cs(
+        statement: &BatchedEvrfStatement,
+        proof: &R1CSProof<R1csCycle>,
+        rng: &mut impl CryptoRngCore,
+        transcript: &mut Transcript,
+    ) -> Result<()> {
         let g_in = Gin::generator();
         let pc_gens = PedersenGens::<R1csCycle>::default();
         let bp_gens =
@@ -1779,7 +1790,7 @@ pub mod secp_secq {
         let h1 = h_gin_1(&statement.msg);
         let h2 = h_gin_2(&statement.msg);
 
-        let mut verifier = Verifier::<R1csCycle, _>::new(batched_r1cs_transcript(statement));
+        let mut verifier = Verifier::<R1csCycle, _>::new(transcript);
         let sk_var = verifier
             .allocate(None)
             .map_err(|_| Error::ProofVerificationFailed)?;
@@ -1822,22 +1833,31 @@ pub mod secp_secq {
         }
 
         verifier
-            .verify(&proof.r1cs, &pc_gens, &bp_gens, rng)
+            .verify(proof, &pc_gens, &bp_gens, rng)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
         Ok(())
     }
 
-    // ------------------------------------------------------------------
-    // DKG bridge: SecpSecqBackend implements EvrfProofBackend over the
-    // halo2curves Secp256k1 GoldenGroup adapter. The proof carries only the
-    // private-witness R1CS proof; public DKG bindings come from EvrfStatement.
-    // ------------------------------------------------------------------
+    /// Verify a Batched Dealer Proof represented as a Proof Stream with one nested R1CS proof.
+    pub fn evrf_batched_verify(
+        statement: &BatchedEvrfStatement,
+        proof: &[u8],
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<()> {
+        validate_batched_public_relations(statement)?;
+        let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
+        observe_batched_statement(&mut stream, statement)?;
+        stream.receive_nested(|transcript, payload| {
+            let r1cs_proof = parse_canonical_r1cs_proof(payload)?;
+            verify_batched_r1cs(statement, &r1cs_proof, rng, transcript)
+        })?;
+        stream.finish()
+    }
 
-    use golden_core::{DealerMessageNonce, EvrfProofBackend};
-    use golden_halo2curves::golden_group::{
-        scalar_to_r1cs_field, Secp256k1Element, Secp256k1GoldenGroup, Secp256k1Scalar,
-    };
+    // ------------------------------------------------------------------
+    // Scalar representation helpers shared by the circuit and DKG adapter.
+    // ------------------------------------------------------------------
 
     /// Convert an `Fp` element to `Fq` by reinterpreting its canonical LE bytes
     /// as a raw integer and reducing mod `q`. Needed because `p > q` for
@@ -1899,309 +1919,9 @@ pub mod secp_secq {
         false
     }
 
-    /// Byte-serialized paper eVRF proof for the DKG. The inner bytes encode
-    /// only the receiver count and the private-witness R1CS proof.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct SecpSecqProof(pub Vec<u8>);
+    mod dkg_backend;
 
-    impl wire::WireEncode for SecpSecqProof {
-        fn write_wire(&self, out: &mut Vec<u8>) {
-            wire::WireEncode::write_wire(&self.0, out);
-        }
-    }
-
-    impl wire::WireDecode for SecpSecqProof {
-        fn read_wire(reader: &mut wire::WireReader<'_>) -> Result<Self> {
-            let bytes = <Vec<u8> as wire::WireDecode>::read_wire(reader)?;
-            decode_proof(&bytes)?;
-            Ok(Self(bytes))
-        }
-    }
-
-    impl wire::WireMessage for SecpSecqProof {
-        const TAG: u8 = wire::TAG_PROOF_BYTES;
-        const CODEC_ID: &'static str = "secp-secq-r1cs-proof-v1";
-    }
-
-    #[cfg(feature = "miden-serde")]
-    impl Serializable for SecpSecqProof {
-        fn write_into<W: ByteWriter>(&self, target: &mut W) {
-            wire::write_miden_wire(self, target);
-        }
-
-        fn get_size_hint(&self) -> usize {
-            wire::miden_wire_size_hint(self)
-        }
-    }
-
-    #[cfg(feature = "miden-serde")]
-    impl Deserializable for SecpSecqProof {
-        fn read_from<R: ByteReader>(
-            source: &mut R,
-        ) -> core::result::Result<Self, DeserializationError> {
-            wire::read_miden_wire(source)
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    impl Serialize for SecpSecqProof {
-        fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
-            serializer.serialize_bytes(&wire::to_wire_bytes(self))
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    impl<'de> Deserialize<'de> for SecpSecqProof {
-        fn deserialize<D: Deserializer<'de>>(
-            deserializer: D,
-        ) -> core::result::Result<Self, D::Error> {
-            deserializer.deserialize_bytes(SecpSecqProofBytes)
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    struct SecpSecqProofBytes;
-
-    #[cfg(feature = "serde")]
-    impl<'de> de::Visitor<'de> for SecpSecqProofBytes {
-        type Value = SecpSecqProof;
-
-        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            formatter.write_str("canonical Golden Secp/Secq proof bytes")
-        }
-
-        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> core::result::Result<Self::Value, E> {
-            wire::from_wire_bytes(value).map_err(|err| E::custom(err.to_string()))
-        }
-
-        fn visit_byte_buf<E: de::Error>(
-            self,
-            value: Vec<u8>,
-        ) -> core::result::Result<Self::Value, E> {
-            wire::from_wire_bytes(&value).map_err(|err| E::custom(err.to_string()))
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
-        where
-            A: de::SeqAccess<'de>,
-        {
-            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-            while let Some(byte) = seq.next_element()? {
-                bytes.push(byte);
-            }
-            wire::from_wire_bytes(&bytes).map_err(|err| de::Error::custom(err.to_string()))
-        }
-    }
-
-    /// Serialize the proof envelope into a flat byte vector.
-    fn encode_proof(envelope: &BatchedEvrfProofEnvelope, num_receivers: usize) -> Result<Vec<u8>> {
-        let n = u32::try_from(num_receivers).map_err(|_| Error::ProofVerificationFailed)?;
-        let r1cs_bytes = envelope.r1cs.to_bytes();
-        let r1cs_len =
-            u32::try_from(r1cs_bytes.len()).map_err(|_| Error::ProofVerificationFailed)?;
-
-        let mut out = Vec::with_capacity(8 + r1cs_bytes.len());
-        out.extend_from_slice(&n.to_le_bytes());
-        out.extend_from_slice(&r1cs_len.to_le_bytes());
-        out.extend_from_slice(&r1cs_bytes);
-        Ok(out)
-    }
-
-    /// Deserialize the proof envelope from a flat byte vector.
-    fn decode_proof(bytes: &[u8]) -> Result<(usize, BatchedEvrfProofEnvelope)> {
-        if bytes.len() < 8 {
-            return Err(Error::ProofVerificationFailed);
-        }
-        let n = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")) as usize;
-        let r1cs_len = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")) as usize;
-        let expected_len = 8usize
-            .checked_add(r1cs_len)
-            .ok_or(Error::ProofVerificationFailed)?;
-        if bytes.len() != expected_len {
-            return Err(Error::ProofVerificationFailed);
-        }
-        let r1cs = R1CSProof::<R1csCycle>::from_bytes(&bytes[8..8 + r1cs_len])
-            .map_err(|_| Error::ProofVerificationFailed)?;
-        Ok((n, BatchedEvrfProofEnvelope { r1cs }))
-    }
-
-    fn ensure_same_batch_context(
-        statement: &EvrfStatement<Secp256k1GoldenGroup>,
-        first: &EvrfStatement<Secp256k1GoldenGroup>,
-    ) -> Result<()> {
-        if statement.protocol_version != first.protocol_version
-            || statement.backend_id != first.backend_id
-            || statement.session_id != first.session_id
-            || statement.registry_root != first.registry_root
-            || statement.threshold != first.threshold
-            || statement.dealer != first.dealer
-            || statement.msg_i != first.msg_i
-            || statement.beta != first.beta
-            || statement.dealer_public_key != first.dealer_public_key
-            || statement.commitment_coefficients != first.commitment_coefficients
-            || statement.transcript_root != first.transcript_root
-        {
-            return Err(Error::ProofVerificationFailed);
-        }
-
-        Ok(())
-    }
-
-    /// Compute the paper eVRF pad `r = beta * T_1.x + T_2.x` as an `Fp`
-    /// element, where `T_1 = H_{G_in,1}(msg)^k`, `T_2 = H_{G_in,2}(msg)^k`,
-    /// and `k = int(S.x)` for `S = PK_j^sk_1`.
-    fn compute_pad_fp(msg: &[u8; MESSAGE_BYTES], sk1: &Fq, pkj: &Gin, beta: &Fp) -> Result<Fp> {
-        let sj = *pkj * sk1;
-        let (s_x, _) = affine(&sj)?;
-        let k_fq = fp_to_fq(&s_x);
-        let h1 = h_gin_1(msg);
-        let h2 = h_gin_2(msg);
-        let t1j = h1 * k_fq;
-        let t2j = h2 * k_fq;
-        let (t1_x, _) = affine(&t1j)?;
-        let (t2_x, _) = affine(&t2j)?;
-        Ok(*beta * t1_x + t2_x)
-    }
-
-    /// Concrete Secp/Secq paper eVRF backend for the DKG.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub struct SecpSecqBackend;
-
-    impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
-        type Proof = SecpSecqProof;
-
-        fn derive_pad(
-            msg_i: DealerMessageNonce,
-            beta: &Secp256k1Scalar,
-            identity_secret: &Secp256k1Scalar,
-            peer_public_key: &Secp256k1Element,
-            _receiver_public_key: &Secp256k1Element,
-        ) -> Result<Secp256k1Scalar> {
-            let beta_fp = scalar_to_r1cs_field(beta).ok_or(Error::ProofVerificationFailed)?;
-            let r = compute_pad_fp(&msg_i.0, &identity_secret.0, &peer_public_key.0, &beta_fp)?;
-            Ok(Secp256k1Scalar(fp_to_fq(&r)))
-        }
-
-        fn prove_batch(
-            statements: &[EvrfStatement<Secp256k1GoldenGroup>],
-            witnesses: &[EvrfWitness<Secp256k1GoldenGroup>],
-            rng: &mut impl CryptoRngCore,
-        ) -> Result<Self::Proof> {
-            if statements.is_empty() || statements.len() != witnesses.len() {
-                return Err(Error::ProofVerificationFailed);
-            }
-            let first = &statements[0];
-            let msg = first.msg_i.0;
-            let pk1 = first.dealer_public_key.0;
-            let beta = scalar_to_r1cs_field(&first.beta).ok_or(Error::ProofVerificationFailed)?;
-            let threshold = first.threshold;
-            let commitment_coefficients: Vec<Gin> = first
-                .commitment_coefficients
-                .iter()
-                .map(|coefficient| coefficient.0)
-                .collect();
-            let sk1 = witnesses[0].identity_secret.0;
-
-            let mut receivers = Vec::with_capacity(statements.len());
-            let mut statement_roots = Vec::with_capacity(statements.len());
-            let mut shares = Vec::with_capacity(witnesses.len());
-            let coefficient_scalars: Vec<GinScalar> = witnesses[0]
-                .polynomial_coefficients
-                .iter()
-                .map(|coefficient| coefficient.0)
-                .collect();
-            for (statement, witness) in statements.iter().zip(witnesses.iter()) {
-                ensure_same_batch_context(statement, first)?;
-                if witness.identity_secret.0 != sk1 {
-                    return Err(Error::ProofVerificationFailed);
-                }
-                if witness.polynomial_coefficients != witnesses[0].polynomial_coefficients {
-                    return Err(Error::ProofVerificationFailed);
-                }
-                let pkj = statement.receiver_public_key.0;
-                let rec = BatchedReceiverStatement {
-                    receiver: statement.receiver,
-                    pkj,
-                    share_commitment: statement.share_commitment.0,
-                    pad_commitment: statement.pad_commitment.0,
-                    dh_commitment: statement.dh_commitment.0,
-                    encrypted_share: statement.encrypted_share.0,
-                };
-                statement_roots.push(statement.root());
-                receivers.push(rec);
-                shares.push(witness.share.0);
-            }
-
-            let batched_statement = BatchedEvrfStatement {
-                msg,
-                pk1,
-                beta,
-                threshold,
-                commitment_coefficients,
-                statement_roots,
-                receivers,
-            };
-            let batched_witness = BatchedEvrfWitness {
-                sk1,
-                coefficient_scalars,
-                shares,
-            };
-            let envelope = evrf_batched_prove(&batched_statement, &batched_witness, rng)?;
-            let bytes = encode_proof(&envelope, statements.len())?;
-            Ok(SecpSecqProof(bytes))
-        }
-
-        fn verify_batch(
-            statements: &[EvrfStatement<Secp256k1GoldenGroup>],
-            proof: &Self::Proof,
-        ) -> Result<()> {
-            if statements.is_empty() {
-                return Err(Error::ProofVerificationFailed);
-            }
-            let (num_receivers, envelope) = decode_proof(&proof.0)?;
-            if num_receivers != statements.len() {
-                return Err(Error::ProofVerificationFailed);
-            }
-            let first = &statements[0];
-            let msg = first.msg_i.0;
-            let pk1 = first.dealer_public_key.0;
-            let beta = scalar_to_r1cs_field(&first.beta).ok_or(Error::ProofVerificationFailed)?;
-            let threshold = first.threshold;
-            let commitment_coefficients: Vec<Gin> = first
-                .commitment_coefficients
-                .iter()
-                .map(|coefficient| coefficient.0)
-                .collect();
-
-            let mut receivers = Vec::with_capacity(statements.len());
-            let mut statement_roots = Vec::with_capacity(statements.len());
-            for statement in statements {
-                ensure_same_batch_context(statement, first)?;
-                statement_roots.push(statement.root());
-                receivers.push(BatchedReceiverStatement {
-                    receiver: statement.receiver,
-                    pkj: statement.receiver_public_key.0,
-                    share_commitment: statement.share_commitment.0,
-                    pad_commitment: statement.pad_commitment.0,
-                    dh_commitment: statement.dh_commitment.0,
-                    encrypted_share: statement.encrypted_share.0,
-                });
-            }
-
-            let batched_statement = BatchedEvrfStatement {
-                msg,
-                pk1,
-                beta,
-                threshold,
-                commitment_coefficients,
-                statement_roots,
-                receivers,
-            };
-            use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-            let mut rng = ChaCha20Rng::seed_from_u64(0xDEAD_BEEF);
-            evrf_batched_verify(&batched_statement, &envelope, &mut rng)
-        }
-    }
+    pub use dkg_backend::SecpSecqBackend;
 
     /// Test-only helpers exposed so integration tests under `tests/` can
     /// build honest statements without re-implementing the protocol's
@@ -2328,15 +2048,6 @@ pub mod secp_secq {
             };
             (statement, witness)
         }
-
-        /// Commit `k` under a fresh Pedersen blinding base. Used by
-        /// integration tests that swap a proof's `k_commitment` to drive
-        /// the verifier's commitment-binding check.
-        pub fn commit_k_for_test(k: R1csField) -> GoutCompressed {
-            let pc_gens = PedersenGens::<R1csCycle>::default();
-            let v_k = pc_gens.commit(k, R1csField::ONE);
-            R1csCycle::point_compress(&v_k)
-        }
     }
 
     #[cfg(test)]
@@ -2452,6 +2163,8 @@ pub mod secp_secq {
         use rand_chacha::rand_core::SeedableRng;
         use rand_chacha::ChaCha20Rng;
 
+        const R1CS_TEST_DOMAIN: &[u8] = b"golden-paper-evrf-r1cs-test";
+
         /// Build a canonical bit decomposition of `k` (little-endian).
         fn decompose_k(k: &R1csField, bits: &mut [Option<R1csField>]) {
             let repr = k.to_repr();
@@ -2491,12 +2204,13 @@ pub mod secp_secq {
             let bp_gens = BulletproofGens::<R1csCycle>::new(1024, 1);
             let mut rng = ChaCha20Rng::seed_from_u64(0xA1B2C3D4);
 
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (v_k, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
             bit_decompose(&mut prover, var_k, bit_assignments)?;
             let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
 
-            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
+            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(R1CS_TEST_DOMAIN));
             let v_k_var = verifier.commit(v_k);
             let verifier_bits = vec![None; K_BITS + 1];
             bit_decompose(&mut verifier, v_k_var, &verifier_bits)?;
@@ -2513,7 +2227,8 @@ pub mod secp_secq {
             let mut bits = vec![None; K_BITS + 1];
             decompose_k(&pad, &mut bits);
 
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (v_pad, var_pad) = prover.commit(pad, random_scalar::<R1csCycle>(&mut rng));
             let (v_reduce, var_reduce) =
                 prover.commit(reduce, random_scalar::<R1csCycle>(&mut rng));
@@ -2532,7 +2247,7 @@ pub mod secp_secq {
             )?;
             let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
 
-            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
+            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(R1CS_TEST_DOMAIN));
             let var_pad = verifier.commit(v_pad);
             let var_reduce = verifier.commit(v_reduce);
             let (_, _, reduce_boolean) = verifier.multiply(
@@ -2662,8 +2377,9 @@ pub mod secp_secq {
 
             let pc_gens = PedersenGens::<R1csCycle>::default();
             let bp_gens = BulletproofGens::<R1csCycle>::new(batched_gens_capacity(1), 1);
-            let mut prover =
-                Prover::<R1csCycle, _>::new(&pc_gens, batched_r1cs_transcript(&statement));
+            let mut prover_stream = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
+            observe_batched_statement(&mut prover_stream, &statement).expect("statement");
+            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, prover_stream.transcript_mut());
             let sk_fp = fq_to_fp(&witness.sk1);
             let mut sk_bits = [false; K_BITS + 1];
             decompose_k_fp(&sk_fp, &mut sk_bits);
@@ -2694,7 +2410,9 @@ pub mod secp_secq {
             .expect("receiver slot");
 
             let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
-            let mut verifier = Verifier::<R1csCycle, _>::new(batched_r1cs_transcript(&statement));
+            let mut verifier_stream = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
+            observe_batched_statement(&mut verifier_stream, &statement).expect("statement");
+            let mut verifier = Verifier::<R1csCycle, _>::new(verifier_stream.transcript_mut());
             let sk_var = verifier.allocate(None).expect("allocate verifier sk");
             let verifier_sk_bits = vec![None; K_BITS + 1];
             let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits)
@@ -2734,7 +2452,8 @@ pub mod secp_secq {
             let k = R1csField::from(0xABCDu64);
             let mut bits = vec![None; K_BITS + 1];
             decompose_k(&k, &mut bits);
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
             let _ = bit_decompose(&mut prover, var_k, &bits).expect("gadget");
 
@@ -2754,7 +2473,8 @@ pub mod secp_secq {
             let pc_gens = PedersenGens::<R1csCycle>::default();
             let mut rng = ChaCha20Rng::seed_from_u64(0xBAAD_0001);
             let k = R1csField::from(0xABCDu64);
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
             // Only K_BITS bits supplied instead of K_BITS + 1: gadget must
             // refuse to build a truncated circuit.
@@ -2783,7 +2503,8 @@ pub mod secp_secq {
                 denom_delta_inverses: vec![R1csField::ZERO; K_BITS],
             };
 
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let k = R1csField::ZERO;
             let (_, var_k) = prover.commit(k, random_scalar::<R1csCycle>(&mut rng));
             let mut bit_assignments = vec![None; K_BITS + 1];
@@ -2895,7 +2616,8 @@ pub mod secp_secq {
                 .collect();
 
             // Prover
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(PROOF_DOMAIN));
+            let mut prover =
+                Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (v_k, var_k) = prover.commit(k_fp, random_scalar::<R1csCycle>(&mut rng));
             let bit_vars = bit_decompose(&mut prover, var_k, &bit_assignments).expect("bit_decomp");
             chord_exponentiate_r1cs(
@@ -2910,7 +2632,7 @@ pub mod secp_secq {
             let proof = prover.prove(&bp_gens, &mut rng)?;
 
             // Verifier
-            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(PROOF_DOMAIN));
+            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(R1CS_TEST_DOMAIN));
             let v_k_var = verifier.commit(v_k);
             let verifier_bits = vec![None; K_BITS + 1];
             let bit_vars =
@@ -2989,6 +2711,20 @@ pub mod secp_secq {
         use rand_chacha::rand_core::SeedableRng;
         use rand_chacha::ChaCha20Rng;
 
+        const CP_TEST_PROOF_ID: &[u8] = b"golden-paper-evrf-cp-tests-v2";
+
+        fn prove(g_in: &Gin, pk2: &Gin, sk1: &GinScalar, rng: &mut impl CryptoRngCore) -> Vec<u8> {
+            let mut stream = ProverProofStream::new(CP_TEST_PROOF_ID).expect("stream");
+            chaum_pedersen_prove(&mut stream, g_in, pk2, sk1, rng).expect("prove");
+            stream.finish()
+        }
+
+        fn verify(proof: &[u8], g_in: &Gin, pk1: &Gin, pk2: &Gin, s: &Gin) -> Result<()> {
+            let mut stream = VerifierProofStream::new(CP_TEST_PROOF_ID, proof)?;
+            chaum_pedersen_verify(&mut stream, g_in, pk1, pk2, s)?;
+            stream.finish()
+        }
+
         #[test]
         fn chaum_pedersen_honest_proof_verifies() {
             let mut rng = ChaCha20Rng::seed_from_u64(0xC0FFEE);
@@ -2998,8 +2734,8 @@ pub mod secp_secq {
             let pk2 = g_in * GinScalar::random(&mut rng);
             let s = pk2 * sk1;
 
-            let proof = chaum_pedersen_prove(&g_in, &pk1, &pk2, &s, &sk1, &mut rng).expect("prove");
-            chaum_pedersen_verify(&g_in, &pk1, &pk2, &s, &proof).expect("verify");
+            let proof = prove(&g_in, &pk2, &sk1, &mut rng);
+            verify(&proof, &g_in, &pk1, &pk2, &s).expect("verify");
         }
 
         #[test]
@@ -3013,10 +2749,9 @@ pub mod secp_secq {
 
             // Prove with the wrong sk1.
             let wrong_sk1 = GinScalar::random(&mut rng);
-            let proof =
-                chaum_pedersen_prove(&g_in, &pk1, &pk2, &s, &wrong_sk1, &mut rng).expect("prove");
+            let proof = prove(&g_in, &pk2, &wrong_sk1, &mut rng);
             assert!(
-                chaum_pedersen_verify(&g_in, &pk1, &pk2, &s, &proof).is_err(),
+                verify(&proof, &g_in, &pk1, &pk2, &s).is_err(),
                 "verifier must reject wrong sk1"
             );
         }
@@ -3028,14 +2763,13 @@ pub mod secp_secq {
             let sk1 = GinScalar::random(&mut rng);
             let pk1 = g_in * sk1;
             let pk2 = g_in * GinScalar::random(&mut rng);
-            let s = pk2 * sk1;
 
-            let proof = chaum_pedersen_prove(&g_in, &pk1, &pk2, &s, &sk1, &mut rng).expect("prove");
+            let proof = prove(&g_in, &pk2, &sk1, &mut rng);
 
             // Verify with a wrong S (different DH point).
             let wrong_s = pk2 * GinScalar::random(&mut rng);
             assert!(
-                chaum_pedersen_verify(&g_in, &pk1, &pk2, &wrong_s, &proof).is_err(),
+                verify(&proof, &g_in, &pk1, &pk2, &wrong_s).is_err(),
                 "verifier must reject wrong S"
             );
         }
@@ -3049,12 +2783,12 @@ pub mod secp_secq {
             let pk2 = g_in * GinScalar::random(&mut rng);
             let s = pk2 * sk1;
 
-            let proof = chaum_pedersen_prove(&g_in, &pk1, &pk2, &s, &sk1, &mut rng).expect("prove");
+            let proof = prove(&g_in, &pk2, &sk1, &mut rng);
 
             // Verify with a wrong PK_2.
             let wrong_pk2 = g_in * GinScalar::random(&mut rng);
             assert!(
-                chaum_pedersen_verify(&g_in, &pk1, &wrong_pk2, &s, &proof).is_err(),
+                verify(&proof, &g_in, &pk1, &wrong_pk2, &s).is_err(),
                 "verifier must reject wrong PK_2"
             );
         }
@@ -3067,6 +2801,8 @@ pub mod secp_secq {
         use rand_chacha::rand_core::SeedableRng;
         use rand_chacha::ChaCha20Rng;
 
+        const DLOG_TEST_PROOF_ID: &[u8] = b"golden-paper-evrf-dlog-tests-v2";
+
         /// Build a Pedersen commitment to `r` with fixed blinding 1 and return
         /// `(V_r compressed, g_out, g_out,1)` matching the step-9 prefix link.
         fn prefix_commit(r: R1csField) -> (GoutCompressed, Secq256k1, Secq256k1) {
@@ -3074,6 +2810,47 @@ pub mod secp_secq {
             let v_r_point = pc_gens.commit(r, R1csField::ONE);
             let v_r = R1csCycle::point_compress(&v_r_point);
             (v_r, pc_gens.B, pc_gens.B_blinding)
+        }
+
+        fn observe_prior_context(
+            stream: &mut impl Observe,
+            r_point: &Secq256k1,
+            v_r: &GoutCompressed,
+        ) -> Result<()> {
+            stream.observe_point::<GoutStreamCurve>(
+                b"statement.r",
+                r_point,
+                IdentityPolicy::Reject,
+            )?;
+            // In the full proof, `V_r` is observed by the preceding R1CS
+            // verifier commitment rather than by this DLOG phase itself.
+            stream.observe_bytes(b"test.r1cs-v-r", R1csCycle::compressed_as_bytes(v_r));
+            Ok(())
+        }
+
+        fn prove(
+            g_out: &Secq256k1,
+            r_point: &Secq256k1,
+            v_r: &GoutCompressed,
+            r: &R1csField,
+            rng: &mut impl CryptoRngCore,
+        ) -> Vec<u8> {
+            let mut stream = ProverProofStream::new(DLOG_TEST_PROOF_ID).expect("stream");
+            observe_prior_context(&mut stream, r_point, v_r).expect("context");
+            dlog_prove(&mut stream, g_out, r, rng).expect("prove");
+            stream.finish()
+        }
+
+        fn verify(
+            proof: &[u8],
+            g_out: &Secq256k1,
+            r_point: &Secq256k1,
+            v_r: &GoutCompressed,
+        ) -> Result<()> {
+            let mut stream = VerifierProofStream::new(DLOG_TEST_PROOF_ID, proof)?;
+            observe_prior_context(&mut stream, r_point, v_r)?;
+            dlog_verify(&mut stream, g_out, r_point)?;
+            stream.finish()
         }
 
         #[test]
@@ -3084,8 +2861,8 @@ pub mod secp_secq {
             let r_point = g_out * r;
 
             pedersen_prefix_link(&g_out_blinding, &r_point, &v_r).expect("prefix link");
-            let proof = dlog_prove(&g_out, &r_point, &v_r, &r, &mut rng).expect("prove");
-            dlog_verify(&g_out, &r_point, &v_r, &proof).expect("verify");
+            let proof = prove(&g_out, &r_point, &v_r, &r, &mut rng);
+            verify(&proof, &g_out, &r_point, &v_r).expect("verify");
         }
 
         #[test]
@@ -3097,9 +2874,9 @@ pub mod secp_secq {
 
             // Prove with the wrong r (the dealer does not know the dlog of R).
             let wrong_r = R1csField::random(&mut rng);
-            let proof = dlog_prove(&g_out, &r_point, &v_r, &wrong_r, &mut rng).expect("prove");
+            let proof = prove(&g_out, &r_point, &v_r, &wrong_r, &mut rng);
             assert!(
-                dlog_verify(&g_out, &r_point, &v_r, &proof).is_err(),
+                verify(&proof, &g_out, &r_point, &v_r).is_err(),
                 "verifier must reject wrong r"
             );
         }
@@ -3111,12 +2888,12 @@ pub mod secp_secq {
             let (v_r, g_out, _) = prefix_commit(r);
             let r_point = g_out * r;
 
-            let proof = dlog_prove(&g_out, &r_point, &v_r, &r, &mut rng).expect("prove");
+            let proof = prove(&g_out, &r_point, &v_r, &r, &mut rng);
 
             // Verify against a different R (not r * g_out).
             let wrong_r_point = g_out * R1csField::random(&mut rng);
             assert!(
-                dlog_verify(&g_out, &wrong_r_point, &v_r, &proof).is_err(),
+                verify(&proof, &g_out, &wrong_r_point, &v_r).is_err(),
                 "verifier must reject wrong R"
             );
         }
@@ -3128,13 +2905,13 @@ pub mod secp_secq {
             let (v_r, g_out, _) = prefix_commit(r);
             let r_point = g_out * r;
 
-            let proof = dlog_prove(&g_out, &r_point, &v_r, &r, &mut rng).expect("prove");
+            let proof = prove(&g_out, &r_point, &v_r, &r, &mut rng);
 
             // Verify against a V_r from a different r (transcript mismatch).
             let wrong_r = R1csField::random(&mut rng);
             let (wrong_v_r, _, _) = prefix_commit(wrong_r);
             assert!(
-                dlog_verify(&g_out, &r_point, &wrong_v_r, &proof).is_err(),
+                verify(&proof, &g_out, &r_point, &wrong_v_r).is_err(),
                 "verifier must reject wrong V_r (transcript binding)"
             );
         }
@@ -3163,7 +2940,7 @@ pub mod secp_secq {
     #[allow(clippy::unwrap_used)]
     mod dkg_unit_tests {
         use super::*;
-        use bulletproofs_cycle::Cycle;
+
         use golden_core::GoldenGroup;
         use halo2curves::secp256k1::Fp;
 
@@ -3238,38 +3015,31 @@ pub mod secp_secq {
             }
         }
 
-        fn structurally_valid_proof_bytes() -> Vec<u8> {
-            const ONE_PHASE_COMMITMENTS: u8 = 0;
-
-            let compressed = Secq256k1Cycle::compressed_identity();
-            let mut r1cs = Vec::new();
-            r1cs.push(ONE_PHASE_COMMITMENTS);
-            for _ in 0..8 {
-                r1cs.extend_from_slice(Secq256k1Cycle::compressed_as_bytes(&compressed));
-            }
-            r1cs.extend_from_slice(&[0u8; 32 * 5]);
-
-            let r1cs_len = u32::try_from(r1cs.len()).unwrap();
-            let mut out = Vec::with_capacity(8 + r1cs.len());
-            out.extend_from_slice(&1u32.to_le_bytes());
-            out.extend_from_slice(&r1cs_len.to_le_bytes());
-            out.extend_from_slice(&r1cs);
-            out
-        }
-
         #[test]
-        fn batched_transcripts_bind_statement_roots() {
+        fn batched_stream_pins_statement_boundary_checkpoint() {
             let statement = context_statement();
             let mut changed = statement.clone();
             changed.statement_roots[0][0] ^= 0x80;
 
-            let mut r1cs_a = batched_r1cs_transcript(&statement);
-            let mut r1cs_b = batched_r1cs_transcript(&changed);
-            assert_ne!(
-                challenge_scalar::<R1csCycle>(&mut r1cs_a, b"probe"),
-                challenge_scalar::<R1csCycle>(&mut r1cs_b, b"probe"),
-                "R1CS transcript must bind the ordered DKG statement roots"
+            let mut stream = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
+            observe_batched_statement(&mut stream, &statement).expect("statement");
+            let mut checkpoint = [0u8; 64];
+            stream.challenge(b"r1cs-boundary", &mut checkpoint);
+            assert_eq!(
+                checkpoint,
+                [
+                    247, 25, 213, 42, 121, 243, 204, 120, 70, 68, 75, 51, 206, 117, 113, 102, 226,
+                    129, 74, 188, 184, 249, 56, 36, 91, 132, 27, 123, 113, 156, 110, 121, 116, 185,
+                    133, 17, 40, 166, 105, 171, 8, 145, 175, 175, 189, 164, 99, 107, 127, 11, 148,
+                    198, 242, 109, 210, 14, 250, 163, 209, 209, 85, 22, 50, 20,
+                ]
             );
+
+            let mut changed_stream = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
+            observe_batched_statement(&mut changed_stream, &changed).expect("statement");
+            let mut changed_checkpoint = [0u8; 64];
+            changed_stream.challenge(b"r1cs-boundary", &mut changed_checkpoint);
+            assert_ne!(changed_checkpoint, checkpoint);
         }
 
         #[test]
@@ -3365,70 +3135,9 @@ pub mod secp_secq {
             let mut changed = first.clone();
             changed.msg_i.0[0] ^= 0x80;
             assert_eq!(
-                ensure_same_batch_context(&changed, &first).unwrap_err(),
+                dkg_backend::ensure_same_batch_context(&changed, &first).unwrap_err(),
                 Error::ProofVerificationFailed
             );
-        }
-
-        #[test]
-        fn secp_secq_proof_wire_wraps_complete_proof_bytes() {
-            let proof = SecpSecqProof(structurally_valid_proof_bytes());
-            let bytes = wire::to_wire_bytes(&proof);
-            let decoded = wire::from_wire_bytes::<SecpSecqProof>(&bytes).unwrap();
-
-            assert_eq!(decoded, proof);
-        }
-
-        #[test]
-        fn secp_secq_proof_wire_rejects_malformed_proof_bytes() {
-            let proof = SecpSecqProof(vec![1, 2, 3, 5, 8, 13]);
-            let bytes = wire::to_wire_bytes(&proof);
-
-            assert_eq!(
-                wire::from_wire_bytes::<SecpSecqProof>(&bytes).unwrap_err(),
-                Error::ProofVerificationFailed
-            );
-        }
-
-        #[cfg(feature = "serde")]
-        #[test]
-        fn secp_secq_proof_serde_uses_canonical_wire_bytes() {
-            use serde_test::{assert_de_tokens, assert_tokens, Token};
-
-            let proof = SecpSecqProof(structurally_valid_proof_bytes());
-            let bytes: &'static [u8] = Box::leak(wire::to_wire_bytes(&proof).into_boxed_slice());
-
-            assert_tokens(&proof, &[Token::Bytes(bytes)]);
-
-            let mut seq = Vec::with_capacity(bytes.len() + 2);
-            seq.push(Token::Seq {
-                len: Some(bytes.len()),
-            });
-            seq.extend(bytes.iter().copied().map(Token::U8));
-            seq.push(Token::SeqEnd);
-
-            assert_de_tokens(&proof, &seq);
-        }
-
-        #[cfg(feature = "miden-serde")]
-        #[test]
-        fn secp_secq_proof_miden_serde_uses_canonical_wire_bytes() {
-            use miden_serde_utils::{Deserializable, Serializable, SliceReader};
-
-            let proof = SecpSecqProof(structurally_valid_proof_bytes());
-            let bytes = proof.to_bytes();
-            let wire_bytes = wire::to_wire_bytes(&proof);
-
-            assert!(bytes.ends_with(&wire_bytes));
-            assert_eq!(SecpSecqProof::read_from_bytes(&bytes).unwrap(), proof);
-
-            let mut adjacent = Vec::new();
-            proof.write_into(&mut adjacent);
-            proof.write_into(&mut adjacent);
-            let mut reader = SliceReader::new(&adjacent);
-
-            assert_eq!(SecpSecqProof::read_from(&mut reader).unwrap(), proof);
-            assert_eq!(SecpSecqProof::read_from(&mut reader).unwrap(), proof);
         }
     }
 }
