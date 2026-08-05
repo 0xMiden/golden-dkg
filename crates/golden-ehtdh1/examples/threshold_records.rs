@@ -5,20 +5,19 @@
 //! 1. Three participants run the two Golden DKG sessions needed by EHTDH1.
 //!    They agree on one public sealing key, and each receives its own secret share.
 //! 2. A client supplies one private value and a uniformly random 256-bit nonce.
-//!    The application derives a shared sealing seed from
-//!    `client_nonce || SHA256(canonical private plaintext)` with domain-separated
-//!    HKDF-SHA256.
+//!    The application derives a shared sealing seed with domain-separated
+//!    HKDF-SHA256, binding the disclosure-group identity, application associated
+//!    data, private-payload commitment, and setup epoch.
 //! 3. Three independent writers encrypt the same logical private payload. Every
 //!    writer uses the same application-level associated data and seeded `r`, so
 //!    the EHTDH1 ciphertexts share `R`. Each writer independently samples a fresh
 //!    content key, outer XChaCha20Poly1305 nonce, and encryption-proof nonce `r'`,
 //!    so the complete ciphertexts, encrypted payloads, and proof fields differ.
-//! 4. Before any request-specific context or disclosure group exists, each
-//!    participant precomputes its secret-bearing contribution for the common `R`.
-//!    The unsealing share and opaque precomputation remain protected in TEE storage.
+//! 4. During the transaction stage, the application creates one stable disclosure
+//!    group from the common `R`, common associated data, and opaque group ID. Before
+//!    any request exists, each participant precomputes its secret-bearing `x_iR`.
 //! 5. Later, the application authenticates the intended record membership and
-//!    creates one disclosure group from the common `R`, common associated data,
-//!    one request-specific decryption context, and an opaque application group ID.
+//!    creates a request-specific decryption context from the stable group.
 //! 6. Each participant issues a disclosure-group share with fresh proof randomness
 //!    and sends its canonical wire form. One threshold set reconstructs one opaque
 //!    group key, which opens all three wrapped content keys and therefore all three
@@ -26,16 +25,20 @@
 //!
 //! # Security warning
 //!
-//! A disclosure-group key opens **any valid ciphertext with the same `R` and
-//! associated data**, not only ciphertexts the application intended to place in
-//! the group. The application **must authenticate disclosure-group membership**
-//! separately before participants release shares. This example uses a trusted
-//! manifest of complete record-envelope digests.
+//! The group ID and request context authorize reconstruction but do not constrain
+//! recovered `xR`. A disclosure-group key opens **any valid ciphertext with the
+//! same `R` and expected associated data**, not only ciphertexts the application
+//! intended to place in the group. The `open` associated-data check is defensive
+//! API policy, not a cryptographic restriction on extracted `xR`. The application
+//! **must authenticate disclosure-group membership** separately before participants
+//! release shares. This example uses a trusted manifest of complete envelope digests.
 //!
-//! Seeded sealing also reuses one payload mask: a writer that knows its own
-//! content key and wrapped payload can recover the mask and open every sibling.
-//! Anyone learning or guessing the seed can derive `r` and do the same without a
-//! threshold. Reusing encryption-proof nonce `r'` can reveal `r`, while reusing
+//! Seeded sealing also reuses one payload mask, revealing `m_1 XOR m_2` from any
+//! two wrapped payloads. It is unsafe for arbitrary or correlated plaintexts; this
+//! example wraps only independently uniform, fixed-length content keys. That does
+//! not protect against known plaintext: a writer that knows its own content key
+//! and wrapper can recover the mask and open every sibling. Anyone learning or
+//! guessing the seed can derive `r` and do the same without a threshold. Reusing
 //! disclosure-share proof nonces can reveal a participant's long-lived shares.
 //! Both are confidentiality failures, not merely proof failures.
 //!
@@ -49,10 +52,10 @@
 //!   as EHTDH1 associated data or outer AEAD associated data.
 //! * The common **application associated data** describes the logical payload and
 //!   is bound into every EHTDH1 ciphertext and every outer record encryption.
-//! * The **request-specific decryption context** binds participant approval to one
-//!   release request.
-//! * The opaque **disclosure-group ID** is supplied by the application and binds
-//!   the released shares to that application group.
+//! * The stable **disclosure group** contains common `R`, associated data, and an
+//!   opaque application group ID; it exists before a release request.
+//! * The **request-specific decryption context** is added later and binds
+//!   participant approval to one release request.
 //! * The [`SetupContext`](golden_ehtdh1::SetupContext) identifies the Golden setup
 //!   that produced the keys and shares.
 //!
@@ -85,8 +88,9 @@
 //!   XChaCha20Poly1305.
 //! * An **EHTDH1 ciphertext** wraps one content key. Its proof uses fresh nonce
 //!   `r'`; reuse of `r'` is a confidentiality failure.
-//! * A **disclosure group** binds common `R` and associated data to a request
-//!   context and opaque group ID. The application authenticates its members.
+//! * A **disclosure group** is stable common `R`, associated data, and opaque group
+//!   ID. A **disclosure request** borrows that group and adds one release context.
+//!   The application authenticates intended members before authorizing a request.
 //! * A **disclosure-group decryption share** is a public, proof-bearing message
 //!   issued with fresh share-proof randomness. It has canonical wire bytes.
 //! * A **disclosure-group key** is reconstructed from a threshold set and opens
@@ -174,12 +178,18 @@ fn main() -> AppResult<()> {
         b"private-record/C".as_slice(),
     ];
     let application_associated_data = b"threshold-records/logical-private-payload/v1";
+    let opaque_disclosure_group_id = b"app-group:7f49b28d6a1c";
     let canonical_private_plaintext = vec![b'T'; RECORD_BYTES];
     // Fixed only to keep the example repeatable. Production clients sample a
     // uniformly random 256-bit client nonce.
     let client_nonce = Zeroizing::new([5u8; 32]);
-    let transaction_sealing_seed =
-        derive_transaction_sealing_seed(&client_nonce, &canonical_private_plaintext)?;
+    let transaction_sealing_seed = derive_transaction_sealing_seed(
+        &client_nonce,
+        opaque_disclosure_group_id,
+        application_associated_data,
+        &canonical_private_plaintext,
+        &first.setup_context.epoch,
+    )?;
     let mut records = Vec::new();
     for (writer_index, record_id) in record_ids.iter().copied().enumerate() {
         // A separate writer RNG independently samples the content key, outer
@@ -259,14 +269,20 @@ fn main() -> AppResult<()> {
         "outer ciphertexts or XChaCha20Poly1305 nonces were not distinct",
     )?;
 
-    // Step 4. Ciphertexts now exist, but no request-specific context or group has
-    // been formed. Each participant calls precompute exactly once for common R.
+    // Step 4. During the transaction stage, establish the stable disclosure group
+    // before any request-specific context exists. Each participant then calls
+    // precompute exactly once for the group's common R.
     let common_ephemeral_public = wrapped_keys[0].ephemeral_public;
+    let disclosure_group = DisclosureGroup::new(
+        common_ephemeral_public,
+        application_associated_data,
+        opaque_disclosure_group_id,
+    )?;
     let mut local_precomputations = Vec::<(UnsealingShare<G>, DecryptionPrecomputation<G>)>::new();
     for material in materials.values() {
         let unsealing_share = UnsealingShare::new(material.secret_share.clone());
         let precomputation =
-            unsealing_share.precompute_for_ephemeral_public(&common_ephemeral_public)?;
+            unsealing_share.precompute_for_ephemeral_public(disclosure_group.ephemeral_public())?;
         // This secret-bearing (UnsealingShare, DecryptionPrecomputation) tuple
         // remains sealed/protected in TEE storage. It is never serialized.
         local_precomputations.push((unsealing_share, precomputation));
@@ -284,15 +300,9 @@ fn main() -> AppResult<()> {
         ),
         "application disclosure-group membership authentication failed",
     )?;
-    // These values are deliberately defined only when this release is requested.
-    let opaque_disclosure_group_id = b"app-group:7f49b28d6a1c";
+    // This context is deliberately defined only when the later release is requested.
     let request_decryption_context = b"request:2026-08-03T12:00:00Z:4e91";
-    let disclosure_group = DisclosureGroup::new(
-        common_ephemeral_public,
-        application_associated_data,
-        request_decryption_context,
-        opaque_disclosure_group_id,
-    )?;
+    let disclosure_request = disclosure_group.request(request_decryption_context);
 
     // Each participant uses fresh share-proof randomness, then exchanges only a
     // canonical DisclosureGroupDecryptionShare. Reusing the two proof nonces
@@ -308,7 +318,7 @@ fn main() -> AppResult<()> {
             &mut share_proof_rng,
             &first.setup_context,
             precomputation,
-            &disclosure_group,
+            &disclosure_request,
         )?;
         disclosure_shares.push(from_wire_bytes::<DisclosureGroupDecryptionShare<G>>(
             &to_wire_bytes(&share),
@@ -320,7 +330,7 @@ fn main() -> AppResult<()> {
     // Step 6. One disclosure-group share is below the two-of-three threshold.
     require(
         combiner
-            .combine_disclosure_group_exact(&disclosure_group, &disclosure_shares[..1])
+            .combine_disclosure_group_exact(&disclosure_request, &disclosure_shares[..1])
             .is_err(),
         "one disclosure-group share unexpectedly constructed a group key",
     )?;
@@ -329,7 +339,7 @@ fn main() -> AppResult<()> {
     // remains in local memory and is intentionally never serialized.
     let threshold_shares = [disclosure_shares[0].clone(), disclosure_shares[1].clone()];
     let disclosure_group_key =
-        combiner.combine_disclosure_group_exact(&disclosure_group, &threshold_shares)?;
+        combiner.combine_disclosure_group_exact(&disclosure_request, &threshold_shares)?;
 
     // The same group key opens every valid same-R/same-AD EHTDH1 ciphertext.
     // Application membership authentication above is therefore mandatory.
@@ -358,7 +368,7 @@ fn main() -> AppResult<()> {
         "In the HPKE-style split, AEAD encrypted {record_bytes} record bytes and EHTDH1 wrapped \
          {wrapped_bytes} bytes total."
     );
-    println!("Participants precomputed once before the request-specific group existed.");
+    println!("Participants precomputed once for the stable group before a request existed.");
     println!("All three disclosure shares completed canonical wire round-trips.");
     println!("One share was rejected; one exact threshold set constructed the group key.");
     println!("The same non-serialized group key opened all three records to the same payload.");
@@ -508,26 +518,32 @@ fn check_shared_setup(materials: &BTreeMap<ParticipantIndex, Ehtdh1Material<G>>)
     Ok(())
 }
 
-/// Derives the shared sealing seed from a client nonce and canonical plaintext.
+/// Derives the shared sealing seed from high-entropy and application-domain inputs.
 fn derive_transaction_sealing_seed(
     client_nonce: &[u8; 32],
+    disclosure_group_id: &[u8],
+    application_associated_data: &[u8],
     canonical_private_plaintext: &[u8],
+    setup_epoch: &[u8; 32],
 ) -> AppResult<Zeroizing<[u8; 32]>> {
     let private_plaintext_digest = Sha256::digest(canonical_private_plaintext);
-    let mut input_key_material = Zeroizing::new([0u8; 64]);
-    input_key_material[..32].copy_from_slice(client_nonce);
-    input_key_material[32..].copy_from_slice(&private_plaintext_digest);
+    let mut seed_context = Sha256::new();
+    seed_context.update(b"threshold-record-transaction-seed-context-v1");
+    seed_context.update((disclosure_group_id.len() as u64).to_be_bytes());
+    seed_context.update(disclosure_group_id);
+    seed_context.update((application_associated_data.len() as u64).to_be_bytes());
+    seed_context.update(application_associated_data);
+    seed_context.update(private_plaintext_digest);
+    seed_context.update(setup_epoch);
+    let seed_context = seed_context.finalize();
 
     let hkdf = Hkdf::<Sha256>::new(
-        Some(b"threshold-record-transaction-seed-v1"),
-        input_key_material.as_ref(),
+        Some(b"threshold-record-application/protocol/v1"),
+        client_nonce,
     );
     let mut transaction_sealing_seed = Zeroizing::new([0u8; 32]);
-    hkdf.expand(
-        b"transaction-sealing-seed",
-        transaction_sealing_seed.as_mut(),
-    )
-    .map_err(|_| io::Error::other("transaction sealing seed derivation failed"))?;
+    hkdf.expand(seed_context.as_ref(), transaction_sealing_seed.as_mut())
+        .map_err(|_| io::Error::other("transaction sealing seed derivation failed"))?;
     Ok(transaction_sealing_seed)
 }
 

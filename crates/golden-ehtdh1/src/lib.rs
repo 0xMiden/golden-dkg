@@ -20,20 +20,33 @@
 //! # Disclosure-group EHTDH1 extension
 //!
 //! [`DisclosureGroup`] is a separate extension, not the exact paper scheme. It
-//! deliberately changes share binding from one complete ciphertext to a setup,
-//! common `R`, application-defined group id, associated data, and decryption
-//! context. Participants may cache secret-bearing `x_iR` in a
-//! [`DecryptionPrecomputation`], then issue a fresh
-//! [`DisclosureGroupDecryptionShare`] with
-//! `W_i = x_iR + z_iS_group` and fresh proof nonces for each request.
+//! holds stable common `R`, associated data, and an application-defined group ID.
+//! A later [`DisclosureRequest`] borrows that group and adds one request-specific
+//! decryption context. Participants may cache secret-bearing `x_iR` in a
+//! [`DecryptionPrecomputation`] before a request exists, reuse it across authorized
+//! requests for that stable group, and issue fresh [`DisclosureGroupDecryptionShare`]
+//! values with `W_i = x_iR + z_iS_group,request` and fresh proof nonces.
 //!
-//! Combining a threshold returns an opaque [`DisclosureGroupKey`] containing
-//! `xR`. That key opens every valid ciphertext with the same `R` and associated
-//! data, including a ciphertext Golden cannot know was intended as a group
-//! member. **Disclosure-group membership and authorization are application-layer
-//! responsibilities.** Authenticate or retrieve ciphertexts from trusted storage
-//! and verify membership before releasing shares. Keep precomputed `x_iR` inside
-//! protected participant storage; a threshold of those values reconstructs `xR`.
+//! `S_group,request` is a random-oracle-style hash-to-group point over the setup,
+//! associated data, request context, group ID, and `R`. Security requires that an
+//! adversary cannot obtain a known discrete-log relation between this point and
+//! the generator, `R`, or another selected point; implementations must not replace
+//! hash-to-group with caller-known `hash_to_scalar(...) * G`.
+//!
+//! Combining a threshold returns an opaque, reusable [`DisclosureGroupKey`]
+//! containing `xR`. **The group ID and request context control which shares can
+//! reconstruct `xR`; they do not restrict what `xR` can open after reconstruction.**
+//! The key opens every valid ciphertext with the same `R` and expected associated
+//! data, including a ciphertext Golden cannot know was intended as a group member.
+//! The associated-data check in [`DisclosureGroupKey::open`] is a defensive API
+//! policy, not a cryptographic restriction on extracted `xR`; raw `xR` could open
+//! any wrapper sharing `R` regardless of associated data.
+//!
+//! **Disclosure-group membership and authorization are application-layer
+//! responsibilities.** Authenticate complete ciphertext envelopes or retrieve
+//! them from trusted storage before releasing shares. Keep precomputed `x_iR`
+//! inside protected participant storage; a threshold of those values reconstructs
+//! `xR`.
 //!
 //! # Golden setup bridge
 //!
@@ -82,10 +95,17 @@
 //!
 //! A normally randomized exact-mode payload stays hidden unless the combiner
 //! receives a threshold of valid EHTDH1 decryption shares. This assumes sound
-//! Golden DKG outputs, group operations, hash to group, and randomness. Seeded
-//! sealing additionally assumes the seed and common payload mask stay unknown:
-//! anyone who derives `r`, or learns the mask from one known wrapped plaintext,
-//! can open every sibling payload using that seeded `r` without threshold shares.
+//! Golden DKG outputs, group operations, random-oracle-style hash to group with
+//! unknown discrete-log relations, and randomness.
+//!
+//! Seeded sealing reuses one payload mask. For siblings `c_1 = m_1 XOR mask` and
+//! `c_2 = m_2 XOR mask`, observers learn `c_1 XOR c_2 = m_1 XOR m_2`; this is
+//! unsafe for arbitrary structured or correlated plaintexts. The motivating
+//! disclosure-group use requires independently uniform, fixed-length content
+//! keys, for which their XOR reveals no useful structure to ciphertext-only
+//! observers. It does not protect against known plaintext: anyone who derives
+//! `r`, guesses the seed, or learns one wrapped plaintext and its mask can open
+//! every sibling without threshold shares.
 //!
 //! Ciphertext checks reject malformed EHTDH1 encryption proofs. Share checks
 //! reject malformed shares and shares made for the wrong context.
@@ -100,7 +120,17 @@
 //! - supplying the same associated data to encryption and verification paths;
 //! - checking [`Ciphertext::associated_data`] or using the `*_with_associated_data`
 //!   methods when the application expects a specific associated data value;
-//! - supplying the intended decryption context to validators and combiners;
+//! - supplying the intended request-specific decryption context to validators
+//!   and combiners;
+//! - deriving each supplied 32-byte sealing seed with an application/protocol/
+//!   version domain and inputs that include the transaction or disclosure-group
+//!   identity, a high-entropy nonce, a private-payload commitment where appropriate,
+//!   and the application setup epoch or identity where relevant; Golden binds the
+//!   backend and joint public key internally, but not these application values;
+//! - recognizing that validators cannot verify caller-provided seed entropy and
+//!   that public `R = rG` permits offline testing of low-entropy seed candidates;
+//! - limiting intentional mask reuse to independently uniform, fixed-length
+//!   content keys, never arbitrary structured or correlated plaintexts;
 //! - using a fresh encryption proof nonce `r'` for every encryption, including
 //!   encryptions sharing a seeded `r`; repeating `r'` can reveal `r` and bypass
 //!   threshold decryption for every payload sharing it;
@@ -134,8 +164,9 @@
 //! [`wire`] defines canonical bytes for setup material, keys, ciphertexts, exact
 //! decryption shares, and released disclosure-group shares. The `miden-serde`
 //! and `serde` features adapt those same bytes to their respective serialization
-//! traits. Secret-bearing [`DecryptionPrecomputation`] and [`DisclosureGroupKey`]
-//! values intentionally have no public wire encoding.
+//! traits. [`DisclosureGroup`], [`DisclosureRequest`], secret-bearing
+//! [`DecryptionPrecomputation`], and [`DisclosureGroupKey`] intentionally have no
+//! public wire encoding.
 //!
 //! # Provided APIs
 //!
@@ -266,7 +297,7 @@ pub use context::{
 pub use decrypt::{Combiner, DecryptionShare, UnsealingShare};
 pub use disclosure::{
     DecryptionPrecomputation, DisclosureError, DisclosureGroup, DisclosureGroupDecryptionShare,
-    DisclosureGroupKey,
+    DisclosureGroupKey, DisclosureRequest,
 };
 pub use dkg_bridge::{material_from_dkg_outputs, Ehtdh1Material};
 pub use encrypt::{Ciphertext, SealingKey};

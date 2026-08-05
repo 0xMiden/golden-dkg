@@ -61,13 +61,28 @@ impl<G: GoldenHashToGroup> SealingKey<G> {
     /// Seal bytes with associated data, deriving `r` from a 32-byte seed.
     ///
     /// For a given sealing key, the seed determines `R` independently of the
-    /// plaintext, associated data, and caller RNG. Reusing the same seed and key
-    /// reuses both `R` and the payload mask, so callers must provide sufficient
-    /// entropy and domain separation to prevent unintended reuse. Anyone who
-    /// learns or guesses the seed can derive `r` and open the payload without
-    /// threshold shares. Likewise, a party that knows one plaintext and its
-    /// wrapped payload can recover the common mask and open every same-seed
-    /// sibling. Use seed reuse only within one intentional disclosure scope.
+    /// plaintext, associated data, and caller RNG. Golden binds the backend and
+    /// joint public key into its internal `r` derivation, but it does not bind the
+    /// application transaction, disclosure-group ID, associated data, plaintext,
+    /// or setup epoch. Callers should derive the supplied seed with an
+    /// application/protocol/version domain and inputs including the transaction or
+    /// disclosure-group identity, a high-entropy nonce, a private-payload
+    /// commitment where appropriate, and the application setup epoch or identity
+    /// where relevant. Validators cannot verify caller-provided entropy, and public
+    /// `R = rG` permits offline testing of low-entropy seed candidates.
+    ///
+    /// Reusing the same seed and key reuses both `R` and the payload mask. For
+    /// siblings `c_1 = m_1 XOR mask` and `c_2 = m_2 XOR mask`, an observer learns
+    /// `c_1 XOR c_2 = m_1 XOR m_2`. Disclosure-group mode does not make this safe
+    /// for arbitrary structured or correlated plaintexts. Its motivating use
+    /// requires independently uniform, fixed-length content keys, whose XOR does
+    /// not reveal useful plaintext structure to a ciphertext-only observer.
+    ///
+    /// This does not protect against known plaintext: a party that knows one
+    /// plaintext and wrapped payload can recover the common mask and open every
+    /// same-seed sibling. Anyone who learns or guesses the seed can derive `r`,
+    /// compute `rX`, and do the same without threshold shares. Use seed reuse only
+    /// within one intentional disclosure scope satisfying this payload contract.
     ///
     /// The caller RNG must provide a fresh `r'` for every encryption. Reusing this
     /// Schnorr nonce across distinct proof statements reveals `r` when their

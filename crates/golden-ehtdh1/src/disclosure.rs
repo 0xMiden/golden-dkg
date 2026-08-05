@@ -3,10 +3,25 @@
 //! # Warning
 //!
 //! This extension is not the exact EHTDH1 scheme described by the paper. A
-//! [`DisclosureGroupKey`] opens every valid ciphertext with the disclosure
-//! group's ephemeral public key and associated data, not only ciphertexts that
-//! an application considers members of the group. Applications must
-//! authenticate disclosure-group membership separately.
+//! [`DisclosureGroup`] holds stable disclosure scope, while each
+//! [`DisclosureRequest`] supplies one request-specific authorization context. A
+//! [`DisclosureGroupKey`] opens every valid ciphertext with the group's ephemeral
+//! public key and associated data, not only ciphertexts that an application
+//! considers members of the group. Applications must authenticate
+//! disclosure-group membership separately.
+//!
+//! Released shares use `W_i = x_iR + z_iS_group,request`, where
+//! `S_group,request` preserves the disclosure transcript over setup root,
+//! associated data, request context, group ID, and `R`. This point must be a
+//! random-oracle-style hash-to-group output with no caller-known discrete-log
+//! relation to the generator, `R`, or another selected point. In particular, an
+//! implementation must not substitute caller-known `hash_to_scalar(...) * G`.
+//!
+//! Interpolation removes the request-binding zero share and recovers only `(R,
+//! xR)`. The group ID and request context authorize reconstruction but do not
+//! constrain that recovered capability. Associated-data checking in
+//! [`DisclosureGroupKey::open`] is likewise defensive API policy, not a
+//! cryptographic restriction on raw `xR`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -48,28 +63,29 @@ pub enum DisclosureError {
     Ehtdh1(#[from] Error),
 }
 
-/// Public inputs identifying a disclosure group.
+/// Stable public inputs identifying a disclosure group.
+///
+/// The group can be established before a release request exists, allowing each
+/// participant to precompute `x_iR` once and reuse it across authorized requests.
 ///
 /// # Warning
 ///
 /// Disclosure groups are an extension to, not the exact scheme from, the
 /// EHTDH1 paper. The application must authenticate which ciphertexts belong to
-/// a group; the cryptographic group key is constrained only by the ephemeral
-/// public key and associated data.
+/// a group. The group ID and request context authorize reconstruction and isolate
+/// shares, but do not constrain the recovered `xR` capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisclosureGroup<G: GoldenGroup> {
     ephemeral_public: G::Element,
     associated_data: Vec<u8>,
-    decryption_context: Vec<u8>,
     group_id: Vec<u8>,
 }
 
 impl<G: GoldenGroup> DisclosureGroup<G> {
-    /// Construct a disclosure group, rejecting an identity ephemeral public key.
+    /// Construct stable disclosure-group state, rejecting an identity `R`.
     pub fn new(
         ephemeral_public: G::Element,
         associated_data: &[u8],
-        decryption_context: &[u8],
         group_id: &[u8],
     ) -> Result<Self, DisclosureError> {
         if bool::from(G::is_identity(&ephemeral_public)) {
@@ -79,9 +95,16 @@ impl<G: GoldenGroup> DisclosureGroup<G> {
         Ok(Self {
             ephemeral_public,
             associated_data: associated_data.to_vec(),
-            decryption_context: decryption_context.to_vec(),
             group_id: group_id.to_vec(),
         })
+    }
+
+    /// Create a release request bound to this stable group.
+    pub fn request<'a>(&'a self, decryption_context: &[u8]) -> DisclosureRequest<'a, G> {
+        DisclosureRequest {
+            group: self,
+            decryption_context: decryption_context.to_vec(),
+        }
     }
 
     /// Return the ephemeral public key `R` shared by this group.
@@ -94,14 +117,31 @@ impl<G: GoldenGroup> DisclosureGroup<G> {
         &self.associated_data
     }
 
-    /// Return the context bound into this disclosure group's shares.
-    pub fn decryption_context(&self) -> &[u8] {
-        &self.decryption_context
-    }
-
     /// Return the application-provided disclosure-group identifier.
     pub fn group_id(&self) -> &[u8] {
         &self.group_id
+    }
+}
+
+/// One request-specific authorization context for a stable disclosure group.
+///
+/// Requests are borrowed, in-memory API values. They have no public wire encoding
+/// and can be created only from a [`DisclosureGroup`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisclosureRequest<'a, G: GoldenGroup> {
+    group: &'a DisclosureGroup<G>,
+    decryption_context: Vec<u8>,
+}
+
+impl<'a, G: GoldenGroup> DisclosureRequest<'a, G> {
+    /// Return the stable disclosure group authorized by this request.
+    pub fn group(&self) -> &'a DisclosureGroup<G> {
+        self.group
+    }
+
+    /// Return the request-specific context bound into released shares.
+    pub fn decryption_context(&self) -> &[u8] {
+        &self.decryption_context
     }
 }
 
@@ -137,7 +177,7 @@ impl<G: GoldenGroup> fmt::Debug for DecryptionPrecomputation<G> {
 pub struct DisclosureGroupDecryptionShare<G: GoldenHashToGroup> {
     /// Participant index.
     pub participant: ParticipantIndex,
-    /// `W_i = x_i R + z_i S_group`.
+    /// `W_i = x_i R + z_i S_group,request`.
     pub share: G::Element,
     /// Double-Schnorr proof challenge.
     pub challenge: G::Scalar,
@@ -151,10 +191,16 @@ pub struct DisclosureGroupDecryptionShare<G: GoldenHashToGroup> {
 ///
 /// # Warning
 ///
-/// This key opens **all** valid ciphertexts with the same ephemeral public key
-/// and associated data. It does not authenticate group membership; applications
-/// must enforce membership separately. The reconstructed Diffie-Hellman point
-/// is secret-bearing and is redacted from `Debug` output.
+/// The group ID and request context authorize which shares reconstruct `xR`; they
+/// do not constrain what `xR` can open after reconstruction. This key opens
+/// **all** valid ciphertexts with the same ephemeral public key and expected
+/// associated data, not only application-authenticated group members.
+///
+/// The associated-data equality check in [`Self::open`] is a defensive API policy,
+/// not a cryptographic restriction on `xR`: disclosure or extraction of the raw
+/// point would permit opening any wrapper sharing `R`, regardless of associated
+/// data. The point remains private, has no wire encoding, and is redacted from
+/// `Debug` output.
 pub struct DisclosureGroupKey<G: GoldenHashToGroup> {
     expected_ephemeral_public: G::Element,
     expected_associated_data: Vec<u8>,
@@ -175,7 +221,9 @@ impl<G: GoldenHashToGroup> fmt::Debug for DisclosureGroupKey<G> {
 impl<G: GoldenHashToGroup> DisclosureGroupKey<G> {
     /// Verify and open a ciphertext matching this key's `R` and associated data.
     ///
-    /// This does not establish application-level disclosure-group membership.
+    /// The associated-data check is a defensive API policy, not a cryptographic
+    /// restriction on the underlying `xR`. This method does not establish
+    /// application-level disclosure-group membership.
     pub fn open(&self, message: &Ciphertext<G>) -> Result<Vec<u8>, DisclosureError> {
         verify_ciphertext(message)?;
         if message.ephemeral_public != self.expected_ephemeral_public {
@@ -217,10 +265,10 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
         })
     }
 
-    /// Issue a fresh proof-bearing share for a disclosure group.
+    /// Issue a fresh proof-bearing share for one disclosure request.
     ///
     /// The application must authenticate that the intended ciphertexts belong
-    /// to `disclosure_group`; this extension does not prove membership.
+    /// to `request.group()`; this extension does not prove membership.
     ///
     /// The RNG must produce a fresh pair of Schnorr proof nonces for every
     /// release. Repeating them across distinct challenges reveals the long-lived
@@ -231,20 +279,20 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
         rng: &mut R,
         setup_context: &SetupContext,
         precomputation: &DecryptionPrecomputation<G>,
-        disclosure_group: &DisclosureGroup<G>,
+        request: &DisclosureRequest<'_, G>,
     ) -> Result<DisclosureGroupDecryptionShare<G>, DisclosureError> {
         if precomputation.participant != self.share.participant {
             return Err(DisclosureError::PrecomputationParticipantMismatch);
         }
-        if precomputation.ephemeral_public != disclosure_group.ephemeral_public {
+        if precomputation.ephemeral_public != request.group.ephemeral_public {
             return Err(DisclosureError::PrecomputationEphemeralPublicMismatch);
         }
 
         let public_decryption_share = G::mul_generator(&self.share.decryption);
         let public_context_share = G::mul_generator(&self.share.context);
-        let decryption_group = disclosure_group_point::<G>(setup_context, disclosure_group)?;
+        let decryption_group = disclosure_group_point::<G>(setup_context, request)?;
 
-        // `W_i = x_i R + z_i S_group`, reusing only the cached `x_i R` term.
+        // `W_i = x_i R + z_i S_group,request`, reusing only cached `x_i R`.
         let share = G::add(
             &precomputation.decryption_contribution,
             &G::mul(&decryption_group, &self.share.context),
@@ -256,7 +304,7 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
         let public_decryption_commitment = G::mul_generator(&decryption_nonce);
         let public_context_commitment = G::mul_generator(&context_nonce);
         let share_commitment = G::add(
-            &G::mul(&disclosure_group.ephemeral_public, &decryption_nonce),
+            &G::mul(&request.group.ephemeral_public, &decryption_nonce),
             &G::mul(&decryption_group, &context_nonce),
         );
 
@@ -284,10 +332,10 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
 }
 
 impl<G: GoldenHashToGroup> Combiner<G> {
-    /// Combine exactly the configured threshold of disclosure-group shares.
+    /// Combine exactly the configured threshold of request-homogeneous shares.
     pub fn combine_disclosure_group_exact(
         &self,
-        disclosure_group: &DisclosureGroup<G>,
+        request: &DisclosureRequest<'_, G>,
         shares: &[DisclosureGroupDecryptionShare<G>],
     ) -> Result<DisclosureGroupKey<G>, CombineError> {
         if shares.len() != self.public_key_set.threshold {
@@ -296,13 +344,13 @@ impl<G: GoldenHashToGroup> Combiner<G> {
                 provided: shares.len(),
             });
         }
-        self.combine_disclosure_group_selected(disclosure_group, shares)
+        self.combine_disclosure_group_selected(request, shares)
     }
 
-    /// Search the supplied shares for a valid threshold disclosure-group set.
+    /// Search the supplied shares for a valid threshold set for this request.
     pub fn combine_disclosure_group_quorum(
         &self,
-        disclosure_group: &DisclosureGroup<G>,
+        request: &DisclosureRequest<'_, G>,
         shares: &[DisclosureGroupDecryptionShare<G>],
     ) -> Result<DisclosureGroupKey<G>, CombineError> {
         let mut seen = BTreeSet::new();
@@ -318,12 +366,7 @@ impl<G: GoldenHashToGroup> Combiner<G> {
                 malformed.push(share.participant.get());
                 continue;
             };
-            match verify_disclosure_group_share(
-                &self.setup_context,
-                disclosure_group,
-                share,
-                public_share,
-            ) {
+            match verify_disclosure_group_share(&self.setup_context, request, share, public_share) {
                 Ok(()) => valid.push(share.clone()),
                 Err(_) => malformed.push(share.participant.get()),
             }
@@ -339,15 +382,12 @@ impl<G: GoldenHashToGroup> Combiner<G> {
             });
         }
 
-        self.combine_disclosure_group_selected(
-            disclosure_group,
-            &valid[..self.public_key_set.threshold],
-        )
+        self.combine_disclosure_group_selected(request, &valid[..self.public_key_set.threshold])
     }
 
     fn combine_disclosure_group_selected(
         &self,
-        disclosure_group: &DisclosureGroup<G>,
+        request: &DisclosureRequest<'_, G>,
         shares: &[DisclosureGroupDecryptionShare<G>],
     ) -> Result<DisclosureGroupKey<G>, CombineError> {
         let mut seen = BTreeSet::new();
@@ -363,13 +403,8 @@ impl<G: GoldenHashToGroup> Combiner<G> {
                 .public_share(share.participant)
                 .ok_or(Error::UnknownParticipant(share.participant.get()))
                 .map_err(CombineError::Ciphertext)?;
-            if verify_disclosure_group_share(
-                &self.setup_context,
-                disclosure_group,
-                share,
-                public_share,
-            )
-            .is_err()
+            if verify_disclosure_group_share(&self.setup_context, request, share, public_share)
+                .is_err()
             {
                 malformed.push(share.participant.get());
             }
@@ -390,8 +425,8 @@ impl<G: GoldenHashToGroup> Combiner<G> {
         }
 
         Ok(DisclosureGroupKey {
-            expected_ephemeral_public: disclosure_group.ephemeral_public.clone(),
-            expected_associated_data: disclosure_group.associated_data.clone(),
+            expected_ephemeral_public: request.group.ephemeral_public.clone(),
+            expected_associated_data: request.group.associated_data.clone(),
             dh_point,
         })
     }
@@ -399,11 +434,11 @@ impl<G: GoldenHashToGroup> Combiner<G> {
 
 fn verify_disclosure_group_share<G: GoldenHashToGroup>(
     setup_context: &SetupContext,
-    disclosure_group: &DisclosureGroup<G>,
+    request: &DisclosureRequest<'_, G>,
     share: &DisclosureGroupDecryptionShare<G>,
     public_share: &PublicShare<G>,
 ) -> Result<(), Error> {
-    let decryption_group = disclosure_group_point::<G>(setup_context, disclosure_group)?;
+    let decryption_group = disclosure_group_point::<G>(setup_context, request)?;
     let public_decryption_commitment = G::sub(
         &G::mul_generator(&share.decryption_response),
         &G::mul(&public_share.decryption, &share.challenge),
@@ -414,10 +449,7 @@ fn verify_disclosure_group_share<G: GoldenHashToGroup>(
     );
     let share_commitment = G::sub(
         &G::add(
-            &G::mul(
-                &disclosure_group.ephemeral_public,
-                &share.decryption_response,
-            ),
+            &G::mul(&request.group.ephemeral_public, &share.decryption_response),
             &G::mul(&decryption_group, &share.context_response),
         ),
         &G::mul(&share.share, &share.challenge),
@@ -441,19 +473,22 @@ fn verify_disclosure_group_share<G: GoldenHashToGroup>(
     }
 }
 
-/// Derive `S_group` from the disclosure-group inputs and setup root.
+/// Derive `S_group,request` from stable group and request inputs.
+///
+/// The transcript domain, labels, field order, and encoded values intentionally
+/// match the original disclosure-group construction.
 fn disclosure_group_point<G: GoldenHashToGroup>(
     setup_context: &SetupContext,
-    disclosure_group: &DisclosureGroup<G>,
+    request: &DisclosureRequest<'_, G>,
 ) -> Result<G::Element, Error> {
     let mut transcript =
         TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"hdgd-disclosure-group");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
     transcript.bytes(b"setup-context-root", &setup_context.root());
-    transcript.bytes(b"ad", &disclosure_group.associated_data);
-    transcript.bytes(b"dc", &disclosure_group.decryption_context);
-    transcript.bytes(b"disclosure-group-id", &disclosure_group.group_id);
-    transcript.element::<G>(b"R", &disclosure_group.ephemeral_public);
+    transcript.bytes(b"ad", &request.group.associated_data);
+    transcript.bytes(b"dc", &request.decryption_context);
+    transcript.bytes(b"disclosure-group-id", &request.group.group_id);
+    transcript.element::<G>(b"R", &request.group.ephemeral_public);
     G::hash_to_group(
         b"golden-ehtdh1-hdgd-disclosure-group-v1",
         &transcript.root(),
@@ -625,16 +660,9 @@ mod tests {
     fn group_for(
         message: &Ciphertext<G>,
         associated_data: &[u8],
-        decryption_context: &[u8],
         group_id: &[u8],
     ) -> DisclosureGroup<G> {
-        DisclosureGroup::new(
-            message.ephemeral_public,
-            associated_data,
-            decryption_context,
-            group_id,
-        )
-        .unwrap()
+        DisclosureGroup::new(message.ephemeral_public, associated_data, group_id).unwrap()
     }
 
     fn ordinary_shares(
@@ -657,7 +685,7 @@ mod tests {
     fn disclosure_shares(
         secret_shares: &[SecretShare<G>],
         setup_context: &SetupContext,
-        disclosure_group: &DisclosureGroup<G>,
+        request: &DisclosureRequest<'_, G>,
         rng_seed: u8,
     ) -> Vec<DisclosureGroupDecryptionShare<G>> {
         let mut rng = ChaCha20Rng::from_seed([rng_seed; 32]);
@@ -666,15 +694,10 @@ mod tests {
             .map(|share| {
                 let unsealing_share = UnsealingShare::new(share.clone());
                 let precomputation = unsealing_share
-                    .precompute_for_ephemeral_public(disclosure_group.ephemeral_public())
+                    .precompute_for_ephemeral_public(request.group().ephemeral_public())
                     .unwrap();
                 unsealing_share
-                    .issue_disclosure_group_share(
-                        &mut rng,
-                        setup_context,
-                        &precomputation,
-                        disclosure_group,
-                    )
+                    .issue_disclosure_group_share(&mut rng, setup_context, &precomputation, request)
                     .unwrap()
             })
             .collect()
@@ -745,20 +768,96 @@ mod tests {
     fn one_disclosure_group_key_opens_multiple_same_r_same_ad_ciphertexts() {
         let fixture = fixture();
         let (first, second) = sibling_ciphertexts(&fixture.sealing_key);
-        let disclosure_group = group_for(&first, ASSOCIATED_DATA, DECRYPTION_CONTEXT, GROUP_ID);
-        let shares = disclosure_shares(
-            &fixture.secret_shares,
-            &fixture.setup_context,
-            &disclosure_group,
-            32,
-        );
+        let disclosure_group = group_for(&first, ASSOCIATED_DATA, GROUP_ID);
+        let request = disclosure_group.request(DECRYPTION_CONTEXT);
+        let shares =
+            disclosure_shares(&fixture.secret_shares, &fixture.setup_context, &request, 32);
         let key = Combiner::new(fixture.public_key_set, fixture.setup_context)
             .unwrap()
-            .combine_disclosure_group_exact(&disclosure_group, &shares[..2])
+            .combine_disclosure_group_exact(&request, &shares[..2])
             .unwrap();
 
         assert_eq!(key.open(&first).unwrap(), b"first content key");
         assert_eq!(key.open(&second).unwrap(), b"second content key");
+    }
+
+    #[test]
+    fn one_precomputation_is_reusable_across_requests_for_a_stable_group() {
+        let fixture = fixture();
+        let (first, second) = sibling_ciphertexts(&fixture.sealing_key);
+        let group =
+            DisclosureGroup::new(first.ephemeral_public, ASSOCIATED_DATA, GROUP_ID).unwrap();
+
+        let participants = fixture
+            .secret_shares
+            .iter()
+            .cloned()
+            .map(UnsealingShare::new)
+            .collect::<Vec<_>>();
+        let precomputations = participants
+            .iter()
+            .map(|participant| {
+                participant
+                    .precompute_for_ephemeral_public(group.ephemeral_public())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let request_a = group.request(b"request a");
+        let request_b = group.request(b"request b");
+        assert_eq!(request_a.group(), &group);
+        assert_eq!(request_a.decryption_context(), b"request a");
+        assert_eq!(request_b.group(), &group);
+        assert_eq!(request_b.decryption_context(), b"request b");
+
+        let mut rng = ChaCha20Rng::from_seed([33u8; 32]);
+        let request_a_shares = participants
+            .iter()
+            .zip(&precomputations)
+            .map(|(participant, precomputation)| {
+                participant
+                    .issue_disclosure_group_share(
+                        &mut rng,
+                        &fixture.setup_context,
+                        precomputation,
+                        &request_a,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let request_b_shares = participants
+            .iter()
+            .zip(&precomputations)
+            .map(|(participant, precomputation)| {
+                participant
+                    .issue_disclosure_group_share(
+                        &mut rng,
+                        &fixture.setup_context,
+                        precomputation,
+                        &request_b,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let combiner = Combiner::new(fixture.public_key_set, fixture.setup_context).unwrap();
+        let request_a_key = combiner
+            .combine_disclosure_group_exact(&request_a, &request_a_shares[..2])
+            .unwrap();
+        let request_b_key = combiner
+            .combine_disclosure_group_exact(&request_b, &request_b_shares[..2])
+            .unwrap();
+
+        assert_eq!(request_a_key.open(&first).unwrap(), b"first content key");
+        assert_eq!(request_a_key.open(&second).unwrap(), b"second content key");
+        assert_eq!(request_b_key.open(&first).unwrap(), b"first content key");
+        assert_eq!(request_b_key.open(&second).unwrap(), b"second content key");
+
+        let mixed_requests = [request_a_shares[0].clone(), request_b_shares[1].clone()];
+        assert_malformed(
+            combiner.combine_disclosure_group_exact(&request_a, &mixed_requests),
+            &[2],
+        );
     }
 
     #[test]
@@ -772,13 +871,10 @@ mod tests {
             ASSOCIATED_DATA,
             &[43u8; 32],
         );
-        let disclosure_group = group_for(&first, ASSOCIATED_DATA, DECRYPTION_CONTEXT, GROUP_ID);
-        let other_r_group = group_for(
-            &other_r_message,
-            ASSOCIATED_DATA,
-            DECRYPTION_CONTEXT,
-            GROUP_ID,
-        );
+        let disclosure_group = group_for(&first, ASSOCIATED_DATA, GROUP_ID);
+        let request = disclosure_group.request(DECRYPTION_CONTEXT);
+        let other_r_group = group_for(&other_r_message, ASSOCIATED_DATA, GROUP_ID);
+        let other_r_request = other_r_group.request(DECRYPTION_CONTEXT);
         let unsealing_share = UnsealingShare::new(fixture.secret_shares[0].clone());
         let precomputation = unsealing_share
             .precompute_for_ephemeral_public(&first.ephemeral_public)
@@ -790,28 +886,24 @@ mod tests {
                 &mut rng,
                 &fixture.setup_context,
                 &precomputation,
-                &other_r_group,
+                &other_r_request,
             ),
             Err(DisclosureError::PrecomputationEphemeralPublicMismatch)
         );
 
-        let shares = disclosure_shares(
-            &fixture.secret_shares,
-            &fixture.setup_context,
-            &disclosure_group,
-            34,
-        );
+        let shares =
+            disclosure_shares(&fixture.secret_shares, &fixture.setup_context, &request, 34);
         let combiner = Combiner::new(
             fixture.public_key_set.clone(),
             fixture.setup_context.clone(),
         )
         .unwrap();
         assert_malformed(
-            combiner.combine_disclosure_group_exact(&other_r_group, &shares[..2]),
+            combiner.combine_disclosure_group_exact(&other_r_request, &shares[..2]),
             &[1, 2],
         );
         let key = combiner
-            .combine_disclosure_group_exact(&disclosure_group, &shares[..2])
+            .combine_disclosure_group_exact(&request, &shares[..2])
             .unwrap();
         assert_eq!(
             key.open(&other_r_message),
@@ -830,7 +922,7 @@ mod tests {
             Err(DisclosureError::AssociatedDataMismatch)
         );
         assert_eq!(
-            DisclosureGroup::<G>::new(G::identity(), ASSOCIATED_DATA, DECRYPTION_CONTEXT, GROUP_ID),
+            DisclosureGroup::<G>::new(G::identity(), ASSOCIATED_DATA, GROUP_ID),
             Err(DisclosureError::InvalidEphemeralPublic)
         );
         assert!(matches!(
@@ -843,43 +935,31 @@ mod tests {
     fn every_disclosure_group_transcript_input_is_bound() {
         let fixture = fixture();
         let (message, _) = sibling_ciphertexts(&fixture.sealing_key);
-        let disclosure_group = group_for(&message, ASSOCIATED_DATA, DECRYPTION_CONTEXT, GROUP_ID);
-        let shares = disclosure_shares(
-            &fixture.secret_shares,
-            &fixture.setup_context,
-            &disclosure_group,
-            35,
-        );
+        let disclosure_group = group_for(&message, ASSOCIATED_DATA, GROUP_ID);
+        let request = disclosure_group.request(DECRYPTION_CONTEXT);
+        let shares =
+            disclosure_shares(&fixture.secret_shares, &fixture.setup_context, &request, 35);
         let combiner = Combiner::new(
             fixture.public_key_set.clone(),
             fixture.setup_context.clone(),
         )
         .unwrap();
 
-        let wrong_group_id = group_for(
-            &message,
-            ASSOCIATED_DATA,
-            DECRYPTION_CONTEXT,
-            b"wrong group",
-        );
+        let wrong_group_id = group_for(&message, ASSOCIATED_DATA, b"wrong group");
+        let wrong_group_id_request = wrong_group_id.request(DECRYPTION_CONTEXT);
         assert_malformed(
-            combiner.combine_disclosure_group_exact(&wrong_group_id, &shares[..2]),
+            combiner.combine_disclosure_group_exact(&wrong_group_id_request, &shares[..2]),
             &[1, 2],
         );
 
-        let wrong_associated_data = group_for(
-            &message,
-            b"wrong associated data",
-            DECRYPTION_CONTEXT,
-            GROUP_ID,
-        );
+        let wrong_associated_data = group_for(&message, b"wrong associated data", GROUP_ID);
+        let wrong_associated_data_request = wrong_associated_data.request(DECRYPTION_CONTEXT);
         assert_malformed(
-            combiner.combine_disclosure_group_exact(&wrong_associated_data, &shares[..2]),
+            combiner.combine_disclosure_group_exact(&wrong_associated_data_request, &shares[..2]),
             &[1, 2],
         );
 
-        let wrong_decryption_context =
-            group_for(&message, ASSOCIATED_DATA, b"wrong request", GROUP_ID);
+        let wrong_decryption_context = disclosure_group.request(b"wrong request");
         assert_malformed(
             combiner.combine_disclosure_group_exact(&wrong_decryption_context, &shares[..2]),
             &[1, 2],
@@ -890,7 +970,7 @@ mod tests {
         let wrong_setup_combiner =
             Combiner::new(fixture.public_key_set, wrong_setup_context).unwrap();
         assert_malformed(
-            wrong_setup_combiner.combine_disclosure_group_exact(&disclosure_group, &shares[..2]),
+            wrong_setup_combiner.combine_disclosure_group_exact(&request, &shares[..2]),
             &[1, 2],
         );
     }
@@ -899,12 +979,22 @@ mod tests {
     fn shares_from_different_groups_or_requests_cannot_be_mixed() {
         let fixture = fixture();
         let (message, _) = sibling_ciphertexts(&fixture.sealing_key);
-        let group_a = group_for(&message, ASSOCIATED_DATA, b"request a", b"group a");
-        let group_b = group_for(&message, ASSOCIATED_DATA, b"request a", b"group b");
-        let group_a_shares =
-            disclosure_shares(&fixture.secret_shares, &fixture.setup_context, &group_a, 36);
-        let group_b_shares =
-            disclosure_shares(&fixture.secret_shares, &fixture.setup_context, &group_b, 37);
+        let group_a = group_for(&message, ASSOCIATED_DATA, b"group a");
+        let group_b = group_for(&message, ASSOCIATED_DATA, b"group b");
+        let group_a_request = group_a.request(b"request a");
+        let group_b_request = group_b.request(b"request a");
+        let group_a_shares = disclosure_shares(
+            &fixture.secret_shares,
+            &fixture.setup_context,
+            &group_a_request,
+            36,
+        );
+        let group_b_shares = disclosure_shares(
+            &fixture.secret_shares,
+            &fixture.setup_context,
+            &group_b_request,
+            37,
+        );
         let combiner = Combiner::new(
             fixture.public_key_set.clone(),
             fixture.setup_context.clone(),
@@ -912,12 +1002,13 @@ mod tests {
         .unwrap();
         let mixed_groups = vec![group_a_shares[0].clone(), group_b_shares[1].clone()];
         assert_malformed(
-            combiner.combine_disclosure_group_exact(&group_a, &mixed_groups),
+            combiner.combine_disclosure_group_exact(&group_a_request, &mixed_groups),
             &[2],
         );
 
-        let request_a = group_for(&message, ASSOCIATED_DATA, b"request a", GROUP_ID);
-        let request_b = group_for(&message, ASSOCIATED_DATA, b"request b", GROUP_ID);
+        let group = group_for(&message, ASSOCIATED_DATA, GROUP_ID);
+        let request_a = group.request(b"request a");
+        let request_b = group.request(b"request b");
         let request_a_shares = disclosure_shares(
             &fixture.secret_shares,
             &fixture.setup_context,
@@ -941,7 +1032,8 @@ mod tests {
     fn precomputation_is_bound_to_its_participant() {
         let fixture = fixture();
         let (message, _) = sibling_ciphertexts(&fixture.sealing_key);
-        let disclosure_group = group_for(&message, ASSOCIATED_DATA, DECRYPTION_CONTEXT, GROUP_ID);
+        let disclosure_group = group_for(&message, ASSOCIATED_DATA, GROUP_ID);
+        let request = disclosure_group.request(DECRYPTION_CONTEXT);
         let first = UnsealingShare::new(fixture.secret_shares[0].clone());
         let second = UnsealingShare::new(fixture.secret_shares[1].clone());
         let precomputation = first
@@ -954,7 +1046,7 @@ mod tests {
                 &mut rng,
                 &fixture.setup_context,
                 &precomputation,
-                &disclosure_group,
+                &request,
             ),
             Err(DisclosureError::PrecomputationParticipantMismatch)
         );
@@ -964,7 +1056,8 @@ mod tests {
     fn repeated_release_reuses_w_but_refreshes_and_verifies_the_proof() {
         let fixture = fixture();
         let (message, _) = sibling_ciphertexts(&fixture.sealing_key);
-        let disclosure_group = group_for(&message, ASSOCIATED_DATA, DECRYPTION_CONTEXT, GROUP_ID);
+        let disclosure_group = group_for(&message, ASSOCIATED_DATA, GROUP_ID);
+        let request = disclosure_group.request(DECRYPTION_CONTEXT);
         let first_participant = UnsealingShare::new(fixture.secret_shares[0].clone());
         let first_precomputation = first_participant
             .precompute_for_ephemeral_public(disclosure_group.ephemeral_public())
@@ -975,7 +1068,7 @@ mod tests {
                 &mut rng,
                 &fixture.setup_context,
                 &first_precomputation,
-                &disclosure_group,
+                &request,
             )
             .unwrap();
         let second_release = first_participant
@@ -983,7 +1076,7 @@ mod tests {
                 &mut rng,
                 &fixture.setup_context,
                 &first_precomputation,
-                &disclosure_group,
+                &request,
             )
             .unwrap();
 
@@ -1008,19 +1101,16 @@ mod tests {
                 &mut rng,
                 &fixture.setup_context,
                 &second_precomputation,
-                &disclosure_group,
+                &request,
             )
             .unwrap();
         let combiner = Combiner::new(fixture.public_key_set, fixture.setup_context).unwrap();
 
         let first_key = combiner
-            .combine_disclosure_group_exact(
-                &disclosure_group,
-                &[first_release, other_share.clone()],
-            )
+            .combine_disclosure_group_exact(&request, &[first_release, other_share.clone()])
             .unwrap();
         let second_key = combiner
-            .combine_disclosure_group_exact(&disclosure_group, &[second_release, other_share])
+            .combine_disclosure_group_exact(&request, &[second_release, other_share])
             .unwrap();
         assert_eq!(first_key.open(&message).unwrap(), b"first content key");
         assert_eq!(second_key.open(&message).unwrap(), b"first content key");
@@ -1030,31 +1120,28 @@ mod tests {
     fn disclosure_exact_count_and_quorum_selection_match_ordinary_semantics() {
         let fixture = fixture();
         let (message, _) = sibling_ciphertexts(&fixture.sealing_key);
-        let disclosure_group = group_for(&message, ASSOCIATED_DATA, DECRYPTION_CONTEXT, GROUP_ID);
-        let shares = disclosure_shares(
-            &fixture.secret_shares,
-            &fixture.setup_context,
-            &disclosure_group,
-            42,
-        );
+        let disclosure_group = group_for(&message, ASSOCIATED_DATA, GROUP_ID);
+        let request = disclosure_group.request(DECRYPTION_CONTEXT);
+        let shares =
+            disclosure_shares(&fixture.secret_shares, &fixture.setup_context, &request, 42);
         let combiner = Combiner::new(fixture.public_key_set, fixture.setup_context).unwrap();
 
         assert!(matches!(
-            combiner.combine_disclosure_group_exact(&disclosure_group, &shares[..1]),
+            combiner.combine_disclosure_group_exact(&request, &shares[..1]),
             Err(CombineError::InsufficientShares {
                 required: 2,
                 provided: 1
             })
         ));
         assert!(matches!(
-            combiner.combine_disclosure_group_exact(&disclosure_group, &shares),
+            combiner.combine_disclosure_group_exact(&request, &shares),
             Err(CombineError::InsufficientShares {
                 required: 2,
                 provided: 3
             })
         ));
         assert!(matches!(
-            combiner.combine_disclosure_group_quorum(&disclosure_group, &shares[..1]),
+            combiner.combine_disclosure_group_quorum(&request, &shares[..1]),
             Err(CombineError::InsufficientShares {
                 required: 2,
                 provided: 1
@@ -1063,14 +1150,14 @@ mod tests {
 
         let duplicate = vec![shares[0].clone(), shares[0].clone()];
         assert_malformed(
-            combiner.combine_disclosure_group_exact(&disclosure_group, &duplicate),
+            combiner.combine_disclosure_group_exact(&request, &duplicate),
             &[1],
         );
 
         let mut with_surplus_malformed = shares.clone();
         with_surplus_malformed[2].share = G::add(&with_surplus_malformed[2].share, &G::generator());
         let quorum_key = combiner
-            .combine_disclosure_group_quorum(&disclosure_group, &with_surplus_malformed)
+            .combine_disclosure_group_quorum(&request, &with_surplus_malformed)
             .unwrap();
         assert_eq!(quorum_key.open(&message).unwrap(), b"first content key");
 
@@ -1079,7 +1166,7 @@ mod tests {
             G::add(&malformed_before_threshold.share, &G::generator());
         assert_malformed(
             combiner.combine_disclosure_group_quorum(
-                &disclosure_group,
+                &request,
                 &[shares[0].clone(), malformed_before_threshold],
             ),
             &[2],

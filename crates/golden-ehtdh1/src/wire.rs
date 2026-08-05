@@ -751,20 +751,15 @@ mod tests {
         let disclosure_group = DisclosureGroup::new(
             ciphertext.ephemeral_public,
             ciphertext.associated_data(),
-            b"request",
             b"group-1",
         )
         .unwrap();
         let precomputation = unsealing_share
             .precompute_for_ephemeral_public(disclosure_group.ephemeral_public())
             .unwrap();
+        let request = disclosure_group.request(b"request");
         let disclosure_group_decryption_share = unsealing_share
-            .issue_disclosure_group_share(
-                &mut rng,
-                &setup_context,
-                &precomputation,
-                &disclosure_group,
-            )
+            .issue_disclosure_group_share(&mut rng, &setup_context, &precomputation, &request)
             .unwrap();
         let public_share = public_key_set
             .public_share(secret_share.participant)
@@ -845,6 +840,11 @@ mod tests {
     fn exact_and_disclosure_group_shares_reject_each_others_bytes() {
         let values = fixtures();
 
+        assert_eq!(DisclosureGroupDecryptionShare::<G>::TAG, 0x27);
+        assert_eq!(
+            DisclosureGroupDecryptionShare::<G>::CODEC_ID,
+            "ehtdh1-disclosure-group-decryption-share-v1"
+        );
         assert_ne!(
             DecryptionShare::<G>::TAG,
             DisclosureGroupDecryptionShare::<G>::TAG
