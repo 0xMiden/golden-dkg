@@ -17,36 +17,40 @@
 //! and [`Combiner::combine_exact`] / [`Combiner::combine_quorum`] APIs retain
 //! these exact-ciphertext semantics.
 //!
-//! # Disclosure-group EHTDH1 extension
+//! # Disclosure-scope EHTDH1 extension
 //!
-//! [`DisclosureGroup`] is a separate extension, not the exact paper scheme. It
-//! holds stable common `R`, associated data, and an application-defined group ID.
-//! A later [`DisclosureRequest`] borrows that group and adds one request-specific
-//! decryption context. Participants may cache secret-bearing `x_iR` in a
-//! [`DecryptionPrecomputation`] before a request exists, reuse it across authorized
-//! requests for that stable group, and issue fresh [`DisclosureGroupDecryptionShare`]
-//! values with `W_i = x_iR + z_iS_group,request` and fresh proof nonces.
+//! [`DisclosureScope`] is a separate extension, not the exact paper scheme. It
+//! holds stable common `R`, associated data, and an application-defined scope ID.
+//! A later [`DisclosureRequest`] borrows that scope and adds one request-specific
+//! decryption context. Request construction describes transcript inputs; it does
+//! not authorize release. Participants may cache secret-bearing `x_iR` in a
+//! [`DecryptionPrecomputation`] before a request exists, reuse it across permitted
+//! requests for that stable scope, and issue fresh [`DisclosureDecryptionShare`]
+//! values with `W_i = x_iR + z_iS_scope,request` and fresh proof nonces.
 //!
-//! `S_group,request` is a random-oracle-style hash-to-group point over the setup,
-//! associated data, request context, group ID, and `R`. Security requires that an
-//! adversary cannot obtain a known discrete-log relation between this point and
-//! the generator, `R`, or another selected point; implementations must not replace
-//! hash-to-group with caller-known `hash_to_scalar(...) * G`.
+//! Each domain-separated `S_scope,request` must behave as an independent random
+//! group element with no exploitable relation to the generator, `R`, or another
+//! selected point; implementations must not replace hash-to-group with publicly
+//! computable `hash_to_scalar(...) * G`. Security across repeated adaptive requests
+//! is extension intuition and an explicit review assumption, not a claim that the
+//! original EHTDH1 proof directly covers the modified statement.
 //!
-//! Combining a threshold returns an opaque, reusable [`DisclosureGroupKey`]
-//! containing `xR`. **The group ID and request context control which shares can
-//! reconstruct `xR`; they do not restrict what `xR` can open after reconstruction.**
-//! The key opens every valid ciphertext with the same `R` and expected associated
-//! data, including a ciphertext Golden cannot know was intended as a group member.
-//! The associated-data check in [`DisclosureGroupKey::open`] is a defensive API
-//! policy, not a cryptographic restriction on extracted `xR`; raw `xR` could open
-//! any wrapper sharing `R` regardless of associated data.
+//! Combining a threshold returns an opaque, reusable [`DisclosureKey`] containing
+//! `xR`. **Scope ID and request context determine which shares can reconstruct
+//! `xR`; they do not restrict what `xR` can open after reconstruction.** The key
+//! opens every valid ciphertext with the same `R` and expected associated data,
+//! including ciphertexts Golden cannot know were intended scope members. The
+//! associated-data check in [`DisclosureKey::open`] is defensive API policy, not a
+//! cryptographic restriction on raw `xR`.
 //!
-//! **Disclosure-group membership and authorization are application-layer
-//! responsibilities.** Authenticate complete ciphertext envelopes or retrieve
-//! them from trusted storage before releasing shares. Keep precomputed `x_iR`
-//! inside protected participant storage; a threshold of those values reconstructs
-//! `xR`.
+//! **Scope membership and release authorization are application-layer
+//! responsibilities.** The application release authorizer must authenticate
+//! complete ciphertext envelopes and decide whether participants may issue shares.
+//! Keep precomputed `x_iR` in protected participant storage only for the legitimate
+//! disclosure window; a threshold of those values reconstructs `xR`.
+//!
+//! See the [disclosure-scope protocol and security model](https://github.com/0xMiden/golden-dkg/blob/main/crates/golden-ehtdh1/DISCLOSURE_SCOPE_SECURITY.md)
+//! for transcript compatibility, assumptions, lifecycle, and blast-radius details.
 //!
 //! # Golden setup bridge
 //!
@@ -84,7 +88,7 @@
 //! | `S = Hdgd(ad, dc, ctxt)` | internal `decryption_group` over [`SetupContext::root`] |
 //! | `W_i = x_i R + z_i S` | [`DecryptionShare::share`] |
 //!
-//! The disclosure-group types are an explicitly separate extension and are not
+//! The disclosure-scope types are an explicitly separate extension and are not
 //! part of this paper mapping.
 //!
 //! This crate also binds [`SetupContext::root`] into `Hdgd`. That root commits
@@ -101,7 +105,7 @@
 //! Seeded sealing reuses one payload mask. For siblings `c_1 = m_1 XOR mask` and
 //! `c_2 = m_2 XOR mask`, observers learn `c_1 XOR c_2 = m_1 XOR m_2`; this is
 //! unsafe for arbitrary structured or correlated plaintexts. The motivating
-//! disclosure-group use requires independently uniform, fixed-length content
+//! disclosure-scope use requires independently uniform, fixed-length content
 //! keys, for which their XOR reveals no useful structure to ciphertext-only
 //! observers. It does not protect against known plaintext: anyone who derives
 //! `r`, guesses the seed, or learns one wrapped plaintext and its mask can open
@@ -123,7 +127,7 @@
 //! - supplying the intended request-specific decryption context to validators
 //!   and combiners;
 //! - deriving each supplied 32-byte sealing seed with an application/protocol/
-//!   version domain and inputs that include the transaction or disclosure-group
+//!   version domain and inputs that include the transaction or disclosure-scope
 //!   identity, a high-entropy nonce, a private-payload commitment where appropriate,
 //!   and the application setup epoch or identity where relevant; Golden binds the
 //!   backend and joint public key internally, but not these application values;
@@ -136,7 +140,8 @@
 //!   threshold decryption for every payload sharing it;
 //! - using fresh disclosure-share proof nonces for every release; repeating them
 //!   across distinct challenges reveals the participant's `x_i` and `z_i`;
-//! - authenticating disclosure-group membership before releasing group shares;
+//! - authenticating disclosure-scope membership and externally authorizing release
+//!   before issuing request-bound disclosure shares;
 //! - keeping [`DecryptionPrecomputation`] values in protected participant storage;
 //! - handling replay, validator identity, transport authentication, and
 //!   malformed share reporting outside this crate.
@@ -162,10 +167,10 @@
 //! prevention.
 //!
 //! [`wire`] defines canonical bytes for setup material, keys, ciphertexts, exact
-//! decryption shares, and released disclosure-group shares. The `miden-serde`
+//! decryption shares, and released disclosure shares. The `miden-serde`
 //! and `serde` features adapt those same bytes to their respective serialization
-//! traits. [`DisclosureGroup`], [`DisclosureRequest`], secret-bearing
-//! [`DecryptionPrecomputation`], and [`DisclosureGroupKey`] intentionally have no
+//! traits. [`DisclosureScope`], [`DisclosureRequest`], secret-bearing
+//! [`DecryptionPrecomputation`], and [`DisclosureKey`] intentionally have no
 //! public wire encoding.
 //!
 //! # Provided APIs
@@ -296,8 +301,8 @@ pub use context::{
 };
 pub use decrypt::{Combiner, DecryptionShare, UnsealingShare};
 pub use disclosure::{
-    DecryptionPrecomputation, DisclosureError, DisclosureGroup, DisclosureGroupDecryptionShare,
-    DisclosureGroupKey, DisclosureRequest,
+    DecryptionPrecomputation, DisclosureDecryptionShare, DisclosureError, DisclosureKey,
+    DisclosureRequest, DisclosureScope,
 };
 pub use dkg_bridge::{material_from_dkg_outputs, Ehtdh1Material};
 pub use encrypt::{Ciphertext, SealingKey};

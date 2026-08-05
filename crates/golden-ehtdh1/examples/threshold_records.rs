@@ -1,12 +1,12 @@
-//! Threshold disclosure-group decryption for stored records with three participants.
+//! Threshold disclosure-scope decryption for stored records with three participants.
 //!
-//! This example follows a two-of-three disclosure-group flow.
+//! This example follows a two-of-three disclosure-scope flow.
 //!
 //! 1. Three participants run the two Golden DKG sessions needed by EHTDH1.
 //!    They agree on one public sealing key, and each receives its own secret share.
 //! 2. A client supplies one private value and a uniformly random 256-bit nonce.
 //!    The application derives a shared sealing seed with domain-separated
-//!    HKDF-SHA256, binding the disclosure-group identity, application associated
+//!    HKDF-SHA256, binding the disclosure-scope identity, application associated
 //!    data, private-payload commitment, and setup epoch.
 //! 3. Three independent writers encrypt the same logical private payload. Every
 //!    writer uses the same application-level associated data and seeded `r`, so
@@ -14,24 +14,27 @@
 //!    content key, outer XChaCha20Poly1305 nonce, and encryption-proof nonce `r'`,
 //!    so the complete ciphertexts, encrypted payloads, and proof fields differ.
 //! 4. During the transaction stage, the application creates one stable disclosure
-//!    group from the common `R`, common associated data, and opaque group ID. Before
+//!    scope from the common `R`, common associated data, and opaque scope ID. Before
 //!    any request exists, each participant precomputes its secret-bearing `x_iR`.
-//! 5. Later, the application authenticates the intended record membership and
-//!    creates a request-specific decryption context from the stable group.
-//! 6. Each participant issues a disclosure-group share with fresh proof randomness
-//!    and sends its canonical wire form. One threshold set reconstructs one opaque
-//!    group key, which opens all three wrapped content keys and therefore all three
-//!    outer records.
+//! 5. Later, the application authenticates every intended complete record envelope.
+//! 6. An external release authorizer decides whether participants may issue shares.
+//! 7. Only after that decision does the application construct a [`DisclosureRequest`].
+//!    Request construction supplies transcript inputs; it is **not authorization**.
+//!    Each participant issues a fresh request-bound [`DisclosureDecryptionShare`]
+//!    and sends its canonical wire form.
+//! 8. One threshold set reconstructs one opaque, reusable [`DisclosureKey`], which
+//!    opens all three authenticated sibling wrappers and outer records.
 //!
 //! # Security warning
 //!
-//! The group ID and request context authorize reconstruction but do not constrain
-//! recovered `xR`. A disclosure-group key opens **any valid ciphertext with the
-//! same `R` and expected associated data**, not only ciphertexts the application
-//! intended to place in the group. The `open` associated-data check is defensive
-//! API policy, not a cryptographic restriction on extracted `xR`. The application
-//! **must authenticate disclosure-group membership** separately before participants
-//! release shares. This example uses a trusted manifest of complete envelope digests.
+//! The scope ID and request context determine which shares can reconstruct `xR`;
+//! they do not constrain recovered `xR`. A [`DisclosureKey`] opens **any valid
+//! ciphertext with the same `R` and expected associated data**, not only ciphertexts
+//! the application intended to place in the scope. The `open` associated-data check
+//! is defensive API policy, not a cryptographic restriction on extracted `xR`. The
+//! application **must authenticate disclosure-scope membership** and obtain an
+//! external release-authorization decision before participants release shares. This
+//! example uses a trusted manifest of complete envelope digests.
 //!
 //! Seeded sealing also reuses one payload mask, revealing `m_1 XOR m_2` from any
 //! two wrapped payloads. It is unsafe for arbitrary or correlated plaintexts; this
@@ -52,18 +55,18 @@
 //!   as EHTDH1 associated data or outer AEAD associated data.
 //! * The common **application associated data** describes the logical payload and
 //!   is bound into every EHTDH1 ciphertext and every outer record encryption.
-//! * The stable **disclosure group** contains common `R`, associated data, and an
-//!   opaque application group ID; it exists before a release request.
-//! * The **request-specific decryption context** is added later and binds
-//!   participant approval to one release request.
+//! * The stable **disclosure scope** contains common `R`, associated data, and an
+//!   opaque application scope ID; it exists before a release request.
+//! * The **request-specific decryption context** is added later so released shares
+//!   bind to one request. Constructing that request is not authorization.
 //! * The [`SetupContext`](golden_ehtdh1::SetupContext) identifies the Golden setup
 //!   that produced the keys and shares.
 //!
 //! # Why setup runs DKG twice
 //!
 //! The first DKG shares the joint decryption secret. The second shares zero so
-//! its contributions cancel for one decryption context and disclosure group, but
-//! not when contexts or groups are mixed.
+//! its contributions cancel for one decryption context and disclosure scope, but
+//! not when contexts or scopes are mixed.
 //!
 //! # Glossary
 //!
@@ -72,8 +75,8 @@
 //! * A **writer role** uses only the sealing key. In this deployment the same
 //!   three TEEs also act as threshold participants, but the writer path never uses
 //!   their participant secrets.
-//! * The **threshold** is the number of valid disclosure-group shares needed to
-//!   construct a group key. This example uses two out of three.
+//! * The **threshold** is the number of valid request-bound disclosure shares
+//!   needed to reconstruct a disclosure key. This example uses two out of three.
 //! * **Golden DKG** creates the joint public key without one party choosing the
 //!   final private key. EHTDH1 setup runs one decryption-key DKG and one zero-sharing
 //!   DKG for context binding.
@@ -82,22 +85,22 @@
 //! * A **decryption precomputation** is the opaque, secret-bearing `x_i R` value a
 //!   participant caches for a common `R`. It stays local and is never serialized.
 //! * A **record ID** identifies storage but does not establish cryptographic
-//!   disclosure-group membership. A trusted manifest authenticates the complete
+//!   disclosure-scope membership. A trusted manifest authenticates the complete
 //!   record envelope, including its ID and wrapped content key.
 //! * A **content key** is a fresh 32-byte secret used to encrypt one record with
 //!   XChaCha20Poly1305.
 //! * An **EHTDH1 ciphertext** wraps one content key. Its proof uses fresh nonce
 //!   `r'`; reuse of `r'` is a confidentiality failure.
-//! * A **disclosure group** is stable common `R`, associated data, and opaque group
-//!   ID. A **disclosure request** borrows that group and adds one release context.
-//!   The application authenticates intended members before authorizing a request.
-//! * A **disclosure-group decryption share** is a public, proof-bearing message
-//!   issued with fresh share-proof randomness. It has canonical wire bytes.
-//! * A **disclosure-group key** is reconstructed from a threshold set and opens
-//!   any valid same-`R`/same-associated-data ciphertext. It is secret-bearing,
+//! * A **disclosure scope** is stable common `R`, associated data, and an opaque
+//!   scope ID. A **disclosure request** borrows that scope and adds one release
+//!   context. It is a transcript-input descriptor, not an authorization decision.
+//! * A **disclosure decryption share** is a public, proof-bearing, request-bound
+//!   message issued with fresh share-proof randomness. It has canonical wire bytes.
+//! * A **disclosure key** is reconstructed from a threshold set and opens any valid
+//!   same-`R`/same-associated-data ciphertext. It is an opaque reusable capability,
 //!   remains in memory, and is never serialized.
-//! * A **combiner** verifies disclosure-group shares against the public setup and
-//!   constructs the group key only from a threshold set.
+//! * A **combiner** verifies request-bound disclosure shares against the public
+//!   setup and reconstructs the disclosure key only from a threshold set.
 //! * The **HPKE-style split** means outer authenticated encryption handles each
 //!   large value while EHTDH1 handles only its fixed-size content key.
 
@@ -114,8 +117,8 @@ use golden_core::{
 use golden_ehtdh1::wire::{from_wire_bytes, to_wire_bytes};
 use golden_ehtdh1::{
     derive_context_session_id, material_from_dkg_outputs, Ciphertext, Combiner,
-    DecryptionPrecomputation, DisclosureGroup, DisclosureGroupDecryptionShare, Ehtdh1Material,
-    SealingKey, UnsealingShare,
+    DecryptionPrecomputation, DisclosureDecryptionShare, DisclosureKey, DisclosureRequest,
+    DisclosureScope, Ehtdh1Material, SealingKey, UnsealingShare,
 };
 use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
@@ -169,23 +172,24 @@ fn main() -> AppResult<()> {
     let public_key_bytes = to_wire_bytes(&first.sealing_key);
     let writer_key = from_wire_bytes::<SealingKey<G>>(&public_key_bytes)?;
 
-    // Step 3. Derive the shared sealing seed and create one independently
-    // randomized record per writer. Record IDs are storage metadata, while every
-    // EHTDH1 ciphertext and outer AEAD uses the same application-level AD.
+    // Step 3. Transaction stage: derive the shared application sealing seed and
+    // create one independently randomized record per writer. Record IDs are storage
+    // metadata, while every EHTDH1 ciphertext and outer AEAD uses the same
+    // application-level AD.
     let record_ids = [
         b"private-record/A".as_slice(),
         b"private-record/B".as_slice(),
         b"private-record/C".as_slice(),
     ];
     let application_associated_data = b"threshold-records/logical-private-payload/v1";
-    let opaque_disclosure_group_id = b"app-group:7f49b28d6a1c";
+    let opaque_disclosure_scope_id = b"app-scope:7f49b28d6a1c";
     let canonical_private_plaintext = vec![b'T'; RECORD_BYTES];
     // Fixed only to keep the example repeatable. Production clients sample a
     // uniformly random 256-bit client nonce.
     let client_nonce = Zeroizing::new([5u8; 32]);
     let transaction_sealing_seed = derive_transaction_sealing_seed(
         &client_nonce,
-        opaque_disclosure_group_id,
+        opaque_disclosure_scope_id,
         application_associated_data,
         &canonical_private_plaintext,
         &first.setup_context.epoch,
@@ -269,28 +273,29 @@ fn main() -> AppResult<()> {
         "outer ciphertexts or XChaCha20Poly1305 nonces were not distinct",
     )?;
 
-    // Step 4. During the transaction stage, establish the stable disclosure group
-    // before any request-specific context exists. Each participant then calls
-    // precompute exactly once for the group's common R.
+    // Step 4. Transaction stage: establish the stable DisclosureScope before any
+    // request-specific context exists. Each participant then precomputes exactly
+    // once for the scope's common R.
     let common_ephemeral_public = wrapped_keys[0].ephemeral_public;
-    let disclosure_group = DisclosureGroup::new(
+    let disclosure_scope = DisclosureScope::new(
         common_ephemeral_public,
         application_associated_data,
-        opaque_disclosure_group_id,
+        opaque_disclosure_scope_id,
     )?;
     let mut local_precomputations = Vec::<(UnsealingShare<G>, DecryptionPrecomputation<G>)>::new();
     for material in materials.values() {
         let unsealing_share = UnsealingShare::new(material.secret_share.clone());
         let precomputation =
-            unsealing_share.precompute_for_ephemeral_public(disclosure_group.ephemeral_public())?;
+            unsealing_share.precompute_for_ephemeral_public(disclosure_scope.ephemeral_public())?;
         // This secret-bearing (UnsealingShare, DecryptionPrecomputation) tuple
         // remains sealed/protected in TEE storage. It is never serialized.
         local_precomputations.push((unsealing_share, precomputation));
     }
 
-    // Step 5. Later, the application authenticates every complete record envelope
-    // against trusted storage before treating it as an intended member.
-    // DisclosureGroup itself does not authenticate membership.
+    // Step 5. Later release stage: authenticate every complete record envelope
+    // against trusted storage before treating it as an intended scope member.
+    // DisclosureScope itself does not authenticate membership, and record IDs are
+    // not membership evidence.
     require(
         records.iter().zip(&authenticated_record_manifest).all(
             |(record, (authenticated_id, authenticated_digest))| {
@@ -298,57 +303,78 @@ fn main() -> AppResult<()> {
                     && authenticated_record_digest(record) == *authenticated_digest
             },
         ),
-        "application disclosure-group membership authentication failed",
+        "application disclosure-scope membership authentication failed",
     )?;
-    // This context is deliberately defined only when the later release is requested.
-    let request_decryption_context = b"request:2026-08-03T12:00:00Z:4e91";
-    let disclosure_request = disclosure_group.request(request_decryption_context);
 
-    // Each participant uses fresh share-proof randomness, then exchanges only a
-    // canonical DisclosureGroupDecryptionShare. Reusing the two proof nonces
+    // This context identifies the intended later release, but no DisclosureRequest
+    // exists yet.
+    let request_decryption_context = b"request:2026-08-03T12:00:00Z:4e91";
+
+    // Step 6. An external application release authorizer evaluates policy after
+    // envelope authentication. The fixed decision models its successful response
+    // in this self-contained example; Golden does not make this decision.
+    let external_release_authorizer_approved = true;
+    require(
+        external_release_authorizer_approved,
+        "external release authorizer denied disclosure",
+    )?;
+
+    // Step 7. Construct the public transcript-input descriptor only after external
+    // authorization. DisclosureScope::request construction is not authorization and
+    // cannot replace the policy decision above. Neither scope nor request is
+    // serialized.
+    let disclosure_request: DisclosureRequest<'_, G> =
+        disclosure_scope.request(request_decryption_context);
+
+    // Step 8. Each participant uses fresh share-proof randomness to issue one
+    // request-bound share, then exchanges only its canonical
+    // DisclosureDecryptionShare. Reusing the two proof nonces
     // across distinct challenges would reveal that participant's x_i and z_i.
     // Local precomputations stay in TEE storage and are not part of the wire
     // message. Fixed seeds below exist only to keep this one release repeatable.
-    let mut disclosure_shares = Vec::<DisclosureGroupDecryptionShare<G>>::new();
+    let mut disclosure_shares = Vec::<DisclosureDecryptionShare<G>>::new();
     for (participant_offset, (unsealing_share, precomputation)) in
         local_precomputations.iter().enumerate()
     {
         let mut share_proof_rng = ChaCha20Rng::from_seed([6 + participant_offset as u8; 32]);
-        let share = unsealing_share.issue_disclosure_group_share(
+        let share = unsealing_share.issue_disclosure_share(
             &mut share_proof_rng,
             &first.setup_context,
             precomputation,
             &disclosure_request,
         )?;
-        disclosure_shares.push(from_wire_bytes::<DisclosureGroupDecryptionShare<G>>(
+        disclosure_shares.push(from_wire_bytes::<DisclosureDecryptionShare<G>>(
             &to_wire_bytes(&share),
         )?);
     }
 
     let combiner = Combiner::new(first.public_key_set.clone(), first.setup_context.clone())?;
 
-    // Step 6. One disclosure-group share is below the two-of-three threshold.
+    // Step 9. One disclosure share is below the two-of-three threshold.
     require(
         combiner
-            .combine_disclosure_group_exact(&disclosure_request, &disclosure_shares[..1])
+            .combine_disclosure_exact(&disclosure_request, &disclosure_shares[..1])
             .is_err(),
-        "one disclosure-group share unexpectedly constructed a group key",
+        "one disclosure share unexpectedly reconstructed a disclosure key",
     )?;
 
-    // One exact threshold set reconstructs one secret-bearing group key. The key
-    // remains in local memory and is intentionally never serialized.
+    // One exact threshold set reconstructs one secret-bearing, opaque, reusable
+    // DisclosureKey. It remains in local memory and is intentionally never
+    // serialized.
     let threshold_shares = [disclosure_shares[0].clone(), disclosure_shares[1].clone()];
-    let disclosure_group_key =
-        combiner.combine_disclosure_group_exact(&disclosure_request, &threshold_shares)?;
+    let disclosure_key: DisclosureKey<G> =
+        combiner.combine_disclosure_exact(&disclosure_request, &threshold_shares)?;
 
-    // The same group key opens every valid same-R/same-AD EHTDH1 ciphertext.
-    // Application membership authentication above is therefore mandatory.
+    // Step 10. The same disclosure key opens every valid same-R/same-AD EHTDH1
+    // ciphertext, so only the authenticated sibling envelopes are opened here.
+    // Application membership authentication and external authorization above are
+    // therefore mandatory.
     for (record, wrapped_key) in records.iter().zip(&wrapped_keys) {
-        let content_key = Zeroizing::new(disclosure_group_key.open(wrapped_key)?);
+        let content_key = Zeroizing::new(disclosure_key.open(wrapped_key)?);
         let opened = open_record(record, &content_key, application_associated_data)?;
         require(
             opened == canonical_private_plaintext,
-            "a disclosure-group member opened to the wrong private payload",
+            "a disclosure-scope member opened to the wrong private payload",
         )?;
     }
 
@@ -368,11 +394,13 @@ fn main() -> AppResult<()> {
         "In the HPKE-style split, AEAD encrypted {record_bytes} record bytes and EHTDH1 wrapped \
          {wrapped_bytes} bytes total."
     );
-    println!("Participants precomputed once for the stable group before a request existed.");
-    println!("All three disclosure shares completed canonical wire round-trips.");
-    println!("One share was rejected; one exact threshold set constructed the group key.");
-    println!("The same non-serialized group key opened all three records to the same payload.");
-    println!("WARNING: a disclosure-group key opens ANY valid ciphertext with the same R and AD.");
+    println!("Participants precomputed once for the stable scope before a request existed.");
+    println!("External release authorization preceded DisclosureRequest construction.");
+    println!("Request construction supplied transcript inputs; it was not authorization.");
+    println!("All three request-bound disclosure shares completed canonical wire round-trips.");
+    println!("One share was rejected; one exact threshold set reconstructed the disclosure key.");
+    println!("The same non-serialized disclosure key opened all three sibling records.");
+    println!("WARNING: a disclosure key opens ANY valid ciphertext with the same R and AD.");
     println!(
         "APPLICATION REQUIREMENT: authenticate complete record envelopes before releasing shares."
     );
@@ -521,7 +549,7 @@ fn check_shared_setup(materials: &BTreeMap<ParticipantIndex, Ehtdh1Material<G>>)
 /// Derives the shared sealing seed from high-entropy and application-domain inputs.
 fn derive_transaction_sealing_seed(
     client_nonce: &[u8; 32],
-    disclosure_group_id: &[u8],
+    disclosure_scope_id: &[u8],
     application_associated_data: &[u8],
     canonical_private_plaintext: &[u8],
     setup_epoch: &[u8; 32],
@@ -529,8 +557,8 @@ fn derive_transaction_sealing_seed(
     let private_plaintext_digest = Sha256::digest(canonical_private_plaintext);
     let mut seed_context = Sha256::new();
     seed_context.update(b"threshold-record-transaction-seed-context-v1");
-    seed_context.update((disclosure_group_id.len() as u64).to_be_bytes());
-    seed_context.update(disclosure_group_id);
+    seed_context.update((disclosure_scope_id.len() as u64).to_be_bytes());
+    seed_context.update(disclosure_scope_id);
     seed_context.update((application_associated_data.len() as u64).to_be_bytes());
     seed_context.update(application_associated_data);
     seed_context.update(private_plaintext_digest);
@@ -595,7 +623,7 @@ fn seal_record(
     })
 }
 
-/// Decrypts one stored value with a content key opened by the disclosure-group key.
+/// Decrypts one stored value with a content key opened by the disclosure key.
 fn open_record(
     record: &StoredRecord,
     content_key: &[u8],

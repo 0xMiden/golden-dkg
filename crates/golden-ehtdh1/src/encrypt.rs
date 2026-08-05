@@ -63,17 +63,17 @@ impl<G: GoldenHashToGroup> SealingKey<G> {
     /// For a given sealing key, the seed determines `R` independently of the
     /// plaintext, associated data, and caller RNG. Golden binds the backend and
     /// joint public key into its internal `r` derivation, but it does not bind the
-    /// application transaction, disclosure-group ID, associated data, plaintext,
+    /// application transaction, disclosure-scope ID, associated data, plaintext,
     /// or setup epoch. Callers should derive the supplied seed with an
     /// application/protocol/version domain and inputs including the transaction or
-    /// disclosure-group identity, a high-entropy nonce, a private-payload
+    /// disclosure-scope identity, a high-entropy nonce, a private-payload
     /// commitment where appropriate, and the application setup epoch or identity
     /// where relevant. Validators cannot verify caller-provided entropy, and public
     /// `R = rG` permits offline testing of low-entropy seed candidates.
     ///
     /// Reusing the same seed and key reuses both `R` and the payload mask. For
     /// siblings `c_1 = m_1 XOR mask` and `c_2 = m_2 XOR mask`, an observer learns
-    /// `c_1 XOR c_2 = m_1 XOR m_2`. Disclosure-group mode does not make this safe
+    /// `c_1 XOR c_2 = m_1 XOR m_2`. Disclosure-scope mode does not make this safe
     /// for arbitrary structured or correlated plaintexts. Its motivating use
     /// requires independently uniform, fixed-length content keys, whose XOR does
     /// not reveal useful plaintext structure to a ciphertext-only observer.
