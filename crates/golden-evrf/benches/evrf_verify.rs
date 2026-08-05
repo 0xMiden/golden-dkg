@@ -25,7 +25,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::unwrap_used)]
 
-#[path = "support.rs"]
+#[path = "support_dir/mod.rs"]
 mod support;
 
 use std::collections::BTreeMap;

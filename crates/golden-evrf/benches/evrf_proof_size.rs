@@ -29,7 +29,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::unwrap_used)]
 
-#[path = "support.rs"]
+#[path = "support_dir/mod.rs"]
 mod support;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
