@@ -23,6 +23,7 @@ merlin = { workspace = true }
 rand_chacha = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = "0.5"
 ff = { workspace = true }
 golden-rustcrypto = { workspace = true, features = ["p256"] }
 rand_chacha = { workspace = true }
@@ -55,6 +56,31 @@ required-features = ["halo2curves-secp256k1"]
 
 [[test]]
 name = "paper_public_api"
+required-features = ["halo2curves-secp256k1"]
+
+[[bench]]
+name = "evrf_prove"
+harness = false
+required-features = ["halo2curves-secp256k1"]
+
+[[bench]]
+name = "evrf_verify"
+harness = false
+required-features = ["halo2curves-secp256k1"]
+
+[[bench]]
+name = "evrf_proof_size"
+harness = false
+required-features = ["halo2curves-secp256k1"]
+
+[[bench]]
+name = "dkg_round"
+harness = false
+required-features = ["halo2curves-secp256k1"]
+
+[[bench]]
+name = "dkg_communication"
+harness = false
 required-features = ["halo2curves-secp256k1"]
 
 [lints]
