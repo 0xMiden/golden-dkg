@@ -17,6 +17,14 @@ Shoup, *Context-Dependent Threshold Decryption and its Applications*,
 > shares to an application-declared scope and request, while reconstruction still
 > produces the broader `(R, xR)` capability.
 
+Seeded sealing and disclosure-scope decryption are separate extensions. Under a
+fixed sealing key, repeated use of one seed deterministically reuses `r`, which
+gives sibling ciphertexts a common `R` and payload mask. It does not make exact
+EHTDH1 shares interchangeable, because exact shares still bind the complete
+ciphertext. Disclosure-scope mode changes that share-binding boundary for
+applications that explicitly accept the broader common-`R` capability and the
+seeded payload contract described below.
+
 In exact-ciphertext EHTDH1, a share uses
 
 ```text

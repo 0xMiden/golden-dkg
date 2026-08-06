@@ -9,7 +9,18 @@ secret share for each participant. The first DKG run shares the decryption
 secret. The second shares zero so that each decryption share is bound to one
 decryption context.
 
-The crate provides two explicitly separated decryption modes:
+## Seeded sealing and decryption modes
+
+Sealing is normally randomized. The additional
+`seal_bytes_with_associated_data_and_seed` API deterministically derives the
+EHTDH1 encryption scalar `r` from a caller-provided 32-byte seed, the Golden
+backend, and the joint public key, while the caller RNG still supplies a fresh
+encryption-proof nonce `r'`. Reusing a seed under one sealing key therefore gives
+distinct ciphertexts a common `R` and payload mask.
+
+Common `R` alone does not make exact EHTDH1 decryption shares reusable: exact
+shares remain bound to the complete ciphertext. The crate therefore provides two
+explicitly separated decryption modes:
 
 * **Exact-ciphertext EHTDH1** follows the paper construction. A participant share
   is bound to one complete ciphertext, associated data value, decryption context,

@@ -6,6 +6,19 @@
 //! joint public key `X`, public shares `(X_i, Z_i)`, secret shares `(x_i, z_i)`,
 //! and a setup context.
 //!
+//! # Seeded sealing
+//!
+//! Sealing normally samples independent encryption scalar `r` and proof nonce
+//! `r'`. [`SealingKey::seal_bytes_with_associated_data_and_seed`] instead derives
+//! `r` from a caller-provided seed, backend, and joint public key while continuing
+//! to sample a fresh `r'` from the caller RNG. Reusing one seed under one sealing
+//! key gives distinct ciphertexts the same `R = rG` and payload mask.
+//!
+//! Common `R` does not make exact-ciphertext shares interchangeable because exact
+//! EHTDH1 still binds each share to the complete ciphertext. The disclosure-scope
+//! extension below separately changes share-binding granularity for applications
+//! that accept the common-`R` capability and repeated-mask contract.
+//!
 //! # Exact-ciphertext EHTDH1
 //!
 //! The paper scheme uses two independent threshold sharings. The first sharing
