@@ -45,11 +45,11 @@ fn evrf_verify_single(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
             // Expensive setup runs once per benchmark invocation, only when
             // criterion actually selects this benchmark.
-            let (statement, proof) = prove_one_batched(n_e);
+            let (params, statement, proof) = prove_one_batched(n_e);
             b.iter_batched(
                 || ChaCha20Rng::from_seed(BENCH_SEED),
                 |mut rng| {
-                    evrf_batched_verify(&statement, &proof, &mut rng).unwrap();
+                    evrf_batched_verify(&params, &statement, &proof, &mut rng).unwrap();
                 },
                 BatchSize::SmallInput,
             )

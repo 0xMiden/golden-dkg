@@ -23,8 +23,8 @@ use golden_core::{
     DkgConfig, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
 };
 use golden_evrf::paper::secp_secq::{
-    evrf_batched_prove, evrf_batched_verify, testing, BatchedEvrfStatement, BatchedEvrfWitness,
-    Gin, GinScalar, R1csField,
+    evrf_batched_prove, evrf_batched_verify, testing, BatchedEvrfPublicParams,
+    BatchedEvrfStatement, BatchedEvrfWitness, Gin, GinScalar, R1csField,
 };
 use golden_evrf::paper::MESSAGE_BYTES;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
@@ -119,15 +119,17 @@ pub fn build_batched_at_ne(
 }
 
 /// Build and prove one batched eVRF proof covering `n_e` receivers. Returns
-/// `(statement, proof)` so callers can verify or measure size.
-pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfStatement, Vec<u8>) {
+/// `(params, statement, proof)` so callers can verify or measure size.
+pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfPublicParams, BatchedEvrfStatement, Vec<u8>) {
     let (statement, witness, _pkjs, _beta) = build_batched_at_ne(n_e);
+    let params = BatchedEvrfPublicParams::setup(statement.threshold, statement.receivers.len())
+        .expect("valid public parameter shape");
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
-    let proof = evrf_batched_prove(&statement, &witness, &mut rng).unwrap();
+    let proof = evrf_batched_prove(&params, &statement, &witness, &mut rng).unwrap();
     // Sanity: the proof must verify before any bench iterates on it.
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
-    evrf_batched_verify(&statement, &proof, &mut rng).unwrap();
-    (statement, proof)
+    evrf_batched_verify(&params, &statement, &proof, &mut rng).unwrap();
+    (params, statement, proof)
 }
 
 /// Run a full DKG Round 0 for `n` participants and return all `n` dealings.

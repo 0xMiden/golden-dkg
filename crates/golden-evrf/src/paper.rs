@@ -214,6 +214,85 @@ pub mod secp_secq {
         pub receivers: Vec<BatchedReceiverStatement>,
     }
 
+    /// Reusable transparent parameters for one batched dealer circuit shape.
+    ///
+    /// Setup derives the exact multiplier count from the DKG threshold and
+    /// receiver count, then expands the deterministic Bulletproof generators
+    /// once. The same value can be shared by every dealer proof with that
+    /// shape.
+    pub struct BatchedEvrfPublicParams {
+        threshold: usize,
+        receiver_count: usize,
+        multiplier_count: usize,
+        pc_gens: PedersenGens<R1csCycle>,
+        bp_gens: BulletproofGens<R1csCycle>,
+    }
+
+    impl BatchedEvrfPublicParams {
+        /// Build transparent parameters for a DKG threshold and receiver count.
+        pub fn setup(threshold: usize, receiver_count: usize) -> Result<Self> {
+            let multiplier_count = batched_multiplier_count(threshold, receiver_count)?;
+            let gens_capacity = multiplier_count
+                .checked_next_power_of_two()
+                .ok_or(Error::ProofVerificationFailed)?;
+            Ok(Self {
+                threshold,
+                receiver_count,
+                multiplier_count,
+                pc_gens: PedersenGens::default(),
+                bp_gens: BulletproofGens::new(gens_capacity, 1),
+            })
+        }
+
+        /// Return process-wide shared parameters for one exact circuit shape.
+        pub fn shared(threshold: usize, receiver_count: usize) -> Result<std::sync::Arc<Self>> {
+            type Cache = std::sync::Mutex<
+                std::collections::HashMap<(usize, usize), std::sync::Arc<BatchedEvrfPublicParams>>,
+            >;
+            static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+
+            let cache =
+                CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut cache = cache.lock().map_err(|_| Error::ProofVerificationFailed)?;
+            if let Some(params) = cache.get(&(threshold, receiver_count)) {
+                return Ok(std::sync::Arc::clone(params));
+            }
+
+            let params = std::sync::Arc::new(Self::setup(threshold, receiver_count)?);
+            cache.insert((threshold, receiver_count), std::sync::Arc::clone(&params));
+            Ok(params)
+        }
+
+        /// DKG threshold used to size these parameters.
+        pub fn threshold(&self) -> usize {
+            self.threshold
+        }
+
+        /// Number of non-dealer receivers used to size these parameters.
+        pub fn receiver_count(&self) -> usize {
+            self.receiver_count
+        }
+
+        /// Exact number of multipliers in the configured circuit shape.
+        pub fn multiplier_count(&self) -> usize {
+            self.multiplier_count
+        }
+
+        /// Padded Bulletproof generator capacity.
+        pub fn gens_capacity(&self) -> usize {
+            self.bp_gens.gens_capacity
+        }
+
+        fn validate_statement(&self, statement: &BatchedEvrfStatement) -> Result<()> {
+            if self.threshold != statement.threshold
+                || self.receiver_count != statement.receivers.len()
+            {
+                return Err(Error::ProofVerificationFailed);
+            }
+            Ok(())
+        }
+    }
+
     /// Witness for the batched dealer proof.
     #[derive(Clone)]
     pub struct BatchedEvrfWitness {
@@ -1368,19 +1447,29 @@ pub mod secp_secq {
     // Batched R1CS relation and prove/verify path.
     // ------------------------------------------------------------------
 
-    /// Bulletproofs generator capacity for the batched DKG relation.
-    ///
-    /// The private DKG relation proves five chord-rule exponentiations per
-    /// receiver (`PK_j^sk`, `H_1^k`, `H_2^k`, `g^pad`, `PK_j^pad`) plus one
-    /// shared `g^sk = PK_1` exponentiation. Round up generously so ignored
-    /// slow tests exercise the real shape without capacity churn.
-    fn batched_gens_capacity(num_receivers: usize) -> usize {
-        let total = R1CS_GENS_CAPACITY * 4 * num_receivers.max(1);
-        let mut cap = R1CS_GENS_CAPACITY;
-        while cap < total {
-            cap *= 2;
+    /// Multipliers shared by every batched circuit: the dealer secret's
+    /// canonical bit decomposition and the `g^sk = PK_1` exponentiation.
+    const BATCHED_SHARED_MULTIPLIERS: usize = 2_051;
+    /// Multipliers added by one non-identity Feldman coefficient opening.
+    const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 2_052;
+    /// Multipliers added by one receiver relation.
+    const BATCHED_RECEIVER_MULTIPLIERS: usize = 11_219;
+
+    /// Count multipliers from the exact public circuit shape.
+    fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
+        if threshold == 0 || receiver_count == 0 {
+            return Err(Error::ProofVerificationFailed);
         }
-        cap
+        let coefficients = threshold
+            .checked_mul(BATCHED_COEFFICIENT_MULTIPLIERS)
+            .ok_or(Error::ProofVerificationFailed)?;
+        let receivers = receiver_count
+            .checked_mul(BATCHED_RECEIVER_MULTIPLIERS)
+            .ok_or(Error::ProofVerificationFailed)?;
+        BATCHED_SHARED_MULTIPLIERS
+            .checked_add(coefficients)
+            .and_then(|count| count.checked_add(receivers))
+            .ok_or(Error::ProofVerificationFailed)
     }
 
     fn bit_options(bits: &[bool]) -> Vec<Option<R1csField>> {
@@ -1670,6 +1759,7 @@ pub mod secp_secq {
     }
 
     fn prove_batched_r1cs(
+        params: &BatchedEvrfPublicParams,
         statement: &BatchedEvrfStatement,
         witness: &BatchedEvrfWitness,
         rng: &mut impl CryptoRngCore,
@@ -1700,11 +1790,7 @@ pub mod secp_secq {
         let h1 = h_gin_1(&statement.msg);
         let h2 = h_gin_2(&statement.msg);
 
-        let pc_gens = PedersenGens::<R1csCycle>::default();
-        let bp_gens =
-            BulletproofGens::<R1csCycle>::new(batched_gens_capacity(statement.receivers.len()), 1);
-
-        let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, transcript);
+        let mut prover = Prover::<R1csCycle, _>::new(&params.pc_gens, transcript);
         let sk_fp = fq_to_fp(&witness.sk1);
         let mut sk_bool_bits = [false; K_BITS + 1];
         decompose_k_fp(&sk_fp, &mut sk_bool_bits);
@@ -1758,7 +1844,7 @@ pub mod secp_secq {
         }
 
         let r1cs_proof = prover
-            .prove(&bp_gens, rng)
+            .prove(&params.bp_gens, rng)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
         Ok(r1cs_proof.to_bytes())
@@ -1766,27 +1852,29 @@ pub mod secp_secq {
 
     /// Generate a Batched Dealer Proof as a Proof Stream containing one nested R1CS proof.
     pub fn evrf_batched_prove(
+        params: &BatchedEvrfPublicParams,
         statement: &BatchedEvrfStatement,
         witness: &BatchedEvrfWitness,
         rng: &mut impl CryptoRngCore,
     ) -> Result<Vec<u8>> {
+        params.validate_statement(statement)?;
         validate_batched_public_relations(statement)?;
         let mut stream = ProverProofStream::new(BATCHED_PROOF_ID)?;
         observe_batched_statement(&mut stream, statement)?;
-        stream.send_nested(|transcript| prove_batched_r1cs(statement, witness, rng, transcript))?;
+        stream.send_nested(|transcript| {
+            prove_batched_r1cs(params, statement, witness, rng, transcript)
+        })?;
         Ok(stream.finish())
     }
 
     fn prepare_batched_r1cs(
+        params: &BatchedEvrfPublicParams,
         statement: &BatchedEvrfStatement,
         proof: &R1CSProof<R1csCycle>,
-        pc_gens: &PedersenGens<R1csCycle>,
-        bp_gens: &BulletproofGens<R1csCycle>,
         rng: &mut impl CryptoRngCore,
         transcript: &mut Transcript,
     ) -> Result<VerificationEquation<R1csCycle>> {
         let g_in = Gin::generator();
-
         // Derive h1, h2 from msg.
         let h1 = h_gin_1(&statement.msg);
         let h2 = h_gin_2(&statement.msg);
@@ -1834,7 +1922,7 @@ pub mod secp_secq {
         }
 
         verifier
-            .verification_equation(proof, pc_gens, bp_gens, rng)
+            .verification_equation(proof, &params.pc_gens, &params.bp_gens, rng)
             .map_err(|_| Error::ProofVerificationFailed)
     }
 
@@ -1853,38 +1941,31 @@ pub mod secp_secq {
 
     /// Verify a Batched Dealer Proof represented as a Proof Stream with one nested R1CS proof.
     pub fn evrf_batched_verify(
+        params: &BatchedEvrfPublicParams,
         statement: &BatchedEvrfStatement,
         proof: &[u8],
         rng: &mut impl CryptoRngCore,
     ) -> Result<()> {
+        params.validate_statement(statement)?;
         validate_batched_public_relations(statement)?;
         let (r1cs_proof, mut transcript) = parse_batched_proof_stream(statement, proof)?;
-        let pc_gens = PedersenGens::<R1csCycle>::default();
-        let bp_gens =
-            BulletproofGens::<R1csCycle>::new(batched_gens_capacity(statement.receivers.len()), 1);
-        let equation = prepare_batched_r1cs(
-            statement,
-            &r1cs_proof,
-            &pc_gens,
-            &bp_gens,
-            rng,
-            &mut transcript,
-        )?;
+        let equation = prepare_batched_r1cs(params, statement, &r1cs_proof, rng, &mut transcript)?;
         equation
             .verify()
             .map_err(|_| Error::ProofVerificationFailed)
     }
 
     /// Verify several independent Batched Dealer Proofs with one shared MSM.
-    pub fn evrf_batched_verify_many(instances: &[(&BatchedEvrfStatement, &[u8])]) -> Result<()> {
-        let first = instances.first().ok_or(Error::ProofVerificationFailed)?.0;
+    pub fn evrf_batched_verify_many(
+        params: &BatchedEvrfPublicParams,
+        instances: &[(&BatchedEvrfStatement, &[u8])],
+    ) -> Result<()> {
+        if instances.is_empty() {
+            return Err(Error::ProofVerificationFailed);
+        }
         for (statement, _) in instances {
+            params.validate_statement(statement)?;
             validate_batched_public_relations(statement)?;
-            if statement.receivers.len() != first.receivers.len()
-                || statement.threshold != first.threshold
-            {
-                return Err(Error::ProofVerificationFailed);
-            }
         }
         let parsed_proofs = instances
             .iter()
@@ -1906,19 +1987,10 @@ pub mod secp_secq {
         batch_transcript.challenge_bytes(b"batch-rng", &mut seed);
         let mut rng = ChaCha20Rng::from_seed(seed);
 
-        let pc_gens = PedersenGens::<R1csCycle>::default();
-        let bp_gens =
-            BulletproofGens::<R1csCycle>::new(batched_gens_capacity(first.receivers.len()), 1);
         let mut equations = Vec::with_capacity(instances.len());
         for ((statement, _), (r1cs_proof, mut transcript)) in instances.iter().zip(parsed_proofs) {
-            let equation = prepare_batched_r1cs(
-                statement,
-                &r1cs_proof,
-                &pc_gens,
-                &bp_gens,
-                &mut rng,
-                &mut transcript,
-            )?;
+            let equation =
+                prepare_batched_r1cs(params, statement, &r1cs_proof, &mut rng, &mut transcript)?;
             equations.push(equation);
         }
 
@@ -2236,6 +2308,28 @@ pub mod secp_secq {
 
         const R1CS_TEST_DOMAIN: &[u8] = b"golden-paper-evrf-r1cs-test";
 
+        #[test]
+        fn batched_parameter_setup_uses_exact_circuit_shape() {
+            for (receivers, multipliers, capacity) in [
+                (1, 17_374, 32_768),
+                (4, 51_031, 65_536),
+                (9, 107_126, 131_072),
+            ] {
+                let count = batched_multiplier_count(2, receivers).expect("valid shape");
+                assert_eq!(count, multipliers, "receiver count {receivers}");
+                assert_eq!(
+                    count.next_power_of_two(),
+                    capacity,
+                    "receiver count {receivers}"
+                );
+            }
+            assert_ne!(
+                batched_multiplier_count(1, 1).expect("valid shape"),
+                batched_multiplier_count(2, 1).expect("valid shape"),
+                "threshold must be part of the parameter shape"
+            );
+        }
+
         /// Build a canonical bit decomposition of `k` (little-endian).
         fn decompose_k(k: &R1csField, bits: &mut [Option<R1csField>]) {
             let repr = k.to_repr();
@@ -2446,8 +2540,8 @@ pub mod secp_secq {
             rec_witness.share_commitment = chord_compute_witness(&wrong_share_bits, &g_in, K_BITS)
                 .expect("wrong share commitment witness");
 
+            let params = BatchedEvrfPublicParams::setup(1, 1).expect("public parameter setup");
             let pc_gens = PedersenGens::<R1csCycle>::default();
-            let bp_gens = BulletproofGens::<R1csCycle>::new(batched_gens_capacity(1), 1);
             let mut prover_stream = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
             observe_batched_statement(&mut prover_stream, &statement).expect("statement");
             let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, prover_stream.transcript_mut());
@@ -2480,7 +2574,7 @@ pub mod secp_secq {
             )
             .expect("receiver slot");
 
-            let proof = prover.prove(&bp_gens, &mut rng).expect("prove");
+            let proof = prover.prove(&params.bp_gens, &mut rng).expect("prove");
             let mut verifier_stream = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
             observe_batched_statement(&mut verifier_stream, &statement).expect("statement");
             let mut verifier = Verifier::<R1csCycle, _>::new(verifier_stream.transcript_mut());
@@ -2510,7 +2604,7 @@ pub mod secp_secq {
 
             assert!(
                 verifier
-                    .verify(&proof, &pc_gens, &bp_gens, &mut rng)
+                    .verify(&proof, &pc_gens, &params.bp_gens, &mut rng)
                     .is_err(),
                 "R1CS must reject a hidden share that does not open share_commitment"
             );
@@ -3126,15 +3220,18 @@ pub mod secp_secq {
         #[test]
         fn public_batched_verifiers_reject_root_count_mismatch() {
             let mut statement = context_statement();
+            let params =
+                BatchedEvrfPublicParams::setup(statement.threshold, statement.receivers.len())
+                    .expect("public parameter setup");
             statement.statement_roots.clear();
             let mut rng = ChaCha20Rng::from_seed([42u8; 32]);
 
             assert_eq!(
-                evrf_batched_verify(&statement, &[], &mut rng).unwrap_err(),
+                evrf_batched_verify(&params, &statement, &[], &mut rng).unwrap_err(),
                 Error::ProofVerificationFailed
             );
             assert_eq!(
-                evrf_batched_verify_many(&[(&statement, &[])]).unwrap_err(),
+                evrf_batched_verify_many(&params, &[(&statement, &[])]).unwrap_err(),
                 Error::ProofVerificationFailed
             );
         }

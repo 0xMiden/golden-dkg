@@ -83,5 +83,15 @@ name = "dkg_communication"
 harness = false
 required-features = ["halo2curves-secp256k1"]
 
+[[bench]]
+name = "batched_setup"
+harness = false
+required-features = ["halo2curves-secp256k1"]
+
+[[bench]]
+name = "table4"
+harness = false
+required-features = ["halo2curves-secp256k1"]
+
 [lints]
 workspace = true

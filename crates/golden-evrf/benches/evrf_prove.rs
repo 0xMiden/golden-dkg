@@ -20,7 +20,7 @@
 mod support;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use golden_evrf::paper::secp_secq::evrf_batched_prove;
+use golden_evrf::paper::secp_secq::{evrf_batched_prove, BatchedEvrfPublicParams};
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use support::{build_batched_at_ne, BENCH_SEED, NE_VALUES, SLOW_SAMPLE_SIZE};
 
@@ -29,6 +29,7 @@ fn evrf_prove_bench(c: &mut Criterion) {
     group.sample_size(SLOW_SAMPLE_SIZE);
     for &n_e in NE_VALUES {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
+            let params = BatchedEvrfPublicParams::setup(support::TABLE4_THRESHOLD, n_e).unwrap();
             b.iter_batched(
                 || {
                     let (statement, witness, _pkjs, _beta) = build_batched_at_ne(n_e);
@@ -36,7 +37,7 @@ fn evrf_prove_bench(c: &mut Criterion) {
                     (statement, witness, rng)
                 },
                 |(statement, witness, mut rng)| {
-                    evrf_batched_prove(&statement, &witness, &mut rng).unwrap();
+                    evrf_batched_prove(&params, &statement, &witness, &mut rng).unwrap();
                 },
                 BatchSize::SmallInput,
             )
