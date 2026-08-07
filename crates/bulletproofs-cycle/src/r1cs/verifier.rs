@@ -39,6 +39,155 @@ pub struct RandomizingVerifier<C: Cycle, T: BorrowMut<Transcript>> {
     verifier: Verifier<C, T>,
 }
 
+/// A fully prepared R1CS verification equation.
+///
+/// The Bulletproof and Pedersen generators are split from proof-specific
+/// points so multiple equations over the same generators can share one MSM.
+pub struct VerificationEquation<C: Cycle> {
+    pedersen_scalars: [C::Scalar; 2],
+    pedersen_points: [C::Point; 2],
+    g_scalars: Vec<C::Scalar>,
+    g_points: Vec<C::Point>,
+    h_scalars: Vec<C::Scalar>,
+    h_points: Vec<C::Point>,
+    proof_scalars: Vec<C::Scalar>,
+    proof_points: Vec<Option<C::Point>>,
+}
+
+impl<C: Cycle> VerificationEquation<C> {
+    /// Check one prepared verification equation.
+    pub fn verify(self) -> Result<(), R1CSError> {
+        let scalars: Vec<C::Scalar> = self
+            .pedersen_scalars
+            .into_iter()
+            .chain(self.g_scalars)
+            .chain(self.h_scalars)
+            .chain(self.proof_scalars)
+            .collect();
+        let points: Vec<Option<C::Point>> = self
+            .pedersen_points
+            .into_iter()
+            .map(Some)
+            .chain(self.g_points.into_iter().map(Some))
+            .chain(self.h_points.into_iter().map(Some))
+            .chain(self.proof_points)
+            .collect();
+        let check =
+            C::vartime_msm_optional(&scalars, &points).ok_or(R1CSError::VerificationError)?;
+        if !bool::from(check.is_identity()) {
+            return Err(R1CSError::VerificationError);
+        }
+        Ok(())
+    }
+
+    /// Check several prepared equations with one MSM.
+    ///
+    /// `rng` supplies the nonzero coefficient for each equation. It must be
+    /// seeded with fresh verifier entropy or from a domain-separated transcript
+    /// that binds the complete ordered batch. Fixed, input-independent
+    /// coefficients do not provide sound batch verification.
+    pub fn verify_batch(
+        equations: Vec<Self>,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<(), R1CSError> {
+        let first = equations.first().ok_or(R1CSError::VerificationError)?;
+        let pedersen_points = first.pedersen_points;
+        let mut pedersen_scalars = [C::Scalar::ZERO; 2];
+        let mut g_scalars = Vec::new();
+        let mut g_points = Vec::new();
+        let mut h_scalars = Vec::new();
+        let mut h_points = Vec::new();
+        let mut proof_scalars = Vec::new();
+        let mut proof_points = Vec::new();
+
+        for equation in equations {
+            if equation.pedersen_points != pedersen_points
+                || equation.proof_scalars.len() != equation.proof_points.len()
+            {
+                return Err(R1CSError::VerificationError);
+            }
+
+            let coefficient = loop {
+                let candidate = C::Scalar::random(&mut *rng);
+                if !bool::from(candidate.is_zero()) {
+                    break candidate;
+                }
+            };
+            for (accumulator, scalar) in pedersen_scalars
+                .iter_mut()
+                .zip(equation.pedersen_scalars.iter())
+            {
+                *accumulator += coefficient * scalar;
+            }
+            Self::accumulate_generator_prefix(
+                &mut g_scalars,
+                &mut g_points,
+                equation.g_scalars,
+                equation.g_points,
+                coefficient,
+            )?;
+            Self::accumulate_generator_prefix(
+                &mut h_scalars,
+                &mut h_points,
+                equation.h_scalars,
+                equation.h_points,
+                coefficient,
+            )?;
+            proof_scalars.extend(
+                equation
+                    .proof_scalars
+                    .into_iter()
+                    .map(|scalar| coefficient * scalar),
+            );
+            proof_points.extend(equation.proof_points);
+        }
+
+        let scalars: Vec<C::Scalar> = pedersen_scalars
+            .into_iter()
+            .chain(g_scalars)
+            .chain(h_scalars)
+            .chain(proof_scalars)
+            .collect();
+        let points: Vec<Option<C::Point>> = pedersen_points
+            .into_iter()
+            .map(Some)
+            .chain(g_points.into_iter().map(Some))
+            .chain(h_points.into_iter().map(Some))
+            .chain(proof_points)
+            .collect();
+        let check =
+            C::vartime_msm_optional(&scalars, &points).ok_or(R1CSError::VerificationError)?;
+        if !bool::from(check.is_identity()) {
+            return Err(R1CSError::VerificationError);
+        }
+        Ok(())
+    }
+
+    fn accumulate_generator_prefix(
+        accumulator_scalars: &mut Vec<C::Scalar>,
+        accumulator_points: &mut Vec<C::Point>,
+        scalars: Vec<C::Scalar>,
+        points: Vec<C::Point>,
+        coefficient: C::Scalar,
+    ) -> Result<(), R1CSError> {
+        if scalars.len() != points.len() {
+            return Err(R1CSError::VerificationError);
+        }
+        let shared_len = accumulator_points.len().min(points.len());
+        if accumulator_points[..shared_len] != points[..shared_len] {
+            return Err(R1CSError::VerificationError);
+        }
+        if points.len() > accumulator_points.len() {
+            accumulator_points.extend_from_slice(&points[accumulator_points.len()..]);
+            accumulator_scalars.resize(points.len(), C::Scalar::ZERO);
+        }
+        for (accumulator, scalar) in accumulator_scalars.iter_mut().zip(scalars) {
+            *accumulator += coefficient * scalar;
+        }
+        Ok(())
+    }
+}
+
 impl<C: Cycle, T: BorrowMut<Transcript>> ConstraintSystem<C> for Verifier<C, T> {
     fn transcript(&mut self) -> &mut Transcript {
         self.transcript.borrow_mut()
@@ -272,12 +421,41 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
 
     /// Same as [`Verifier::verify`] but returns the transcript.
     pub fn verify_and_return_transcript(
-        mut self,
+        self,
         proof: &R1CSProof<C>,
         pc_gens: &PedersenGens<C>,
         bp_gens: &BulletproofGens<C>,
         rng: &mut impl CryptoRngCore,
     ) -> Result<T, R1CSError> {
+        let (equation, transcript) =
+            self.verification_equation_and_return_transcript(proof, pc_gens, bp_gens, rng)?;
+        equation.verify()?;
+        Ok(transcript)
+    }
+
+    /// Prepare the proof's verification equation without running its MSM.
+    pub fn verification_equation(
+        self,
+        proof: &R1CSProof<C>,
+        pc_gens: &PedersenGens<C>,
+        bp_gens: &BulletproofGens<C>,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<VerificationEquation<C>, R1CSError> {
+        self.verification_equation_and_return_transcript(proof, pc_gens, bp_gens, rng)
+            .map(|(equation, _)| equation)
+    }
+
+    /// Prepare the proof's verification equation without running its MSM.
+    ///
+    /// This retains the verifier transcript so callers that use a borrowed
+    /// transcript receive the same state update as [`Verifier::verify`].
+    pub fn verification_equation_and_return_transcript(
+        mut self,
+        proof: &R1CSProof<C>,
+        pc_gens: &PedersenGens<C>,
+        bp_gens: &BulletproofGens<C>,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<(VerificationEquation<C>, T), R1CSError> {
         let transcript = self.transcript.borrow_mut();
         transcript.append_u64(b"m", self.V.len() as u64);
 
@@ -421,7 +599,7 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
             proof.T_6.clone(),
         ];
 
-        let mega_scalars: Vec<C::Scalar> = iter::once(x)
+        let proof_scalars: Vec<C::Scalar> = iter::once(x)
             .chain(iter::once(xx))
             .chain(iter::once(xxx))
             .chain(iter::once(u * x))
@@ -429,17 +607,11 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
             .chain(iter::once(u * xxx))
             .chain(wV.iter().map(|wVi| *wVi * rxx))
             .chain(T_scalars.iter().copied())
-            .chain(iter::once(
-                w * (proof.t_x - a * b) + r * (xx * (wc + delta) - proof.t_x),
-            ))
-            .chain(iter::once(-proof.e_blinding - r * proof.t_x_blinding))
-            .chain(g_scalars.iter().copied())
-            .chain(h_scalars.iter().copied())
             .chain(u_sq.iter().copied())
             .chain(u_inv_sq.iter().copied())
             .collect();
 
-        let mega_points: Vec<Option<C::Point>> = iter::once(C::compressed_decompress(&proof.A_I1))
+        let proof_points: Vec<Option<C::Point>> = iter::once(C::compressed_decompress(&proof.A_I1))
             .chain(iter::once(C::compressed_decompress(&proof.A_O1)))
             .chain(iter::once(C::compressed_decompress(&proof.S1)))
             .chain(iter::once(C::compressed_decompress(&proof.A_I2)))
@@ -447,21 +619,30 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
             .chain(iter::once(C::compressed_decompress(&proof.S2)))
             .chain(self.V.iter().map(C::compressed_decompress))
             .chain(T_points.iter().map(C::compressed_decompress))
-            .chain(iter::once(Some(pc_gens.B)))
-            .chain(iter::once(Some(pc_gens.B_blinding)))
-            .chain(gens.G(padded_n).map(|p| Some(*p)))
-            .chain(gens.H(padded_n).map(|p| Some(*p)))
             .chain(proof.ipp_proof.L_vec.iter().map(C::compressed_decompress))
             .chain(proof.ipp_proof.R_vec.iter().map(C::compressed_decompress))
             .collect();
 
-        let mega_check = C::vartime_msm_optional(&mega_scalars, &mega_points)
-            .ok_or(R1CSError::VerificationError)?;
+        let pedersen_scalars = [
+            w * (proof.t_x - a * b) + r * (xx * (wc + delta) - proof.t_x),
+            -proof.e_blinding - r * proof.t_x_blinding,
+        ];
+        let pedersen_points = [pc_gens.B, pc_gens.B_blinding];
+        let g_points = gens.G(padded_n).copied().collect();
+        let h_points = gens.H(padded_n).copied().collect();
 
-        if !bool::from(mega_check.is_identity()) {
-            return Err(R1CSError::VerificationError);
-        }
-
-        Ok(self.transcript)
+        Ok((
+            VerificationEquation {
+                pedersen_scalars,
+                pedersen_points,
+                g_scalars,
+                g_points,
+                h_scalars,
+                h_points,
+                proof_scalars,
+                proof_points,
+            },
+            self.transcript,
+        ))
     }
 }

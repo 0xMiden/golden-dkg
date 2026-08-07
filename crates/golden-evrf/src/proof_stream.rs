@@ -186,6 +186,12 @@ pub(crate) trait Observe {
     }
 }
 
+impl Observe for Transcript {
+    fn transcript_mut(&mut self) -> &mut Transcript {
+        self
+    }
+}
+
 /// Prover-side proof stream backed by one transcript and an output buffer.
 pub(crate) struct ProverProofStream {
     transcript: Transcript,

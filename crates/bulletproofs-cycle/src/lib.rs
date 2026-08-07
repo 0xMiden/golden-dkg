@@ -77,5 +77,5 @@ pub use inner_product_proof::InnerProductProof;
 pub use linear_proof::LinearProof;
 pub use r1cs::{
     ConstraintSystem, LinearCombination, Metrics, Prover, R1CSProof, RandomizableConstraintSystem,
-    RandomizedConstraintSystem, Variable, Verifier,
+    RandomizedConstraintSystem, Variable, VerificationEquation, Verifier,
 };

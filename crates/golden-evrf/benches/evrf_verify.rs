@@ -8,14 +8,9 @@
 //!    n_e=1 -> 0.1s, n_e=9 -> 0.5s, n_e=49 -> 2.5s, n_e=99 -> 4.8s.
 //!
 //! 2. `eVRF verify-loop/secp256k1` - the DKG receiver's actual Round 1 work:
-//!    `verify_dealing` over `n_e` independent dealer messages. This is an
-//!    UPPER BOUND on the paper's "Batch Verification" column because the
-//!    in-tree `verify_dealing` calls `B::verify_batch` once per dealer with
-//!    no cross-proof MSM sharing (Bulletproofs Section 4.6 batch verification
-//!    is not implemented in this tree). The paper's sub-linear "Batch
-//!    Verification" numbers (0.6s / 6.7s / 22.1s at n_e = 9 / 49 / 99) are
-//!    therefore not reproducible without new production code; this group
-//!    measures the linear-in-n_e fallback the DKG actually ships today.
+//!    `verify_dealings` over `n_e` independent dealer messages. This checks
+//!    all proof equations with one shared MSM. Compare to the paper's "Batch
+//!    Verification" column: 0.6s / 6.7s / 22.1s at n_e = 9 / 49 / 99.
 //!
 //! Setup (proof building) runs inside `bench_with_input`'s routine body so
 //! criterion's regex filter can skip the expensive setup for benchmarks the
@@ -31,7 +26,7 @@ mod support;
 use std::collections::BTreeMap;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use golden_core::{create_dealing, verify_dealing, DealerMessage, DkgConfig};
+use golden_core::{create_dealing, verify_dealings, DealerMessage, DkgConfig};
 use golden_evrf::paper::secp_secq::{evrf_batched_verify, SecpSecqBackend};
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
@@ -65,8 +60,8 @@ fn evrf_verify_single(c: &mut Criterion) {
 
 /// Build `n_e` independent dealer messages for an `(n_e + 1)`-participant
 /// DKG (threshold 2). Each dealer broadcasts one batched proof over its `n_e`
-/// peer receivers. The receiver then runs `verify_dealing` on each of the
-/// `n_e` peer messages. This loop is what a real DKG receiver does in Round 1.
+/// peer receivers. The receiver verifies the `n_e` peer messages as one batch.
+/// This is what a real DKG receiver does in Round 1.
 fn build_n_independent_messages(
     n_e: usize,
 ) -> (
@@ -96,9 +91,9 @@ fn build_n_independent_messages(
     (config, messages)
 }
 
-/// Time `verify_dealing` over `n_e` independent dealer messages. This is the
-/// receiver's Round 1 verification loop without cross-proof MSM sharing.
-fn evrf_verify_loop(c: &mut Criterion) {
+/// Time `verify_dealings` over `n_e` independent dealer messages. This is the
+/// receiver's Round 1 proof check with cross-proof MSM sharing.
+fn evrf_verify_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("eVRF verify-loop/secp256k1");
     group.sample_size(SLOW_SAMPLE_SIZE);
     for &n_e in NE_VALUES {
@@ -107,16 +102,14 @@ fn evrf_verify_loop(c: &mut Criterion) {
             // one batched proof. Runs only when criterion selects this bench.
             let (config, messages) = build_n_independent_messages(n_e);
             let peer_messages: Vec<_> = messages.values().cloned().collect();
-            for msg in &peer_messages {
-                verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(msg, &config).unwrap();
-            }
+            let peer_refs: Vec<_> = peer_messages.iter().collect();
+            verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(&peer_refs, &config).unwrap();
             b.iter_batched(
                 || peer_messages.clone(),
                 |msgs| {
-                    for msg in &msgs {
-                        verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(msg, &config)
-                            .unwrap();
-                    }
+                    let refs: Vec<_> = msgs.iter().collect();
+                    verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(&refs, &config)
+                        .unwrap();
                 },
                 BatchSize::SmallInput,
             )
@@ -127,7 +120,7 @@ fn evrf_verify_loop(c: &mut Criterion) {
 
 fn criterion_benches(c: &mut Criterion) {
     evrf_verify_single(c);
-    evrf_verify_loop(c);
+    evrf_verify_batch(c);
 }
 
 criterion_group!(benches, criterion_benches);

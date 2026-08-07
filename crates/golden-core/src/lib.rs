@@ -20,9 +20,9 @@ mod test_support;
 
 pub use dkg::{
     complete, create_dealing, create_dealing_with_secret, verify_dealing,
-    verify_dealing_for_receiver, DealerMessage, DealerMessageNonce, DkgConfig, DkgDealing,
-    DkgOutput, EncryptedShare, EvrfProofBackend, EvrfStatement, EvrfWitness, ParticipantRegistry,
-    SessionId, DEALER_MESSAGE_NONCE_BYTES, PROTOCOL_VERSION,
+    verify_dealing_for_receiver, verify_dealings, DealerMessage, DealerMessageNonce, DkgConfig,
+    DkgDealing, DkgOutput, EncryptedShare, EvrfProofBackend, EvrfStatement, EvrfWitness,
+    ParticipantRegistry, SessionId, DEALER_MESSAGE_NONCE_BYTES, PROTOCOL_VERSION,
 };
 pub use error::{Error, Result};
 pub use feldman::FeldmanCommitment;

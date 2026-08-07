@@ -349,3 +349,35 @@ fn evrf_batched_dealer_four_receivers_verifies() {
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_batched_verify(&statement, &proof, &mut verify_rng).expect("verify");
 }
+
+#[test]
+#[ignore = "slow: builds two full dealer proofs for cross-proof verification"]
+fn evrf_cross_proof_batch_verifies_and_rejects_mismatched_pairs() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_BA7C);
+    let pkjs = make_pkjs(&mut rng, 1);
+    let beta = R1csField::from(7u64);
+    let (first_statement, first_witness) =
+        paper::testing::build_batched(&make_msg(10), GinScalar::from(3u64), &pkjs, beta);
+    let (second_statement, second_witness) =
+        paper::testing::build_batched(&make_msg(11), GinScalar::from(5u64), &pkjs, beta);
+    let first_proof =
+        paper::evrf_batched_prove(&first_statement, &first_witness, &mut rng).expect("first proof");
+    let second_proof = paper::evrf_batched_prove(&second_statement, &second_witness, &mut rng)
+        .expect("second proof");
+
+    paper::evrf_batched_verify_many(&[
+        (&first_statement, &first_proof),
+        (&second_statement, &second_proof),
+    ])
+    .expect("honest batch");
+    paper::evrf_batched_verify_many(&[
+        (&second_statement, &second_proof),
+        (&first_statement, &first_proof),
+    ])
+    .expect("reordered honest pairs");
+    assert!(paper::evrf_batched_verify_many(&[
+        (&first_statement, &first_proof),
+        (&first_statement, &second_proof),
+    ])
+    .is_err());
+}
