@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use golden_core::{create_dealing, verify_dealing, DealerMessage, DkgConfig};
-use golden_evrf::paper::secp_secq::{evrf_batched_verify, SecpSecqBackend, SecpSecqProof};
+use golden_evrf::paper::secp_secq::{evrf_batched_verify, SecpSecqBackend};
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use support::{
@@ -70,7 +70,7 @@ fn build_n_independent_messages(
     n_e: usize,
 ) -> (
     DkgConfig<Secp256k1GoldenGroup>,
-    BTreeMap<golden_core::ParticipantIndex, DealerMessage<Secp256k1GoldenGroup, SecpSecqProof>>,
+    BTreeMap<golden_core::ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>>,
 ) {
     let n = n_e + 1;
     let config = build_config(n, 1);

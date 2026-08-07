@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use golden_core::{complete, create_dealing, DealerMessage};
-use golden_evrf::paper::secp_secq::{SecpSecqBackend, SecpSecqProof};
+use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use support::{
@@ -88,7 +88,7 @@ fn dkg_round1(c: &mut Criterion) {
             let own_dealing = dealings.get(&receiver).cloned().unwrap();
             let peer_dealings: BTreeMap<
                 golden_core::ParticipantIndex,
-                DealerMessage<Secp256k1GoldenGroup, SecpSecqProof>,
+                DealerMessage<Secp256k1GoldenGroup>,
             > = dealings
                 .iter()
                 .filter_map(|(dealer, dealing)| {

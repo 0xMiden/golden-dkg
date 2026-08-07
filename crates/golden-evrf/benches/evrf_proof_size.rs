@@ -57,7 +57,7 @@ fn one_dealer_proof_bytes(n: usize) -> usize {
         &mut rng,
     )
     .unwrap();
-    dealing.message.proof.0.len()
+    dealing.message.proof.len()
 }
 
 /// Build `n_e` independent dealer proofs in an `(n_e + 1)`-participant DKG.
@@ -76,7 +76,7 @@ fn n_independent_proof_byte_sizes_total(n_e: usize) -> usize {
                 &mut rng,
             )
             .unwrap();
-            dealing.message.proof.0.len()
+            dealing.message.proof.len()
         })
         .sum()
 }

@@ -23,8 +23,8 @@ use golden_core::{
     DkgConfig, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
 };
 use golden_evrf::paper::secp_secq::{
-    evrf_batched_prove, evrf_batched_verify, testing, BatchedEvrfProofEnvelope,
-    BatchedEvrfStatement, BatchedEvrfWitness, Gin, GinScalar, R1csField,
+    evrf_batched_prove, evrf_batched_verify, testing, BatchedEvrfStatement, BatchedEvrfWitness,
+    Gin, GinScalar, R1csField,
 };
 use golden_evrf::paper::MESSAGE_BYTES;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
@@ -115,7 +115,7 @@ pub fn build_batched_at_ne(
 
 /// Build and prove one batched eVRF proof covering `n_e` receivers. Returns
 /// `(statement, proof)` so callers can verify or measure size.
-pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfStatement, BatchedEvrfProofEnvelope) {
+pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfStatement, Vec<u8>) {
     let (statement, witness, _pkjs, _beta) = build_batched_at_ne(n_e);
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
     let proof = evrf_batched_prove(&statement, &witness, &mut rng).unwrap();
@@ -129,10 +129,7 @@ pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfStatement, BatchedEvrfProofE
 /// Each dealing carries one batched eVRF proof over `n - 1` receivers.
 pub fn round0_all_dealings(
     config: &DkgConfig<Secp256k1GoldenGroup>,
-) -> BTreeMap<
-    ParticipantIndex,
-    golden_core::DkgDealing<Secp256k1GoldenGroup, golden_evrf::paper::secp_secq::SecpSecqProof>,
-> {
+) -> BTreeMap<ParticipantIndex, golden_core::DkgDealing<Secp256k1GoldenGroup>> {
     use golden_core::create_dealing;
     use golden_evrf::paper::secp_secq::SecpSecqBackend;
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
