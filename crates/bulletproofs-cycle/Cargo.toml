@@ -31,6 +31,9 @@ halo2curves = { workspace = true, features = ["std"] }
 postcard = { workspace = true }
 rand_chacha = { workspace = true }
 
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+halo2curves = { workspace = true, features = ["asm"] }
+
 [features]
 default = ["cycle-pedersen"]
 cycle-pedersen = []
