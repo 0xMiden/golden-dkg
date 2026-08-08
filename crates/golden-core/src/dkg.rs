@@ -588,7 +588,9 @@ where
 ///
 /// Every message is checked against `config` before any proof equations are
 /// combined. Backends without a cross-proof optimization use the trait's
-/// linear fallback.
+/// linear fallback. If combined verification fails, each proof is retried so
+/// the returned error can identify an invalid dealer. The original batch error
+/// is preserved if every individual proof passes.
 pub fn verify_dealings<G, B>(messages: &[&DealerMessage<G>], config: &DkgConfig<G>) -> Result<()>
 where
     G: GoldenGroup,
@@ -606,7 +608,16 @@ where
         .zip(messages.iter())
         .map(|(statements, message)| (statements.as_slice(), message.proof.as_slice()))
         .collect();
-    B::verify_proof_batch(&proof_batches)
+    let batch_error = match B::verify_proof_batch(&proof_batches) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    for ((statements, proof), message) in proof_batches.iter().zip(messages) {
+        if B::verify_batch(statements, proof).is_err() {
+            return Err(Error::DealerProofVerificationFailed(message.dealer.get()));
+        }
+    }
+    Err(batch_error)
 }
 
 /// Verify one dealer message for a concrete receiver before accepting it.
@@ -1075,6 +1086,29 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    enum BatchRejectingBackend {}
+
+    impl EvrfProofBackend<TinyGroup> for BatchRejectingBackend {
+        const PROOF_ID: &'static [u8] = FAKE_PROOF_ID;
+
+        fn prove_batch(
+            statements: &[EvrfStatement<TinyGroup>],
+            witnesses: &[EvrfWitness<TinyGroup>],
+            rng: &mut impl CryptoRngCore,
+        ) -> Result<Vec<u8>> {
+            FakeEvrfBackend::prove_batch(statements, witnesses, rng)
+        }
+
+        fn verify_batch(statements: &[EvrfStatement<TinyGroup>], proof: &[u8]) -> Result<()> {
+            FakeEvrfBackend::verify_batch(statements, proof)
+        }
+
+        fn verify_proof_batch(_batches: &[(&[EvrfStatement<TinyGroup>], &[u8])]) -> Result<()> {
+            Err(Error::ProofVerificationFailed)
+        }
+    }
+
     fn fake_proof_bytes(statements: &[EvrfStatement<TinyGroup>]) -> Result<Vec<u8>> {
         let id_len =
             u32::try_from(FAKE_PROOF_ID.len()).map_err(|_| Error::ProofVerificationFailed)?;
@@ -1350,10 +1384,22 @@ mod tests {
             let references: Vec<_> = messages.iter().collect();
             assert_eq!(
                 verify_dealings::<TinyGroup, FakeEvrfBackend>(&references, &config).unwrap_err(),
-                Error::ProofVerificationFailed,
+                Error::DealerProofVerificationFailed(messages[invalid_index].dealer.get()),
                 "invalid proof at position {invalid_index} must fail"
             );
         }
+    }
+
+    #[test]
+    fn verify_dealings_preserves_batch_error_when_individual_proofs_pass() {
+        let config = config();
+        let dealings = all_dealings(&config);
+        let messages: Vec<_> = dealings.values().map(|dealing| &dealing.message).collect();
+
+        assert_eq!(
+            verify_dealings::<TinyGroup, BatchRejectingBackend>(&messages, &config).unwrap_err(),
+            Error::ProofVerificationFailed
+        );
     }
 
     #[test]
