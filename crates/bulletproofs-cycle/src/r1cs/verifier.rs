@@ -5,6 +5,7 @@
 use core::borrow::BorrowMut;
 use core::iter;
 
+use alloc::sync::Arc;
 use ff::Field;
 use group::Group;
 use merlin::Transcript;
@@ -47,9 +48,9 @@ pub struct VerificationEquation<C: Cycle> {
     pedersen_scalars: [C::Scalar; 2],
     pedersen_points: [C::Point; 2],
     g_scalars: Vec<C::Scalar>,
-    g_points: Vec<C::Point>,
+    g_points: Arc<Vec<C::Point>>,
     h_scalars: Vec<C::Scalar>,
-    h_points: Vec<C::Point>,
+    h_points: Arc<Vec<C::Point>>,
     proof_scalars: Vec<C::Scalar>,
     proof_points: Vec<Option<C::Point>>,
 }
@@ -57,6 +58,8 @@ pub struct VerificationEquation<C: Cycle> {
 impl<C: Cycle> VerificationEquation<C> {
     /// Check one prepared verification equation.
     pub fn verify(self) -> Result<(), R1CSError> {
+        let g_len = self.g_scalars.len();
+        let h_len = self.h_scalars.len();
         let scalars: Vec<C::Scalar> = self
             .pedersen_scalars
             .into_iter()
@@ -68,8 +71,8 @@ impl<C: Cycle> VerificationEquation<C> {
             .pedersen_points
             .into_iter()
             .map(Some)
-            .chain(self.g_points.into_iter().map(Some))
-            .chain(self.h_points.into_iter().map(Some))
+            .chain(self.g_points.iter().take(g_len).copied().map(Some))
+            .chain(self.h_points.iter().take(h_len).copied().map(Some))
             .chain(self.proof_points)
             .collect();
         let check =
@@ -94,9 +97,9 @@ impl<C: Cycle> VerificationEquation<C> {
         let pedersen_points = first.pedersen_points;
         let mut pedersen_scalars = [C::Scalar::ZERO; 2];
         let mut g_scalars = Vec::new();
-        let mut g_points = Vec::new();
+        let mut g_points = Arc::clone(&first.g_points);
         let mut h_scalars = Vec::new();
-        let mut h_points = Vec::new();
+        let mut h_points = Arc::clone(&first.h_points);
         let mut proof_scalars = Vec::new();
         let mut proof_points = Vec::new();
 
@@ -142,6 +145,8 @@ impl<C: Cycle> VerificationEquation<C> {
             proof_points.extend(equation.proof_points);
         }
 
+        let g_len = g_scalars.len();
+        let h_len = h_scalars.len();
         let scalars: Vec<C::Scalar> = pedersen_scalars
             .into_iter()
             .chain(g_scalars)
@@ -151,8 +156,8 @@ impl<C: Cycle> VerificationEquation<C> {
         let points: Vec<Option<C::Point>> = pedersen_points
             .into_iter()
             .map(Some)
-            .chain(g_points.into_iter().map(Some))
-            .chain(h_points.into_iter().map(Some))
+            .chain(g_points.iter().take(g_len).copied().map(Some))
+            .chain(h_points.iter().take(h_len).copied().map(Some))
             .chain(proof_points)
             .collect();
         let check =
@@ -165,21 +170,23 @@ impl<C: Cycle> VerificationEquation<C> {
 
     fn accumulate_generator_prefix(
         accumulator_scalars: &mut Vec<C::Scalar>,
-        accumulator_points: &mut Vec<C::Point>,
+        accumulator_points: &mut Arc<Vec<C::Point>>,
         scalars: Vec<C::Scalar>,
-        points: Vec<C::Point>,
+        points: Arc<Vec<C::Point>>,
         coefficient: C::Scalar,
     ) -> Result<(), R1CSError> {
-        if scalars.len() != points.len() {
+        if scalars.len() > points.len() {
             return Err(R1CSError::VerificationError);
         }
-        let shared_len = accumulator_points.len().min(points.len());
+        let shared_len = accumulator_points.len().min(scalars.len());
         if accumulator_points[..shared_len] != points[..shared_len] {
             return Err(R1CSError::VerificationError);
         }
-        if points.len() > accumulator_points.len() {
-            accumulator_points.extend_from_slice(&points[accumulator_points.len()..]);
-            accumulator_scalars.resize(points.len(), C::Scalar::ZERO);
+        if scalars.len() > accumulator_points.len() {
+            *accumulator_points = points;
+        }
+        if scalars.len() > accumulator_scalars.len() {
+            accumulator_scalars.resize(scalars.len(), C::Scalar::ZERO);
         }
         for (accumulator, scalar) in accumulator_scalars.iter_mut().zip(scalars) {
             *accumulator += coefficient * scalar;
@@ -628,8 +635,8 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
             -proof.e_blinding - r * proof.t_x_blinding,
         ];
         let pedersen_points = [pc_gens.B, pc_gens.B_blinding];
-        let g_points = gens.G(padded_n).copied().collect();
-        let h_points = gens.H(padded_n).copied().collect();
+        let g_points = gens.shared_G();
+        let h_points = gens.shared_H();
 
         Ok((
             VerificationEquation {

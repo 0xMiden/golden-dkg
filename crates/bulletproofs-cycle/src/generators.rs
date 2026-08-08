@@ -4,7 +4,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 
 use digest::{ExtendableOutput, Update, XofReader};
 #[cfg(all(feature = "cycle-pedersen", not(feature = "bulletproofs-compat")))]
@@ -107,8 +107,8 @@ pub struct BulletproofGens<C: Cycle> {
     pub gens_capacity: usize,
     /// Number of parties supported.
     pub party_capacity: usize,
-    G_vec: Vec<Vec<C::Point>>,
-    H_vec: Vec<Vec<C::Point>>,
+    G_vec: Vec<Arc<Vec<C::Point>>>,
+    H_vec: Vec<Arc<Vec<C::Point>>>,
 }
 
 impl<C: Cycle> BulletproofGens<C> {
@@ -117,8 +117,8 @@ impl<C: Cycle> BulletproofGens<C> {
         let mut gens = BulletproofGens {
             gens_capacity: 0,
             party_capacity,
-            G_vec: (0..party_capacity).map(|_| Vec::new()).collect(),
-            H_vec: (0..party_capacity).map(|_| Vec::new()).collect(),
+            G_vec: (0..party_capacity).map(|_| Arc::new(Vec::new())).collect(),
+            H_vec: (0..party_capacity).map(|_| Arc::new(Vec::new())).collect(),
         };
         gens.increase_capacity(gens_capacity);
         gens
@@ -141,7 +141,7 @@ impl<C: Cycle> BulletproofGens<C> {
             let party_index = i as u32;
             let mut label_g = [b'G', 0, 0, 0, 0];
             label_g[1..5].copy_from_slice(&party_index.to_le_bytes());
-            self.G_vec[i].extend(
+            Arc::make_mut(&mut self.G_vec[i]).extend(
                 GeneratorsChain::new(&label_g)
                     .fast_forward(self.gens_capacity)
                     .take(new_capacity - self.gens_capacity)
@@ -150,7 +150,7 @@ impl<C: Cycle> BulletproofGens<C> {
 
             let mut label_h = [b'H', 0, 0, 0, 0];
             label_h[1..5].copy_from_slice(&party_index.to_le_bytes());
-            self.H_vec[i].extend(
+            Arc::make_mut(&mut self.H_vec[i]).extend(
                 GeneratorsChain::new(&label_h)
                     .fast_forward(self.gens_capacity)
                     .take(new_capacity - self.gens_capacity)
@@ -177,5 +177,13 @@ impl<'a, C: Cycle> BulletproofGensShare<'a, C> {
     /// This party's first `n` `H` generators.
     pub fn H(&self, n: usize) -> impl Iterator<Item = &'a C::Point> {
         self.gens.H_vec[self.share].iter().take(n)
+    }
+
+    pub(crate) fn shared_G(&self) -> Arc<Vec<C::Point>> {
+        Arc::clone(&self.gens.G_vec[self.share])
+    }
+
+    pub(crate) fn shared_H(&self) -> Arc<Vec<C::Point>> {
+        Arc::clone(&self.gens.H_vec[self.share])
     }
 }
