@@ -135,20 +135,47 @@ jobs:
         run: cargo nextest run -p golden-ehtdh1 --features prototype-bridge
       - name: Test Secp/Secq R1CS cycle
         run: cargo nextest run -p golden-halo2curves --features halo2curves-secp256k1
-      - name: Test Ristretto Cycle impl and upstream byte parity
-        run: cargo nextest run -p bulletproofs-cycle --features ristretto
       - name: Test bulletproofs-compat (upstream domain separation)
         run: cargo nextest run -p bulletproofs-cycle --no-default-features --features bulletproofs-compat
-      - name: Test golden-evrf Secp/Secq backend
-        run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1
-      - name: Test golden-evrf parallel Secp/Secq backend
-        run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1,parallel
-      - name: Test golden-evrf wire serialization adapters
-        run: cargo nextest run -p golden-evrf --features serde,miden-serde,halo2curves-secp256k1
       - name: Test EHTDH1 wire serialization adapters
         run: cargo nextest run -p golden-ehtdh1 --features serde,miden-serde
       - name: Doctests
         run: cargo test --workspace --doc
+
+  backend-test:
+    name: Test Secp/Secq backend (${{ matrix.backend }})
+    runs-on: warp-ubuntu-latest-x64-8x
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: sequential
+            bulletproofs_features: ristretto
+            evrf_features: serde,miden-serde,halo2curves-secp256k1
+          - backend: parallel
+            bulletproofs_features: ristretto,parallel
+            evrf_features: halo2curves-secp256k1,parallel
+    env:
+      BULLETPROOFS_FEATURES: ${{ matrix.bulletproofs_features }}
+      EVRF_FEATURES: ${{ matrix.evrf_features }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.backend }}
+      - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
+        with:
+          tool: cargo-nextest
+      - name: Test Ristretto generator backend
+        run: cargo nextest run -p bulletproofs-cycle --features "$BULLETPROOFS_FEATURES"
+      - name: Test golden-evrf Secp/Secq backend
+        run: cargo nextest run -p golden-evrf --features "$EVRF_FEATURES"
 
   doc:
     name: Docs
