@@ -1700,8 +1700,8 @@ pub mod secp_secq {
         cs: &mut CS,
         coefficients: &[Gin],
         coefficient_scalars: Option<&[GinScalar]>,
-        g_in: &Gin,
     ) -> core::result::Result<(), R1CSError> {
+        let g_in = Gin::generator();
         let precomp = shared_g_in_chord_precomp();
 
         for (i, coefficient) in coefficients.iter().enumerate() {
@@ -1726,7 +1726,7 @@ pub mod secp_secq {
                     let mut bits = [false; K_BITS + 1];
                     decompose_k_fp(scalar_fp, &mut bits);
                     Some(
-                        chord_compute_witness(&bits, g_in, K_BITS)
+                        chord_compute_witness(&bits, &g_in, K_BITS)
                             .map_err(|_| R1CSError::VerificationError)?,
                     )
                 } else {
@@ -2007,7 +2007,6 @@ pub mod secp_secq {
             &mut prover,
             &statement.commitment_coefficients,
             Some(&witness.coefficient_scalars),
-            &g_in,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
@@ -2063,11 +2062,6 @@ pub mod secp_secq {
     where
         T: core::borrow::BorrowMut<Transcript>,
     {
-        let g_in = Gin::generator();
-        let pc_gens = PedersenGens::<R1csCycle>::default();
-        let bp_gens =
-            BulletproofGens::<R1csCycle>::new(batched_gens_capacity(statement.receivers.len()), 1);
-
         // Derive h1, h2 from msg. Their chord tables are receiver-independent;
         // compute once and share across every receiver slot below.
         let h1 = h_gin_1(&statement.msg);
@@ -2096,13 +2090,8 @@ pub mod secp_secq {
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
-        prove_feldman_coefficients(
-            &mut verifier,
-            &statement.commitment_coefficients,
-            None,
-            &g_in,
-        )
-        .map_err(|_| Error::ProofVerificationFailed)?;
+        prove_feldman_coefficients(&mut verifier, &statement.commitment_coefficients, None)
+            .map_err(|_| Error::ProofVerificationFailed)?;
 
         for rec in &statement.receivers {
             build_hidden_receiver_slot(
