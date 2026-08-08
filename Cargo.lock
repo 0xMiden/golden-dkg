@@ -500,6 +500,7 @@ name = "golden-evrf"
 version = "0.2.0"
 dependencies = [
  "bulletproofs-cycle",
+ "criterion",
  "ff",
  "golden-core",
  "golden-halo2curves",
