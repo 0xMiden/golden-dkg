@@ -280,7 +280,11 @@ pub trait EvrfProofBackend<G: GoldenGroup> {
     ///
     /// Each entry contains the ordered receiver statements and proof bytes for
     /// one dealer. Backends may combine the proof equations into one MSM. The
-    /// default preserves correctness for backends without that optimization.
+    /// combining coefficients must be nonzero and unpredictable to the
+    /// dealers, using fresh verifier entropy or a domain-separated transcript
+    /// that binds the complete ordered batch. Fixed or input-independent
+    /// coefficients do not provide sound batch verification. The default
+    /// preserves correctness for backends without that optimization.
     fn verify_proof_batch(batches: &[(&[EvrfStatement<G>], &[u8])]) -> Result<()> {
         for (statements, proof) in batches {
             Self::verify_batch(statements, proof)?;
