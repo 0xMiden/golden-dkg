@@ -41,6 +41,7 @@ mod support;
 
 use std::collections::BTreeMap;
 
+use codspeed_criterion_compat as criterion;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use golden_core::{complete, create_dealing, DealerMessage};
 use golden_evrf::paper::secp_secq::SecpSecqBackend;

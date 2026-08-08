@@ -23,6 +23,7 @@
 #[path = "support_dir/mod.rs"]
 mod support;
 
+use codspeed_criterion_compat as criterion;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use golden_evrf::paper::secp_secq::{evrf_batched_prove, BatchedEvrfPublicParams};
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};

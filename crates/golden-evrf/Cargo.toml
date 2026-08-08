@@ -24,6 +24,7 @@ rand_chacha = { workspace = true, optional = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 
 [dev-dependencies]
+codspeed-criterion-compat = "5.0.1"
 criterion = "0.5"
 ff = { workspace = true }
 golden-rustcrypto = { workspace = true, features = ["p256"] }
