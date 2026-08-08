@@ -11,8 +11,8 @@ use rand_core::CryptoRngCore;
 
 use super::{
     affine, evrf_batched_prove, evrf_batched_verify_many, fp_to_fq, h_gin_1, h_gin_2,
-    BatchedEvrfStatement, BatchedEvrfWitness, BatchedReceiverStatement, Gin, GinScalar,
-    BATCHED_PROOF_ID, MESSAGE_BYTES,
+    BatchedEvrfPublicParams, BatchedEvrfStatement, BatchedEvrfWitness, BatchedReceiverStatement,
+    Gin, GinScalar, BATCHED_PROOF_ID, MESSAGE_BYTES,
 };
 
 pub(super) fn ensure_same_batch_context(
@@ -173,7 +173,8 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
             coefficient_scalars,
             shares,
         };
-        evrf_batched_prove(&batched_statement, &batched_witness, rng)
+        let params = BatchedEvrfPublicParams::shared(threshold, batched_statement.receivers.len())?;
+        evrf_batched_prove(&params, &batched_statement, &batched_witness, rng)
     }
 
     fn verify_batch(
@@ -181,7 +182,9 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
         proof: &[u8],
     ) -> Result<()> {
         let statement = batched_statement(statements)?;
-        evrf_batched_verify_many(&[(&statement, proof)])
+        let params =
+            BatchedEvrfPublicParams::shared(statement.threshold, statement.receivers.len())?;
+        evrf_batched_verify_many(&params, &[(&statement, proof)])
     }
 
     fn verify_proof_batch(
@@ -194,11 +197,13 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
             .iter()
             .map(|(batch, _)| batched_statement(batch))
             .collect::<Result<Vec<_>>>()?;
+        let first = statements.first().ok_or(Error::ProofVerificationFailed)?;
+        let params = BatchedEvrfPublicParams::shared(first.threshold, first.receivers.len())?;
         let instances = statements
             .iter()
             .zip(batches.iter())
             .map(|(statement, (_, proof))| (statement, *proof))
             .collect::<Vec<_>>();
-        evrf_batched_verify_many(&instances)
+        evrf_batched_verify_many(&params, &instances)
     }
 }

@@ -21,17 +21,26 @@ group = { workspace = true, optional = true }
 halo2curves = { workspace = true, optional = true }
 merlin = { workspace = true }
 rand_chacha = { workspace = true, optional = true }
+serde = { workspace = true, optional = true, features = ["derive"] }
 
 [dev-dependencies]
+codspeed-criterion-compat = "5.0.1"
 criterion = "0.5"
 ff = { workspace = true }
 golden-rustcrypto = { workspace = true, features = ["p256"] }
+postcard = { workspace = true }
 rand_chacha = { workspace = true }
 
 [features]
 default = []
 miden-serde = ["golden-core/miden-serde"]
-serde = ["golden-core/serde"]
+parallel = ["bulletproofs-cycle?/parallel"]
+serde = [
+    "dep:serde",
+    "bulletproofs-cycle?/serde",
+    "golden-core/serde",
+    "halo2curves?/derive_serde",
+]
 halo2curves-secp256k1 = [
     "dep:bulletproofs-cycle",
     "dep:golden-halo2curves",
@@ -58,15 +67,19 @@ required-features = ["halo2curves-secp256k1"]
 name = "paper_public_api"
 required-features = ["halo2curves-secp256k1"]
 
+[[test]]
+name = "public_params_serde"
+required-features = ["halo2curves-secp256k1", "serde"]
+
 [[bench]]
 name = "evrf_prove"
 harness = false
-required-features = ["halo2curves-secp256k1"]
+required-features = ["halo2curves-secp256k1", "parallel"]
 
 [[bench]]
 name = "evrf_verify"
 harness = false
-required-features = ["halo2curves-secp256k1"]
+required-features = ["halo2curves-secp256k1", "parallel"]
 
 [[bench]]
 name = "evrf_proof_size"
@@ -76,12 +89,17 @@ required-features = ["halo2curves-secp256k1"]
 [[bench]]
 name = "dkg_round"
 harness = false
-required-features = ["halo2curves-secp256k1"]
+required-features = ["halo2curves-secp256k1", "parallel"]
 
 [[bench]]
 name = "dkg_communication"
 harness = false
 required-features = ["halo2curves-secp256k1"]
+
+[[bench]]
+name = "batched_setup"
+harness = false
+required-features = ["halo2curves-secp256k1", "parallel"]
 
 [lints]
 workspace = true

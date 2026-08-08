@@ -181,9 +181,9 @@ mod sanity {
     fn generator_decompress<C: Cycle>() {
         let bp_gens = BulletproofGens::<C>::new(8, 1);
         let g = bp_gens.share(0).G(1).next().unwrap();
-        let comp = <C as Cycle>::point_compress(g);
+        let comp = <C as Cycle>::affine_compress(g);
         let decomp = <C as Cycle>::compressed_decompress(&comp).expect("decompress");
-        assert_eq!(*g, decomp, "generator roundtrip");
+        assert_eq!(*g, C::point_to_affine(&decomp), "generator roundtrip");
     }
 
     fn scalar_from_wide_consistency<C: Cycle>() {

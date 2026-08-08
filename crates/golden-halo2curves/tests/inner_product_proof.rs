@@ -32,8 +32,8 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([42; 32]);
 
         let bp_gens = BulletproofGens::<C>::new(n, 1);
-        let G: Vec<C::Point> = bp_gens.share(0).G(n).copied().collect();
-        let H: Vec<C::Point> = bp_gens.share(0).H(n).copied().collect();
+        let G: Vec<C::Point> = bp_gens.share(0).G(n).map(C::affine_to_point).collect();
+        let H: Vec<C::Point> = bp_gens.share(0).H(n).map(C::affine_to_point).collect();
 
         // Q is a fixed base derived from a uniform 64-byte input. Upstream
         // hashes b"test point" to a RistrettoPoint; we feed the same tag
@@ -170,8 +170,8 @@ mod tests {
     {
         let mut rng = ChaCha20Rng::from_seed([42; 32]);
         let bp_gens = BulletproofGens::<C>::new(n, 1);
-        let G: Vec<C::Point> = bp_gens.share(0).G(n).copied().collect();
-        let H: Vec<C::Point> = bp_gens.share(0).H(n).copied().collect();
+        let G: Vec<C::Point> = bp_gens.share(0).G(n).map(C::affine_to_point).collect();
+        let H: Vec<C::Point> = bp_gens.share(0).H(n).map(C::affine_to_point).collect();
 
         let mut q_seed = [0u8; 64];
         let tag = b"test point";

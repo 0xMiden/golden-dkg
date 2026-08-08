@@ -48,9 +48,9 @@ pub struct VerificationEquation<C: Cycle> {
     pedersen_scalars: [C::Scalar; 2],
     pedersen_points: [C::Point; 2],
     g_scalars: Vec<C::Scalar>,
-    g_points: Arc<Vec<C::Point>>,
+    g_points: Arc<Vec<C::Affine>>,
     h_scalars: Vec<C::Scalar>,
-    h_points: Arc<Vec<C::Point>>,
+    h_points: Arc<Vec<C::Affine>>,
     proof_scalars: Vec<C::Scalar>,
     proof_points: Vec<Option<C::Point>>,
 }
@@ -63,20 +63,18 @@ impl<C: Cycle> VerificationEquation<C> {
         let scalars: Vec<C::Scalar> = self
             .pedersen_scalars
             .into_iter()
-            .chain(self.g_scalars)
-            .chain(self.h_scalars)
             .chain(self.proof_scalars)
             .collect();
         let points: Vec<Option<C::Point>> = self
             .pedersen_points
             .into_iter()
             .map(Some)
-            .chain(self.g_points.iter().take(g_len).copied().map(Some))
-            .chain(self.h_points.iter().take(h_len).copied().map(Some))
             .chain(self.proof_points)
             .collect();
-        let check =
+        let mut check =
             C::vartime_msm_optional(&scalars, &points).ok_or(R1CSError::VerificationError)?;
+        check += C::vartime_msm_affine(&self.g_scalars, &self.g_points[..g_len]);
+        check += C::vartime_msm_affine(&self.h_scalars, &self.h_points[..h_len]);
         if !bool::from(check.is_identity()) {
             return Err(R1CSError::VerificationError);
         }
@@ -147,21 +145,16 @@ impl<C: Cycle> VerificationEquation<C> {
 
         let g_len = g_scalars.len();
         let h_len = h_scalars.len();
-        let scalars: Vec<C::Scalar> = pedersen_scalars
-            .into_iter()
-            .chain(g_scalars)
-            .chain(h_scalars)
-            .chain(proof_scalars)
-            .collect();
+        let scalars: Vec<C::Scalar> = pedersen_scalars.into_iter().chain(proof_scalars).collect();
         let points: Vec<Option<C::Point>> = pedersen_points
             .into_iter()
             .map(Some)
-            .chain(g_points.iter().take(g_len).copied().map(Some))
-            .chain(h_points.iter().take(h_len).copied().map(Some))
             .chain(proof_points)
             .collect();
-        let check =
+        let mut check =
             C::vartime_msm_optional(&scalars, &points).ok_or(R1CSError::VerificationError)?;
+        check += C::vartime_msm_affine(&g_scalars, &g_points[..g_len]);
+        check += C::vartime_msm_affine(&h_scalars, &h_points[..h_len]);
         if !bool::from(check.is_identity()) {
             return Err(R1CSError::VerificationError);
         }
@@ -170,9 +163,9 @@ impl<C: Cycle> VerificationEquation<C> {
 
     fn accumulate_generator_prefix(
         accumulator_scalars: &mut Vec<C::Scalar>,
-        accumulator_points: &mut Arc<Vec<C::Point>>,
+        accumulator_points: &mut Arc<Vec<C::Affine>>,
         scalars: Vec<C::Scalar>,
-        points: Arc<Vec<C::Point>>,
+        points: Arc<Vec<C::Affine>>,
         coefficient: C::Scalar,
     ) -> Result<(), R1CSError> {
         if scalars.len() > points.len() {

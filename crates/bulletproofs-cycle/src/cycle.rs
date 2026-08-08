@@ -25,9 +25,11 @@ use rand_core::CryptoRngCore;
 /// a group element used in proof transcripts and serialized proofs.
 pub trait Cycle: Clone + Eq + Debug + 'static {
     /// R1CS coefficient field, also the scalar field of [`Cycle::Point`].
-    type Scalar: Field + PrimeField + Copy + Default + Eq + Debug + 'static;
+    type Scalar: Field + PrimeField + Copy + Default + Eq + Debug + Send + Sync + 'static;
     /// Projective group element used for Pedersen and Bulletproofs commitments.
-    type Point: Group<Scalar = Self::Scalar> + Copy + Eq + Debug + 'static;
+    type Point: Group<Scalar = Self::Scalar> + Copy + Eq + Debug + Send + Sync + 'static;
+    /// Affine group element used to store and reuse preprocessed generators.
+    type Affine: Copy + Eq + Debug + Send + Sync + 'static;
     /// Fixed-width compressed encoding of a [`Cycle::Point`].
     type Compressed: Clone + Debug + 'static;
 
@@ -93,11 +95,26 @@ pub trait Cycle: Clone + Eq + Debug + 'static {
     /// independent Bulletproofs generators from a SHAKE256 stream.
     fn point_hash_from_uniform(bytes: &[u8; 64]) -> Self::Point;
 
+    /// Convert a projective point to affine form.
+    fn point_to_affine(point: &Self::Point) -> Self::Affine;
+
+    /// Convert an affine point to projective form.
+    fn affine_to_point(point: &Self::Affine) -> Self::Point;
+
+    /// Convert projective points to affine form with a batch inversion where available.
+    fn batch_normalize(points: &[Self::Point]) -> Vec<Self::Affine>;
+
+    /// Compress an affine point to its fixed-width encoding.
+    fn affine_compress(point: &Self::Affine) -> Self::Compressed;
+
     /// Variable-time multiscalar multiplication of `scalars` and `points`.
     ///
     /// Panics if the slice lengths differ. The first milestone does not require
     /// constant-time multiplication.
     fn vartime_msm(scalars: &[Self::Scalar], points: &[Self::Point]) -> Self::Point;
+
+    /// Variable-time multiscalar multiplication over preprocessed affine points.
+    fn vartime_msm_affine(scalars: &[Self::Scalar], points: &[Self::Affine]) -> Self::Point;
 
     /// Variable-time multiscalar multiplication where each point may be
     /// missing. Returns `None` if any required point is `None`.

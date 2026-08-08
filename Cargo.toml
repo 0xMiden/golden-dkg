@@ -40,6 +40,7 @@ k256 = { version = "0.13", default-features = false }
 merlin = { version = "3", default-features = false }
 miden-serde-utils = { version = "0.28", default-features = false }
 p3-maybe-rayon = { version = "0.6.2", default-features = false }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 rand_chacha = "0.3"
 rand_core = "0.6"
 serde = { version = "1", default-features = false, features = ["alloc"] }

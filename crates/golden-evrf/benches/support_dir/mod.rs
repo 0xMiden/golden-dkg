@@ -23,8 +23,8 @@ use golden_core::{
     DkgConfig, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
 };
 use golden_evrf::paper::secp_secq::{
-    evrf_batched_prove, evrf_batched_verify, testing, BatchedEvrfStatement, BatchedEvrfWitness,
-    Gin, GinScalar, R1csField,
+    evrf_batched_prove, evrf_batched_verify, testing, BatchedEvrfPublicParams,
+    BatchedEvrfStatement, BatchedEvrfWitness, Gin, GinScalar, R1csField,
 };
 use golden_evrf::paper::MESSAGE_BYTES;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
@@ -41,6 +41,31 @@ pub const TABLE4_THRESHOLD: usize = 2;
 
 /// Table 5 columns: number of DKG participants in an n-of-n configuration.
 pub const N_VALUES: &[usize] = &[2, 10, 50, 100];
+
+fn selected_values(variable: &str, defaults: &[usize]) -> Vec<usize> {
+    std::env::var(variable).map_or_else(
+        |_| defaults.to_vec(),
+        |raw| {
+            raw.split(',')
+                .map(|value| {
+                    value
+                        .parse()
+                        .expect("benchmark row must be a positive integer")
+                })
+                .collect()
+        },
+    )
+}
+
+/// Table 4 rows selected for this run.
+pub fn table4_ne_values() -> Vec<usize> {
+    selected_values("GOLDEN_TABLE4_NE_VALUES", NE_VALUES)
+}
+
+/// Table 5 rows selected for this run.
+pub fn table5_n_values() -> Vec<usize> {
+    selected_values("GOLDEN_TABLE5_N_VALUES", N_VALUES)
+}
 
 /// Sample size passed to criterion for the slowest benches. Matches the
 /// `crates/bulletproofs-cycle/benches/r1cs.rs` convention: at `n_e = 99` a
@@ -119,15 +144,17 @@ pub fn build_batched_at_ne(
 }
 
 /// Build and prove one batched eVRF proof covering `n_e` receivers. Returns
-/// `(statement, proof)` so callers can verify or measure size.
-pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfStatement, Vec<u8>) {
+/// `(params, statement, proof)` so callers can verify or measure size.
+pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfPublicParams, BatchedEvrfStatement, Vec<u8>) {
     let (statement, witness, _pkjs, _beta) = build_batched_at_ne(n_e);
+    let params = BatchedEvrfPublicParams::setup(statement.threshold, statement.receivers.len())
+        .expect("valid public parameter shape");
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
-    let proof = evrf_batched_prove(&statement, &witness, &mut rng).unwrap();
+    let proof = evrf_batched_prove(&params, &statement, &witness, &mut rng).unwrap();
     // Sanity: the proof must verify before any bench iterates on it.
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
-    evrf_batched_verify(&statement, &proof, &mut rng).unwrap();
-    (statement, proof)
+    evrf_batched_verify(&params, &statement, &proof, &mut rng).unwrap();
+    (params, statement, proof)
 }
 
 /// Run a full DKG Round 0 for `n` participants and return all `n` dealings.
