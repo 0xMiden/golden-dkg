@@ -9,6 +9,11 @@ members = [
 ]
 resolver = "2"
 
+[profile.optimized]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+
 [workspace.package]
 edition = "2021"
 homepage = "https://miden.xyz"
