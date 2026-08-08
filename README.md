@@ -40,6 +40,10 @@ Rust 1.93 or later.
   Secp256k1/Secq256k1 curve cycle, plus the Secp256k1 `GoldenGroup`
   adapter used by the Secp/Secq eVRF backend.
 
+## Performance
+
+For performance sensitive workloads, one can use the `optimized` profile when compiling.
+
 ## Useful checks
 
 ```bash
