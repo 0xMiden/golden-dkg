@@ -290,38 +290,69 @@ pub mod secp_secq {
     }
 
     impl BatchedEvrfPublicParams {
-        /// Build transparent parameters for a DKG threshold and receiver count.
-        pub fn setup(threshold: usize, receiver_count: usize) -> Result<Self> {
+        fn validated_shape(threshold: usize, receiver_count: usize) -> Result<(usize, usize)> {
             let multiplier_count = batched_multiplier_count(threshold, receiver_count)?;
             let gens_capacity = multiplier_count
                 .checked_next_power_of_two()
                 .ok_or(Error::ProofVerificationFailed)?;
-            Ok(Self {
+            Ok((multiplier_count, gens_capacity))
+        }
+
+        fn from_shape(
+            threshold: usize,
+            receiver_count: usize,
+            multiplier_count: usize,
+            gens_capacity: usize,
+        ) -> Self {
+            Self {
                 threshold,
                 receiver_count,
                 multiplier_count,
                 pc_gens: PedersenGens::default(),
                 bp_gens: BulletproofGens::new(gens_capacity, 1),
-            })
+            }
+        }
+
+        /// Build transparent parameters for a DKG threshold and receiver count.
+        pub fn setup(threshold: usize, receiver_count: usize) -> Result<Self> {
+            let (multiplier_count, gens_capacity) =
+                Self::validated_shape(threshold, receiver_count)?;
+            Ok(Self::from_shape(
+                threshold,
+                receiver_count,
+                multiplier_count,
+                gens_capacity,
+            ))
         }
 
         /// Return process-wide shared parameters for one exact circuit shape.
         pub fn shared(threshold: usize, receiver_count: usize) -> Result<std::sync::Arc<Self>> {
-            type Cache = std::sync::Mutex<
-                std::collections::HashMap<(usize, usize), std::sync::Arc<BatchedEvrfPublicParams>>,
-            >;
+            type CacheEntry =
+                std::sync::Arc<std::sync::OnceLock<std::sync::Arc<BatchedEvrfPublicParams>>>;
+            type Cache = std::sync::Mutex<std::collections::HashMap<(usize, usize), CacheEntry>>;
             static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
 
+            let (multiplier_count, gens_capacity) =
+                Self::validated_shape(threshold, receiver_count)?;
             let cache =
                 CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-            let mut cache = cache.lock().map_err(|_| Error::ProofVerificationFailed)?;
-            if let Some(params) = cache.get(&(threshold, receiver_count)) {
-                return Ok(std::sync::Arc::clone(params));
-            }
-
-            let params = std::sync::Arc::new(Self::setup(threshold, receiver_count)?);
-            cache.insert((threshold, receiver_count), std::sync::Arc::clone(&params));
-            Ok(params)
+            let entry = {
+                let mut cache = cache.lock().map_err(|_| Error::ProofVerificationFailed)?;
+                std::sync::Arc::clone(
+                    cache
+                        .entry((threshold, receiver_count))
+                        .or_insert_with(|| std::sync::Arc::new(std::sync::OnceLock::new())),
+                )
+            };
+            let params = entry.get_or_init(|| {
+                std::sync::Arc::new(Self::from_shape(
+                    threshold,
+                    receiver_count,
+                    multiplier_count,
+                    gens_capacity,
+                ))
+            });
+            Ok(std::sync::Arc::clone(params))
         }
 
         /// DKG threshold used to size these parameters.
