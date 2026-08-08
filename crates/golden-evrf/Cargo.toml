@@ -23,9 +23,6 @@ merlin = { workspace = true }
 rand_chacha = { workspace = true, optional = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-halo2curves = { workspace = true, optional = true, features = ["asm"] }
-
 [dev-dependencies]
 codspeed-criterion-compat = "5.0.1"
 criterion = "0.5"
