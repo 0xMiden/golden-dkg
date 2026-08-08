@@ -42,6 +42,31 @@ pub const TABLE4_THRESHOLD: usize = 2;
 /// Table 5 columns: number of DKG participants in an n-of-n configuration.
 pub const N_VALUES: &[usize] = &[2, 10, 50, 100];
 
+fn selected_values(variable: &str, defaults: &[usize]) -> Vec<usize> {
+    std::env::var(variable).map_or_else(
+        |_| defaults.to_vec(),
+        |raw| {
+            raw.split(',')
+                .map(|value| {
+                    value
+                        .parse()
+                        .expect("benchmark row must be a positive integer")
+                })
+                .collect()
+        },
+    )
+}
+
+/// Table 4 rows selected for this run.
+pub fn table4_ne_values() -> Vec<usize> {
+    selected_values("GOLDEN_TABLE4_NE_VALUES", NE_VALUES)
+}
+
+/// Table 5 rows selected for this run.
+pub fn table5_n_values() -> Vec<usize> {
+    selected_values("GOLDEN_TABLE5_N_VALUES", N_VALUES)
+}
+
 /// Sample size passed to criterion for the slowest benches. Matches the
 /// `crates/bulletproofs-cycle/benches/r1cs.rs` convention: at `n_e = 99` a
 /// single prove iteration is paper-estimated around 13.5s, so the default

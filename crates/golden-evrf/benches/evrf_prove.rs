@@ -1,5 +1,6 @@
-//! Table 4 prover column: `evrf_batched_prove` cost as a function of the
-//! number of receiver statements `n_e` covered by one batched proof.
+//! Table 4 prover column over the Secp256k1/Secq256k1 cycle:
+//! `evrf_batched_prove` cost as a function of the number of receiver
+//! statements `n_e` covered by one batched proof.
 //!
 //! The timed region is the Bulletproofs R1CS prover only. Statement/witness
 //! construction (chord-rule derivation, Feldman commitments, share pads) is
@@ -11,6 +12,9 @@
 //! Direction: scales roughly linearly in `n_e`. Our numbers will differ in
 //! absolute terms because this backend runs over Secp256k1/Secq256k1, not
 //! BLS12-381.
+//!
+//! `GOLDEN_TABLE4_NE_VALUES` may select a comma-separated subset for tracked
+//! runs. Local runs use the complete paper row set by default.
 
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
@@ -22,12 +26,12 @@ mod support;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use golden_evrf::paper::secp_secq::{evrf_batched_prove, BatchedEvrfPublicParams};
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-use support::{build_batched_at_ne, BENCH_SEED, NE_VALUES, SLOW_SAMPLE_SIZE};
+use support::{build_batched_at_ne, table4_ne_values, BENCH_SEED, SLOW_SAMPLE_SIZE};
 
 fn evrf_prove_bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("eVRF prove/secp256k1");
+    let mut group = c.benchmark_group("paper/table-4/Secp256k1-Secq256k1/prover");
     group.sample_size(SLOW_SAMPLE_SIZE);
-    for &n_e in NE_VALUES {
+    for n_e in table4_ne_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
             let params = BatchedEvrfPublicParams::setup(support::TABLE4_THRESHOLD, n_e).unwrap();
             b.iter_batched(

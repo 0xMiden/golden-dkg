@@ -1,11 +1,11 @@
 //! Table 5 runtime columns: per-participant Round 0 and Round 1 cost for an
 //! n-of-n DKG over Secp256k1/Secq256k1.
 //!
-//! - `dkg-round0/secp256k1`: time `create_dealing` for ONE dealer at
-//!   participant count `n`. Includes the batched eVRF prove over `n - 1`
-//!   receivers, which dominates.
-//! - `dkg-round1/secp256k1`: pre-build all `n` dealings outside the timed
-//!   region, then time `complete` for ONE receiver. This is one
+//! - `paper/table-5/Secp256k1-Secq256k1/round-0` times `create_dealing` for
+//!   one dealer at participant count `n`. It includes the batched eVRF prove
+//!   over `n - 1` receivers, which dominates.
+//! - `paper/table-5/Secp256k1-Secq256k1/round-1` pre-builds all `n` dealings
+//!   outside the timed region, then times `complete` for one receiver. This is one
 //!   participant's Round 1 work: verify `n` dealings (including own) and
 //!   aggregate the share.
 //!
@@ -20,6 +20,11 @@
 //! linearly in `n`. Our absolute numbers will differ from the paper because
 //! of the curve choice and because we measure a real implementation rather
 //! than an asymptotic estimate.
+//!
+//! CodSpeed sets `GOLDEN_TABLE5_METRIC=total` to measure Round 0 and Round 1
+//! together, matching the value reported by Table 5. Local runs retain the
+//! separate diagnostic measurements. `GOLDEN_TABLE5_N_VALUES` may select a
+//! comma-separated row subset.
 //!
 //! Setup (`round0_all_dealings` builds `n` proofs for Round 1) runs inside
 //! `bench_with_input`'s routine body so criterion's regex filter can skip
@@ -42,14 +47,15 @@ use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use support::{
-    build_config, identity_secret, idx, round0_all_dealings, BENCH_SEED, N_VALUES, SLOW_SAMPLE_SIZE,
+    build_config, identity_secret, idx, round0_all_dealings, table5_n_values, BENCH_SEED,
+    SLOW_SAMPLE_SIZE,
 };
 
 /// Per-participant Round 0: one dealer builds its dealing.
 fn dkg_round0(c: &mut Criterion) {
-    let mut group = c.benchmark_group("dkg-round0/secp256k1");
+    let mut group = c.benchmark_group("paper/table-5/Secp256k1-Secq256k1/round-0");
     group.sample_size(SLOW_SAMPLE_SIZE);
-    for &n in N_VALUES {
+    for n in table5_n_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             // n-of-n: threshold = n - 1, matching Table 5. Setup is cheap
             // (one config); the timed region pays the prove cost per iter.
@@ -74,9 +80,9 @@ fn dkg_round0(c: &mut Criterion) {
 /// Per-participant Round 1: one receiver verifies all `n` dealings and
 /// aggregates its share.
 fn dkg_round1(c: &mut Criterion) {
-    let mut group = c.benchmark_group("dkg-round1/secp256k1");
+    let mut group = c.benchmark_group("paper/table-5/Secp256k1-Secq256k1/round-1");
     group.sample_size(SLOW_SAMPLE_SIZE);
-    for &n in N_VALUES {
+    for n in table5_n_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             // Expensive setup: build all `n` dealer messages. At n=100 this
             // is ~100x the per-dealer Round 0 cost. Runs only when criterion
@@ -127,9 +133,68 @@ fn dkg_round1(c: &mut Criterion) {
     group.finish();
 }
 
+/// Table 5 per-participant runtime: perform this participant's Round 0 and
+/// Round 1 work in one measured iteration. Peer dealings are prepared outside
+/// the timed region because their creation is work performed by other
+/// participants.
+fn dkg_total(c: &mut Criterion) {
+    let mut group = c.benchmark_group("paper/table-5/Secp256k1-Secq256k1/per-participant-runtime");
+    group.sample_size(SLOW_SAMPLE_SIZE);
+    for n in table5_n_values() {
+        let config = build_config(n, n - 1);
+        let participant = idx(n as u32);
+        let secret = identity_secret(participant);
+        let mut setup_rng = ChaCha20Rng::from_seed(BENCH_SEED);
+        let peer_dealings: BTreeMap<_, _> = config
+            .registry
+            .indexes()
+            .filter(|dealer| *dealer != participant)
+            .map(|dealer| {
+                let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
+                    dealer,
+                    &identity_secret(dealer),
+                    &config,
+                    &mut setup_rng,
+                )
+                .unwrap();
+                (dealer, dealing.message)
+            })
+            .collect();
+
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter_batched(
+                || ChaCha20Rng::from_seed(BENCH_SEED),
+                |mut rng| {
+                    let own_dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
+                        participant,
+                        &secret,
+                        &config,
+                        &mut rng,
+                    )
+                    .unwrap();
+                    complete::<Secp256k1GoldenGroup, SecpSecqBackend>(
+                        participant,
+                        &secret,
+                        &own_dealing,
+                        &peer_dealings,
+                        &config,
+                    )
+                    .unwrap();
+                },
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 fn criterion_benches(c: &mut Criterion) {
-    dkg_round0(c);
-    dkg_round1(c);
+    if std::env::var("GOLDEN_TABLE5_METRIC").as_deref() == Ok("total") {
+        dkg_total(c);
+    } else {
+        dkg_round0(c);
+        dkg_round1(c);
+    }
 }
 
 criterion_group!(benches, criterion_benches);

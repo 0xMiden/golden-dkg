@@ -73,12 +73,12 @@ required-features = ["halo2curves-secp256k1", "serde"]
 [[bench]]
 name = "evrf_prove"
 harness = false
-required-features = ["halo2curves-secp256k1"]
+required-features = ["halo2curves-secp256k1", "parallel"]
 
 [[bench]]
 name = "evrf_verify"
 harness = false
-required-features = ["halo2curves-secp256k1"]
+required-features = ["halo2curves-secp256k1", "parallel"]
 
 [[bench]]
 name = "evrf_proof_size"
@@ -88,7 +88,7 @@ required-features = ["halo2curves-secp256k1"]
 [[bench]]
 name = "dkg_round"
 harness = false
-required-features = ["halo2curves-secp256k1"]
+required-features = ["halo2curves-secp256k1", "parallel"]
 
 [[bench]]
 name = "dkg_communication"
@@ -97,11 +97,6 @@ required-features = ["halo2curves-secp256k1"]
 
 [[bench]]
 name = "batched_setup"
-harness = false
-required-features = ["halo2curves-secp256k1", "parallel"]
-
-[[bench]]
-name = "table4"
 harness = false
 required-features = ["halo2curves-secp256k1", "parallel"]
 

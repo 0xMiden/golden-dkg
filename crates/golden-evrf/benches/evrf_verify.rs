@@ -1,20 +1,25 @@
-//! Table 4 verifier columns.
+//! Table 4 verifier columns over the Secp256k1/Secq256k1 cycle.
 //!
 //! Two groups per `n_e`:
 //!
-//! 1. `eVRF verify-single/secp256k1` - `evrf_batched_verify` on ONE proof
-//!    covering `n_e` statements. Compare to the paper's "Verifier" column
+//! 1. `paper/table-4/Secp256k1-Secq256k1/verifier` runs
+//!    `evrf_batched_verify` on one proof covering `n_e` statements. Compare
+//!    to the paper's "Verifier" column
 //!    (per-proof cost, scales with statements batched inside one proof):
 //!    n_e=1 -> 0.1s, n_e=9 -> 0.5s, n_e=49 -> 2.5s, n_e=99 -> 4.8s.
 //!
-//! 2. `eVRF verify-loop/secp256k1` - the DKG receiver's actual Round 1 work:
-//!    `verify_dealings` over `n_e` independent dealer messages. This checks
+//! 2. `paper/table-4/Secp256k1-Secq256k1/batch-verification` runs the DKG
+//!    receiver's actual Round 1 work over `n_e` independent dealer messages.
+//!    This checks
 //!    all proof equations with one shared MSM. Compare to the paper's "Batch
 //!    Verification" column: 0.6s / 6.7s / 22.1s at n_e = 9 / 49 / 99.
 //!
 //! Setup (proof building) runs inside `bench_with_input`'s routine body so
 //! criterion's regex filter can skip the expensive setup for benchmarks the
 //! user did not select.
+//!
+//! `GOLDEN_TABLE4_NE_VALUES` may select a comma-separated subset for tracked
+//! runs. Local runs use the complete paper row set by default.
 
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
@@ -31,17 +36,17 @@ use golden_evrf::paper::secp_secq::{evrf_batched_verify, SecpSecqBackend};
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use support::{
-    build_config, identity_secret, idx, prove_one_batched, BENCH_SEED, NE_VALUES, SLOW_SAMPLE_SIZE,
-    TABLE4_THRESHOLD,
+    build_config, identity_secret, idx, prove_one_batched, table4_ne_values, BENCH_SEED,
+    SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD,
 };
 
 /// Time `evrf_batched_verify` on one precomputed proof covering `n_e`
 /// statements. The proof is built once inside the routine body (outside the
 /// timed region) so criterion's filter can skip its construction.
 fn evrf_verify_single(c: &mut Criterion) {
-    let mut group = c.benchmark_group("eVRF verify-single/secp256k1");
+    let mut group = c.benchmark_group("paper/table-4/Secp256k1-Secq256k1/verifier");
     group.sample_size(SLOW_SAMPLE_SIZE);
-    for &n_e in NE_VALUES {
+    for n_e in table4_ne_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
             // Expensive setup runs once per benchmark invocation, only when
             // criterion actually selects this benchmark.
@@ -94,9 +99,9 @@ fn build_n_independent_messages(
 /// Time `verify_dealings` over `n_e` independent dealer messages. This is the
 /// receiver's Round 1 proof check with cross-proof MSM sharing.
 fn evrf_verify_batch(c: &mut Criterion) {
-    let mut group = c.benchmark_group("eVRF verify-loop/secp256k1");
+    let mut group = c.benchmark_group("paper/table-4/Secp256k1-Secq256k1/batch-verification");
     group.sample_size(SLOW_SAMPLE_SIZE);
-    for &n_e in NE_VALUES {
+    for n_e in table4_ne_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
             // Expensive setup: build `n_e` peer messages, each carrying
             // one batched proof. Runs only when criterion selects this bench.
