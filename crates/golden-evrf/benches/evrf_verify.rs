@@ -37,6 +37,7 @@ use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use support::{
     build_config, identity_secret, idx, prove_one_batched, BENCH_SEED, NE_VALUES, SLOW_SAMPLE_SIZE,
+    TABLE4_THRESHOLD,
 };
 
 /// Time `evrf_batched_verify` on one precomputed proof covering `n_e`
@@ -63,7 +64,7 @@ fn evrf_verify_single(c: &mut Criterion) {
 }
 
 /// Build `n_e` independent dealer messages for an `(n_e + 1)`-participant
-/// DKG (threshold 1). Each dealer broadcasts one batched proof over its `n_e`
+/// DKG (threshold 2). Each dealer broadcasts one batched proof over its `n_e`
 /// peer receivers. The receiver then runs `verify_dealing` on each of the
 /// `n_e` peer messages. This loop is what a real DKG receiver does in Round 1.
 fn build_n_independent_messages(
@@ -73,11 +74,13 @@ fn build_n_independent_messages(
     BTreeMap<golden_core::ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>>,
 ) {
     let n = n_e + 1;
-    let config = build_config(n, 1);
+    let config = build_config(n, TABLE4_THRESHOLD);
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
+    let receiver = idx(n as u32);
     let messages: BTreeMap<_, _> = config
         .registry
         .indexes()
+        .filter(|dealer| *dealer != receiver)
         .map(|dealer| {
             let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
                 dealer,
@@ -89,6 +92,7 @@ fn build_n_independent_messages(
             (dealer, dealing.message)
         })
         .collect();
+    assert_eq!(messages.len(), n_e);
     (config, messages)
 }
 
@@ -99,15 +103,10 @@ fn evrf_verify_loop(c: &mut Criterion) {
     group.sample_size(SLOW_SAMPLE_SIZE);
     for &n_e in NE_VALUES {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
-            // Expensive setup: build `n_e + 1` dealer messages, each carrying
+            // Expensive setup: build `n_e` peer messages, each carrying
             // one batched proof. Runs only when criterion selects this bench.
             let (config, messages) = build_n_independent_messages(n_e);
-            let receiver = idx(n_e as u32 + 1);
-            let peer_messages: Vec<_> = messages
-                .iter()
-                .filter(|(dealer, _)| **dealer != receiver)
-                .map(|(_, msg)| msg.clone())
-                .collect();
+            let peer_messages: Vec<_> = messages.values().cloned().collect();
             for msg in &peer_messages {
                 verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(msg, &config).unwrap();
             }

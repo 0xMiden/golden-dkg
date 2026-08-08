@@ -35,6 +35,10 @@ use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 /// receivers for an `(n_e + 1)`-participant DKG).
 pub const NE_VALUES: &[usize] = &[1, 9, 49, 99];
 
+/// Threshold used by the Table 4 helpers. The isolated batched fixture has
+/// two Feldman coefficients, so full-DKG fixtures must use the same threshold.
+pub const TABLE4_THRESHOLD: usize = 2;
+
 /// Table 5 columns: number of DKG participants in an n-of-n configuration.
 pub const N_VALUES: &[usize] = &[2, 10, 50, 100];
 
@@ -110,6 +114,7 @@ pub fn build_batched_at_ne(
     let pkjs: Vec<Gin> = (0..n_e).map(synthetic_pkj).collect();
     let beta = R1csField::from(77u64);
     let (statement, witness) = testing::build_batched(&msg, sk1, &pkjs, beta);
+    assert_eq!(statement.threshold, TABLE4_THRESHOLD);
     (statement, witness, pkjs, beta)
 }
 

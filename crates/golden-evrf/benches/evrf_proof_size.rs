@@ -37,7 +37,7 @@ use golden_core::create_dealing;
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-use support::{build_config, identity_secret, idx, BENCH_SEED, SLOW_SAMPLE_SIZE};
+use support::{build_config, identity_secret, idx, BENCH_SEED, SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD};
 
 /// Subset of `NE_VALUES` for which we actually build proofs. Larger `n_e`
 /// takes minutes per proof and adds little size information because the
@@ -47,7 +47,7 @@ const NE_SIZE_SWEEP: &[usize] = &[1, 9];
 /// Build one dealer's proof bytes for an `n`-participant DKG. The proof
 /// covers `n - 1` receivers.
 fn one_dealer_proof_bytes(n: usize) -> usize {
-    let config = build_config(n, 1);
+    let config = build_config(n, TABLE4_THRESHOLD);
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
     let dealer = idx(1);
     let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
@@ -63,11 +63,13 @@ fn one_dealer_proof_bytes(n: usize) -> usize {
 /// Build `n_e` independent dealer proofs in an `(n_e + 1)`-participant DKG.
 fn n_independent_proof_byte_sizes_total(n_e: usize) -> usize {
     let n = n_e + 1;
-    let config = build_config(n, 1);
+    let config = build_config(n, TABLE4_THRESHOLD);
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
+    let receiver = idx(n as u32);
     config
         .registry
         .indexes()
+        .filter(|dealer| *dealer != receiver)
         .map(|dealer| {
             let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
                 dealer,
