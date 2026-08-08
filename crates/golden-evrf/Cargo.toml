@@ -34,7 +34,12 @@ rand_chacha = { workspace = true }
 default = []
 miden-serde = ["golden-core/miden-serde"]
 parallel = ["bulletproofs-cycle?/parallel"]
-serde = ["dep:serde", "bulletproofs-cycle?/serde", "golden-core/serde"]
+serde = [
+    "dep:serde",
+    "bulletproofs-cycle?/serde",
+    "golden-core/serde",
+    "halo2curves?/derive_serde",
+]
 halo2curves-secp256k1 = [
     "dep:bulletproofs-cycle",
     "dep:golden-halo2curves",

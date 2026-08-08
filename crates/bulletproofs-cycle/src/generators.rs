@@ -114,102 +114,76 @@ pub struct BulletproofGens<C: Cycle> {
 
 #[cfg(feature = "serde")]
 #[derive(serde::Serialize, serde::Deserialize)]
-struct BulletproofGensRepr {
+#[serde(bound(
+    serialize = "A: serde::Serialize",
+    deserialize = "A: serde::Deserialize<'de>"
+))]
+struct BulletproofGensRepr<A> {
     gens_capacity: usize,
     party_capacity: usize,
-    g_bytes: Vec<u8>,
-    h_bytes: Vec<u8>,
+    g_vec: Vec<Arc<Vec<A>>>,
+    h_vec: Vec<Arc<Vec<A>>>,
 }
 
 #[cfg(feature = "serde")]
-impl<C: Cycle> serde::Serialize for BulletproofGens<C> {
+impl<C> serde::Serialize for BulletproofGens<C>
+where
+    C: Cycle,
+    C::Affine: serde::Serialize,
+{
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        fn encode<C: Cycle>(parties: &[Arc<Vec<C::Affine>>]) -> Vec<u8> {
-            let point_count = parties.iter().map(|party| party.len()).sum::<usize>();
-            let mut bytes = Vec::with_capacity(point_count * C::COMPRESSED_BYTES);
-            for point in parties.iter().flat_map(|party| party.iter()) {
-                let compressed = C::affine_compress(point);
-                bytes.extend_from_slice(C::compressed_as_bytes(&compressed));
-            }
-            bytes
-        }
-
         BulletproofGensRepr {
             gens_capacity: self.gens_capacity,
             party_capacity: self.party_capacity,
-            g_bytes: encode::<C>(&self.G_vec),
-            h_bytes: encode::<C>(&self.H_vec),
+            g_vec: self.G_vec.clone(),
+            h_vec: self.H_vec.clone(),
         }
         .serialize(serializer)
     }
 }
 
 #[cfg(feature = "serde")]
-impl<'de, C: Cycle> serde::Deserialize<'de> for BulletproofGens<C> {
+impl<'de, C> serde::Deserialize<'de> for BulletproofGens<C>
+where
+    C: Cycle,
+    C::Affine: serde::Deserialize<'de>,
+{
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        fn decode<C: Cycle, E: serde::de::Error>(
-            bytes: &[u8],
+        fn validate<C: Cycle, E: serde::de::Error>(
+            parties: &[Arc<Vec<C::Affine>>],
             gens_capacity: usize,
             party_capacity: usize,
-        ) -> Result<Vec<Vec<C::Affine>>, E> {
-            let point_count = gens_capacity
+        ) -> Result<(), E> {
+            gens_capacity
                 .checked_mul(party_capacity)
                 .ok_or_else(|| E::custom("generator count overflow"))?;
-            let byte_count = point_count
-                .checked_mul(C::COMPRESSED_BYTES)
-                .ok_or_else(|| E::custom("encoded generator length overflow"))?;
-            if bytes.len() != byte_count {
-                return Err(E::custom("invalid encoded generator length"));
+            if parties.len() != party_capacity
+                || parties.iter().any(|party| party.len() != gens_capacity)
+            {
+                return Err(E::custom("generator dimensions do not match capacities"));
             }
-            if gens_capacity == 0 {
-                let mut parties = Vec::new();
-                parties
-                    .try_reserve_exact(party_capacity)
-                    .map_err(|_| E::custom("party capacity exceeds available memory"))?;
-                parties.resize_with(party_capacity, Vec::new);
-                return Ok(parties);
-            }
-            if party_capacity == 0 {
-                return Ok(Vec::new());
-            }
-
-            let mut parties = Vec::with_capacity(party_capacity);
-            for party_bytes in bytes.chunks_exact(gens_capacity * C::COMPRESSED_BYTES) {
-                let mut party = Vec::with_capacity(gens_capacity);
-                for point_bytes in party_bytes.chunks_exact(C::COMPRESSED_BYTES) {
-                    let compressed = C::compressed_from_bytes(point_bytes);
-                    if C::compressed_is_identity(&compressed) {
-                        return Err(E::custom("generator must not be the identity"));
-                    }
-                    let point = C::compressed_decompress(&compressed)
-                        .ok_or_else(|| E::custom("invalid encoded generator"))?;
-                    party.push(C::point_to_affine(&point));
+            for point in parties.iter().flat_map(|party| party.iter()) {
+                if C::compressed_is_identity(&C::affine_compress(point)) {
+                    return Err(E::custom("generator must not be the identity"));
                 }
-                parties.push(party);
             }
-            Ok(parties)
+            Ok(())
         }
 
-        let repr = BulletproofGensRepr::deserialize(deserializer)?;
-        let G_vec = decode::<C, D::Error>(&repr.g_bytes, repr.gens_capacity, repr.party_capacity)?
-            .into_iter()
-            .map(Arc::new)
-            .collect();
-        let H_vec = decode::<C, D::Error>(&repr.h_bytes, repr.gens_capacity, repr.party_capacity)?
-            .into_iter()
-            .map(Arc::new)
-            .collect();
+        let repr = BulletproofGensRepr::<C::Affine>::deserialize(deserializer)?;
+        validate::<C, D::Error>(&repr.g_vec, repr.gens_capacity, repr.party_capacity)?;
+        validate::<C, D::Error>(&repr.h_vec, repr.gens_capacity, repr.party_capacity)?;
         Ok(Self {
             gens_capacity: repr.gens_capacity,
             party_capacity: repr.party_capacity,
-            G_vec,
-            H_vec,
+            G_vec: repr.g_vec,
+            H_vec: repr.h_vec,
         })
     }
 }
@@ -324,6 +298,8 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn generator_serialization_roundtrip() {
+        use group::Group as _;
+
         type C = RistrettoCycle;
 
         let gens = BulletproofGens::<C>::new(8, 2);
@@ -345,5 +321,23 @@ mod tests {
         }
 
         assert!(postcard::from_bytes::<BulletproofGens<C>>(&encoded[..encoded.len() - 1]).is_err());
+
+        #[derive(serde::Serialize)]
+        struct Repr<A> {
+            gens_capacity: usize,
+            party_capacity: usize,
+            g_vec: Vec<Arc<Vec<A>>>,
+            h_vec: Vec<Arc<Vec<A>>>,
+        }
+
+        let identity = C::point_to_affine(&<C as Cycle>::Point::identity());
+        let encoded_identity = postcard::to_allocvec(&Repr {
+            gens_capacity: 1,
+            party_capacity: 1,
+            g_vec: vec![Arc::new(vec![identity])],
+            h_vec: vec![Arc::new(vec![identity])],
+        })
+        .expect("serialize identity generators");
+        assert!(postcard::from_bytes::<BulletproofGens<C>>(&encoded_identity).is_err());
     }
 }

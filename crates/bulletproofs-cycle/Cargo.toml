@@ -17,7 +17,7 @@ group = { workspace = true }
 merlin = { workspace = true }
 p3-maybe-rayon = { workspace = true }
 rand_core = { workspace = true }
-serde = { workspace = true, optional = true, features = ["derive"] }
+serde = { workspace = true, optional = true, features = ["derive", "rc"] }
 sha3 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
@@ -35,7 +35,7 @@ rand_chacha = { workspace = true }
 default = ["cycle-pedersen"]
 cycle-pedersen = []
 parallel = ["p3-maybe-rayon/parallel"]
-serde = ["dep:serde"]
+serde = ["dep:serde", "curve25519-dalek?/serde"]
 bulletproofs-compat = ["ristretto", "curve25519-dalek/digest"]
 ristretto = ["dep:curve25519-dalek", "curve25519-dalek/group", "curve25519-dalek/rand_core", "curve25519-dalek/alloc"]
 
