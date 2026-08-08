@@ -43,7 +43,7 @@ pub mod secp_secq {
     use ff::{Field, PrimeField};
     use golden_halo2curves::{Secp256k1Cycle, Secq256k1Cycle};
     use group::{Curve, Group};
-    use halo2curves::secp256k1::{Fp, Fq, Secp256k1};
+    use halo2curves::secp256k1::{Fp, Fq, Secp256k1, Secp256k1Affine};
     use halo2curves::secq256k1::Secq256k1;
     use halo2curves::{Coordinates, CurveAffine, CurveExt};
     use merlin::Transcript;
@@ -420,6 +420,22 @@ pub mod secp_secq {
         *point == Gin::identity()
     }
 
+    /// Batch-convert `points` to affine `(x, y)` coordinates with a single
+    /// field inversion (Montgomery's trick via `group::Curve::batch_normalize`),
+    /// instead of one inversion per point via [`affine`].
+    fn batch_affine(points: &[Gin]) -> Result<Vec<(Fp, Fp)>> {
+        let mut affines = vec![Secp256k1Affine::default(); points.len()];
+        Gin::batch_normalize(points, &mut affines);
+        affines
+            .iter()
+            .map(|aff| {
+                let opt: Option<Coordinates<Secp256k1Affine>> = Option::from(aff.coordinates());
+                opt.map(|c| (*c.x(), *c.y()))
+                    .ok_or(Error::ProofVerificationFailed)
+            })
+            .collect()
+    }
+
     /// Bit length used for the `k = int(S.x)` decomposition. The Secp256k1
     /// base field modulus fits in 256 bits, so 256 bits cover every canonical
     /// `Fp` element.
@@ -505,16 +521,36 @@ pub mod secp_secq {
     /// correction points.  All coordinates are native `Fp` elements.
     fn precompute_chord(X: &Gin, lambda: usize) -> Result<ChordPrecomp> {
         let g_s = chord_correction_generator(X);
-        let mut c = Vec::with_capacity(lambda + 1);
-        let mut d = Vec::with_capacity(lambda + 1);
+
+        // chord_cj only ever returns one of three distinct scalars across
+        // j = 0..=lambda (1, 2, and 1-2λ), so C_j = c_j * G_S collapses to
+        // three distinct points; compute each once instead of once per j.
+        let c_first = g_s;
+        let c_mid = g_s * Fq::from(2);
+        let c_last = g_s * chord_cj(lambda, lambda);
+
+        let mut points = Vec::with_capacity(2 * (lambda + 1));
         let mut p_j = *X; // P_0 = 2^0 · X = X
         for j in 0..=lambda {
-            let cj = chord_cj(j, lambda);
-            let c_j_point = g_s * cj; // C_j = c_j · G_S(X)
-            let d_j_point = p_j + c_j_point; // D_j = P_j + C_j
-            c.push(affine(&c_j_point)?);
-            d.push(affine(&d_j_point)?);
+            let c_j_point = if j == 0 {
+                c_first
+            } else if j < lambda {
+                c_mid
+            } else {
+                c_last
+            };
+            points.push(c_j_point); // C_j = c_j · G_S(X)
+            points.push(p_j + c_j_point); // D_j = P_j + C_j
             p_j = p_j.double(); // P_{j+1} = 2 · P_j
+        }
+
+        // Batch-normalize every C_j/D_j point with a single field inversion.
+        let affines = batch_affine(&points)?;
+        let mut c = Vec::with_capacity(lambda + 1);
+        let mut d = Vec::with_capacity(lambda + 1);
+        for pair in affines.chunks_exact(2) {
+            c.push(pair[0]);
+            d.push(pair[1]);
         }
         Ok(ChordPrecomp { c, d })
     }
@@ -538,11 +574,20 @@ pub mod secp_secq {
             return Err(Error::ProofVerificationFailed);
         }
         let g_s = chord_correction_generator(X);
+        // See precompute_chord: chord_cj collapses to three distinct scalars.
+        let c_first = g_s;
+        let c_mid = g_s * Fq::from(2);
+        let c_last = g_s * chord_cj(lambda, lambda);
         let mut p_j = *X;
         let mut l = Gin::identity();
         for (j, &bit) in bits.iter().enumerate().take(lambda + 1) {
-            let cj = chord_cj(j, lambda);
-            let c_j_point = g_s * cj;
+            let c_j_point = if j == 0 {
+                c_first
+            } else if j < lambda {
+                c_mid
+            } else {
+                c_last
+            };
             let delta = if bit { p_j + c_j_point } else { c_j_point };
             l = if j == 0 { delta } else { l + delta };
             p_j = p_j.double();
@@ -732,48 +777,72 @@ pub mod secp_secq {
             return Err(Error::ProofVerificationFailed);
         }
 
-        let mut l_coords = Vec::with_capacity(lambda + 1);
-        let mut slopes = Vec::with_capacity(lambda);
-        let mut denom_delta_inverses = Vec::with_capacity(lambda);
-
         let g_s = chord_correction_generator(X);
+        // See precompute_chord: chord_cj collapses to three distinct scalars.
+        let c_first = g_s;
+        let c_mid = g_s * Fq::from(2);
+        let c_last = g_s * chord_cj(lambda, lambda);
+
+        // Pass 1: accumulate L_j via native curve addition (no field
+        // inversions), recording every Δ_j (j >= 1) needed for a slope so
+        // every point can be normalized to affine coordinates together, in
+        // a single batched inversion below.
+        let mut l_points = Vec::with_capacity(lambda + 1);
+        let mut delta_points = Vec::with_capacity(lambda); // Δ_1..Δ_λ
         let mut p_j = *X;
         let mut l = Gin::identity();
-
         for (j, &bit) in bits.iter().enumerate().take(lambda + 1) {
-            let cj = chord_cj(j, lambda);
-            let c_j_point = g_s * cj;
+            let c_j_point = if j == 0 {
+                c_first
+            } else if j < lambda {
+                c_mid
+            } else {
+                c_last
+            };
             let delta = if bit { p_j + c_j_point } else { c_j_point };
 
             if j == 0 {
                 l = delta;
             } else {
-                // Compute slope s_j = (y_{L_{j-1}} - y_{Δ_j}) / (x_{L_{j-1}} - x_{Δ_j})
-                let (x_prev, y_prev) = *l_coords.last().expect("L_{j-1} exists");
-                let (x_delta, y_delta) = affine(&delta)?;
-
-                let dx: R1csField = x_prev - x_delta;
-                let dy: R1csField = y_prev - y_delta;
-                let dx_inv = match Option::from(dx.invert()) {
-                    Some(inv) => inv,
-                    None => return Err(Error::ProofVerificationFailed),
-                };
-                let s_j = dy * dx_inv;
-                slopes.push(s_j);
-                denom_delta_inverses.push(dx_inv);
-
+                delta_points.push(delta);
                 l += delta;
             }
-
-            let coords = affine(&l)?;
-            l_coords.push(coords);
+            l_points.push(l);
             p_j = p_j.double();
         }
 
+        // Batch-normalize every L_j and Δ_j (j >= 1) with a single inversion.
+        let mut points = l_points;
+        points.extend_from_slice(&delta_points);
+        let affines = batch_affine(&points)?;
+        let (l_coords, delta_coords) = affines.split_at(lambda + 1);
+
+        // Pass 2: slopes s_j = (y_{L_{j-1}} - y_{Δ_j}) / (x_{L_{j-1}} - x_{Δ_j}),
+        // batching the λ field inversions into one.
+        let mut dxs = Vec::with_capacity(lambda);
+        let mut dys = Vec::with_capacity(lambda);
+        for j in 1..=lambda {
+            let (x_prev, y_prev) = l_coords[j - 1];
+            let (x_delta, y_delta) = delta_coords[j - 1];
+            let dx: R1csField = x_prev - x_delta;
+            let dy: R1csField = y_prev - y_delta;
+            if bool::from(dx.is_zero()) {
+                return Err(Error::ProofVerificationFailed);
+            }
+            dxs.push(dx);
+            dys.push(dy);
+        }
+        R1csCycle::scalar_batch_invert(&mut dxs);
+        let slopes: Vec<R1csField> = dys
+            .iter()
+            .zip(dxs.iter())
+            .map(|(dy, dx_inv)| *dy * dx_inv)
+            .collect();
+
         Ok(ChordWitness {
-            l_coords,
+            l_coords: l_coords.to_vec(),
             slopes,
-            denom_delta_inverses,
+            denom_delta_inverses: dxs,
         })
     }
 
@@ -1132,6 +1201,21 @@ pub mod secp_secq {
     fn shared_pc_gens() -> &'static PedersenGens<R1csCycle> {
         static GEN: std::sync::OnceLock<PedersenGens<R1csCycle>> = std::sync::OnceLock::new();
         GEN.get_or_init(PedersenGens::default)
+    }
+
+    /// Process-wide cache for `g_in`'s chord-rule precompute table.
+    ///
+    /// `g_in = Gin::generator()` is a compile-time constant, so
+    /// `precompute_chord` produces the same table on every call. PK_1, the
+    /// Feldman coefficient openings, and every receiver's pad/share
+    /// commitments all exponentiate against `g_in`, so this is computed once
+    /// per process instead of repeatedly per proof.
+    fn shared_g_in_chord_precomp() -> &'static ChordPrecomp {
+        static PRECOMP: std::sync::OnceLock<ChordPrecomp> = std::sync::OnceLock::new();
+        PRECOMP.get_or_init(|| {
+            precompute_chord(&Gin::generator(), K_BITS)
+                .expect("chord precompute for the fixed G_in generator must succeed")
+        })
     }
 
     /// Random-oracle domain tag for `H_{G_in,1}`.
@@ -1616,9 +1700,9 @@ pub mod secp_secq {
         cs: &mut CS,
         coefficients: &[Gin],
         coefficient_scalars: Option<&[GinScalar]>,
-        g_in: &Gin,
     ) -> core::result::Result<(), R1CSError> {
-        let precomp = precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
+        let g_in = Gin::generator();
+        let precomp = shared_g_in_chord_precomp();
 
         for (i, coefficient) in coefficients.iter().enumerate() {
             let scalar_fp = coefficient_scalars.map(|scalars| fq_to_fp(&scalars[i]));
@@ -1642,7 +1726,7 @@ pub mod secp_secq {
                     let mut bits = [false; K_BITS + 1];
                     decompose_k_fp(scalar_fp, &mut bits);
                     Some(
-                        chord_compute_witness(&bits, g_in, K_BITS)
+                        chord_compute_witness(&bits, &g_in, K_BITS)
                             .map_err(|_| R1CSError::VerificationError)?,
                     )
                 } else {
@@ -1651,7 +1735,7 @@ pub mod secp_secq {
                 chord_exponentiate_r1cs_with_result(
                     cs,
                     &scalar_bit_vars,
-                    &precomp,
+                    precomp,
                     Some((coefficient_x, coefficient_y)),
                     witness.as_ref(),
                 )?;
@@ -1687,18 +1771,19 @@ pub mod secp_secq {
         cs: &mut CS,
         rec: &BatchedReceiverStatement,
         sk_bit_vars: &[Variable<R1csField>],
-        h1: &Gin,
-        h2: &Gin,
+        precomp_h1: &ChordPrecomp,
+        precomp_h2: &ChordPrecomp,
         beta: R1csField,
-        g_in: &Gin,
         witness: Option<&HiddenReceiverWitness>,
     ) -> core::result::Result<(), R1CSError> {
-        let precomp_s =
+        // PK_j's chord table is shared by both exponentiations against it
+        // below (S_j = PK_j^sk and DH_j = PK_j^pad); compute it once.
+        let precomp_pkj =
             precompute_chord(&rec.pkj, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         let (s_x, _) = chord_exponentiate_r1cs_with_result(
             cs,
             sk_bit_vars,
-            &precomp_s,
+            &precomp_pkj,
             None,
             witness.map(|w| &w.sk_pkj),
         )?;
@@ -1707,19 +1792,17 @@ pub mod secp_secq {
         let k_bits = witness.map_or(verifier_k_bits.as_slice(), |w| w.k_bits.as_slice());
         let k_bit_vars = bit_decompose(cs, s_x, k_bits)?;
 
-        let precomp1 = precompute_chord(h1, K_BITS).map_err(|_| R1CSError::VerificationError)?;
-        let precomp2 = precompute_chord(h2, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         let (x_t1, _) = chord_exponentiate_r1cs_with_result(
             cs,
             &k_bit_vars,
-            &precomp1,
+            precomp_h1,
             None,
             witness.map(|w| &w.t1),
         )?;
         let (x_t2, _) = chord_exponentiate_r1cs_with_result(
             cs,
             &k_bit_vars,
-            &precomp2,
+            precomp_h2,
             None,
             witness.map(|w| &w.t2),
         )?;
@@ -1739,14 +1822,16 @@ pub mod secp_secq {
         let pad_bit_vars = bit_decompose_q(cs, pad_var, pad_bits)?;
         constrain_bits_lt_bound_when(cs, &pad_bit_vars, pad_bits, &SECP256K1_P_MINUS_Q_LE, reduce)?;
 
+        // g_in's chord table is process-wide cached and shared by both
+        // exponentiations against it below (pad and share commitments).
+        let precomp_g_in = shared_g_in_chord_precomp();
+
         let (pad_commitment_x, pad_commitment_y) =
             affine(&rec.pad_commitment).map_err(|_| R1CSError::VerificationError)?;
-        let precomp_pad =
-            precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         chord_exponentiate_r1cs_with_result(
             cs,
             &pad_bit_vars,
-            &precomp_pad,
+            precomp_g_in,
             Some((pad_commitment_x, pad_commitment_y)),
             witness.map(|w| &w.pad_commitment),
         )?;
@@ -1758,24 +1843,20 @@ pub mod secp_secq {
         let share_bit_vars = bit_decompose_q(cs, share_var, share_bits)?;
         let (share_commitment_x, share_commitment_y) =
             affine(&rec.share_commitment).map_err(|_| R1CSError::VerificationError)?;
-        let precomp_share =
-            precompute_chord(g_in, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         chord_exponentiate_r1cs_with_result(
             cs,
             &share_bit_vars,
-            &precomp_share,
+            precomp_g_in,
             Some((share_commitment_x, share_commitment_y)),
             witness.map(|w| &w.share_commitment),
         )?;
 
         let (dh_commitment_x, dh_commitment_y) =
             affine(&rec.dh_commitment).map_err(|_| R1CSError::VerificationError)?;
-        let precomp_dh =
-            precompute_chord(&rec.pkj, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         chord_exponentiate_r1cs_with_result(
             cs,
             &pad_bit_vars,
-            &precomp_dh,
+            &precomp_pkj,
             Some((dh_commitment_x, dh_commitment_y)),
             witness.map(|w| &w.dh_commitment),
         )?;
@@ -1784,24 +1865,26 @@ pub mod secp_secq {
     }
 
     fn compute_hidden_receiver_witness(
-        msg: &[u8; MESSAGE_BYTES],
         sk1: &Fq,
         share: &Fq,
         rec: &BatchedReceiverStatement,
         beta: &Fp,
+        h1: &Gin,
+        h2: &Gin,
     ) -> Result<HiddenReceiverWitness> {
         let g_in = Gin::generator();
-        let h1 = h_gin_1(msg);
-        let h2 = h_gin_2(msg);
         let sj = rec.pkj * *sk1;
         let (s_x, _) = affine(&sj)?;
         let mut k_bool_bits = [false; K_BITS + 1];
         decompose_k_fp(&s_x, &mut k_bool_bits);
         let k_bits = bit_options(&k_bool_bits);
-        let t1 = chord_evaluate_point(&k_bool_bits, &h1, K_BITS)?;
-        let t2 = chord_evaluate_point(&k_bool_bits, &h2, K_BITS)?;
-        let (t1_x, _) = affine(&t1)?;
-        let (t2_x, _) = affine(&t2)?;
+        // chord_compute_witness's L_λ coordinates ARE T_1/T_2's affine
+        // coordinates, so compute the witness once and reuse it below
+        // instead of separately re-deriving T_1/T_2 via chord_evaluate_point.
+        let t1_witness = chord_compute_witness(&k_bool_bits, h1, K_BITS)?;
+        let t2_witness = chord_compute_witness(&k_bool_bits, h2, K_BITS)?;
+        let (t1_x, _) = t1_witness.l_coords[K_BITS];
+        let (t2_x, _) = t2_witness.l_coords[K_BITS];
         let r = *beta * t1_x + t2_x;
         let pad_fq = fp_to_fq(&r);
         let pad = fq_to_fp(&pad_fq);
@@ -1845,8 +1928,8 @@ pub mod secp_secq {
         Ok(HiddenReceiverWitness {
             sk_pkj: chord_compute_witness(&sk_bits, &rec.pkj, K_BITS)?,
             k_bits,
-            t1: chord_compute_witness(&k_bool_bits, &h1, K_BITS)?,
-            t2: chord_compute_witness(&k_bool_bits, &h2, K_BITS)?,
+            t1: t1_witness,
+            t2: t2_witness,
             reduce_q,
             pad,
             pad_bits: bit_options(&pad_bool_bits),
@@ -1889,6 +1972,13 @@ pub mod secp_secq {
         // values directly).
         let h1 = h_gin_1(&statement.msg);
         let h2 = h_gin_2(&statement.msg);
+        // h1/h2's chord tables are receiver-independent; compute once and
+        // share across every receiver slot below instead of rebuilding them
+        // once per receiver.
+        let precomp_h1 =
+            precompute_chord(&h1, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
+        let precomp_h2 =
+            precompute_chord(&h2, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
 
         let mut prover = Prover::<R1csCycle, _>::new(&params.pc_gens, transcript);
         let sk_fp = fq_to_fp(&witness.sk1);
@@ -1902,13 +1992,12 @@ pub mod secp_secq {
             .map_err(|_| Error::ProofVerificationFailed)?;
 
         let pk1_witness = chord_compute_witness(&sk_bool_bits, &g_in, K_BITS)?;
-        let pk1_precomp =
-            precompute_chord(&g_in, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
+        let pk1_precomp = shared_g_in_chord_precomp();
         let (pk1_x, pk1_y) = affine(&statement.pk1)?;
         chord_exponentiate_r1cs_with_result(
             &mut prover,
             &sk_bit_vars,
-            &pk1_precomp,
+            pk1_precomp,
             Some((pk1_x, pk1_y)),
             Some(&pk1_witness),
         )
@@ -1918,26 +2007,25 @@ pub mod secp_secq {
             &mut prover,
             &statement.commitment_coefficients,
             Some(&witness.coefficient_scalars),
-            &g_in,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
         for (rec, share) in statement.receivers.iter().zip(witness.shares.iter()) {
             let rec_witness = compute_hidden_receiver_witness(
-                &statement.msg,
                 &witness.sk1,
                 share,
                 rec,
                 &statement.beta,
+                &h1,
+                &h2,
             )?;
             build_hidden_receiver_slot(
                 &mut prover,
                 rec,
                 &sk_bit_vars,
-                &h1,
-                &h2,
+                &precomp_h1,
+                &precomp_h2,
                 statement.beta,
-                &g_in,
                 Some(&rec_witness),
             )
             .map_err(|_| Error::ProofVerificationFailed)?;
@@ -1974,10 +2062,14 @@ pub mod secp_secq {
     where
         T: core::borrow::BorrowMut<Transcript>,
     {
-        let g_in = Gin::generator();
-        // Derive h1, h2 from msg.
+        // Derive h1, h2 from msg. Their chord tables are receiver-independent;
+        // compute once and share across every receiver slot below.
         let h1 = h_gin_1(&statement.msg);
         let h2 = h_gin_2(&statement.msg);
+        let precomp_h1 =
+            precompute_chord(&h1, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
+        let precomp_h2 =
+            precompute_chord(&h2, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
 
         let mut verifier = Verifier::<R1csCycle, _>::new(transcript);
         let sk_var = verifier
@@ -1987,35 +2079,28 @@ pub mod secp_secq {
         let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits)
             .map_err(|_| Error::ProofVerificationFailed)?;
 
-        let pk1_precomp =
-            precompute_chord(&g_in, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
+        let pk1_precomp = shared_g_in_chord_precomp();
         let (pk1_x, pk1_y) = affine(&statement.pk1)?;
         chord_exponentiate_r1cs_with_result(
             &mut verifier,
             &sk_bit_vars,
-            &pk1_precomp,
+            pk1_precomp,
             Some((pk1_x, pk1_y)),
             None,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
-        prove_feldman_coefficients(
-            &mut verifier,
-            &statement.commitment_coefficients,
-            None,
-            &g_in,
-        )
-        .map_err(|_| Error::ProofVerificationFailed)?;
+        prove_feldman_coefficients(&mut verifier, &statement.commitment_coefficients, None)
+            .map_err(|_| Error::ProofVerificationFailed)?;
 
         for rec in &statement.receivers {
             build_hidden_receiver_slot(
                 &mut verifier,
                 rec,
                 &sk_bit_vars,
-                &h1,
-                &h2,
+                &precomp_h1,
+                &precomp_h2,
                 statement.beta,
-                &g_in,
                 None,
             )
             .map_err(|_| Error::ProofVerificationFailed)?;
@@ -2633,13 +2718,16 @@ pub mod secp_secq {
             let g_in = Gin::generator();
             let h1 = h_gin_1(&statement.msg);
             let h2 = h_gin_2(&statement.msg);
+            let precomp_h1 = precompute_chord(&h1, K_BITS).expect("H1 precompute");
+            let precomp_h2 = precompute_chord(&h2, K_BITS).expect("H2 precompute");
 
             let mut rec_witness = compute_hidden_receiver_witness(
-                &statement.msg,
                 &witness.sk1,
                 &witness.shares[0],
                 rec,
                 &statement.beta,
+                &h1,
+                &h2,
             )
             .expect("honest hidden receiver witness");
 
@@ -2678,10 +2766,9 @@ pub mod secp_secq {
                 &mut prover,
                 rec,
                 &sk_bit_vars,
-                &h1,
-                &h2,
+                &precomp_h1,
+                &precomp_h2,
                 statement.beta,
-                &g_in,
                 Some(&rec_witness),
             )
             .expect("receiver slot");
@@ -2706,10 +2793,9 @@ pub mod secp_secq {
                 &mut verifier,
                 rec,
                 &sk_bit_vars,
-                &h1,
-                &h2,
+                &precomp_h1,
+                &precomp_h2,
                 statement.beta,
-                &g_in,
                 None,
             )
             .expect("verifier receiver slot");
