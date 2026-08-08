@@ -1838,6 +1838,19 @@ pub mod secp_secq {
             .map_err(|_| Error::ProofVerificationFailed)
     }
 
+    fn parse_batched_proof_stream(
+        statement: &BatchedEvrfStatement,
+        proof: &[u8],
+    ) -> Result<(R1CSProof<R1csCycle>, Transcript)> {
+        let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
+        observe_batched_statement(&mut stream, statement)?;
+        let parsed = stream.receive_nested(|transcript, payload| {
+            Ok((parse_canonical_r1cs_proof(payload)?, transcript.clone()))
+        })?;
+        stream.finish()?;
+        Ok(parsed)
+    }
+
     /// Verify a Batched Dealer Proof represented as a Proof Stream with one nested R1CS proof.
     pub fn evrf_batched_verify(
         statement: &BatchedEvrfStatement,
@@ -1845,16 +1858,18 @@ pub mod secp_secq {
         rng: &mut impl CryptoRngCore,
     ) -> Result<()> {
         validate_batched_public_relations(statement)?;
+        let (r1cs_proof, mut transcript) = parse_batched_proof_stream(statement, proof)?;
         let pc_gens = PedersenGens::<R1csCycle>::default();
         let bp_gens =
             BulletproofGens::<R1csCycle>::new(batched_gens_capacity(statement.receivers.len()), 1);
-        let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
-        observe_batched_statement(&mut stream, statement)?;
-        let equation = stream.receive_nested(|transcript, payload| {
-            let r1cs_proof = parse_canonical_r1cs_proof(payload)?;
-            prepare_batched_r1cs(statement, &r1cs_proof, &pc_gens, &bp_gens, rng, transcript)
-        })?;
-        stream.finish()?;
+        let equation = prepare_batched_r1cs(
+            statement,
+            &r1cs_proof,
+            &pc_gens,
+            &bp_gens,
+            rng,
+            &mut transcript,
+        )?;
         equation
             .verify()
             .map_err(|_| Error::ProofVerificationFailed)
@@ -1871,6 +1886,10 @@ pub mod secp_secq {
                 return Err(Error::ProofVerificationFailed);
             }
         }
+        let parsed_proofs = instances
+            .iter()
+            .map(|(statement, proof)| parse_batched_proof_stream(statement, proof))
+            .collect::<Result<Vec<_>>>()?;
 
         // Derive the batching entropy from the complete ordered statements and
         // proof bytes. The lower layer samples a fresh nonzero coefficient for
@@ -1891,21 +1910,15 @@ pub mod secp_secq {
         let bp_gens =
             BulletproofGens::<R1csCycle>::new(batched_gens_capacity(first.receivers.len()), 1);
         let mut equations = Vec::with_capacity(instances.len());
-        for (statement, proof) in instances {
-            let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
-            observe_batched_statement(&mut stream, statement)?;
-            let equation = stream.receive_nested(|transcript, payload| {
-                let r1cs_proof = parse_canonical_r1cs_proof(payload)?;
-                prepare_batched_r1cs(
-                    statement,
-                    &r1cs_proof,
-                    &pc_gens,
-                    &bp_gens,
-                    &mut rng,
-                    transcript,
-                )
-            })?;
-            stream.finish()?;
+        for ((statement, _), (r1cs_proof, mut transcript)) in instances.iter().zip(parsed_proofs) {
+            let equation = prepare_batched_r1cs(
+                statement,
+                &r1cs_proof,
+                &pc_gens,
+                &bp_gens,
+                &mut rng,
+                &mut transcript,
+            )?;
             equations.push(equation);
         }
 
