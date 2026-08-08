@@ -93,12 +93,12 @@ required-features = ["halo2curves-secp256k1"]
 [[bench]]
 name = "batched_setup"
 harness = false
-required-features = ["halo2curves-secp256k1"]
+required-features = ["halo2curves-secp256k1", "parallel"]
 
 [[bench]]
 name = "table4"
 harness = false
-required-features = ["halo2curves-secp256k1"]
+required-features = ["halo2curves-secp256k1", "parallel"]
 
 [lints]
 workspace = true

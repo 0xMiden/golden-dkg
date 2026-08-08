@@ -135,6 +135,8 @@ jobs:
         run: cargo nextest run -p bulletproofs-cycle --no-default-features --features bulletproofs-compat
       - name: Test golden-evrf Secp/Secq backend
         run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1
+      - name: Test golden-evrf parallel Secp/Secq backend
+        run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1,parallel
       - name: Test golden-evrf wire serialization adapters
         run: cargo nextest run -p golden-evrf --features serde,miden-serde,halo2curves-secp256k1
       - name: Test EHTDH1 wire serialization adapters
