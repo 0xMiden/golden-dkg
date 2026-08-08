@@ -1,9 +1,9 @@
 //! End-to-end tests for the batched-dealer paper eVRF relation.
 //!
 //! These exercise the public `evrf_batched_prove` / `evrf_batched_verify`
-//! surface for an arbitrary number of receivers. Each test is marked
-//! `#[ignore]` because building the Bulletproofs generators dominates
-//! runtime; run via `cargo nextest --run-ignored only`.
+//! surface for an arbitrary number of receivers. Tests that build full proofs
+//! are marked `#[ignore]` because building the Bulletproofs generators
+//! dominates runtime; run them via `cargo nextest --run-ignored only`.
 
 #![allow(clippy::unwrap_used)]
 
@@ -59,7 +59,6 @@ fn evrf_batched_dealer_honest_proof_verifies() {
 }
 
 #[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn evrf_batched_dealer_rejects_identity_share_commitment() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C10);
     let sk1 = GinScalar::random(&mut rng);
@@ -232,7 +231,6 @@ fn evrf_batched_dealer_rejects_wrong_share_commitment() {
 }
 
 #[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn evrf_batched_dealer_rejects_wrong_polynomial_coefficient_witness() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C63);
     let sk1 = GinScalar::random(&mut rng);
@@ -348,4 +346,36 @@ fn evrf_batched_dealer_four_receivers_verifies() {
     let proof = paper::evrf_batched_prove(&statement, &witness, &mut rng).expect("prove");
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_batched_verify(&statement, &proof, &mut verify_rng).expect("verify");
+}
+
+#[test]
+#[ignore = "slow: builds two full dealer proofs for cross-proof verification"]
+fn evrf_cross_proof_batch_verifies_and_rejects_mismatched_pairs() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_BA7C);
+    let pkjs = make_pkjs(&mut rng, 1);
+    let beta = R1csField::from(7u64);
+    let (first_statement, first_witness) =
+        paper::testing::build_batched(&make_msg(10), GinScalar::from(3u64), &pkjs, beta);
+    let (second_statement, second_witness) =
+        paper::testing::build_batched(&make_msg(11), GinScalar::from(5u64), &pkjs, beta);
+    let first_proof =
+        paper::evrf_batched_prove(&first_statement, &first_witness, &mut rng).expect("first proof");
+    let second_proof = paper::evrf_batched_prove(&second_statement, &second_witness, &mut rng)
+        .expect("second proof");
+
+    paper::evrf_batched_verify_many(&[
+        (&first_statement, &first_proof),
+        (&second_statement, &second_proof),
+    ])
+    .expect("honest batch");
+    paper::evrf_batched_verify_many(&[
+        (&second_statement, &second_proof),
+        (&first_statement, &first_proof),
+    ])
+    .expect("reordered honest pairs");
+    assert!(paper::evrf_batched_verify_many(&[
+        (&first_statement, &first_proof),
+        (&first_statement, &second_proof),
+    ])
+    .is_err());
 }

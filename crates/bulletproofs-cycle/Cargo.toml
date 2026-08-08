@@ -44,6 +44,10 @@ required-features = ["cycle-pedersen", "ristretto"]
 name = "ristretto_parity"
 required-features = ["cycle-pedersen", "ristretto"]
 
+[[test]]
+name = "r1cs_batch"
+required-features = ["cycle-pedersen", "ristretto"]
+
 [[bench]]
 name = "generators"
 harness = false

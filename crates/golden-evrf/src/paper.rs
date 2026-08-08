@@ -38,6 +38,7 @@ pub mod secp_secq {
         generators::{BulletproofGens, PedersenGens},
         r1cs::{Prover, Verifier},
         ConstraintSystem, Cycle, LinearCombination, R1CSError, R1CSProof, Variable,
+        VerificationEquation,
     };
     use ff::{Field, PrimeField};
     use golden_halo2curves::{Secp256k1Cycle, Secq256k1Cycle};
@@ -46,6 +47,7 @@ pub mod secp_secq {
     use halo2curves::secq256k1::Secq256k1;
     use halo2curves::{Coordinates, CurveAffine, CurveExt};
     use merlin::Transcript;
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
     #[cfg(test)]
     use golden_core::{DealerMessageNonce, EvrfStatement};
@@ -1775,16 +1777,15 @@ pub mod secp_secq {
         Ok(stream.finish())
     }
 
-    fn verify_batched_r1cs(
+    fn prepare_batched_r1cs(
         statement: &BatchedEvrfStatement,
         proof: &R1CSProof<R1csCycle>,
+        pc_gens: &PedersenGens<R1csCycle>,
+        bp_gens: &BulletproofGens<R1csCycle>,
         rng: &mut impl CryptoRngCore,
         transcript: &mut Transcript,
-    ) -> Result<()> {
+    ) -> Result<VerificationEquation<R1csCycle>> {
         let g_in = Gin::generator();
-        let pc_gens = PedersenGens::<R1csCycle>::default();
-        let bp_gens =
-            BulletproofGens::<R1csCycle>::new(batched_gens_capacity(statement.receivers.len()), 1);
 
         // Derive h1, h2 from msg.
         let h1 = h_gin_1(&statement.msg);
@@ -1833,10 +1834,21 @@ pub mod secp_secq {
         }
 
         verifier
-            .verify(proof, &pc_gens, &bp_gens, rng)
-            .map_err(|_| Error::ProofVerificationFailed)?;
+            .verification_equation(proof, pc_gens, bp_gens, rng)
+            .map_err(|_| Error::ProofVerificationFailed)
+    }
 
-        Ok(())
+    fn parse_batched_proof_stream(
+        statement: &BatchedEvrfStatement,
+        proof: &[u8],
+    ) -> Result<(R1CSProof<R1csCycle>, Transcript)> {
+        let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
+        observe_batched_statement(&mut stream, statement)?;
+        let parsed = stream.receive_nested(|transcript, payload| {
+            Ok((parse_canonical_r1cs_proof(payload)?, transcript.clone()))
+        })?;
+        stream.finish()?;
+        Ok(parsed)
     }
 
     /// Verify a Batched Dealer Proof represented as a Proof Stream with one nested R1CS proof.
@@ -1846,13 +1858,72 @@ pub mod secp_secq {
         rng: &mut impl CryptoRngCore,
     ) -> Result<()> {
         validate_batched_public_relations(statement)?;
-        let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
-        observe_batched_statement(&mut stream, statement)?;
-        stream.receive_nested(|transcript, payload| {
-            let r1cs_proof = parse_canonical_r1cs_proof(payload)?;
-            verify_batched_r1cs(statement, &r1cs_proof, rng, transcript)
-        })?;
-        stream.finish()
+        let (r1cs_proof, mut transcript) = parse_batched_proof_stream(statement, proof)?;
+        let pc_gens = PedersenGens::<R1csCycle>::default();
+        let bp_gens =
+            BulletproofGens::<R1csCycle>::new(batched_gens_capacity(statement.receivers.len()), 1);
+        let equation = prepare_batched_r1cs(
+            statement,
+            &r1cs_proof,
+            &pc_gens,
+            &bp_gens,
+            rng,
+            &mut transcript,
+        )?;
+        equation
+            .verify()
+            .map_err(|_| Error::ProofVerificationFailed)
+    }
+
+    /// Verify several independent Batched Dealer Proofs with one shared MSM.
+    pub fn evrf_batched_verify_many(instances: &[(&BatchedEvrfStatement, &[u8])]) -> Result<()> {
+        let first = instances.first().ok_or(Error::ProofVerificationFailed)?.0;
+        for (statement, _) in instances {
+            validate_batched_public_relations(statement)?;
+            if statement.receivers.len() != first.receivers.len()
+                || statement.threshold != first.threshold
+            {
+                return Err(Error::ProofVerificationFailed);
+            }
+        }
+        let parsed_proofs = instances
+            .iter()
+            .map(|(statement, proof)| parse_batched_proof_stream(statement, proof))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Derive the batching entropy from the complete ordered statements and
+        // proof bytes. The lower layer samples a fresh nonzero coefficient for
+        // each equation from this transcript-derived RNG.
+        let mut batch_transcript = Transcript::new(b"golden-paper-evrf-proof-batch-v1");
+        batch_transcript.append_u64(b"batch-len", instances.len() as u64);
+        for (index, (statement, proof)) in instances.iter().enumerate() {
+            batch_transcript.append_u64(b"proof-index", index as u64);
+            observe_batched_statement(&mut batch_transcript, statement)?;
+            batch_transcript.append_u64(b"proof-len", proof.len() as u64);
+            batch_transcript.append_message(b"proof", proof);
+        }
+        let mut seed = [0u8; 32];
+        batch_transcript.challenge_bytes(b"batch-rng", &mut seed);
+        let mut rng = ChaCha20Rng::from_seed(seed);
+
+        let pc_gens = PedersenGens::<R1csCycle>::default();
+        let bp_gens =
+            BulletproofGens::<R1csCycle>::new(batched_gens_capacity(first.receivers.len()), 1);
+        let mut equations = Vec::with_capacity(instances.len());
+        for ((statement, _), (r1cs_proof, mut transcript)) in instances.iter().zip(parsed_proofs) {
+            let equation = prepare_batched_r1cs(
+                statement,
+                &r1cs_proof,
+                &pc_gens,
+                &bp_gens,
+                &mut rng,
+                &mut transcript,
+            )?;
+            equations.push(equation);
+        }
+
+        VerificationEquation::verify_batch(equations, &mut rng)
+            .map_err(|_| Error::ProofVerificationFailed)
     }
 
     // ------------------------------------------------------------------
@@ -3048,6 +3119,22 @@ pub mod secp_secq {
             statement.statement_roots.clear();
             assert_eq!(
                 validate_batched_public_relations(&statement).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        #[test]
+        fn public_batched_verifiers_reject_root_count_mismatch() {
+            let mut statement = context_statement();
+            statement.statement_roots.clear();
+            let mut rng = ChaCha20Rng::from_seed([42u8; 32]);
+
+            assert_eq!(
+                evrf_batched_verify(&statement, &[], &mut rng).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+            assert_eq!(
+                evrf_batched_verify_many(&[(&statement, &[])]).unwrap_err(),
                 Error::ProofVerificationFailed
             );
         }

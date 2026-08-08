@@ -7,11 +7,10 @@ use golden_halo2curves::golden_group::{
     scalar_to_r1cs_field, Secp256k1Element, Secp256k1GoldenGroup, Secp256k1Scalar,
 };
 use halo2curves::secp256k1::{Fp, Fq};
-use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use rand_core::CryptoRngCore;
 
 use super::{
-    affine, evrf_batched_prove, evrf_batched_verify, fp_to_fq, h_gin_1, h_gin_2,
+    affine, evrf_batched_prove, evrf_batched_verify_many, fp_to_fq, h_gin_1, h_gin_2,
     BatchedEvrfStatement, BatchedEvrfWitness, BatchedReceiverStatement, Gin, GinScalar,
     BATCHED_PROOF_ID, MESSAGE_BYTES,
 };
@@ -57,6 +56,43 @@ fn compute_pad_fp(msg: &[u8; MESSAGE_BYTES], sk1: &Fq, pkj: &Gin, beta: &Fp) -> 
 /// Concrete Secp/Secq paper eVRF backend for the DKG.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SecpSecqBackend;
+
+fn batched_statement(
+    statements: &[EvrfStatement<Secp256k1GoldenGroup>],
+) -> Result<BatchedEvrfStatement> {
+    let first = statements.first().ok_or(Error::ProofVerificationFailed)?;
+    let beta = scalar_to_r1cs_field(&first.beta).ok_or(Error::ProofVerificationFailed)?;
+    let commitment_coefficients = first
+        .commitment_coefficients
+        .iter()
+        .map(|coefficient| coefficient.0)
+        .collect();
+
+    let mut receivers = Vec::with_capacity(statements.len());
+    let mut statement_roots = Vec::with_capacity(statements.len());
+    for statement in statements {
+        ensure_same_batch_context(statement, first)?;
+        statement_roots.push(statement.root());
+        receivers.push(BatchedReceiverStatement {
+            receiver: statement.receiver,
+            pkj: statement.receiver_public_key.0,
+            share_commitment: statement.share_commitment.0,
+            pad_commitment: statement.pad_commitment.0,
+            dh_commitment: statement.dh_commitment.0,
+            encrypted_share: statement.encrypted_share.0,
+        });
+    }
+
+    Ok(BatchedEvrfStatement {
+        msg: first.msg_i.0,
+        pk1: first.dealer_public_key.0,
+        beta,
+        threshold: first.threshold,
+        commitment_coefficients,
+        statement_roots,
+        receivers,
+    })
+}
 
 impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
     const PROOF_ID: &'static [u8] = BATCHED_PROOF_ID;
@@ -144,45 +180,25 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
         statements: &[EvrfStatement<Secp256k1GoldenGroup>],
         proof: &[u8],
     ) -> Result<()> {
-        if statements.is_empty() {
+        let statement = batched_statement(statements)?;
+        evrf_batched_verify_many(&[(&statement, proof)])
+    }
+
+    fn verify_proof_batch(
+        batches: &[(&[EvrfStatement<Secp256k1GoldenGroup>], &[u8])],
+    ) -> Result<()> {
+        if batches.is_empty() {
             return Err(Error::ProofVerificationFailed);
         }
-        let first = &statements[0];
-        let msg = first.msg_i.0;
-        let pk1 = first.dealer_public_key.0;
-        let beta = scalar_to_r1cs_field(&first.beta).ok_or(Error::ProofVerificationFailed)?;
-        let threshold = first.threshold;
-        let commitment_coefficients: Vec<Gin> = first
-            .commitment_coefficients
+        let statements = batches
             .iter()
-            .map(|coefficient| coefficient.0)
-            .collect();
-
-        let mut receivers = Vec::with_capacity(statements.len());
-        let mut statement_roots = Vec::with_capacity(statements.len());
-        for statement in statements {
-            ensure_same_batch_context(statement, first)?;
-            statement_roots.push(statement.root());
-            receivers.push(BatchedReceiverStatement {
-                receiver: statement.receiver,
-                pkj: statement.receiver_public_key.0,
-                share_commitment: statement.share_commitment.0,
-                pad_commitment: statement.pad_commitment.0,
-                dh_commitment: statement.dh_commitment.0,
-                encrypted_share: statement.encrypted_share.0,
-            });
-        }
-
-        let batched_statement = BatchedEvrfStatement {
-            msg,
-            pk1,
-            beta,
-            threshold,
-            commitment_coefficients,
-            statement_roots,
-            receivers,
-        };
-        let mut rng = ChaCha20Rng::seed_from_u64(0xDEAD_BEEF);
-        evrf_batched_verify(&batched_statement, proof, &mut rng)
+            .map(|(batch, _)| batched_statement(batch))
+            .collect::<Result<Vec<_>>>()?;
+        let instances = statements
+            .iter()
+            .zip(batches.iter())
+            .map(|(statement, (_, proof))| (statement, *proof))
+            .collect::<Vec<_>>();
+        evrf_batched_verify_many(&instances)
     }
 }

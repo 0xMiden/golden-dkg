@@ -103,6 +103,10 @@ pub enum Error {
     #[error("proof verification failed")]
     ProofVerificationFailed,
 
+    /// A dealer proof failed individual verification after a batch failure.
+    #[error("proof verification failed for dealer {0}")]
+    DealerProofVerificationFailed(u32),
+
     /// A dealing share did not match its Feldman commitment.
     #[error("commitment verification failed")]
     CommitmentVerificationFailed,
