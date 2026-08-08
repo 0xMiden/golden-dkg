@@ -19,6 +19,10 @@ halo2curves = { workspace = true, features = ["std"] }
 rand_core = { workspace = true }
 subtle = { workspace = true }
 
+# NOTE: This prevents cross-compilation from ARM.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+halo2curves = { workspace = true, features = ["asm"] }
+
 [dev-dependencies]
 merlin = { workspace = true }
 rand_chacha = { workspace = true }
