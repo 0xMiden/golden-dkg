@@ -1541,7 +1541,7 @@ pub mod secp_secq {
 
     /// Multipliers shared by every batched circuit: the dealer secret's
     /// canonical bit decomposition and the `g^sk = PK_1` exponentiation.
-    const BATCHED_SHARED_MULTIPLIERS: usize = 2_051;
+    const BATCHED_SHARED_MULTIPLIERS: usize = 2_052;
     /// Multipliers added by one non-identity Feldman coefficient opening.
     const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 2_052;
     /// Multipliers added by one receiver relation.
@@ -1558,9 +1558,17 @@ pub mod secp_secq {
         let receivers = receiver_count
             .checked_mul(BATCHED_RECEIVER_MULTIPLIERS)
             .ok_or(Error::ProofVerificationFailed)?;
+        // The shared prefix and each coefficient gadget make an odd number
+        // of `allocate` calls. Each adjacent pair therefore shares one
+        // multiplier slot in the constraint system.
+        let shared_allocations = threshold
+            .checked_add(1)
+            .ok_or(Error::ProofVerificationFailed)?
+            / 2;
         BATCHED_SHARED_MULTIPLIERS
             .checked_add(coefficients)
             .and_then(|count| count.checked_add(receivers))
+            .and_then(|count| count.checked_sub(shared_allocations))
             .ok_or(Error::ProofVerificationFailed)
     }
 
@@ -1959,13 +1967,13 @@ pub mod secp_secq {
         Ok(stream.finish())
     }
 
-    fn prepare_batched_r1cs(
-        params: &BatchedEvrfPublicParams,
+    fn build_batched_verifier<T>(
         statement: &BatchedEvrfStatement,
-        proof: &R1CSProof<R1csCycle>,
-        rng: &mut impl CryptoRngCore,
-        transcript: &mut Transcript,
-    ) -> Result<VerificationEquation<R1csCycle>> {
+        transcript: T,
+    ) -> Result<Verifier<R1csCycle, T>>
+    where
+        T: core::borrow::BorrowMut<Transcript>,
+    {
         let g_in = Gin::generator();
         // Derive h1, h2 from msg.
         let h1 = h_gin_1(&statement.msg);
@@ -2013,6 +2021,17 @@ pub mod secp_secq {
             .map_err(|_| Error::ProofVerificationFailed)?;
         }
 
+        Ok(verifier)
+    }
+
+    fn prepare_batched_r1cs(
+        params: &BatchedEvrfPublicParams,
+        statement: &BatchedEvrfStatement,
+        proof: &R1CSProof<R1csCycle>,
+        rng: &mut impl CryptoRngCore,
+        transcript: &mut Transcript,
+    ) -> Result<VerificationEquation<R1csCycle>> {
+        let verifier = build_batched_verifier(statement, transcript)?;
         verifier
             .verification_equation(proof, &params.pc_gens, &params.bp_gens, rng)
             .map_err(|_| Error::ProofVerificationFailed)
@@ -2401,25 +2420,26 @@ pub mod secp_secq {
         const R1CS_TEST_DOMAIN: &[u8] = b"golden-paper-evrf-r1cs-test";
 
         #[test]
-        fn batched_parameter_setup_uses_exact_circuit_shape() {
-            for (receivers, multipliers, capacity) in [
-                (1, 17_374, 32_768),
-                (4, 51_031, 65_536),
-                (9, 107_126, 131_072),
-            ] {
-                let count = batched_multiplier_count(2, receivers).expect("valid shape");
-                assert_eq!(count, multipliers, "receiver count {receivers}");
-                assert_eq!(
-                    count.next_power_of_two(),
-                    capacity,
-                    "receiver count {receivers}"
-                );
-            }
-            assert_ne!(
-                batched_multiplier_count(1, 1).expect("valid shape"),
-                batched_multiplier_count(2, 1).expect("valid shape"),
-                "threshold must be part of the parameter shape"
+        fn batched_parameter_setup_matches_verifier_metrics() {
+            let threshold = 3;
+            let receiver_count = 1;
+            let pkj = Gin::generator() * GinScalar::from(3u64);
+            let (mut statement, _) = testing::build_batched(
+                &[0x42; MESSAGE_BYTES],
+                GinScalar::from(7u64),
+                &[pkj],
+                R1csField::from(11u64),
             );
+            statement.threshold = threshold;
+            statement.commitment_coefficients = (1..=threshold)
+                .map(|coefficient| Gin::generator() * GinScalar::from(coefficient as u64 + 20))
+                .collect();
+
+            let verifier = build_batched_verifier(&statement, Transcript::new(R1CS_TEST_DOMAIN))
+                .expect("valid verifier circuit");
+            let multiplier_count =
+                batched_multiplier_count(threshold, receiver_count).expect("valid shape");
+            assert_eq!(multiplier_count, verifier.metrics().multipliers);
         }
 
         /// Build a canonical bit decomposition of `k` (little-endian).
