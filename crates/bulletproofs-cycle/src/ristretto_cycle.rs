@@ -29,6 +29,7 @@ pub struct RistrettoCycle;
 impl Cycle for RistrettoCycle {
     type Scalar = Scalar;
     type Point = RistrettoPoint;
+    type Affine = RistrettoPoint;
     type Compressed = CompressedRistretto;
     const COMPRESSED_BYTES: usize = 32;
 
@@ -94,10 +95,30 @@ impl Cycle for RistrettoCycle {
         RistrettoPoint::from_uniform_bytes(bytes)
     }
 
+    fn point_to_affine(point: &Self::Point) -> Self::Affine {
+        *point
+    }
+
+    fn affine_to_point(point: &Self::Affine) -> Self::Point {
+        *point
+    }
+
+    fn batch_normalize(points: &[Self::Point]) -> Vec<Self::Affine> {
+        points.to_vec()
+    }
+
+    fn affine_compress(point: &Self::Affine) -> Self::Compressed {
+        point.compress()
+    }
+
     fn vartime_msm(scalars: &[Self::Scalar], points: &[Self::Point]) -> Self::Point {
         // RistrettoPoint: VartimeMultiscalarMul takes owned iterators. The
         // Cycle signature hands us slices of references, so collect once to
         // bridge into dalek's iterator API.
+        RistrettoPoint::vartime_multiscalar_mul(scalars.to_vec(), points.to_vec())
+    }
+
+    fn vartime_msm_affine(scalars: &[Self::Scalar], points: &[Self::Affine]) -> Self::Point {
         RistrettoPoint::vartime_multiscalar_mul(scalars.to_vec(), points.to_vec())
     }
 

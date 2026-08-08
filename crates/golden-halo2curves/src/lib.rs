@@ -32,6 +32,7 @@ macro_rules! impl_cycle {
         impl Cycle for $wrapper {
             type Scalar = $scalar;
             type Point = $curve;
+            type Affine = <$curve as halo2curves::CurveExt>::AffineExt;
             type Compressed = <$curve as GroupEncoding>::Repr;
             const COMPRESSED_BYTES: usize = $compressed_bytes;
 
@@ -121,6 +122,29 @@ macro_rules! impl_cycle {
                 hash(&bytes[..])
             }
 
+            fn point_to_affine(point: &Self::Point) -> Self::Affine {
+                use group::Curve;
+                point.to_affine()
+            }
+
+            fn affine_to_point(point: &Self::Affine) -> Self::Point {
+                use group::prime::PrimeCurveAffine;
+                point.to_curve()
+            }
+
+            fn batch_normalize(points: &[Self::Point]) -> Vec<Self::Affine> {
+                use group::Curve;
+
+                let mut affine = vec![Self::Affine::default(); points.len()];
+                <Self::Point as Curve>::batch_normalize(points, &mut affine);
+                affine
+            }
+
+            fn affine_compress(point: &Self::Affine) -> Self::Compressed {
+                use group::GroupEncoding;
+                point.to_bytes()
+            }
+
             fn vartime_msm(scalars: &[Self::Scalar], points: &[Self::Point]) -> Self::Point {
                 // Use a two-point path for IPA folds, and Pippenger for
                 // larger MSMs.
@@ -196,6 +220,16 @@ macro_rules! impl_cycle {
                 let mut bases = vec![Affine::default(); filtered_points.len()];
                 <Self::Point as Curve>::batch_normalize(&filtered_points, &mut bases);
                 msm_best::<Affine>(&scalars, &bases)
+            }
+
+            fn vartime_msm_affine(
+                scalars: &[Self::Scalar],
+                points: &[Self::Affine],
+            ) -> Self::Point {
+                use halo2curves::msm::msm_best;
+
+                assert_eq!(scalars.len(), points.len());
+                msm_best::<Self::Affine>(scalars, points)
             }
 
             fn vartime_msm_optional(

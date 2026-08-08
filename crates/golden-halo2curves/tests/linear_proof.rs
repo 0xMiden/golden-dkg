@@ -29,7 +29,7 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([42; 32]);
 
         let bp_gens = BulletproofGens::<C>::new(n, 1);
-        let G: Vec<C::Point> = bp_gens.share(0).G(n).copied().collect();
+        let G: Vec<C::Point> = bp_gens.share(0).G(n).map(C::affine_to_point).collect();
 
         let pedersen_gens = PedersenGens::<C>::default();
         let F = pedersen_gens.B;

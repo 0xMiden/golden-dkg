@@ -70,6 +70,17 @@ mod tests {
                     assert!(got == expected, "{label}");
                 }
 
+                fn assert_affine_msm_matches_reference(
+                    label: &str,
+                    scalars: &[<C as Cycle>::Scalar],
+                    points: &[<C as Cycle>::Point],
+                ) {
+                    let affine = C::batch_normalize(points);
+                    let got = C::vartime_msm_affine(scalars, &affine);
+                    let expected = reference_msm(scalars, points);
+                    assert!(got == expected, "{label}");
+                }
+
                 let mut rng = ChaCha20Rng::seed_from_u64(0x2b4d_5015);
                 let identity = <$point as Group>::identity();
                 let points = [point(1), point(2), point(3), point(4)];
@@ -104,6 +115,7 @@ mod tests {
                 );
                 assert_msm_matches_reference("three points", &scalars[..3], &points[..3]);
                 assert_msm_matches_reference("larger msm", &scalars, &points);
+                assert_affine_msm_matches_reference("affine msm", &scalars, &points);
             }
         };
     }

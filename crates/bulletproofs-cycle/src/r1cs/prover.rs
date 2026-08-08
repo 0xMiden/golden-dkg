@@ -378,36 +378,34 @@ impl<'g, C: Cycle, T: BorrowMut<Transcript>> Prover<'g, C, T> {
         let s_L1: Vec<C::Scalar> = (0..n1).map(|_| C::Scalar::random(&mut rng)).collect();
         let s_R1: Vec<C::Scalar> = (0..n1).map(|_| C::Scalar::random(&mut rng)).collect();
 
-        let g_points: Vec<C::Point> = gens.G(n1).copied().collect();
-        let h_points: Vec<C::Point> = gens.H(n1).copied().collect();
+        let g_points: Vec<C::Affine> = gens.G(n1).copied().collect();
+        let h_points: Vec<C::Affine> = gens.H(n1).copied().collect();
 
-        let mut scalars = Vec::with_capacity(1 + 2 * n1);
-        scalars.push(i_blinding1);
+        let mut scalars = Vec::with_capacity(2 * n1);
         scalars.extend(self.secrets.a_L.iter().copied());
         scalars.extend(self.secrets.a_R.iter().copied());
-        let mut points = Vec::with_capacity(1 + 2 * n1);
-        points.push(self.pc_gens.B_blinding);
+        let mut points = Vec::with_capacity(2 * n1);
         points.extend(g_points.iter().copied());
         points.extend(h_points.iter().copied());
-        let A_I1 = C::point_compress(&C::vartime_msm(&scalars, &points));
+        let A_I1 = C::point_compress(
+            &(C::vartime_msm_affine(&scalars, &points) + self.pc_gens.B_blinding * i_blinding1),
+        );
 
-        let mut scalars = Vec::with_capacity(1 + n1);
-        scalars.push(o_blinding1);
+        let mut scalars = Vec::with_capacity(n1);
         scalars.extend(self.secrets.a_O.iter().copied());
-        let mut points = Vec::with_capacity(1 + n1);
-        points.push(self.pc_gens.B_blinding);
-        points.extend(g_points.iter().copied());
-        let A_O1 = C::point_compress(&C::vartime_msm(&scalars, &points));
+        let A_O1 = C::point_compress(
+            &(C::vartime_msm_affine(&scalars, &g_points) + self.pc_gens.B_blinding * o_blinding1),
+        );
 
-        let mut scalars = Vec::with_capacity(1 + 2 * n1);
-        scalars.push(s_blinding1);
+        let mut scalars = Vec::with_capacity(2 * n1);
         scalars.extend(s_L1.iter().copied());
         scalars.extend(s_R1.iter().copied());
-        let mut points = Vec::with_capacity(1 + 2 * n1);
-        points.push(self.pc_gens.B_blinding);
+        let mut points = Vec::with_capacity(2 * n1);
         points.extend(g_points.iter().copied());
         points.extend(h_points.iter().copied());
-        let S1 = C::point_compress(&C::vartime_msm(&scalars, &points));
+        let S1 = C::point_compress(
+            &(C::vartime_msm_affine(&scalars, &points) + self.pc_gens.B_blinding * s_blinding1),
+        );
 
         {
             let transcript = self.transcript.borrow_mut();
@@ -443,36 +441,34 @@ impl<'g, C: Cycle, T: BorrowMut<Transcript>> Prover<'g, C, T> {
 
         let (A_I2, A_O2, S2) = if has_2nd_phase {
             let gens = bp_gens.share(0);
-            let g_tail: Vec<C::Point> = gens.G(n).skip(n1).copied().collect();
-            let h_tail: Vec<C::Point> = gens.H(n).skip(n1).copied().collect();
+            let g_tail: Vec<C::Affine> = gens.G(n).skip(n1).copied().collect();
+            let h_tail: Vec<C::Affine> = gens.H(n).skip(n1).copied().collect();
 
-            let mut scalars = Vec::with_capacity(1 + 2 * n2);
-            scalars.push(i_blinding2);
+            let mut scalars = Vec::with_capacity(2 * n2);
             scalars.extend(self.secrets.a_L.iter().skip(n1).copied());
             scalars.extend(self.secrets.a_R.iter().skip(n1).copied());
-            let mut points = Vec::with_capacity(1 + 2 * n2);
-            points.push(self.pc_gens.B_blinding);
+            let mut points = Vec::with_capacity(2 * n2);
             points.extend(g_tail.iter().copied());
             points.extend(h_tail.iter().copied());
-            let a_i2 = C::point_compress(&C::vartime_msm(&scalars, &points));
+            let a_i2 = C::point_compress(
+                &(C::vartime_msm_affine(&scalars, &points) + self.pc_gens.B_blinding * i_blinding2),
+            );
 
-            let mut scalars = Vec::with_capacity(1 + n2);
-            scalars.push(o_blinding2);
+            let mut scalars = Vec::with_capacity(n2);
             scalars.extend(self.secrets.a_O.iter().skip(n1).copied());
-            let mut points = Vec::with_capacity(1 + n2);
-            points.push(self.pc_gens.B_blinding);
-            points.extend(g_tail.iter().copied());
-            let a_o2 = C::point_compress(&C::vartime_msm(&scalars, &points));
+            let a_o2 = C::point_compress(
+                &(C::vartime_msm_affine(&scalars, &g_tail) + self.pc_gens.B_blinding * o_blinding2),
+            );
 
-            let mut scalars = Vec::with_capacity(1 + 2 * n2);
-            scalars.push(s_blinding2);
+            let mut scalars = Vec::with_capacity(2 * n2);
             scalars.extend(s_L2.iter().copied());
             scalars.extend(s_R2.iter().copied());
-            let mut points = Vec::with_capacity(1 + 2 * n2);
-            points.push(self.pc_gens.B_blinding);
+            let mut points = Vec::with_capacity(2 * n2);
             points.extend(g_tail.iter().copied());
             points.extend(h_tail.iter().copied());
-            let s2 = C::point_compress(&C::vartime_msm(&scalars, &points));
+            let s2 = C::point_compress(
+                &(C::vartime_msm_affine(&scalars, &points) + self.pc_gens.B_blinding * s_blinding2),
+            );
 
             (a_i2, a_o2, s2)
         } else {
@@ -596,8 +592,8 @@ impl<'g, C: Cycle, T: BorrowMut<Transcript>> Prover<'g, C, T> {
             .collect();
 
         let gens = bp_gens.share(0);
-        let G_vec: Vec<C::Point> = gens.G(padded_n).copied().collect();
-        let H_vec: Vec<C::Point> = gens.H(padded_n).copied().collect();
+        let G_vec: Vec<C::Point> = gens.G(padded_n).map(C::affine_to_point).collect();
+        let H_vec: Vec<C::Point> = gens.H(padded_n).map(C::affine_to_point).collect();
 
         let ipp_proof = InnerProductProof::<C>::create(
             self.transcript.borrow_mut(),

@@ -219,13 +219,74 @@ pub mod secp_secq {
     /// Setup derives the exact multiplier count from the DKG threshold and
     /// receiver count, then expands the deterministic Bulletproof generators
     /// once. The same value can be shared by every dealer proof with that
-    /// shape.
+    /// shape. With the `serde` feature, serialized parameters contain the
+    /// prepared bases and must be authenticated before loading; deserialization
+    /// validates encodings and dimensions but does not rederive every base.
     pub struct BatchedEvrfPublicParams {
         threshold: usize,
         receiver_count: usize,
         multiplier_count: usize,
         pc_gens: PedersenGens<R1csCycle>,
         bp_gens: BulletproofGens<R1csCycle>,
+    }
+
+    #[cfg(feature = "serde")]
+    impl serde::Serialize for BatchedEvrfPublicParams {
+        fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            #[derive(serde::Serialize)]
+            struct Repr<'a> {
+                threshold: usize,
+                receiver_count: usize,
+                bp_gens: &'a BulletproofGens<R1csCycle>,
+            }
+
+            Repr {
+                threshold: self.threshold,
+                receiver_count: self.receiver_count,
+                bp_gens: &self.bp_gens,
+            }
+            .serialize(serializer)
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    impl<'de> serde::Deserialize<'de> for BatchedEvrfPublicParams {
+        fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            use serde::de::Error as _;
+
+            #[derive(serde::Deserialize)]
+            struct Repr {
+                threshold: usize,
+                receiver_count: usize,
+                bp_gens: BulletproofGens<R1csCycle>,
+            }
+
+            let repr = Repr::deserialize(deserializer)?;
+            let multiplier_count = batched_multiplier_count(repr.threshold, repr.receiver_count)
+                .map_err(|_| D::Error::custom("invalid batched public parameter shape"))?;
+            let gens_capacity = multiplier_count
+                .checked_next_power_of_two()
+                .ok_or_else(|| D::Error::custom("batched public parameter capacity overflow"))?;
+            if repr.bp_gens.gens_capacity != gens_capacity || repr.bp_gens.party_capacity != 1 {
+                return Err(D::Error::custom(
+                    "generator capacity does not match the batched circuit shape",
+                ));
+            }
+
+            Ok(Self {
+                threshold: repr.threshold,
+                receiver_count: repr.receiver_count,
+                multiplier_count,
+                pc_gens: PedersenGens::default(),
+                bp_gens: repr.bp_gens,
+            })
+        }
     }
 
     impl BatchedEvrfPublicParams {

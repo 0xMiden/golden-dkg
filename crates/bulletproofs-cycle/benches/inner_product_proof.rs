@@ -59,8 +59,8 @@ fn ipp_setup<C: Cycle>(n: usize) -> IppInputs<C> {
     let mut rng = ChaCha20Rng::from_seed([42; 32]);
 
     let bp_gens = BulletproofGens::<C>::new(n, 1);
-    let G: Vec<C::Point> = bp_gens.share(0).G(n).copied().collect();
-    let H: Vec<C::Point> = bp_gens.share(0).H(n).copied().collect();
+    let G: Vec<C::Point> = bp_gens.share(0).G(n).map(C::affine_to_point).collect();
+    let H: Vec<C::Point> = bp_gens.share(0).H(n).map(C::affine_to_point).collect();
     let Q = q_base::<C>();
 
     let a: Vec<C::Scalar> = (0..n).map(|_| random_scalar::<C>(&mut rng)).collect();
