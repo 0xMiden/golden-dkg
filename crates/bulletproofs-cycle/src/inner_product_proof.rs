@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use core::borrow::Borrow;
 use core::iter;
 use merlin::Transcript;
+use p3_maybe_rayon::prelude::*;
 
 use crate::cycle::Cycle;
 use crate::errors::ProofError;
@@ -107,18 +108,24 @@ impl<C: Cycle> InnerProductProof<C> {
             let u = challenge_scalar::<C>(transcript, b"u");
             let u_inv = C::scalar_invert(&u);
 
-            for i in 0..n {
-                a_L[i] = a_L[i] * u + u_inv * a_R[i];
-                b_L[i] = b_L[i] * u_inv + u * b_R[i];
-                G_L[i] = C::vartime_msm(
+            a_L.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, a_L_i)| *a_L_i = *a_L_i * u + u_inv * a_R[i]);
+            b_L.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, b_L_i)| *b_L_i = *b_L_i * u_inv + u * b_R[i]);
+            G_L.par_iter_mut().enumerate().for_each(|(i, G_L_i)| {
+                *G_L_i = C::vartime_msm(
                     &[u_inv * G_factors[i], u * G_factors[n + i]],
-                    &[G_L[i], G_R[i]],
+                    &[*G_L_i, G_R[i]],
                 );
-                H_L[i] = C::vartime_msm(
+            });
+            H_L.par_iter_mut().enumerate().for_each(|(i, H_L_i)| {
+                *H_L_i = C::vartime_msm(
                     &[u * H_factors[i], u_inv * H_factors[n + i]],
-                    &[H_L[i], H_R[i]],
+                    &[*H_L_i, H_R[i]],
                 );
-            }
+            });
 
             a = a_L;
             b = b_L;
@@ -173,12 +180,18 @@ impl<C: Cycle> InnerProductProof<C> {
             let u = challenge_scalar::<C>(transcript, b"u");
             let u_inv = C::scalar_invert(&u);
 
-            for i in 0..n {
-                a_L[i] = a_L[i] * u + u_inv * a_R[i];
-                b_L[i] = b_L[i] * u_inv + u * b_R[i];
-                G_L[i] = C::vartime_msm(&[u_inv, u], &[G_L[i], G_R[i]]);
-                H_L[i] = C::vartime_msm(&[u, u_inv], &[H_L[i], H_R[i]]);
-            }
+            a_L.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, a_L_i)| *a_L_i = *a_L_i * u + u_inv * a_R[i]);
+            b_L.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, b_L_i)| *b_L_i = *b_L_i * u_inv + u * b_R[i]);
+            G_L.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, G_L_i)| *G_L_i = C::vartime_msm(&[u_inv, u], &[*G_L_i, G_R[i]]));
+            H_L.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, H_L_i)| *H_L_i = C::vartime_msm(&[u, u_inv], &[*H_L_i, H_R[i]]));
 
             a = a_L;
             b = b_L;
