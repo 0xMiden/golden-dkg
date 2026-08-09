@@ -35,17 +35,17 @@ impl<C: Cycle> InnerProductProof<C> {
         Q: &C::Point,
         G_factors: &[C::Scalar],
         H_factors: &[C::Scalar],
-        mut G_vec: Vec<C::Point>,
-        mut H_vec: Vec<C::Point>,
+        G_vec: Vec<C::Point>,
+        H_vec: Vec<C::Point>,
         mut a_vec: Vec<C::Scalar>,
         mut b_vec: Vec<C::Scalar>,
     ) -> InnerProductProof<C> {
-        let mut G = &mut G_vec[..];
-        let mut H = &mut H_vec[..];
+        let G = &G_vec[..];
+        let H = &H_vec[..];
         let mut a = &mut a_vec[..];
         let mut b = &mut b_vec[..];
 
-        let mut n = G.len();
+        let n = G.len();
         debug_assert_eq!(H.len(), n);
         debug_assert_eq!(a.len(), n);
         debug_assert_eq!(b.len(), n);
@@ -59,116 +59,47 @@ impl<C: Cycle> InnerProductProof<C> {
         let mut L_vec = Vec::with_capacity(lg_n);
         let mut R_vec = Vec::with_capacity(lg_n);
 
-        if n != 1 {
-            n /= 2;
-            let (a_L, a_R) = a.split_at_mut(n);
-            let (b_L, b_R) = b.split_at_mut(n);
-            let (G_L, G_R) = G.split_at_mut(n);
-            let (H_L, H_R) = H.split_at_mut(n);
+        let mut g_coef = G_factors.to_vec();
+        let mut h_coef = H_factors.to_vec();
+
+        for round in 0..lg_n {
+            let m = n >> (round + 1);
+            let shift = lg_n - round - 1;
+            let mask = m - 1;
+
+            let (a_L, a_R) = a.split_at_mut(m);
+            let (b_L, b_R) = b.split_at_mut(m);
 
             let c_L = inner_product(a_L, b_R);
             let c_R = inner_product(a_R, b_L);
 
-            let scalars_l: Vec<C::Scalar> = a_L
-                .iter()
-                .zip(G_factors[n..2 * n].iter())
-                .map(|(a_L_i, g)| *a_L_i * g)
-                .chain(
-                    b_R.iter()
-                        .zip(H_factors[0..n].iter())
-                        .map(|(b_R_i, h)| *b_R_i * h),
-                )
-                .chain(iter::once(c_L))
-                .collect();
-            let mut points_l: Vec<C::Point> = G_R.iter().chain(H_L.iter()).copied().collect();
+            let mut scalars_l = Vec::with_capacity(n + 1);
+            let mut points_l = Vec::with_capacity(n + 1);
+            let mut scalars_r = Vec::with_capacity(n + 1);
+            let mut points_r = Vec::with_capacity(n + 1);
+
+            for j in 0..n {
+                let idx = j & mask;
+                if (j >> shift) & 1 == 1 {
+                    // R-half this round: G feeds L (paired with a_L), H feeds R (paired with b_L).
+                    scalars_l.push(a_L[idx] * g_coef[j]);
+                    points_l.push(G[j]);
+                    scalars_r.push(b_L[idx] * h_coef[j]);
+                    points_r.push(H[j]);
+                } else {
+                    // L-half this round: G feeds R (paired with a_R), H feeds L (paired with b_R).
+                    scalars_r.push(a_R[idx] * g_coef[j]);
+                    points_r.push(G[j]);
+                    scalars_l.push(b_R[idx] * h_coef[j]);
+                    points_l.push(H[j]);
+                }
+            }
+            scalars_l.push(c_L);
             points_l.push(*Q);
-            let L = C::point_compress(&C::vartime_msm(&scalars_l, &points_l));
-
-            let scalars_r: Vec<C::Scalar> = a_R
-                .iter()
-                .zip(G_factors[0..n].iter())
-                .map(|(a_R_i, g)| *a_R_i * g)
-                .chain(
-                    b_L.iter()
-                        .zip(H_factors[n..2 * n].iter())
-                        .map(|(b_L_i, h)| *b_L_i * h),
-                )
-                .chain(iter::once(c_R))
-                .collect();
-            let mut points_r: Vec<C::Point> = G_L.iter().chain(H_R.iter()).copied().collect();
+            scalars_r.push(c_R);
             points_r.push(*Q);
-            let R = C::point_compress(&C::vartime_msm(&scalars_r, &points_r));
 
-            L_vec.push(L.clone());
-            R_vec.push(R.clone());
-
-            append_point::<C>(transcript, b"L", &L);
-            append_point::<C>(transcript, b"R", &R);
-
-            let u = challenge_scalar::<C>(transcript, b"u");
-            let u_inv = C::scalar_invert(&u);
-
-            a_L.par_iter_mut()
-                .enumerate()
-                .for_each(|(i, a_L_i)| *a_L_i = *a_L_i * u + u_inv * a_R[i]);
-            b_L.par_iter_mut()
-                .enumerate()
-                .for_each(|(i, b_L_i)| *b_L_i = *b_L_i * u_inv + u * b_R[i]);
-            G_L.par_iter_mut().enumerate().for_each(|(i, G_L_i)| {
-                *G_L_i = C::vartime_msm(
-                    &[u_inv * G_factors[i], u * G_factors[n + i]],
-                    &[*G_L_i, G_R[i]],
-                );
-            });
-            H_L.par_iter_mut().enumerate().for_each(|(i, H_L_i)| {
-                *H_L_i = C::vartime_msm(
-                    &[u * H_factors[i], u_inv * H_factors[n + i]],
-                    &[*H_L_i, H_R[i]],
-                );
-            });
-
-            a = a_L;
-            b = b_L;
-            G = G_L;
-            H = H_L;
-        }
-
-        while n != 1 {
-            n /= 2;
-            let (a_L, a_R) = a.split_at_mut(n);
-            let (b_L, b_R) = b.split_at_mut(n);
-            let (G_L, G_R) = G.split_at_mut(n);
-            let (H_L, H_R) = H.split_at_mut(n);
-
-            let c_L = inner_product(a_L, b_R);
-            let c_R = inner_product(a_R, b_L);
-
-            let scalars_l: Vec<C::Scalar> = a_L
-                .iter()
-                .chain(b_R.iter())
-                .chain(iter::once(&c_L))
-                .copied()
-                .collect();
-            let points_l: Vec<C::Point> = G_R
-                .iter()
-                .chain(H_L.iter())
-                .chain(iter::once(Q))
-                .copied()
-                .collect();
             let L = C::point_compress(&C::vartime_msm(&scalars_l, &points_l));
-
-            let scalars_r: Vec<C::Scalar> = a_R
-                .iter()
-                .chain(b_L.iter())
-                .chain(iter::once(&c_R))
-                .copied()
-                .collect();
-            let points_r: Vec<C::Point> = G_L
-                .iter()
-                .chain(H_R.iter())
-                .chain(iter::once(Q))
-                .copied()
-                .collect();
             let R = C::point_compress(&C::vartime_msm(&scalars_r, &points_r));
 
             L_vec.push(L.clone());
@@ -186,17 +117,15 @@ impl<C: Cycle> InnerProductProof<C> {
             b_L.par_iter_mut()
                 .enumerate()
                 .for_each(|(i, b_L_i)| *b_L_i = *b_L_i * u_inv + u * b_R[i]);
-            G_L.par_iter_mut()
-                .enumerate()
-                .for_each(|(i, G_L_i)| *G_L_i = C::vartime_msm(&[u_inv, u], &[*G_L_i, G_R[i]]));
-            H_L.par_iter_mut()
-                .enumerate()
-                .for_each(|(i, H_L_i)| *H_L_i = C::vartime_msm(&[u, u_inv], &[*H_L_i, H_R[i]]));
+            g_coef.par_iter_mut().enumerate().for_each(|(j, gc)| {
+                *gc *= if (j >> shift) & 1 == 1 { u } else { u_inv };
+            });
+            h_coef.par_iter_mut().enumerate().for_each(|(j, hc)| {
+                *hc *= if (j >> shift) & 1 == 1 { u_inv } else { u };
+            });
 
             a = a_L;
             b = b_L;
-            G = G_L;
-            H = H_L;
         }
 
         InnerProductProof {
@@ -412,5 +341,83 @@ impl<C: Cycle> InnerProductProof<C> {
             })
             .chain(C::scalar_to_canonical(&self.a))
             .chain(C::scalar_to_canonical(&self.b))
+    }
+}
+
+#[cfg(all(test, feature = "ristretto"))]
+mod tests {
+    use super::*;
+    use crate::cycle::random_scalar;
+    use crate::generators::BulletproofGens;
+    use crate::ristretto_cycle::RistrettoCycle;
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    fn roundtrip(n: usize) {
+        let mut rng = ChaCha20Rng::seed_from_u64(n as u64);
+        let bp_gens = BulletproofGens::<RistrettoCycle>::new(n, 1);
+        let share = bp_gens.share(0);
+        let G: Vec<_> = share.G(n).map(RistrettoCycle::affine_to_point).collect();
+        let H: Vec<_> = share.H(n).map(RistrettoCycle::affine_to_point).collect();
+        let Q = RistrettoCycle::point_hash_from_uniform(&[7u8; 64]);
+
+        let G_factors: Vec<_> = (0..n)
+            .map(|_| random_scalar::<RistrettoCycle>(&mut rng))
+            .collect();
+        let H_factors: Vec<_> = (0..n)
+            .map(|_| random_scalar::<RistrettoCycle>(&mut rng))
+            .collect();
+        let a: Vec<_> = (0..n)
+            .map(|_| random_scalar::<RistrettoCycle>(&mut rng))
+            .collect();
+        let b: Vec<_> = (0..n)
+            .map(|_| random_scalar::<RistrettoCycle>(&mut rng))
+            .collect();
+
+        let ab = inner_product(&a, &b);
+        let mut scalars: Vec<_> = a
+            .iter()
+            .zip(G_factors.iter())
+            .map(|(a_i, g)| *a_i * g)
+            .collect();
+        scalars.extend(b.iter().zip(H_factors.iter()).map(|(b_i, h)| *b_i * h));
+        scalars.push(ab);
+        let mut points = G.clone();
+        points.extend(H.iter().copied());
+        points.push(Q);
+        let P = RistrettoCycle::vartime_msm(&scalars, &points);
+
+        let mut prover_transcript = Transcript::new(b"ipp-roundtrip-test");
+        let proof = InnerProductProof::<RistrettoCycle>::create(
+            &mut prover_transcript,
+            &Q,
+            &G_factors,
+            &H_factors,
+            G.clone(),
+            H.clone(),
+            a,
+            b,
+        );
+
+        let mut verifier_transcript = Transcript::new(b"ipp-roundtrip-test");
+        assert!(proof
+            .verify(
+                n,
+                &mut verifier_transcript,
+                G_factors,
+                H_factors,
+                &P,
+                &Q,
+                &G,
+                &H,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn roundtrips_for_small_powers_of_two() {
+        for n in [1usize, 2, 4, 8, 16, 64] {
+            roundtrip(n);
+        }
     }
 }
