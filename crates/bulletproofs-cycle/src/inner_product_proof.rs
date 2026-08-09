@@ -35,13 +35,12 @@ impl<C: Cycle> InnerProductProof<C> {
         Q: &C::Point,
         G_factors: &[C::Scalar],
         H_factors: &[C::Scalar],
-        G_vec: Vec<C::Point>,
-        H_vec: Vec<C::Point>,
+        G: &[C::Affine],
+        H: &[C::Affine],
         mut a_vec: Vec<C::Scalar>,
         mut b_vec: Vec<C::Scalar>,
     ) -> InnerProductProof<C> {
-        let G = &G_vec[..];
-        let H = &H_vec[..];
+        let Q_affine = C::point_to_affine(Q);
         let mut a = &mut a_vec[..];
         let mut b = &mut b_vec[..];
 
@@ -95,12 +94,12 @@ impl<C: Cycle> InnerProductProof<C> {
                 }
             }
             scalars_l.push(c_L);
-            points_l.push(*Q);
+            points_l.push(Q_affine);
             scalars_r.push(c_R);
-            points_r.push(*Q);
+            points_r.push(Q_affine);
 
-            let L = C::point_compress(&C::vartime_msm(&scalars_l, &points_l));
-            let R = C::point_compress(&C::vartime_msm(&scalars_r, &points_r));
+            let L = C::point_compress(&C::vartime_msm_affine(&scalars_l, &points_l));
+            let R = C::point_compress(&C::vartime_msm_affine(&scalars_r, &points_r));
 
             L_vec.push(L.clone());
             R_vec.push(R.clone());
@@ -357,8 +356,16 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(n as u64);
         let bp_gens = BulletproofGens::<RistrettoCycle>::new(n, 1);
         let share = bp_gens.share(0);
-        let G: Vec<_> = share.G(n).map(RistrettoCycle::affine_to_point).collect();
-        let H: Vec<_> = share.H(n).map(RistrettoCycle::affine_to_point).collect();
+        let G_affine: Vec<_> = share.G(n).copied().collect();
+        let H_affine: Vec<_> = share.H(n).copied().collect();
+        let G: Vec<_> = G_affine
+            .iter()
+            .map(RistrettoCycle::affine_to_point)
+            .collect();
+        let H: Vec<_> = H_affine
+            .iter()
+            .map(RistrettoCycle::affine_to_point)
+            .collect();
         let Q = RistrettoCycle::point_hash_from_uniform(&[7u8; 64]);
 
         let G_factors: Vec<_> = (0..n)
@@ -393,8 +400,8 @@ mod tests {
             &Q,
             &G_factors,
             &H_factors,
-            G.clone(),
-            H.clone(),
+            &G_affine,
+            &H_affine,
             a,
             b,
         );
