@@ -180,18 +180,24 @@ impl<C: Cycle> InnerProductProof<C> {
             let u = challenge_scalar::<C>(transcript, b"u");
             let u_inv = C::scalar_invert(&u);
 
+            // `u`/`u_inv` are the same two scalars for every point-pair fold
+            // below; recode each into radix-4 windows once per round instead
+            // of once per pair.
+            let w_u = C::scalar_radix4_windows(&u);
+            let w_u_inv = C::scalar_radix4_windows(&u_inv);
+
             a_L.par_iter_mut()
                 .enumerate()
                 .for_each(|(i, a_L_i)| *a_L_i = *a_L_i * u + u_inv * a_R[i]);
             b_L.par_iter_mut()
                 .enumerate()
                 .for_each(|(i, b_L_i)| *b_L_i = *b_L_i * u_inv + u * b_R[i]);
-            G_L.par_iter_mut()
-                .enumerate()
-                .for_each(|(i, G_L_i)| *G_L_i = C::vartime_msm(&[u_inv, u], &[*G_L_i, G_R[i]]));
-            H_L.par_iter_mut()
-                .enumerate()
-                .for_each(|(i, H_L_i)| *H_L_i = C::vartime_msm(&[u, u_inv], &[*H_L_i, H_R[i]]));
+            G_L.par_iter_mut().enumerate().for_each(|(i, G_L_i)| {
+                *G_L_i = C::vartime_msm_two_windowed(&w_u_inv, &w_u, *G_L_i, G_R[i]);
+            });
+            H_L.par_iter_mut().enumerate().for_each(|(i, H_L_i)| {
+                *H_L_i = C::vartime_msm_two_windowed(&w_u, &w_u_inv, *H_L_i, H_R[i]);
+            });
 
             a = a_L;
             b = b_L;

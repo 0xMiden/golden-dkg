@@ -159,46 +159,9 @@ macro_rules! impl_cycle {
                 let identity = <Self::Point as Group>::identity();
 
                 if points.len() == 2 && points[0] != identity && points[1] != identity {
-                    let p = points[0];
-                    let q = points[1];
-
-                    let mut table = [identity; 15];
-                    table[3] = p; // P
-                    table[0] = q; // Q
-                    table[7] = table[3].double(); // 2P
-                    table[1] = table[0].double(); // 2Q
-                    table[11] = table[7] + p; // 3P
-                    table[2] = table[1] + q; // 3Q
-
-                    // table[i * 4 + j - 1] = i*P + j*Q for 0 <= i,j <= 3.
-                    table[4] = table[3] + q;
-                    table[5] = table[4] + q;
-                    table[6] = table[5] + q;
-                    table[8] = table[7] + q;
-                    table[9] = table[8] + q;
-                    table[10] = table[9] + q;
-                    table[12] = table[11] + q;
-                    table[13] = table[12] + q;
-                    table[14] = table[13] + q;
-
-                    let mut affine_table = [Affine::default(); 15];
-                    <Self::Point as Curve>::batch_normalize(&table, &mut affine_table);
-
-                    let s1 = scalars[0].to_repr();
-                    let s2 = scalars[1].to_repr();
-                    let mut acc = identity;
-                    for (b1, b2) in s1.as_ref().iter().rev().zip(s2.as_ref().iter().rev()) {
-                        for i in (0..8u32).rev().step_by(2) {
-                            acc = acc.double().double();
-                            let w1 = (((b1 >> i) & 1) << 1) | ((b1 >> (i - 1)) & 1);
-                            let w2 = (((b2 >> i) & 1) << 1) | ((b2 >> (i - 1)) & 1);
-                            let idx = (w1 as usize) * 4 + (w2 as usize);
-                            if idx != 0 {
-                                acc += affine_table[idx - 1];
-                            }
-                        }
-                    }
-                    return acc;
+                    let w1 = Self::scalar_radix4_windows(&scalars[0]);
+                    let w2 = Self::scalar_radix4_windows(&scalars[1]);
+                    return Self::vartime_msm_two_windowed(&w1, &w2, points[0], points[1]);
                 }
 
                 if !points.iter().any(|p| *p == identity) {
@@ -220,6 +183,67 @@ macro_rules! impl_cycle {
                 let mut bases = vec![Affine::default(); filtered_points.len()];
                 <Self::Point as Curve>::batch_normalize(&filtered_points, &mut bases);
                 msm_best::<Affine>(&scalars, &bases)
+            }
+
+            fn vartime_msm_two_windowed(
+                w1: &[u8],
+                w2: &[u8],
+                p: Self::Point,
+                q: Self::Point,
+            ) -> Self::Point {
+                use group::Curve;
+                use group::Group;
+
+                type Affine = <$curve as halo2curves::CurveExt>::AffineExt;
+                let identity = <Self::Point as Group>::identity();
+                assert_eq!(w1.len(), w2.len());
+
+                let mut table = [identity; 15];
+                table[3] = p; // P
+                table[0] = q; // Q
+                table[7] = table[3].double(); // 2P
+                table[1] = table[0].double(); // 2Q
+                table[11] = table[7] + p; // 3P
+                table[2] = table[1] + q; // 3Q
+
+                // table[i * 4 + j - 1] = i*P + j*Q for 0 <= i,j <= 3.
+                table[4] = table[3] + q;
+                table[5] = table[4] + q;
+                table[6] = table[5] + q;
+                table[8] = table[7] + q;
+                table[9] = table[8] + q;
+                table[10] = table[9] + q;
+                table[12] = table[11] + q;
+                table[13] = table[12] + q;
+                table[14] = table[13] + q;
+
+                // batch_normalize does not support the point-at-infinity affine
+                // representation, so fall back to a projective table whenever
+                // either input might be identity.
+                if p == identity || q == identity {
+                    let mut acc = identity;
+                    for (&w_a, &w_b) in w1.iter().zip(w2.iter()) {
+                        acc = acc.double().double();
+                        let idx = (w_a as usize) * 4 + (w_b as usize);
+                        if idx != 0 {
+                            acc += table[idx - 1];
+                        }
+                    }
+                    return acc;
+                }
+
+                let mut affine_table = [Affine::default(); 15];
+                <Self::Point as Curve>::batch_normalize(&table, &mut affine_table);
+
+                let mut acc = identity;
+                for (&w_a, &w_b) in w1.iter().zip(w2.iter()) {
+                    acc = acc.double().double();
+                    let idx = (w_a as usize) * 4 + (w_b as usize);
+                    if idx != 0 {
+                        acc += affine_table[idx - 1];
+                    }
+                }
+                acc
             }
 
             fn vartime_msm_affine(

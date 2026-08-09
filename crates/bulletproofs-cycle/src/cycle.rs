@@ -122,6 +122,65 @@ pub trait Cycle: Clone + Eq + Debug + 'static {
         scalars: &[Self::Scalar],
         points: &[Option<Self::Point>],
     ) -> Option<Self::Point>;
+
+    /// Radix-4 (2-bit) window decomposition of a scalar's canonical
+    /// little-endian byte encoding, most-significant window first.
+    ///
+    /// Lets callers that reuse the same scalar across many
+    /// [`Cycle::vartime_msm_two_windowed`] calls (e.g. a shared IPP fold
+    /// challenge `u` or `u^{-1}`) recode it once instead of per call.
+    fn scalar_radix4_windows(scalar: &Self::Scalar) -> Vec<u8> {
+        let bytes = Self::scalar_to_canonical(scalar);
+        let mut windows = Vec::with_capacity(bytes.len() * 4);
+        for byte in bytes.iter().rev() {
+            for i in (0..8u32).rev().step_by(2) {
+                windows.push((((byte >> i) & 1) << 1) | ((byte >> (i - 1)) & 1));
+            }
+        }
+        windows
+    }
+
+    /// Two-point variable-time scalar multiplication `p * s1 + q * s2`,
+    /// given `s1` and `s2` already decomposed via
+    /// [`Cycle::scalar_radix4_windows`].
+    ///
+    /// Panics if `w1.len() != w2.len()`.
+    fn vartime_msm_two_windowed(
+        w1: &[u8],
+        w2: &[u8],
+        p: Self::Point,
+        q: Self::Point,
+    ) -> Self::Point {
+        assert_eq!(w1.len(), w2.len());
+        let identity = Self::Point::identity();
+
+        let mut table = [identity; 15];
+        table[3] = p; // P
+        table[0] = q; // Q
+        table[7] = table[3].double(); // 2P
+        table[1] = table[0].double(); // 2Q
+        table[11] = table[7] + p; // 3P
+        table[2] = table[1] + q; // 3Q
+        table[4] = table[3] + q;
+        table[5] = table[4] + q;
+        table[6] = table[5] + q;
+        table[8] = table[7] + q;
+        table[9] = table[8] + q;
+        table[10] = table[9] + q;
+        table[12] = table[11] + q;
+        table[13] = table[12] + q;
+        table[14] = table[13] + q;
+
+        let mut acc = identity;
+        for (&w_a, &w_b) in w1.iter().zip(w2.iter()) {
+            acc = acc.double().double();
+            let idx = (w_a as usize) * 4 + (w_b as usize);
+            if idx != 0 {
+                acc += table[idx - 1];
+            }
+        }
+        acc
+    }
 }
 
 /// Helper: random scalar drawn from a cryptographic RNG.
