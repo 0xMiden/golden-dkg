@@ -24,7 +24,7 @@
 mod support;
 
 use codspeed_criterion_compat as criterion;
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode};
 use golden_evrf::paper::secp_secq::{evrf_batched_prove, BatchedEvrfPublicParams};
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use support::{build_batched_at_ne, table4_ne_values, BENCH_SEED, SLOW_SAMPLE_SIZE};
@@ -32,6 +32,7 @@ use support::{build_batched_at_ne, table4_ne_values, BENCH_SEED, SLOW_SAMPLE_SIZ
 fn evrf_prove_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("paper/table-4/Secp256k1-Secq256k1/prover");
     group.sample_size(SLOW_SAMPLE_SIZE);
+    group.sampling_mode(SamplingMode::Flat);
     for n_e in table4_ne_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
             let params = BatchedEvrfPublicParams::setup(support::TABLE4_THRESHOLD, n_e).unwrap();

@@ -27,7 +27,7 @@
 #[path = "support_dir/mod.rs"]
 mod support;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
 use golden_core::{create_dealing, wire::WireEncode};
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
@@ -54,6 +54,7 @@ fn dkg_communication(c: &mut Criterion) {
         let bytes = dealing.message.to_nested_wire_bytes().len();
         let mut group = c.benchmark_group(format!("dkg-communication/secp256k1/{n}"));
         group.sample_size(SLOW_SAMPLE_SIZE);
+        group.sampling_mode(SamplingMode::Flat);
         group.throughput(Throughput::Bytes(bytes as u64));
         group.bench_function("size", |b| b.iter(|| criterion::black_box(bytes)));
         group.finish();

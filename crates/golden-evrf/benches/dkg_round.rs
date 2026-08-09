@@ -42,7 +42,7 @@ mod support;
 use std::collections::BTreeMap;
 
 use codspeed_criterion_compat as criterion;
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode};
 use golden_core::{complete, create_dealing, DealerMessage};
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
@@ -56,6 +56,7 @@ use support::{
 fn dkg_round0(c: &mut Criterion) {
     let mut group = c.benchmark_group("paper/table-5/Secp256k1-Secq256k1/round-0");
     group.sample_size(SLOW_SAMPLE_SIZE);
+    group.sampling_mode(SamplingMode::Flat);
     for n in table5_n_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             // n-of-n: threshold = n - 1, matching Table 5. Setup is cheap
@@ -83,6 +84,7 @@ fn dkg_round0(c: &mut Criterion) {
 fn dkg_round1(c: &mut Criterion) {
     let mut group = c.benchmark_group("paper/table-5/Secp256k1-Secq256k1/round-1");
     group.sample_size(SLOW_SAMPLE_SIZE);
+    group.sampling_mode(SamplingMode::Flat);
     for n in table5_n_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             // Expensive setup: build all `n` dealer messages. At n=100 this
@@ -141,6 +143,7 @@ fn dkg_round1(c: &mut Criterion) {
 fn dkg_total(c: &mut Criterion) {
     let mut group = c.benchmark_group("paper/table-5/Secp256k1-Secq256k1/per-participant-runtime");
     group.sample_size(SLOW_SAMPLE_SIZE);
+    group.sampling_mode(SamplingMode::Flat);
     for n in table5_n_values() {
         let config = build_config(n, n - 1);
         let participant = idx(n as u32);
