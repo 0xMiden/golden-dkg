@@ -58,15 +58,6 @@ pub fn exp_iter<S: PrimeField>(x: S) -> ScalarExp<S> {
 }
 
 impl<S: PrimeField> VecPoly3<S> {
-    pub(crate) fn zero(n: usize) -> Self {
-        VecPoly3(
-            vec![S::ZERO; n],
-            vec![S::ZERO; n],
-            vec![S::ZERO; n],
-            vec![S::ZERO; n],
-        )
-    }
-
     /// Inner product of `lhs` and `rhs` assuming `lhs.0` and `rhs.2` are zero,
     /// which holds for the R1CS proof polynomials.
     pub(crate) fn special_inner_product(lhs: &Self, rhs: &Self) -> Poly6<S> {
@@ -86,11 +77,21 @@ impl<S: PrimeField> VecPoly3<S> {
         }
     }
 
+    /// Horner-evaluates the polynomial at `x`. Any field left empty (as an
+    /// allocation-free stand-in for an all-zero limb the caller knows never
+    /// gets written) is read back as zero rather than indexed.
     pub(crate) fn eval(&self, x: S) -> Vec<S> {
-        let n = self.0.len();
+        let n = self
+            .0
+            .len()
+            .max(self.1.len())
+            .max(self.2.len())
+            .max(self.3.len());
+        let at = |v: &Vec<S>, i: usize| v.get(i).copied().unwrap_or(S::ZERO);
         let mut out = vec![S::ZERO; n];
         for (i, out_i) in out.iter_mut().enumerate().take(n) {
-            *out_i = self.0[i] + x * (self.1[i] + x * (self.2[i] + x * self.3[i]));
+            *out_i =
+                at(&self.0, i) + x * (at(&self.1, i) + x * (at(&self.2, i) + x * at(&self.3, i)));
         }
         out
     }
@@ -319,8 +320,30 @@ mod tests {
 
     #[test]
     fn vecpoly3_zero_evaluates_to_zero() {
-        let p = VecPoly3::<S>::zero(4);
+        let p = VecPoly3(
+            vec![S::ZERO; 4],
+            vec![S::ZERO; 4],
+            vec![S::ZERO; 4],
+            vec![S::ZERO; 4],
+        );
         assert_eq!(p.eval(S::from(7)), vec![S::ZERO; 4]);
+    }
+
+    #[test]
+    fn vecpoly3_eval_treats_empty_fields_as_zero() {
+        // Mirrors the r1cs prover's l_poly/r_poly construction, which leaves
+        // a known-zero limb unallocated rather than filling it with zeros.
+        let p = VecPoly3(
+            Vec::new(),
+            vec![S::from(3), S::from(4)],
+            vec![S::from(5), S::from(6)],
+            vec![S::from(7), S::from(8)],
+        );
+        let x = S::from(2);
+        let got = p.eval(x);
+        let want0 = x * (S::from(3) + x * (S::from(5) + x * S::from(7)));
+        let want1 = x * (S::from(4) + x * (S::from(6) + x * S::from(8)));
+        assert_eq!(got, vec![want0, want1]);
     }
 
     // The tests below are ported from upstream `bulletproofs 5.0.0/src/util.rs`

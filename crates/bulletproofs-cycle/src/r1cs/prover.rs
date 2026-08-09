@@ -146,7 +146,13 @@ impl<'g, C: Cycle, T: BorrowMut<Transcript>> ConstraintSystem<C> for Prover<'g, 
         }
     }
 
-    fn constrain(&mut self, lc: LinearCombination<C::Scalar>) {
+    fn constrain(&mut self, mut lc: LinearCombination<C::Scalar>) {
+        // Constraints accumulate for the lifetime of the proof and are never
+        // pushed to again once stored, so the `Vec` growth strategy's spare
+        // capacity (typically ~1.5x the final term count) is pure overhead
+        // across the hundreds of thousands of small per-constraint `terms`
+        // allocations a real circuit produces.
+        lc.terms.shrink_to_fit();
         self.constraints.push(lc);
     }
 }
@@ -509,8 +515,13 @@ impl<'g, C: Cycle, T: BorrowMut<Transcript>> Prover<'g, C, T> {
 
         let (wL, wR, wO, wV) = self.flattened_constraints(&z);
 
-        let mut l_poly = VecPoly3::<C::Scalar>::zero(n);
-        let mut r_poly = VecPoly3::<C::Scalar>::zero(n);
+        // `l_poly`'s constant term and `r_poly`'s quadratic term are never
+        // written below (`special_inner_product`'s doc contract already
+        // assumes as much) — leave them unallocated instead of paying for
+        // two more full-length zero-filled `Vec`s.
+        let zeros = || vec![C::Scalar::ZERO; n];
+        let mut l_poly = VecPoly3(Vec::new(), zeros(), zeros(), zeros());
+        let mut r_poly = VecPoly3(zeros(), zeros(), Vec::new(), zeros());
 
         let mut exp_y = C::Scalar::ONE;
         let y_inv = C::scalar_invert(&y);
