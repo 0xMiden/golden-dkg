@@ -31,7 +31,7 @@ mod support;
 use std::collections::BTreeMap;
 
 use codspeed_criterion_compat as criterion;
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode};
 use golden_core::{create_dealing, verify_dealings, DealerMessage, DkgConfig};
 use golden_evrf::paper::secp_secq::{evrf_batched_verify, SecpSecqBackend};
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
@@ -47,6 +47,7 @@ use support::{
 fn evrf_verify_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("paper/table-4/Secp256k1-Secq256k1/verifier");
     group.sample_size(SLOW_SAMPLE_SIZE);
+    group.sampling_mode(SamplingMode::Flat);
     for n_e in table4_ne_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
             // Expensive setup runs once per benchmark invocation, only when
@@ -102,6 +103,7 @@ fn build_n_independent_messages(
 fn evrf_verify_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("paper/table-4/Secp256k1-Secq256k1/batch-verification");
     group.sample_size(SLOW_SAMPLE_SIZE);
+    group.sampling_mode(SamplingMode::Flat);
     for n_e in table4_ne_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
             // Expensive setup: build `n_e` peer messages, each carrying

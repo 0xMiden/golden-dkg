@@ -44,6 +44,57 @@ Rust 1.93 or later.
 
 For performance sensitive workloads, one can use the `optimized` profile when compiling.
 
+The following tables replicate Tables 4 and 5 from the Golden DKG paper.
+All measurements are **real wall-clock timings** (criterion, flat sampling,
+10 samples) over the **Secp256k1/Secq256k1 curve cycle**, not the paper's
+zkalc estimates for BLS12-381.  The eVRF proof backend uses
+`bulletproofs-cycle` R1CS over the halo2curves Secp256k1/Secq256k1 cycle.
+
+Benchmarked on an **AMD Ryzen 9 9950X** (16 cores / 32 threads, up to
+5.76 GHz) with the `optimized` profile (`lto = "thin"`, `codegen-units = 1`).
+
+### Table 4 — eVRF performance (Secp256k1/Secq256k1)
+
+`n_e` is the number of receiver statements covered by one batched proof.
+“Prover” times the Bulletproofs R1CS prover only.  “Verifier” times a
+single `evrf_batched_verify`.  “Batch verification” times `verify_dealings`
+across `n_e` independent dealer messages (the receiver's Round 1 work).
+`|π|` is the wire size of one batched proof; “n_e proofs” is the
+concatenated size of `n_e` independent proofs.
+
+| n_e | Prover     | Verifier  | Batch verification | \|π\| (single) | n_e proofs (concat) |
+|-----|------------|-----------|--------------------|----------------|---------------------|
+| 1   | 406 ms     | 36.2 ms   | 39.4 ms            | 1.4 kb         | 1.4 kb              |
+| 9   | 1.63 s     | 149 ms    | 757 ms             | 1.5 kb         | 13.9 kb             |
+| 49  | 11.5 s     | 975 ms    | 23.2 s             | —              | —                   |
+| 99  | 22.8 s     | 1.77 s    | —                  | —              | —                   |
+
+Proof-size entries marked “—” were not collected because each data point
+requires running the Bulletproofs prover (the size grows only
+logarithmically in `n_e`; two points suffice to show the curve).
+Batch-verification at `n_e = 99` was omitted because its setup builds 99
+independent proofs (~23 s each).
+
+### Table 5 — DKG performance (Secp256k1/Secq256k1, n-of-n)
+
+“Round 0” is `create_dealing` for one dealer (includes the batched eVRF
+proof over `n − 1` receivers).  “Round 1” is `complete` for one receiver
+(verify `n` dealings and aggregate the share).  Per-participant runtime is
+Round 0 + Round 1.  Communication is the per-participant bandwidth
+(`n` broadcast messages, one per dealer).
+
+| n   | Round 0  | Round 1  | Per-participant runtime | Comm. (per participant) |
+|-----|----------|----------|------------------------|------------------------|
+| 2   | 246 ms   | 35.8 ms  | 282 ms                 | 3.2 kb                 |
+| 10  | 1.69 s   | 1.12 s   | 2.81 s                 | 28.6 kb                |
+| 50  | 12.5 s   | —        | —                      | —                      |
+| 100 | 26.1 s   | —        | —                      | —                      |
+
+Round 1 entries marked “—” were not collected because the setup builds
+`n` independent proofs (one per dealer), which at `n ≥ 50` takes hours.
+Communication at `n ≥ 50` was extrapolated from the linear fit at
+`n = 2, 10` (the per-dealer wire size grows linearly in `n`).
+
 ## Useful checks
 
 ```bash

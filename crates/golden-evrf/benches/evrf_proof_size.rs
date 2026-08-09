@@ -32,7 +32,7 @@
 #[path = "support_dir/mod.rs"]
 mod support;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
 use golden_core::create_dealing;
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
@@ -88,6 +88,7 @@ fn evrf_proof_size_single(c: &mut Criterion) {
         let bytes = one_dealer_proof_bytes(n_e + 1);
         let mut group = c.benchmark_group(format!("eVRF proof-size-single/secp256k1/{n_e}"));
         group.sample_size(SLOW_SAMPLE_SIZE);
+        group.sampling_mode(SamplingMode::Flat);
         group.throughput(Throughput::Bytes(bytes as u64));
         group.bench_function("size", |b| b.iter(|| criterion::black_box(bytes)));
         group.finish();
@@ -99,6 +100,7 @@ fn evrf_proof_size_concat(c: &mut Criterion) {
         let total = n_independent_proof_byte_sizes_total(n_e);
         let mut group = c.benchmark_group(format!("eVRF proof-size-concat/secp256k1/{n_e}"));
         group.sample_size(SLOW_SAMPLE_SIZE);
+        group.sampling_mode(SamplingMode::Flat);
         group.throughput(Throughput::Bytes(total as u64));
         group.bench_function("size", |b| b.iter(|| criterion::black_box(total)));
         group.finish();
