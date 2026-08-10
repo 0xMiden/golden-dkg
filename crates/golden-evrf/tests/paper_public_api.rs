@@ -43,7 +43,6 @@ fn minimal_evrf_statement() -> EvrfStatement<Secp256k1GoldenGroup> {
         commitment_coefficients: vec![Secp256k1GoldenGroup::mul_generator(&share)],
         share_commitment: Secp256k1GoldenGroup::mul_generator(&share),
         pad_commitment: Secp256k1GoldenGroup::mul_generator(&pad),
-        dh_commitment: Secp256k1GoldenGroup::mul(&receiver_public_key, &pad),
         encrypted_share: Secp256k1Scalar::add(&share, &pad),
         transcript_root: [3u8; 32],
     }

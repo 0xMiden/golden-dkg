@@ -150,7 +150,6 @@ fn build_statements(
             commitment_coefficients: dealing.message.commitment.coefficients().to_vec(),
             share_commitment,
             pad_commitment: encrypted_share.pad_commitment,
-            dh_commitment: encrypted_share.dh_commitment,
             encrypted_share: encrypted_share.encrypted_share,
             transcript_root: dealing.message.transcript_root,
         });
@@ -235,16 +234,6 @@ fn dkg_rejects_tampered_pad_commitment() {
         let receiver = idx(2);
         let entry = msg.encrypted_shares.get_mut(&receiver).unwrap();
         entry.pad_commitment = tamper_element(&entry.pad_commitment);
-    });
-}
-
-#[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-fn dkg_rejects_tampered_dh_commitment() {
-    assert_dealing_rejected(|msg| {
-        let receiver = idx(2);
-        let entry = msg.encrypted_shares.get_mut(&receiver).unwrap();
-        entry.dh_commitment = tamper_element(&entry.dh_commitment);
     });
 }
 
@@ -463,28 +452,5 @@ fn backend_rejects_pad_commitment_not_opened_by_proof_pad() {
     assert!(
         result.is_err(),
         "backend must reject pad_commitment not opened by proof pad, got {result:?}"
-    );
-}
-
-#[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-fn backend_rejects_dh_commitment_not_opened_by_proof_pad() {
-    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-    let config = config();
-    let dealer = idx(1);
-    let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-        dealer,
-        &identity_secret(dealer),
-        &config,
-        &mut rng,
-    )
-    .unwrap();
-    let mut statements = build_statements(&dealing, &config, dealer);
-    SecpSecqBackend::verify_batch(&statements, &dealing.message.proof).unwrap();
-    statements[0].dh_commitment = tamper_element(&statements[0].dh_commitment);
-    let result = SecpSecqBackend::verify_batch(&statements, &dealing.message.proof);
-    assert!(
-        result.is_err(),
-        "backend must reject dh_commitment not opened by proof pad, got {result:?}"
     );
 }

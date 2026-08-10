@@ -78,7 +78,6 @@ fn batched_statement(
             pkj: statement.receiver_public_key.0,
             share_commitment: statement.share_commitment.0,
             pad_commitment: statement.pad_commitment.0,
-            dh_commitment: statement.dh_commitment.0,
             encrypted_share: statement.encrypted_share.0,
         });
     }
@@ -151,7 +150,6 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
                 pkj,
                 share_commitment: statement.share_commitment.0,
                 pad_commitment: statement.pad_commitment.0,
-                dh_commitment: statement.dh_commitment.0,
                 encrypted_share: statement.encrypted_share.0,
             };
             statement_roots.push(statement.root());

@@ -72,7 +72,7 @@ fn proof_header_len(proof: &[u8]) -> usize {
 }
 
 fn proof_record_len() -> usize {
-    3 * P256Backend::ELEMENT_REPR_BYTES + 2 * P256Scalar::REPR_BYTES
+    2 * P256Backend::ELEMENT_REPR_BYTES + 2 * P256Scalar::REPR_BYTES
 }
 
 fn proof_statements(
@@ -105,7 +105,6 @@ fn proof_statements(
                     .public_key_share(receiver)
                     .unwrap(),
                 pad_commitment: encrypted_share.pad_commitment,
-                dh_commitment: encrypted_share.dh_commitment,
                 encrypted_share: encrypted_share.encrypted_share,
                 transcript_root: dealing.message.transcript_root,
             }
@@ -131,11 +130,7 @@ fn prototype_challenge_checkpoints(
     let mut cursor = proof_header_len(proof);
     let mut checkpoints = Vec::with_capacity(statements.len());
     for _ in statements {
-        for label in [
-            b"share-nonce-point".as_slice(),
-            b"pad-nonce-point",
-            b"dh-nonce-point",
-        ] {
+        for label in [b"share-nonce-point".as_slice(), b"pad-nonce-point"] {
             let end = cursor + P256Backend::ELEMENT_REPR_BYTES;
             transcript.append_message(label, &proof[cursor..end]);
             cursor = end;
@@ -167,11 +162,12 @@ fn assert_proof_rejected(seed: u8, mutate: impl FnOnce(&mut Vec<u8>)) {
 }
 
 #[test]
-fn deterministic_prototype_proof_stream_matches_v2_vector() {
+fn deterministic_prototype_proof_stream_matches_v3_vector() {
     let (config, dealing) = create_dealing_fixture(10);
+
     assert_eq!(
         dealing.message.proof.as_slice(),
-        include_bytes!("vectors/prototype-share-opening-v2.bin")
+        include_bytes!("vectors/prototype-share-opening-v3.bin")
     );
     assert_eq!(
         prototype_challenge_checkpoints(
@@ -180,16 +176,16 @@ fn deterministic_prototype_proof_stream_matches_v2_vector() {
         ),
         vec![
             [
-                142, 252, 171, 24, 105, 249, 248, 176, 173, 23, 255, 203, 18, 222, 71, 127, 178,
-                54, 206, 5, 88, 232, 120, 19, 2, 70, 233, 160, 224, 145, 40, 72,
+                110, 162, 168, 92, 153, 134, 208, 169, 69, 65, 191, 158, 163, 176, 106, 22, 211,
+                41, 78, 102, 61, 86, 164, 208, 248, 62, 19, 250, 135, 165, 30, 124,
             ],
             [
-                219, 194, 100, 9, 205, 72, 142, 140, 30, 249, 59, 90, 49, 249, 184, 91, 102, 46,
-                74, 235, 178, 234, 52, 101, 182, 191, 33, 4, 209, 143, 235, 202,
+                40, 120, 209, 8, 247, 242, 111, 162, 24, 101, 143, 255, 237, 182, 219, 188, 159,
+                133, 122, 213, 116, 76, 113, 137, 148, 134, 199, 43, 49, 77, 233, 147,
             ],
             [
-                149, 20, 3, 176, 39, 198, 129, 62, 112, 196, 221, 165, 178, 90, 18, 67, 185, 246,
-                100, 212, 189, 187, 167, 77, 62, 126, 202, 218, 40, 162, 206, 241,
+                122, 20, 204, 11, 11, 35, 13, 135, 234, 194, 6, 69, 194, 167, 30, 24, 169, 224,
+                215, 141, 69, 199, 98, 241, 113, 199, 132, 217, 175, 235, 158, 222,
             ],
         ]
     );
@@ -249,8 +245,8 @@ fn dkg_rejects_each_tampered_nonce_and_response() {
         0,
         point_bytes,
         2 * point_bytes,
-        3 * point_bytes,
-        3 * point_bytes + scalar_bytes,
+        2 * point_bytes,
+        2 * point_bytes + scalar_bytes,
     ];
     for (case, field_offset) in field_offsets.into_iter().enumerate() {
         assert_proof_rejected(2 + u8::try_from(case).unwrap(), |proof| {

@@ -113,8 +113,8 @@ pub mod secp_secq {
 
     /// Versioned proof-stream grammar for the standalone one-receiver relation.
     const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v3";
-    /// Proof protocol identifier for the batched dealer relation and v3 stream grammar.
-    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v3";
+    /// Proof protocol identifier for the batched dealer relation and v4 stream grammar.
+    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v4";
 
     type GinStreamCurve = CycleCurve<Secp256k1Cycle>;
     type GoutStreamCurve = CycleCurve<R1csCycle>;
@@ -188,8 +188,6 @@ pub mod secp_secq {
         pub share_commitment: Gin,
         /// Published pad commitment `g_in^pad_j` in the dealer broadcast.
         pub pad_commitment: Gin,
-        /// Published DH commitment `PK_j^pad_j` in the dealer broadcast.
-        pub dh_commitment: Gin,
         /// Published encrypted share scalar `share_j + pad_j`.
         pub encrypted_share: GinScalar,
     }
@@ -1766,7 +1764,6 @@ pub mod secp_secq {
             if is_identity(&rec.pkj)
                 || is_identity(&rec.share_commitment)
                 || is_identity(&rec.pad_commitment)
-                || is_identity(&rec.dh_commitment)
             {
                 return Err(Error::ProofVerificationFailed);
             }
@@ -1830,11 +1827,6 @@ pub mod secp_secq {
             stream.observe_point::<GinStreamCurve>(
                 b"pad-commitment",
                 &rec.pad_commitment,
-                IdentityPolicy::Reject,
-            )?;
-            stream.observe_point::<GinStreamCurve>(
-                b"dh-commitment",
-                &rec.dh_commitment,
                 IdentityPolicy::Reject,
             )?;
             stream.observe_scalar::<GinStreamCurve>(b"encrypted-share", &rec.encrypted_share)?;
@@ -1915,8 +1907,6 @@ pub mod secp_secq {
         share_commitment: ChordWitness,
         /// Chord witness for `g_in^pad_j`.
         pad_commitment: ChordWitness,
-        /// Chord witness for `PK_j^pad_j`.
-        dh_commitment: ChordWitness,
     }
 
     fn prove_feldman_coefficients<CS: ConstraintSystem<R1csCycle>>(
@@ -2002,8 +1992,7 @@ pub mod secp_secq {
         beta: R1csField,
         witness: Option<&HiddenReceiverWitness>,
     ) -> core::result::Result<(), R1CSError> {
-        // PK_j's chord table is shared by both exponentiations against it
-        // below (S_j = PK_j^sk and DH_j = PK_j^pad); compute it once.
+        // Precompute PK_j's chord table for S_j = PK_j^sk.
         let precomp_pkj =
             precompute_chord(&rec.pkj, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         let (s_x, _) = chord_exponentiate_r1cs_with_result(
@@ -2089,17 +2078,6 @@ pub mod secp_secq {
             witness.map(|w| &w.share_commitment),
         )?;
 
-        let (dh_commitment_x, dh_commitment_y) =
-            affine(&rec.dh_commitment).map_err(|_| R1CSError::VerificationError)?;
-        chord_exponentiate_r1cs_with_result(
-            cs,
-            &pad_bit_vars,
-            &precomp_pkj,
-            &pad_window_products,
-            Some((dh_commitment_x, dh_commitment_y)),
-            witness.map(|w| &w.dh_commitment),
-        )?;
-
         Ok(())
     }
 
@@ -2147,13 +2125,6 @@ pub mod secp_secq {
         {
             return Err(Error::ProofVerificationFailed);
         }
-        let dh_commitment = rec.pkj * pad_fq;
-        if Secp256k1Cycle::point_compress(&dh_commitment).as_ref()
-            != Secp256k1Cycle::point_compress(&rec.dh_commitment).as_ref()
-        {
-            return Err(Error::ProofVerificationFailed);
-        }
-
         let share_commitment = g_in * *share;
         if Secp256k1Cycle::point_compress(&share_commitment).as_ref()
             != Secp256k1Cycle::point_compress(&rec.share_commitment).as_ref()
@@ -2184,7 +2155,6 @@ pub mod secp_secq {
             share_bits: bit_options(&share_bool_bits),
             share_commitment: chord_compute_witness(&share_bool_bits, &g_in, K_BITS)?,
             pad_commitment: chord_compute_witness(&pad_bool_bits, &g_in, K_BITS)?,
-            dh_commitment: chord_compute_witness(&pad_bool_bits, &rec.pkj, K_BITS)?,
         })
     }
 
@@ -2616,7 +2586,6 @@ pub mod secp_secq {
                         pkj,
                         share_commitment: g_in * share,
                         pad_commitment: g_in * pad,
-                        dh_commitment: pkj * pad,
                         encrypted_share: share + pad,
                     }
                 })
@@ -3632,7 +3601,6 @@ pub mod secp_secq {
                     pkj,
                     share_commitment: g_in * share,
                     pad_commitment: g_in * pad,
-                    dh_commitment: pkj * pad,
                     encrypted_share: share + pad,
                 }],
             }
@@ -3661,7 +3629,6 @@ pub mod secp_secq {
                     .collect(),
                 share_commitment: Secp256k1Element(rec.share_commitment),
                 pad_commitment: Secp256k1Element(rec.pad_commitment),
-                dh_commitment: Secp256k1Element(rec.dh_commitment),
                 encrypted_share: Secp256k1Scalar(rec.encrypted_share),
                 transcript_root: [5u8; 32],
             }
@@ -3790,13 +3757,6 @@ pub mod secp_secq {
         fn batched_statement_rejects_identity_pad_commitment() {
             assert_batched_statement_rejects_identity(|statement| {
                 statement.receivers[0].pad_commitment = Gin::identity();
-            });
-        }
-
-        #[test]
-        fn batched_statement_rejects_identity_dh_commitment() {
-            assert_batched_statement_rejects_identity(|statement| {
-                statement.receivers[0].dh_commitment = Gin::identity();
             });
         }
 

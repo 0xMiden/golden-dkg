@@ -11,7 +11,7 @@ use crate::{
 };
 
 /// Protocol version used in transcript binding.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Byte length of the paper's `lambda`-bit dealer message `msg_i`.
 pub const DEALER_MESSAGE_NONCE_BYTES: usize = 32;
@@ -181,8 +181,6 @@ pub struct EvrfStatement<G: GoldenGroup> {
     pub share_commitment: G::Element,
     /// Public commitment to the pad scalar.
     pub pad_commitment: G::Element,
-    /// DH relation commitment, computed as receiver public key times the pad scalar.
-    pub dh_commitment: G::Element,
     /// Encrypted share scalar, `pad + share`.
     pub encrypted_share: G::Scalar,
     /// Dealing transcript root.
@@ -205,7 +203,7 @@ pub struct EvrfWitness<G: GoldenGroup> {
     pub polynomial_coefficients: Vec<G::Scalar>,
     /// Scalar share opening the public share commitment.
     pub share: G::Scalar,
-    /// Scalar pad opening the public pad and DH commitments.
+    /// Scalar pad opening the public pad commitment.
     pub pad: G::Scalar,
 }
 
@@ -298,8 +296,6 @@ pub trait EvrfProofBackend<G: GoldenGroup> {
 pub struct EncryptedShare<G: GoldenGroup> {
     /// Public commitment to the pad scalar.
     pub pad_commitment: G::Element,
-    /// DH relation commitment, computed as receiver public key times the pad scalar.
-    pub dh_commitment: G::Element,
     /// Encrypted share scalar, `pad + share`.
     pub encrypted_share: G::Scalar,
 }
@@ -421,7 +417,6 @@ where
             *receiver,
             EncryptedShare {
                 pad_commitment: G::mul_generator(&pad),
-                dh_commitment: G::mul(receiver_public_key, &pad),
                 encrypted_share: share.add(&pad),
             },
         );
@@ -805,7 +800,6 @@ fn dealing_root<G: GoldenGroup>(
     for (receiver, encrypted_share) in encrypted_shares {
         transcript.participant(b"encrypted-receiver", *receiver);
         transcript.element::<G>(b"pad-commitment", &encrypted_share.pad_commitment);
-        transcript.element::<G>(b"dh-commitment", &encrypted_share.dh_commitment);
         transcript.scalar::<G>(b"encrypted-share", &encrypted_share.encrypted_share);
     }
     transcript.root()
@@ -910,7 +904,6 @@ fn statement_for_receiver<G: GoldenGroup>(
         commitment_coefficients,
         share_commitment,
         pad_commitment: encrypted_share.pad_commitment,
-        dh_commitment: encrypted_share.dh_commitment,
         encrypted_share: encrypted_share.encrypted_share,
         transcript_root,
     })
@@ -935,7 +928,6 @@ fn statement_root<G: GoldenGroup>(statement: &EvrfStatement<G>) -> TranscriptRoo
     }
     transcript.element::<G>(b"share-commitment", &statement.share_commitment);
     transcript.element::<G>(b"pad-commitment", &statement.pad_commitment);
-    transcript.element::<G>(b"dh-commitment", &statement.dh_commitment);
     transcript.scalar::<G>(b"encrypted-share", &statement.encrypted_share);
     transcript.bytes(b"dealing-root", &statement.transcript_root);
     transcript.root()
@@ -2098,10 +2090,6 @@ mod tests {
             receiver,
             EncryptedShare {
                 pad_commitment: TinyGroup::mul_generator(&bad_pad),
-                dh_commitment: TinyGroup::mul(
-                    config.registry.public_key(receiver).unwrap(),
-                    &bad_pad,
-                ),
                 encrypted_share: share_commitment.add(&bad_pad),
             },
         );

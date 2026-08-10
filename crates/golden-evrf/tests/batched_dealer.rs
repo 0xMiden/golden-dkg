@@ -33,7 +33,7 @@ fn public_params(
 
 #[test]
 #[ignore = "slow: pins the complete batched dealer proof stream"]
-fn evrf_batched_dealer_matches_v3_vector() {
+fn evrf_batched_dealer_matches_v4_vector() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0002);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 1);
@@ -44,9 +44,10 @@ fn evrf_batched_dealer_matches_v3_vector() {
     let proof =
         paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)
             .expect("prove");
+
     assert_eq!(
         proof.as_slice(),
-        include_bytes!("vectors/paper-batched-dealer-v3.bin")
+        include_bytes!("vectors/paper-batched-dealer-v4.bin")
     );
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_batched_verify(
@@ -224,30 +225,6 @@ fn evrf_batched_dealer_rejects_wrong_pad_commitment() {
         paper::evrf_batched_verify(&public_params(&statement), &bad, &proof, &mut verify_rng)
             .is_err(),
         "verifier must reject a swapped pad commitment"
-    );
-}
-
-#[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-fn evrf_batched_dealer_rejects_wrong_dh_commitment() {
-    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C7);
-    let sk1 = GinScalar::random(&mut rng);
-    let pkjs = make_pkjs(&mut rng, 2);
-    let beta = R1csField::from(7u64);
-    let msg = make_msg(5);
-    let (statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
-
-    let proof =
-        paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)
-            .expect("prove");
-
-    let mut bad = statement.clone();
-    bad.receivers[1].dh_commitment = Gin::generator() * GinScalar::random(&mut rng);
-    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
-    assert!(
-        paper::evrf_batched_verify(&public_params(&statement), &bad, &proof, &mut verify_rng)
-            .is_err(),
-        "verifier must reject a swapped DH commitment"
     );
 }
 
