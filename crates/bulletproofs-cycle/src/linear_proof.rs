@@ -88,7 +88,10 @@ impl<C: Cycle> LinearProof<C> {
         let mut a = &mut a_vec[..];
         let mut b = &mut b_vec[..];
 
-        let lg_n = n.next_power_of_two().trailing_zeros() as usize;
+        let lg_n = n
+        .checked_next_power_of_two()
+        .ok_or(ProofError::VerificationError)?
+        .trailing_zeros() as usize;
         let mut L_vec = Vec::with_capacity(lg_n);
         let mut R_vec = Vec::with_capacity(lg_n);
 
