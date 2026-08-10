@@ -33,7 +33,7 @@ fn public_params(
 
 #[test]
 #[ignore = "slow: pins the complete batched dealer proof stream"]
-fn evrf_batched_dealer_matches_v5_vector() {
+fn evrf_batched_dealer_matches_v6_vector() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0002);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 1);
@@ -47,7 +47,7 @@ fn evrf_batched_dealer_matches_v5_vector() {
 
     assert_eq!(
         proof.as_slice(),
-        include_bytes!("vectors/paper-batched-dealer-v5.bin")
+        include_bytes!("vectors/paper-batched-dealer-v6.bin")
     );
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_batched_verify(

@@ -113,8 +113,8 @@ pub mod secp_secq {
 
     /// Versioned proof-stream grammar for the standalone one-receiver relation.
     const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v3";
-    /// Proof protocol identifier for the batched dealer relation and v5 stream grammar.
-    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v5";
+    /// Proof protocol identifier for the batched dealer relation and v6 stream grammar.
+    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v6";
 
     type GinStreamCurve = CycleCurve<Secp256k1Cycle>;
     type GoutStreamCurve = CycleCurve<R1csCycle>;
@@ -2601,7 +2601,7 @@ pub mod secp_secq {
 
             let verifier = build_batched_verifier(&statement, Transcript::new(R1CS_TEST_DOMAIN))
                 .expect("valid verifier circuit");
-            assert_eq!(verifier.metrics().multipliers, 17_313);
+            assert_eq!(verifier.metrics().multipliers, 8_224);
             assert_eq!(
                 batched_multiplier_count(threshold, receiver_count).expect("valid shape"),
                 verifier.metrics().multipliers
@@ -3389,10 +3389,10 @@ pub mod secp_secq {
             assert_eq!(
                 checkpoint,
                 [
-                    79, 200, 236, 164, 117, 125, 234, 243, 140, 173, 156, 99, 212, 3, 63, 161, 148,
-                    165, 242, 21, 103, 6, 165, 22, 87, 13, 14, 81, 35, 83, 214, 173, 11, 18, 98,
-                    235, 5, 96, 100, 56, 211, 162, 198, 48, 112, 57, 70, 114, 212, 92, 176, 120,
-                    99, 1, 66, 51, 200, 34, 9, 200, 38, 144, 19, 93,
+                    239, 46, 13, 84, 252, 135, 233, 217, 163, 40, 125, 78, 140, 34, 155, 56, 232,
+                    119, 48, 35, 65, 61, 20, 68, 91, 162, 28, 33, 88, 114, 149, 2, 128, 116, 249,
+                    49, 208, 12, 39, 239, 218, 184, 14, 141, 7, 249, 240, 141, 253, 68, 245, 78,
+                    144, 38, 66, 239, 81, 17, 42, 100, 218, 209, 204, 33,
                 ]
             );
 
