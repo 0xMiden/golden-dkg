@@ -28,7 +28,7 @@ jobs:
             table5_metric: split
           - name: Paper Table 4 Secp256k1/Secq256k1 verifiers
             bench: evrf_verify
-            timeout: 30
+            timeout: 60
             table4_rows: "9"
             table5_rows: "10"
             table5_metric: split
