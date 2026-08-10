@@ -138,9 +138,29 @@ impl<'a> WireReader<'a> {
         Ok(u64::from_be_bytes(bytes))
     }
 
-    /// Read a length prefix as a `usize`.
+    /// Read a varint length prefix.
     pub fn read_len(&mut self) -> Result<usize> {
-        usize::try_from(self.read_u64()?).map_err(|_| Error::InvalidEncoding)
+        let mut value: u64 = 0;
+        let mut shift = 0;
+
+        loop {
+            let byte = self.read_u8()?;
+
+            // A 64-bit varint requires at most 10 bytes. At the 10th byte (shift == 63),
+            // the value can only utilize 1 bit. Any value greater than 0x01 will overflow.
+            if shift >= 64 || (shift == 63 && byte > 0x01) {
+                return Err(Error::InvalidEncoding);
+            }
+
+            value |= u64::from(byte & 0x7F) << shift;
+
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+
+        usize::try_from(value).map_err(|_| Error::InvalidEncoding)
     }
 
     /// Return the number of unread bytes.
