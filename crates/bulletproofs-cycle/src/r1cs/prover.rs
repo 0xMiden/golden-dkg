@@ -404,8 +404,7 @@ impl<'g, C: Cycle, T: BorrowMut<Transcript>> Prover<'g, C, T> {
                             + self.pc_gens.B_blinding * i_blinding1
                     },
                     || {
-                        let scalars: Vec<C::Scalar> = self.secrets.a_O.to_vec();
-                        C::vartime_msm_affine(&scalars, g_points)
+                        C::vartime_msm_affine(&self.secrets.a_O, g_points)
                             + self.pc_gens.B_blinding * o_blinding1
                     },
                 )
@@ -474,9 +473,7 @@ impl<'g, C: Cycle, T: BorrowMut<Transcript>> Prover<'g, C, T> {
                                 + self.pc_gens.B_blinding * i_blinding2
                         },
                         || {
-                            let scalars: Vec<C::Scalar> =
-                                self.secrets.a_O.iter().skip(n1).copied().collect();
-                            C::vartime_msm_affine(&scalars, g_tail)
+                            C::vartime_msm_affine(&self.secrets.a_O[n1..], g_tail)
                                 + self.pc_gens.B_blinding * o_blinding2
                         },
                     )
