@@ -481,7 +481,10 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
         // `u` so the verifier weights phase-1 vs phase-2 rows correctly.
         let n = self.num_vars;
         let n2 = n - n1;
-        let padded_n = self.num_vars.next_power_of_two();
+        let padded_n = self
+        .num_vars
+        .checked_next_power_of_two()
+        .ok_or(Error::InvalidProof)?;
         let pad = padded_n - n;
 
         if bp_gens.gens_capacity < padded_n {
