@@ -101,6 +101,32 @@ fn evrf_batched_dealer_rejects_identity_share_commitment() {
 
 #[test]
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+fn evrf_batched_dealer_accepts_identity_coefficient_commitment() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C11);
+    let sk1 = GinScalar::random(&mut rng);
+    let pkjs = make_pkjs(&mut rng, 1);
+    let beta = R1csField::from(7u64);
+    let msg = make_msg(0xABCF);
+    let (mut statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+
+    statement.commitment_coefficients =
+        vec![Gin::identity(), Gin::generator() * GinScalar::from(11u64)];
+
+    let proof =
+        paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)
+            .expect("prove without coefficient scalar witnesses");
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    paper::evrf_batched_verify(
+        &public_params(&statement),
+        &statement,
+        &proof,
+        &mut verify_rng,
+    )
+    .expect("verify identity coefficient commitment");
+}
+
+#[test]
+#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn evrf_batched_dealer_rejects_wrong_receiver_pk() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C2);
     let sk1 = GinScalar::random(&mut rng);
@@ -246,22 +272,6 @@ fn evrf_batched_dealer_rejects_wrong_share_commitment() {
 }
 
 #[test]
-fn evrf_batched_dealer_rejects_wrong_polynomial_coefficient_witness() {
-    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C63);
-    let sk1 = GinScalar::random(&mut rng);
-    let pkjs = make_pkjs(&mut rng, 2);
-    let beta = R1csField::from(7u64);
-    let msg = make_msg(5);
-    let (statement, mut witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
-
-    witness.coefficient_scalars[0] += GinScalar::ONE;
-    assert!(
-        paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng).is_err(),
-        "prover must reject polynomial coefficients that do not open the public Feldman commitments"
-    );
-}
-
-#[test]
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn evrf_batched_dealer_rejects_wrong_encrypted_share() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C62);
@@ -361,7 +371,7 @@ fn evrf_batched_dealer_rejects_proof_replay_across_dealer_keys() {
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn evrf_batched_dealer_four_receivers_verifies() {
     // Regression for generator sizing: this two-coefficient, four-receiver
-    // shape uses 17,546 multipliers and therefore needs 32,768 generators.
+    // shape uses 15,349 multipliers and therefore needs 16,384 generators.
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C9);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 4);

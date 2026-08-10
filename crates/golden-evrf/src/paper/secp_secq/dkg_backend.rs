@@ -12,7 +12,7 @@ use rand_core::CryptoRngCore;
 use super::{
     affine, evrf_batched_prove, evrf_batched_verify_many, fp_to_fq, h_gin_1, h_gin_2,
     BatchedEvrfPublicParams, BatchedEvrfStatement, BatchedEvrfWitness, BatchedReceiverStatement,
-    Gin, GinScalar, BATCHED_PROOF_ID, MESSAGE_BYTES,
+    Gin, BATCHED_PROOF_ID, MESSAGE_BYTES,
 };
 
 pub(super) fn ensure_same_batch_context(
@@ -130,19 +130,12 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
 
         let mut receivers = Vec::with_capacity(statements.len());
         let mut statement_roots = Vec::with_capacity(statements.len());
-        let coefficient_scalars: Vec<GinScalar> = witnesses[0]
-            .polynomial_coefficients
-            .iter()
-            .map(|coefficient| coefficient.0)
-            .collect();
         for (statement, witness) in statements.iter().zip(witnesses.iter()) {
             ensure_same_batch_context(statement, first)?;
             if witness.identity_secret.0 != sk1 {
                 return Err(Error::ProofVerificationFailed);
             }
-            if witness.polynomial_coefficients != witnesses[0].polynomial_coefficients {
-                return Err(Error::ProofVerificationFailed);
-            }
+
             let pkj = statement.receiver_public_key.0;
             let rec = BatchedReceiverStatement {
                 receiver: statement.receiver,
@@ -164,10 +157,7 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
             statement_roots,
             receivers,
         };
-        let batched_witness = BatchedEvrfWitness {
-            sk1,
-            coefficient_scalars,
-        };
+        let batched_witness = BatchedEvrfWitness { sk1 };
         let params = BatchedEvrfPublicParams::shared(threshold, batched_statement.receivers.len())?;
         evrf_batched_prove(&params, &batched_statement, &batched_witness, rng)
     }

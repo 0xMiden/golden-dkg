@@ -214,10 +214,10 @@ pub mod secp_secq {
 
     /// Reusable transparent parameters for one batched dealer circuit shape.
     ///
-    /// Setup derives the exact multiplier count from the DKG threshold and
-    /// receiver count, then expands the deterministic Bulletproof generators
-    /// once. The same value can be shared by every dealer proof with that
-    /// shape. With the `serde` feature, serialized parameters contain the
+    /// Setup validates the DKG threshold and derives the exact multiplier count
+    /// from the receiver count, then expands the deterministic Bulletproof
+    /// generators once. The same value can be shared by every dealer proof with
+    /// that statement shape. With the `serde` feature, serialized parameters contain the
     /// prepared bases and must be authenticated before loading; deserialization
     /// validates encodings and dimensions but does not rederive every base.
     pub struct BatchedEvrfPublicParams {
@@ -353,7 +353,7 @@ pub mod secp_secq {
             Ok(std::sync::Arc::clone(params))
         }
 
-        /// DKG threshold used to size these parameters.
+        /// DKG threshold retained for statement-shape validation.
         pub fn threshold(&self) -> usize {
             self.threshold
         }
@@ -388,15 +388,12 @@ pub mod secp_secq {
     pub struct BatchedEvrfWitness {
         /// Dealer identity secret `sk_1` in `Fq` (shared across the batch).
         pub sk1: GinScalar,
-        /// Dealer polynomial coefficients in ascending degree order.
-        pub coefficient_scalars: Vec<GinScalar>,
     }
 
     impl core::fmt::Debug for BatchedEvrfWitness {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.debug_struct("BatchedEvrfWitness")
                 .field("sk1", &"<redacted>")
-                .field("coefficient_scalars", &"<redacted>")
                 .finish()
         }
     }
@@ -1405,10 +1402,9 @@ pub mod secp_secq {
     /// Process-wide cache for `g_in`'s chord-rule precompute table.
     ///
     /// `g_in = Gin::generator()` is a compile-time constant, so
-    /// `precompute_chord` produces the same table on every call. PK_1, the
-    /// Feldman coefficient openings, and every receiver's pad/share
-    /// commitments all exponentiate against `g_in`, so this is computed once
-    /// per process instead of repeatedly per proof.
+    /// `precompute_chord` produces the same table on every call. PK_1 and every
+    /// receiver's pad commitment exponentiate against `g_in`, so this is
+    /// computed once per process instead of repeatedly per proof.
     fn shared_g_in_chord_precomp() -> &'static ChordPrecomp {
         static PRECOMP: std::sync::OnceLock<ChordPrecomp> = std::sync::OnceLock::new();
         PRECOMP.get_or_init(|| {
@@ -1838,8 +1834,6 @@ pub mod secp_secq {
     /// Multipliers shared by every batched circuit: the dealer secret's
     /// canonical bit decomposition and the `g^sk = PK_1` exponentiation.
     const BATCHED_SHARED_MULTIPLIERS: usize = 1_099;
-    /// Multipliers added by one non-identity Feldman coefficient opening.
-    const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 1_099;
     /// Multipliers added by one receiver relation.
     const BATCHED_RECEIVER_MULTIPLIERS: usize = 3_563;
 
@@ -1848,23 +1842,18 @@ pub mod secp_secq {
         if threshold == 0 || receiver_count == 0 {
             return Err(Error::ProofVerificationFailed);
         }
-        let coefficients = threshold
-            .checked_mul(BATCHED_COEFFICIENT_MULTIPLIERS)
-            .ok_or(Error::ProofVerificationFailed)?;
         let receivers = receiver_count
             .checked_mul(BATCHED_RECEIVER_MULTIPLIERS)
             .ok_or(Error::ProofVerificationFailed)?;
-        // The shared prefix, each coefficient gadget, and each receiver slot
-        // make an odd number of `allocate` calls. Each adjacent pair therefore
-        // shares one multiplier slot in the constraint system.
-        let shared_allocations = threshold
-            .checked_add(receiver_count)
-            .and_then(|count| count.checked_add(1))
+        // The shared prefix and each receiver slot make an odd number of
+        // `allocate` calls. Each adjacent pair therefore shares one multiplier
+        // slot in the constraint system.
+        let shared_allocations = receiver_count
+            .checked_add(1)
             .ok_or(Error::ProofVerificationFailed)?
             / 2;
         BATCHED_SHARED_MULTIPLIERS
-            .checked_add(coefficients)
-            .and_then(|count| count.checked_add(receivers))
+            .checked_add(receivers)
             .and_then(|count| count.checked_sub(shared_allocations))
             .ok_or(Error::ProofVerificationFailed)
     }
@@ -1899,78 +1888,6 @@ pub mod secp_secq {
         pad_bits: Vec<Option<R1csField>>,
         /// Chord witness for `g_in^pad_j`.
         pad_commitment: ChordWitness,
-    }
-
-    fn prove_feldman_coefficients<CS: ConstraintSystem<R1csCycle>>(
-        cs: &mut CS,
-        coefficients: &[Gin],
-        coefficient_scalars: Option<&[GinScalar]>,
-    ) -> core::result::Result<(), R1CSError> {
-        let g_in = Gin::generator();
-        let precomp = shared_g_in_chord_precomp();
-
-        for (i, coefficient) in coefficients.iter().enumerate() {
-            let scalar_fp = coefficient_scalars.map(|scalars| fq_to_fp(&scalars[i]));
-            let scalar_bits = if let Some(scalar_fp) = scalar_fp.as_ref() {
-                let mut bits = [false; K_BITS + 1];
-                decompose_k_fp(scalar_fp, &mut bits);
-                bit_options(&bits)
-            } else {
-                vec![None; K_BITS + 1]
-            };
-            let scalar_var = cs.allocate(scalar_fp)?;
-            let scalar_bit_vars = bit_decompose_q(cs, scalar_var, &scalar_bits)?;
-            if is_identity(coefficient) {
-                for &bit_var in &scalar_bit_vars {
-                    cs.constrain(bit_var.into());
-                }
-            } else {
-                let (coefficient_x, coefficient_y) =
-                    affine(coefficient).map_err(|_| R1CSError::VerificationError)?;
-                let witness = if let Some(scalar_fp) = scalar_fp.as_ref() {
-                    let mut bits = [false; K_BITS + 1];
-                    decompose_k_fp(scalar_fp, &mut bits);
-                    Some(
-                        chord_compute_witness(&bits, &g_in, K_BITS)
-                            .map_err(|_| R1CSError::VerificationError)?,
-                    )
-                } else {
-                    None
-                };
-                let window_products = chord_window_products(cs, &scalar_bit_vars)?;
-                chord_exponentiate_r1cs_with_result(
-                    cs,
-                    &scalar_bit_vars,
-                    precomp,
-                    &window_products,
-                    Some((coefficient_x, coefficient_y)),
-                    witness.as_ref(),
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn ensure_feldman_coefficient_openings(
-        coefficients: &[Gin],
-        coefficient_scalars: &[GinScalar],
-    ) -> Result<()> {
-        if coefficients.len() != coefficient_scalars.len() {
-            return Err(Error::ProofVerificationFailed);
-        }
-
-        let g_in = Gin::generator();
-        for (coefficient, scalar) in coefficients.iter().zip(coefficient_scalars.iter()) {
-            let opened = g_in * *scalar;
-            if Secp256k1Cycle::point_compress(&opened).as_ref()
-                != Secp256k1Cycle::point_compress(coefficient).as_ref()
-            {
-                return Err(Error::ProofVerificationFailed);
-            }
-        }
-
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2120,15 +2037,7 @@ pub mod secp_secq {
         rng: &mut impl CryptoRngCore,
         transcript: &mut Transcript,
     ) -> Result<Vec<u8>> {
-        if witness.coefficient_scalars.len() != statement.commitment_coefficients.len() {
-            return Err(Error::ProofVerificationFailed);
-        }
         let g_in = Gin::generator();
-
-        ensure_feldman_coefficient_openings(
-            &statement.commitment_coefficients,
-            &witness.coefficient_scalars,
-        )?;
 
         // Verify PK_1 = g_in^sk_1.
         let pk1_computed = g_in * witness.sk1;
@@ -2175,13 +2084,6 @@ pub mod secp_secq {
             &sk_window_products,
             Some((pk1_x, pk1_y)),
             Some(&pk1_witness),
-        )
-        .map_err(|_| Error::ProofVerificationFailed)?;
-
-        prove_feldman_coefficients(
-            &mut prover,
-            &statement.commitment_coefficients,
-            Some(&witness.coefficient_scalars),
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
@@ -2262,9 +2164,6 @@ pub mod secp_secq {
             None,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
-
-        prove_feldman_coefficients(&mut verifier, &statement.commitment_coefficients, None)
-            .map_err(|_| Error::ProofVerificationFailed)?;
 
         for rec in &statement.receivers {
             build_hidden_receiver_slot(
@@ -2503,11 +2402,7 @@ pub mod secp_secq {
             let pk1 = g_in * sk1;
             let h1 = h_gin_1(msg);
             let h2 = h_gin_2(msg);
-            let coefficient_scalars = vec![GinScalar::from(10u64), GinScalar::ONE];
-            let commitment_coefficients = coefficient_scalars
-                .iter()
-                .map(|coefficient| g_in * *coefficient)
-                .collect::<Vec<_>>();
+            let commitment_coefficients = vec![g_in * GinScalar::from(10u64), g_in];
 
             let receivers: Vec<BatchedReceiverStatement> = pkjs
                 .iter()
@@ -2551,10 +2446,7 @@ pub mod secp_secq {
                     .collect(),
                 receivers,
             };
-            let witness = BatchedEvrfWitness {
-                sk1,
-                coefficient_scalars,
-            };
+            let witness = BatchedEvrfWitness { sk1 };
             (statement, witness)
         }
     }
@@ -2694,28 +2586,42 @@ pub mod secp_secq {
 
         #[test]
         fn batched_parameter_setup_matches_verifier_metrics() {
-            let threshold = 3;
+            let threshold = 2;
             let receiver_count = 2;
             let pkjs = [
                 Gin::generator() * GinScalar::from(3u64),
                 Gin::generator() * GinScalar::from(5u64),
             ];
-            let (mut statement, _) = testing::build_batched(
+            let (statement, _) = testing::build_batched(
                 &[0x42; MESSAGE_BYTES],
                 GinScalar::from(7u64),
                 &pkjs,
                 R1csField::from(11u64),
             );
-            statement.threshold = threshold;
-            statement.commitment_coefficients = (1..=threshold)
-                .map(|coefficient| Gin::generator() * GinScalar::from(coefficient as u64 + 20))
-                .collect();
 
             let verifier = build_batched_verifier(&statement, Transcript::new(R1CS_TEST_DOMAIN))
                 .expect("valid verifier circuit");
-            let multiplier_count =
-                batched_multiplier_count(threshold, receiver_count).expect("valid shape");
-            assert_eq!(multiplier_count, verifier.metrics().multipliers);
+            assert_eq!(verifier.metrics().multipliers, 17_313);
+            assert_eq!(
+                batched_multiplier_count(threshold, receiver_count).expect("valid shape"),
+                verifier.metrics().multipliers
+            );
+        }
+
+        #[test]
+        fn batched_parameter_dimensions_do_not_scale_with_threshold() {
+            for (threshold, receiver_count, multipliers, padded) in [
+                (2, 1, 4_661, 8_192),
+                (2, 2, 8_224, 16_384),
+                (2, 9, 33_161, 65_536),
+                (49, 49, 175_661, 262_144),
+                (99, 99, 353_786, 524_288),
+            ] {
+                let actual = batched_multiplier_count(threshold, receiver_count)
+                    .expect("valid batched circuit shape");
+                assert_eq!(actual, multipliers);
+                assert_eq!(actual.next_power_of_two(), padded);
+            }
         }
 
         /// Build a canonical bit decomposition of `k` (little-endian).
