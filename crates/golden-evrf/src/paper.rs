@@ -112,9 +112,9 @@ pub mod secp_secq {
     }
 
     /// Versioned proof-stream grammar for the standalone one-receiver relation.
-    const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v2";
-    /// Proof protocol identifier for the batched dealer relation and v2 stream grammar.
-    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v2";
+    const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v3";
+    /// Proof protocol identifier for the batched dealer relation and v3 stream grammar.
+    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v3";
 
     type GinStreamCurve = CycleCurve<Secp256k1Cycle>;
     type GoutStreamCurve = CycleCurve<R1csCycle>;
@@ -502,24 +502,37 @@ pub mod secp_secq {
         }
     }
 
-    /// Precomputed `Fp` coordinates for one chord-rule exponentiation.  Index
-    /// `j` ranges over `0..=lambda`.  `c` holds coordinates of `C_j = c_j · G_S`
-    /// and `d` holds coordinates of `D_j = P_j + C_j` where `P_j = 2^j · X`.
-    /// The R1CS computes `x_{Δ_j} = k_j · (d.x - c.x) + c.x` and the
-    /// corresponding `y` as a linear function of the witness bit `k_j`.
+    /// Precomputed `Fp` coordinates for one chord-rule exponentiation,
+    /// grouped for 2-bit windowed selection. Bit `0` is the gadget's
+    /// unpaired base case; bits `1..=lambda` pair into `lambda / 2` windows,
+    /// window `w` (`w = 1..=lambda/2`) covering bits `(2w-1, 2w)`.
+    ///
+    /// For window `w`, `windows[w-1]` holds the four combined candidate
+    /// points `Q_{b0,b1} = (b0 ? P_{2w-1} : 0) + (b1 ? P_{2w} : 0) + C_{2w-1}
+    /// + C_{2w}` (with `P_j = 2^j · X`, `C_j = c_j · G_S`), indexed
+    ///   `[Q00, Q10, Q01, Q11]` for `(bit_{2w-1}, bit_{2w}) = (0,0), (1,0),
+    ///   (0,1), (1,1)`. The R1CS selects `x_{Δ_w}` as the corresponding
+    ///   linear combination of the two window bits and their product (see
+    ///   [`window_delta_x_lc`]).
     #[derive(Clone, Debug)]
     struct ChordPrecomp {
-        /// `(x, y)` coordinates of `C_j = c_j · G_S` for `j = 0..=lambda`.
-        c: Vec<(Fp, Fp)>,
-        /// `(x, y)` coordinates of `D_j = P_j + C_j` for `j = 0..=lambda`.
-        d: Vec<(Fp, Fp)>,
+        /// `(x, y)` of `C_0 = c_0 · G_S`, the base case's correction point.
+        c0: (Fp, Fp),
+        /// `(x, y)` of `D_0 = P_0 + C_0`, the base case's bit-set point.
+        d0: (Fp, Fp),
+        /// Combined window candidate points for `w = 1..=lambda/2`.
+        windows: Vec<[(Fp, Fp); 4]>,
     }
 
-    /// Precompute the `C_j` and `D_j` coordinates for a chord-rule
-    /// exponentiation of base `X` with `lambda + 1` bits.  The correction
-    /// generator `G_S(X)` is derived from `X`, so each base gets independent
-    /// correction points.  All coordinates are native `Fp` elements.
+    /// Precompute the base-case and windowed candidate coordinates for a
+    /// chord-rule exponentiation of base `X` with `lambda + 1` bits (`lambda`
+    /// must be even). The correction generator `G_S(X)` is derived from `X`,
+    /// so each base gets independent correction points. All coordinates are
+    /// native `Fp` elements.
     fn precompute_chord(X: &Gin, lambda: usize) -> Result<ChordPrecomp> {
+        if lambda == 0 || !lambda.is_multiple_of(2) {
+            return Err(Error::ProofVerificationFailed);
+        }
         let g_s = chord_correction_generator(X);
 
         // chord_cj only ever returns one of three distinct scalars across
@@ -529,7 +542,9 @@ pub mod secp_secq {
         let c_mid = g_s * Fq::from(2);
         let c_last = g_s * chord_cj(lambda, lambda);
 
-        let mut points = Vec::with_capacity(2 * (lambda + 1));
+        // Raw per-bit C_j and D_j = P_j + C_j (still projective), j = 0..=lambda.
+        let mut c_points = Vec::with_capacity(lambda + 1);
+        let mut d_points = Vec::with_capacity(lambda + 1);
         let mut p_j = *X; // P_0 = 2^0 · X = X
         for j in 0..=lambda {
             let c_j_point = if j == 0 {
@@ -539,20 +554,37 @@ pub mod secp_secq {
             } else {
                 c_last
             };
-            points.push(c_j_point); // C_j = c_j · G_S(X)
-            points.push(p_j + c_j_point); // D_j = P_j + C_j
+            c_points.push(c_j_point);
+            d_points.push(p_j + c_j_point);
             p_j = p_j.double(); // P_{j+1} = 2 · P_j
         }
 
-        // Batch-normalize every C_j/D_j point with a single field inversion.
-        let affines = batch_affine(&points)?;
-        let mut c = Vec::with_capacity(lambda + 1);
-        let mut d = Vec::with_capacity(lambda + 1);
-        for pair in affines.chunks_exact(2) {
-            c.push(pair[0]);
-            d.push(pair[1]);
+        let num_windows = lambda / 2;
+        let mut points = Vec::with_capacity(2 + 4 * num_windows);
+        points.push(c_points[0]);
+        points.push(d_points[0]);
+        for w in 1..=num_windows {
+            let (j1, j2) = (2 * w - 1, 2 * w);
+            let (c1, d1) = (c_points[j1], d_points[j1]);
+            let (c2, d2) = (c_points[j2], d_points[j2]);
+            points.push(c1 + c2); // Q00 = C_j1 + C_j2
+            points.push(d1 + c2); // Q10 = P_j1 + C_j1 + C_j2
+            points.push(c1 + d2); // Q01 = C_j1 + P_j2 + C_j2
+            points.push(d1 + d2); // Q11 = P_j1 + P_j2 + C_j1 + C_j2
         }
-        Ok(ChordPrecomp { c, d })
+
+        // Batch-normalize every point with a single field inversion.
+        let affines = batch_affine(&points)?;
+        let (base, window_coords) = affines.split_at(2);
+        let windows = window_coords
+            .chunks_exact(4)
+            .map(|q| [q[0], q[1], q[2], q[3]])
+            .collect();
+        Ok(ChordPrecomp {
+            c0: base[0],
+            d0: base[1],
+            windows,
+        })
     }
 
     /// Evaluate the chord-rule exponentiation using actual elliptic curve
@@ -760,20 +792,24 @@ pub mod secp_secq {
     /// `L_i` coordinates and slopes `s_i` needed by the R1CS gadget.
     #[derive(Clone, Debug)]
     struct ChordWitness {
-        /// `(x_{L_i}, y_{L_i})` for `i = 0..=lambda`.
+        /// `(x_{L_w}, y_{L_w})` for `w = 0..=lambda/2` (`w = 0` is the base
+        /// case).
         l_coords: Vec<(R1csField, R1csField)>,
-        /// `s_i` for `i = 1..=lambda` (slope of the chord between
-        /// `L_{i-1}` and `Δ_i`).
+        /// `s_w` for `w = 1..=lambda/2` (slope of the chord between
+        /// `L_{w-1}` and the windowed `Δ_w`).
         slopes: Vec<R1csField>,
     }
 
-    /// Compute the full chord-rule witness: all intermediate `L_i` points and
-    /// slopes `s_i`.  Uses actual elliptic curve point arithmetic in `G_in`
-    /// and field inversion in `Fp` for the slopes.
+    /// Compute the full chord-rule witness: `L_w` at every window boundary
+    /// (`w = 0..=lambda/2`, `w = 0` being the base case) and the window
+    /// addition slopes `s_w`. Uses actual elliptic curve point arithmetic in
+    /// `G_in` and field inversion in `Fp` for the slopes, mirroring the
+    /// windowed accumulation the R1CS gadget performs.
     fn chord_compute_witness(bits: &[bool], X: &Gin, lambda: usize) -> Result<ChordWitness> {
-        if bits.len() != lambda + 1 {
+        if bits.len() != lambda + 1 || lambda == 0 || !lambda.is_multiple_of(2) {
             return Err(Error::ProofVerificationFailed);
         }
+        let num_windows = lambda / 2;
 
         let g_s = chord_correction_generator(X);
         // See precompute_chord: chord_cj collapses to three distinct scalars.
@@ -781,47 +817,64 @@ pub mod secp_secq {
         let c_mid = g_s * Fq::from(2);
         let c_last = g_s * chord_cj(lambda, lambda);
 
-        // Pass 1: accumulate L_j via native curve addition (no field
-        // inversions), recording every Δ_j (j >= 1) needed for a slope so
-        // every point can be normalized to affine coordinates together, in
-        // a single batched inversion below.
-        let mut l_points = Vec::with_capacity(lambda + 1);
-        let mut delta_points = Vec::with_capacity(lambda); // Δ_1..Δ_λ
+        // Per-bit C_j and P_j = 2^j * X, j = 0..=lambda, matching precompute_chord.
+        let mut c_points = Vec::with_capacity(lambda + 1);
+        let mut p_points = Vec::with_capacity(lambda + 1);
         let mut p_j = *X;
-        let mut l = Gin::identity();
-        for (j, &bit) in bits.iter().enumerate().take(lambda + 1) {
-            let c_j_point = if j == 0 {
+        for j in 0..=lambda {
+            c_points.push(if j == 0 {
                 c_first
             } else if j < lambda {
                 c_mid
             } else {
                 c_last
-            };
-            let delta = if bit { p_j + c_j_point } else { c_j_point };
-
-            if j == 0 {
-                l = delta;
-            } else {
-                delta_points.push(delta);
-                l += delta;
-            }
-            l_points.push(l);
+            });
+            p_points.push(p_j);
             p_j = p_j.double();
         }
 
-        // Batch-normalize every L_j and Δ_j (j >= 1) with a single inversion.
+        // Pass 1: accumulate L_w via native curve addition (no field
+        // inversions), one window at a time, recording every combined Δ_w
+        // (w >= 1) needed for a slope so every point can be normalized to
+        // affine coordinates together, in a single batched inversion below.
+        let mut l_points = Vec::with_capacity(num_windows + 1);
+        let mut delta_points = Vec::with_capacity(num_windows); // Δ_1..Δ_{num_windows}
+
+        // Base case: L_0 = Δ_0 = (bit_0 ? P_0 : 0) + C_0.
+        let mut l = if bits[0] {
+            p_points[0] + c_points[0]
+        } else {
+            c_points[0]
+        };
+        l_points.push(l);
+
+        for w in 1..=num_windows {
+            let (j1, j2) = (2 * w - 1, 2 * w);
+            let mut delta = c_points[j1] + c_points[j2];
+            if bits[j1] {
+                delta += p_points[j1];
+            }
+            if bits[j2] {
+                delta += p_points[j2];
+            }
+            delta_points.push(delta);
+            l += delta;
+            l_points.push(l);
+        }
+
+        // Batch-normalize every L_w and Δ_w (w >= 1) with a single inversion.
         let mut points = l_points;
         points.extend_from_slice(&delta_points);
         let affines = batch_affine(&points)?;
-        let (l_coords, delta_coords) = affines.split_at(lambda + 1);
+        let (l_coords, delta_coords) = affines.split_at(num_windows + 1);
 
-        // Pass 2: slopes s_j = (y_{L_{j-1}} - y_{Δ_j}) / (x_{L_{j-1}} - x_{Δ_j}),
-        // batching the λ field inversions into one.
-        let mut dxs = Vec::with_capacity(lambda);
-        let mut dys = Vec::with_capacity(lambda);
-        for j in 1..=lambda {
-            let (x_prev, y_prev) = l_coords[j - 1];
-            let (x_delta, y_delta) = delta_coords[j - 1];
+        // Pass 2: slopes s_w = (y_{L_{w-1}} - y_{Δ_w}) / (x_{L_{w-1}} - x_{Δ_w}),
+        // batching the num_windows field inversions into one.
+        let mut dxs = Vec::with_capacity(num_windows);
+        let mut dys = Vec::with_capacity(num_windows);
+        for w in 1..=num_windows {
+            let (x_prev, y_prev) = l_coords[w - 1];
+            let (x_delta, y_delta) = delta_coords[w - 1];
             let dx: R1csField = x_prev - x_delta;
             let dy: R1csField = y_prev - y_delta;
             if bool::from(dx.is_zero()) {
@@ -843,27 +896,89 @@ pub mod secp_secq {
         })
     }
 
-    /// Build the linear combination for `x_{Δ_j}` = `k_j * (x_{D_j} - x_{C_j})
-    /// + x_{C_j}`, expressed in terms of the bit variable `k_j_var`.
-    fn delta_x_lc(
-        k_j_var: Variable<R1csField>,
+    /// Build the linear combination for `x_{Δ_0}` = `k_0 * (x_{D_0} - x_{C_0})
+    /// + x_{C_0}`, the gadget's unpaired base-case bit.
+    fn delta0_x_lc(
+        k0_var: Variable<R1csField>,
         precomp: &ChordPrecomp,
-        j: usize,
     ) -> LinearCombination<R1csField> {
-        let (cx, _) = precomp.c[j];
-        let (dx, _) = precomp.d[j];
-        LinearCombination::from(cx) + k_j_var * (dx - cx)
+        let (cx, _) = precomp.c0;
+        let (dx, _) = precomp.d0;
+        LinearCombination::from(cx) + k0_var * (dx - cx)
     }
 
-    /// Build the linear combination for `y_{Δ_j}`.
-    fn delta_y_lc(
-        k_j_var: Variable<R1csField>,
+    /// Build the linear combination for `y_{Δ_0}`.
+    fn delta0_y_lc(
+        k0_var: Variable<R1csField>,
         precomp: &ChordPrecomp,
-        j: usize,
     ) -> LinearCombination<R1csField> {
-        let (_, cy) = precomp.c[j];
-        let (_, dy) = precomp.d[j];
-        LinearCombination::from(cy) + k_j_var * (dy - cy)
+        let (_, cy) = precomp.c0;
+        let (_, dy) = precomp.d0;
+        LinearCombination::from(cy) + k0_var * (dy - cy)
+    }
+
+    /// Build the linear combination for `x_{Δ_w}`, the x-coordinate of the
+    /// combined 2-bit-window candidate selected by `(s0, s1) = (k_{2w-1},
+    /// k_{2w})`, given their shared product `and_var = s0 * s1`:
+    /// `x_{Δ_w} = Q00.x + s0*(Q10.x-Q00.x) + s1*(Q01.x-Q00.x) +
+    /// and_var*(Q11.x-Q10.x-Q01.x+Q00.x)`. A pure linear combination once
+    /// `and_var` is known, so window selection costs no multiplier gate of
+    /// its own beyond the one shared `and_var` product.
+    fn window_delta_x_lc(
+        s0_var: Variable<R1csField>,
+        s1_var: Variable<R1csField>,
+        and_var: Variable<R1csField>,
+        window: &[(Fp, Fp); 4],
+    ) -> LinearCombination<R1csField> {
+        let (q00x, _) = window[0];
+        let (q10x, _) = window[1];
+        let (q01x, _) = window[2];
+        let (q11x, _) = window[3];
+        LinearCombination::from(q00x)
+            + s0_var * (q10x - q00x)
+            + s1_var * (q01x - q00x)
+            + and_var * (q11x - q10x - q01x + q00x)
+    }
+
+    /// Build the linear combination for `y_{Δ_w}`, the y-coordinate
+    /// analogue of [`window_delta_x_lc`].
+    fn window_delta_y_lc(
+        s0_var: Variable<R1csField>,
+        s1_var: Variable<R1csField>,
+        and_var: Variable<R1csField>,
+        window: &[(Fp, Fp); 4],
+    ) -> LinearCombination<R1csField> {
+        let (_, q00y) = window[0];
+        let (_, q10y) = window[1];
+        let (_, q01y) = window[2];
+        let (_, q11y) = window[3];
+        LinearCombination::from(q00y)
+            + s0_var * (q10y - q00y)
+            + s1_var * (q01y - q00y)
+            + and_var * (q11y - q10y - q01y + q00y)
+    }
+
+    /// Compute the shared 2-bit-window AND products `k_{2w-1} * k_{2w}` for
+    /// `w = 1..=(bit_vars.len()-1)/2` (`bit_vars.len()` must be odd; bit `0`
+    /// is the chord-rule gadget's unpaired base case and is excluded).
+    /// Callable once per distinct bit vector and shared as `window_products`
+    /// across every [`chord_exponentiate_r1cs_with_result`] call that reuses
+    /// those bits, so the shared product is paid for once rather than once
+    /// per chord.
+    fn chord_window_products<CS: ConstraintSystem<R1csCycle>>(
+        cs: &mut CS,
+        bit_vars: &[Variable<R1csField>],
+    ) -> core::result::Result<Vec<Variable<R1csField>>, R1CSError> {
+        if bit_vars.len() < 3 || bit_vars.len().is_multiple_of(2) {
+            return Err(R1CSError::FormatError);
+        }
+        let num_windows = (bit_vars.len() - 1) / 2;
+        let mut products = Vec::with_capacity(num_windows);
+        for w in 1..=num_windows {
+            let (_, _, and_var) = cs.multiply(bit_vars[2 * w - 1].into(), bit_vars[2 * w].into());
+            products.push(and_var);
+        }
+        Ok(products)
     }
 
     /// Interval, in loop iterations, at which the chord-rule gadget
@@ -873,16 +988,21 @@ pub mod secp_secq {
     /// gate (an allocated pair) per interval.
     const CHORD_CHECKPOINT_INTERVAL: usize = 16;
 
-    /// Chord-rule exponentiation R1CS gadget (paper Section 4.3). Given the
-    /// bit variables from [`bit_decompose`], the precomputed `C_j`/`D_j`
-    /// coordinates, and an optional public result point `(result_x, result_y)`,
-    /// constrains:
+    /// Chord-rule exponentiation R1CS gadget (paper Section 4.3), using 2-bit
+    /// windowed selection. Given the bit variables from [`bit_decompose`],
+    /// the windowed precomputed coordinates, the shared window AND products
+    /// from [`chord_window_products`], and an optional public result point
+    /// `(result_x, result_y)`, constrains:
     /// - `L_0 = Δ_0` (base case, expressed directly as a linear combination
     ///   of `bit_vars[0]`, no allocation)
-    /// - `L_i = L_{i-1} + Δ_i` for `i = 1..λ` (3 multiplication gates per
-    ///   iteration via the chord-rule formulas; `x_{L_i}`/`y_{L_i}` are
-    ///   themselves linear combinations of the gate outputs rather than
-    ///   separately allocated and constrained)
+    /// - `L_w = L_{w-1} + Δ_w` for each window `w = 1..=lambda/2` (3
+    ///   multiplication gates per window via the chord-rule formulas, plus
+    ///   the shared `and_var` product amortized across every gadget call
+    ///   that reuses `window_products`; `x_{L_w}`/`y_{L_w}` are themselves
+    ///   linear combinations of the gate outputs rather than separately
+    ///   allocated and constrained), where `Δ_w` is the windowed selection
+    ///   of one of four precomputed candidates by `(bit_{2w-1}, bit_{2w})`
+    ///   (see [`window_delta_x_lc`])
     /// - when `result` is present, `L_λ = (result_x, result_y)` (final
     ///   full-point binding, 2 linear constraints)
     ///
@@ -890,90 +1010,98 @@ pub mod secp_secq {
     /// x-only check cannot distinguish `L_λ` from `-L_λ`, which would allow
     /// non-canonical bit aliases (see [`bit_decompose`] doc).
     ///
-    /// The chord-addition denominator `x_{L_{i-1}} - x_{Δ_i}` is not
+    /// The chord-addition denominator `x_{L_{w-1}} - x_{Δ_w}` is not
     /// explicitly constrained nonzero: a zero denominator would require the
     /// prover to know a discrete-log relation between the base point and the
     /// hash-derived correction generator `G_S`, which is assumed hard.
     ///
     /// The running point is re-materialized as an allocated variable pair
-    /// every [`CHORD_CHECKPOINT_INTERVAL`] iterations (see that constant),
-    /// so the gadget costs `3λ` multiplication gates for the chord additions
-    /// plus one allocated pair per checkpoint, rather than one allocated
-    /// pair per iteration.
+    /// every [`CHORD_CHECKPOINT_INTERVAL`] windows (see that constant), so
+    /// the gadget costs `3 * lambda/2` multiplication gates for the chord
+    /// additions plus one allocated pair per checkpoint, rather than one
+    /// allocated pair per window.
     ///
     /// Returns the `(x_{L_λ}, y_{L_λ})` variables.
     fn chord_exponentiate_r1cs_with_result<CS: ConstraintSystem<R1csCycle>>(
         cs: &mut CS,
         bit_vars: &[Variable<R1csField>],
         precomp: &ChordPrecomp,
+        window_products: &[Variable<R1csField>],
         result: Option<(R1csField, R1csField)>,
         witness: Option<&ChordWitness>,
     ) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
-        // The chord-rule gadget consumes bit_vars[0..=λ], precomp.{c,d}[0..=λ],
-        // and witness.l_coords[0..=λ]/slopes[0..λ].  Reject mismatches before
-        // building the circuit so a caller mistake surfaces as a format error
-        // rather than a truncated exponentiation that silently binds L_λ.
+        // The chord-rule gadget consumes bit_vars[0..=λ] (λ even, so bits
+        // 1..=λ pair into λ/2 windows), precomp.windows[0..λ/2],
+        // window_products[0..λ/2], and witness.l_coords[0..=λ/2]/
+        // slopes[0..λ/2]. Reject mismatches before building the circuit so a
+        // caller mistake surfaces as a format error rather than a truncated
+        // exponentiation that silently binds L_λ.
         let lambda_plus_one = bit_vars.len();
-        if lambda_plus_one < 2
-            || precomp.c.len() != lambda_plus_one
-            || precomp.d.len() != lambda_plus_one
-        {
+        if lambda_plus_one < 3 || lambda_plus_one.is_multiple_of(2) {
+            return Err(R1CSError::FormatError);
+        }
+        let num_windows = (lambda_plus_one - 1) / 2;
+        if precomp.windows.len() != num_windows || window_products.len() != num_windows {
             return Err(R1CSError::FormatError);
         }
         if let Some(w) = witness {
-            if w.l_coords.len() != lambda_plus_one || w.slopes.len() != lambda_plus_one - 1 {
+            if w.l_coords.len() != num_windows + 1 || w.slopes.len() != num_windows {
                 return Err(R1CSError::FormatError);
             }
         }
 
-        let lambda = lambda_plus_one - 1;
-
         // --- Base case: L_0 = Δ_0, expressed directly as a linear
         // combination of the bit variable rather than an allocated pair
         // constrained equal to it.
-        let mut x_prev = delta_x_lc(bit_vars[0], precomp, 0);
-        let mut y_prev = delta_y_lc(bit_vars[0], precomp, 0);
+        let mut x_prev = delta0_x_lc(bit_vars[0], precomp);
+        let mut y_prev = delta0_y_lc(bit_vars[0], precomp);
         let mut checkpoint: Option<(Variable<R1csField>, Variable<R1csField>)> = None;
 
-        for (i, &bit_var) in bit_vars.iter().enumerate().skip(1) {
-            // Slope s_i (witness value).
-            let s_assign = witness.map(|w| w.slopes[i - 1]);
+        for w in 1..=num_windows {
+            let s0_var = bit_vars[2 * w - 1];
+            let s1_var = bit_vars[2 * w];
+            let and_var = window_products[w - 1];
+            let window = &precomp.windows[w - 1];
+
+            // Slope s_w (witness value).
+            let s_assign = witness.map(|wit| wit.slopes[w - 1]);
             let s_var = cs.allocate(s_assign)?;
 
-            // Linear combinations for Δ_i in terms of k_i_var.
-            let dx_i = delta_x_lc(bit_var, precomp, i);
-            let dy_i = delta_y_lc(bit_var, precomp, i);
-            let denom_delta = x_prev.clone() - dx_i.clone();
+            // Windowed selection of Δ_w in terms of the two window bits and
+            // their shared product.
+            let dx_w = window_delta_x_lc(s0_var, s1_var, and_var, window);
+            let dy_w = window_delta_y_lc(s0_var, s1_var, and_var, window);
+            let denom_delta = x_prev.clone() - dx_w.clone();
 
-            // Constraint 1: s_i * (x_{L_{i-1}} - x_{Δ_i}) = y_{L_{i-1}} - y_{Δ_i}
+            // Constraint 1: s_w * (x_{L_{w-1}} - x_{Δ_w}) = y_{L_{w-1}} - y_{Δ_w}
             let (_, _, out1) = cs.multiply(s_var.into(), denom_delta);
-            cs.constrain(out1 - (y_prev.clone() - dy_i));
+            cs.constrain(out1 - (y_prev.clone() - dy_w));
 
-            // Constraint 2 defines x_{L_i} directly as a linear combination
-            // of the gate output, rather than allocating x_{L_i} and
+            // Constraint 2 defines x_{L_w} directly as a linear combination
+            // of the gate output, rather than allocating x_{L_w} and
             // constraining it equal to this same expression:
-            // x_{L_i} = s_i^2 - x_{L_{i-1}} - x_{Δ_i}
+            // x_{L_w} = s_w^2 - x_{L_{w-1}} - x_{Δ_w}
             let (_, _, out2) = cs.multiply(s_var.into(), s_var.into());
-            let mut x_l = out2 - x_prev.clone() - dx_i;
+            let mut x_l = out2 - x_prev.clone() - dx_w;
 
-            // Constraint 3 defines y_{L_i} the same way:
-            // y_{L_i} = s_i * (x_{L_{i-1}} - x_{L_i}) - y_{L_{i-1}}
+            // Constraint 3 defines y_{L_w} the same way:
+            // y_{L_w} = s_w * (x_{L_{w-1}} - x_{L_w}) - y_{L_{w-1}}
             let denom_result = x_prev - x_l.clone();
             let (_, _, out3) = cs.multiply(s_var.into(), denom_result);
             let mut y_l = out3 - y_prev;
 
             // An un-checkpointed running point grows the term count of
-            // x_l/y_l by a constant amount every iteration, since each
-            // iteration's definition embeds the previous one. Left
-            // unchecked over the full 256-step chain this makes every
-            // subsequent `multiply()` evaluation (and the final flattened
-            // constraint) increasingly expensive. Every
-            // `CHORD_CHECKPOINT_INTERVAL` steps, and unconditionally on the
-            // last step (so the gadget always has a `Variable` pair to
-            // return), materialize the running point as a fresh allocated
-            // pair and resume accumulating from that 1-term LC.
-            if i % CHORD_CHECKPOINT_INTERVAL == 0 || i == lambda {
-                let (x_ck_assign, y_ck_assign) = witness.map(|w| w.l_coords[i]).unzip();
+            // x_l/y_l by a constant amount every window, since each
+            // window's definition embeds the previous one. Left unchecked
+            // over the full 128-window chain this makes every subsequent
+            // `multiply()` evaluation (and the final flattened constraint)
+            // increasingly expensive. Every `CHORD_CHECKPOINT_INTERVAL`
+            // windows, and unconditionally on the last window (so the
+            // gadget always has a `Variable` pair to return), materialize
+            // the running point as a fresh allocated pair and resume
+            // accumulating from that 1-term LC.
+            if w % CHORD_CHECKPOINT_INTERVAL == 0 || w == num_windows {
+                let (x_ck_assign, y_ck_assign) = witness.map(|wit| wit.l_coords[w]).unzip();
                 let x_ck = cs.allocate(x_ck_assign)?;
                 let y_ck = cs.allocate(y_ck_assign)?;
                 cs.constrain(x_l - x_ck);
@@ -987,9 +1115,10 @@ pub mod secp_secq {
             y_prev = y_l;
         }
 
-        // The loop always visits `i == lambda` on its last iteration, which
-        // unconditionally checkpoints, so `checkpoint` is always populated
-        // here (lambda >= 1 is guaranteed by the length check above).
+        // The loop always visits `w == num_windows` on its last iteration,
+        // which unconditionally checkpoints, so `checkpoint` is always
+        // populated here (num_windows >= 1 is guaranteed by the length
+        // check above).
         let (x_final, y_final) =
             checkpoint.expect("final loop iteration always checkpoints the running point");
 
@@ -1006,6 +1135,7 @@ pub mod secp_secq {
         cs: &mut CS,
         bit_vars: &[Variable<R1csField>],
         precomp: &ChordPrecomp,
+        window_products: &[Variable<R1csField>],
         result_x: R1csField,
         result_y: R1csField,
         witness: Option<&ChordWitness>,
@@ -1014,6 +1144,7 @@ pub mod secp_secq {
             cs,
             bit_vars,
             precomp,
+            window_products,
             Some((result_x, result_y)),
             witness,
         )
@@ -1211,8 +1342,9 @@ pub mod secp_secq {
     // ------------------------------------------------------------------
 
     /// Bulletproofs generator capacity for the one-receiver relation.
-    /// Bit-decomp uses 514 multiplier gates; each chord-rule uses 912.
-    /// Total 2338, padded to 8192 for the inner-product layer.
+    /// Bit-decomp uses 514 multiplier gates; the shared window AND products
+    /// for T_1/T_2 use 128; each chord-rule uses 456. Total 1554, padded to
+    /// 8192 for the inner-product layer.
     const R1CS_GENS_CAPACITY: usize = 8192;
 
     /// Process-wide cache for the single-receiver `BulletproofGens`.
@@ -1326,12 +1458,31 @@ pub mod secp_secq {
         cs.constrain(var_k - s_x);
 
         let bit_vars = bit_decompose(cs, var_k, bit_assignments)?;
+        // k's window AND products are shared by both exponentiations below
+        // (T_1 = H1^k, T_2 = H2^k), which reuse the same bit vector.
+        let k_window_products = chord_window_products(cs, &bit_vars)?;
 
         let precomp1 = precompute_chord(h1, K_BITS).map_err(|_| R1CSError::VerificationError)?;
         let precomp2 = precompute_chord(h2, K_BITS).map_err(|_| R1CSError::VerificationError)?;
 
-        let (x_t1, _) = chord_exponentiate_r1cs(cs, &bit_vars, &precomp1, t1_x, t1_y, witness1)?;
-        let (x_t2, _) = chord_exponentiate_r1cs(cs, &bit_vars, &precomp2, t2_x, t2_y, witness2)?;
+        let (x_t1, _) = chord_exponentiate_r1cs(
+            cs,
+            &bit_vars,
+            &precomp1,
+            &k_window_products,
+            t1_x,
+            t1_y,
+            witness1,
+        )?;
+        let (x_t2, _) = chord_exponentiate_r1cs(
+            cs,
+            &bit_vars,
+            &precomp2,
+            &k_window_products,
+            t2_x,
+            t2_y,
+            witness2,
+        )?;
 
         // Step 8: r = beta * r_1 + r_2  (r_1 = T_1.x, r_2 = T_2.x)
         cs.constrain(var_r - (x_t1 * beta + x_t2));
@@ -1658,11 +1809,11 @@ pub mod secp_secq {
 
     /// Multipliers shared by every batched circuit: the dealer secret's
     /// canonical bit decomposition and the `g^sk = PK_1` exponentiation.
-    const BATCHED_SHARED_MULTIPLIERS: usize = 1_427;
+    const BATCHED_SHARED_MULTIPLIERS: usize = 1_099;
     /// Multipliers added by one non-identity Feldman coefficient opening.
-    const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 1_427;
+    const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 1_099;
     /// Multipliers added by one receiver relation.
-    const BATCHED_RECEIVER_MULTIPLIERS: usize = 7_469;
+    const BATCHED_RECEIVER_MULTIPLIERS: usize = 5_117;
 
     /// Count multipliers from the exact public circuit shape.
     fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
@@ -1765,10 +1916,12 @@ pub mod secp_secq {
                 } else {
                     None
                 };
+                let window_products = chord_window_products(cs, &scalar_bit_vars)?;
                 chord_exponentiate_r1cs_with_result(
                     cs,
                     &scalar_bit_vars,
                     precomp,
+                    &window_products,
                     Some((coefficient_x, coefficient_y)),
                     witness.as_ref(),
                 )?;
@@ -1804,6 +1957,7 @@ pub mod secp_secq {
         cs: &mut CS,
         rec: &BatchedReceiverStatement,
         sk_bit_vars: &[Variable<R1csField>],
+        sk_window_products: &[Variable<R1csField>],
         precomp_h1: &ChordPrecomp,
         precomp_h2: &ChordPrecomp,
         beta: R1csField,
@@ -1817,6 +1971,7 @@ pub mod secp_secq {
             cs,
             sk_bit_vars,
             &precomp_pkj,
+            sk_window_products,
             None,
             witness.map(|w| &w.sk_pkj),
         )?;
@@ -1824,11 +1979,15 @@ pub mod secp_secq {
         let verifier_k_bits = vec![None; K_BITS + 1];
         let k_bits = witness.map_or(verifier_k_bits.as_slice(), |w| w.k_bits.as_slice());
         let k_bit_vars = bit_decompose(cs, s_x, k_bits)?;
+        // k's window AND products are shared by both exponentiations below
+        // (T_1 = H1^k, T_2 = H2^k), which reuse the same bit vector.
+        let k_window_products = chord_window_products(cs, &k_bit_vars)?;
 
         let (x_t1, _) = chord_exponentiate_r1cs_with_result(
             cs,
             &k_bit_vars,
             precomp_h1,
+            &k_window_products,
             None,
             witness.map(|w| &w.t1),
         )?;
@@ -1836,6 +1995,7 @@ pub mod secp_secq {
             cs,
             &k_bit_vars,
             precomp_h2,
+            &k_window_products,
             None,
             witness.map(|w| &w.t2),
         )?;
@@ -1854,6 +2014,9 @@ pub mod secp_secq {
         let pad_bits = witness.map_or(verifier_pad_bits.as_slice(), |w| w.pad_bits.as_slice());
         let pad_bit_vars = bit_decompose_q(cs, pad_var, pad_bits)?;
         constrain_bits_lt_bound_when(cs, &pad_bit_vars, pad_bits, &SECP256K1_P_MINUS_Q_LE, reduce)?;
+        // pad's window AND products are shared by both exponentiations below
+        // (pad commitment against g_in, DH commitment against PK_j).
+        let pad_window_products = chord_window_products(cs, &pad_bit_vars)?;
 
         // g_in's chord table is process-wide cached and shared by both
         // exponentiations against it below (pad and share commitments).
@@ -1865,6 +2028,7 @@ pub mod secp_secq {
             cs,
             &pad_bit_vars,
             precomp_g_in,
+            &pad_window_products,
             Some((pad_commitment_x, pad_commitment_y)),
             witness.map(|w| &w.pad_commitment),
         )?;
@@ -1874,12 +2038,14 @@ pub mod secp_secq {
         let share_bits =
             witness.map_or(verifier_share_bits.as_slice(), |w| w.share_bits.as_slice());
         let share_bit_vars = bit_decompose_q(cs, share_var, share_bits)?;
+        let share_window_products = chord_window_products(cs, &share_bit_vars)?;
         let (share_commitment_x, share_commitment_y) =
             affine(&rec.share_commitment).map_err(|_| R1CSError::VerificationError)?;
         chord_exponentiate_r1cs_with_result(
             cs,
             &share_bit_vars,
             precomp_g_in,
+            &share_window_products,
             Some((share_commitment_x, share_commitment_y)),
             witness.map(|w| &w.share_commitment),
         )?;
@@ -1890,6 +2056,7 @@ pub mod secp_secq {
             cs,
             &pad_bit_vars,
             &precomp_pkj,
+            &pad_window_products,
             Some((dh_commitment_x, dh_commitment_y)),
             witness.map(|w| &w.dh_commitment),
         )?;
@@ -1916,8 +2083,8 @@ pub mod secp_secq {
         // instead of separately re-deriving T_1/T_2 via chord_evaluate_point.
         let t1_witness = chord_compute_witness(&k_bool_bits, h1, K_BITS)?;
         let t2_witness = chord_compute_witness(&k_bool_bits, h2, K_BITS)?;
-        let (t1_x, _) = t1_witness.l_coords[K_BITS];
-        let (t2_x, _) = t2_witness.l_coords[K_BITS];
+        let (t1_x, _) = t1_witness.l_coords[K_BITS / 2];
+        let (t2_x, _) = t2_witness.l_coords[K_BITS / 2];
         let r = *beta * t1_x + t2_x;
         let pad_fq = fp_to_fq(&r);
         let pad = fq_to_fp(&pad_fq);
@@ -2023,6 +2190,10 @@ pub mod secp_secq {
             .map_err(|_| Error::ProofVerificationFailed)?;
         let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &sk_bit_assignments)
             .map_err(|_| Error::ProofVerificationFailed)?;
+        // sk's window AND products are shared by PK_1 = g_in^sk below and
+        // every receiver's S_j = PK_j^sk chord in the loop below.
+        let sk_window_products = chord_window_products(&mut prover, &sk_bit_vars)
+            .map_err(|_| Error::ProofVerificationFailed)?;
 
         let pk1_witness = chord_compute_witness(&sk_bool_bits, &g_in, K_BITS)?;
         let pk1_precomp = shared_g_in_chord_precomp();
@@ -2031,6 +2202,7 @@ pub mod secp_secq {
             &mut prover,
             &sk_bit_vars,
             pk1_precomp,
+            &sk_window_products,
             Some((pk1_x, pk1_y)),
             Some(&pk1_witness),
         )
@@ -2056,6 +2228,7 @@ pub mod secp_secq {
                 &mut prover,
                 rec,
                 &sk_bit_vars,
+                &sk_window_products,
                 &precomp_h1,
                 &precomp_h2,
                 statement.beta,
@@ -2111,6 +2284,8 @@ pub mod secp_secq {
         let verifier_sk_bits = vec![None; K_BITS + 1];
         let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits)
             .map_err(|_| Error::ProofVerificationFailed)?;
+        let sk_window_products = chord_window_products(&mut verifier, &sk_bit_vars)
+            .map_err(|_| Error::ProofVerificationFailed)?;
 
         let pk1_precomp = shared_g_in_chord_precomp();
         let (pk1_x, pk1_y) = affine(&statement.pk1)?;
@@ -2118,6 +2293,7 @@ pub mod secp_secq {
             &mut verifier,
             &sk_bit_vars,
             pk1_precomp,
+            &sk_window_products,
             Some((pk1_x, pk1_y)),
             None,
         )
@@ -2131,6 +2307,7 @@ pub mod secp_secq {
                 &mut verifier,
                 rec,
                 &sk_bit_vars,
+                &sk_window_products,
                 &precomp_h1,
                 &precomp_h2,
                 statement.beta,
@@ -2492,22 +2669,40 @@ pub mod secp_secq {
             let g_s = chord_correction_generator(&X);
             let precomp = precompute_chord(&X, K_BITS).expect("precompute");
 
-            assert_eq!(precomp.c.len(), K_BITS + 1, "c vector length");
-            assert_eq!(precomp.d.len(), K_BITS + 1, "d vector length");
+            assert_eq!(precomp.windows.len(), K_BITS / 2, "windows vector length");
 
-            // Independently recompute C_j = c_j · G_S and D_j = 2^j · X + C_j
-            // for a representative sample of indices (first, middle, last, and
-            // a few in between) and verify the precomputed coordinates match.
+            // Independently recompute C_j = c_j · G_S and P_j = 2^j · X for
+            // every bit, then check the base case and a representative
+            // sample of windows (first, middle, last) against the
+            // precomputed candidates.
+            let mut p_points = Vec::with_capacity(K_BITS + 1);
+            let mut c_points = Vec::with_capacity(K_BITS + 1);
             let mut p_j = X;
             for j in 0..=K_BITS {
-                let cj = chord_cj(j, K_BITS);
-                let c_j_point = g_s * cj;
-                let d_j_point = p_j + c_j_point;
-                let (cx, cy) = affine(&c_j_point).expect("C_j affine");
-                let (dx, dy) = affine(&d_j_point).expect("D_j affine");
-                assert_eq!(precomp.c[j], (cx, cy), "C_{j} coordinate mismatch");
-                assert_eq!(precomp.d[j], (dx, dy), "D_{j} coordinate mismatch");
+                c_points.push(g_s * chord_cj(j, K_BITS));
+                p_points.push(p_j);
                 p_j = p_j.double();
+            }
+
+            let (c0x, c0y) = affine(&c_points[0]).expect("C_0 affine");
+            let (d0x, d0y) = affine(&(p_points[0] + c_points[0])).expect("D_0 affine");
+            assert_eq!(precomp.c0, (c0x, c0y), "C_0 coordinate mismatch");
+            assert_eq!(precomp.d0, (d0x, d0y), "D_0 coordinate mismatch");
+
+            for w in [1, K_BITS / 4, K_BITS / 2] {
+                let (j1, j2) = (2 * w - 1, 2 * w);
+                let expected = [
+                    affine(&(c_points[j1] + c_points[j2])).expect("Q00 affine"),
+                    affine(&(p_points[j1] + c_points[j1] + c_points[j2])).expect("Q10 affine"),
+                    affine(&(c_points[j1] + p_points[j2] + c_points[j2])).expect("Q01 affine"),
+                    affine(&(p_points[j1] + p_points[j2] + c_points[j1] + c_points[j2]))
+                        .expect("Q11 affine"),
+                ];
+                assert_eq!(
+                    precomp.windows[w - 1],
+                    expected,
+                    "window {w} candidates mismatch"
+                );
             }
         }
 
@@ -2784,6 +2979,8 @@ pub mod secp_secq {
             let sk_var = prover.allocate(Some(sk_fp)).expect("allocate sk");
             let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &bit_options(&sk_bits))
                 .expect("sk bit decomposition");
+            let sk_window_products =
+                chord_window_products(&mut prover, &sk_bit_vars).expect("sk window products");
 
             let pk1_precomp = precompute_chord(&g_in, K_BITS).expect("PK1 precompute");
             let (pk1_x, pk1_y) = affine(&statement.pk1).expect("PK1 affine");
@@ -2791,6 +2988,7 @@ pub mod secp_secq {
                 &mut prover,
                 &sk_bit_vars,
                 &pk1_precomp,
+                &sk_window_products,
                 Some((pk1_x, pk1_y)),
                 Some(&chord_compute_witness(&sk_bits, &g_in, K_BITS).expect("PK1 witness")),
             )
@@ -2799,6 +2997,7 @@ pub mod secp_secq {
                 &mut prover,
                 rec,
                 &sk_bit_vars,
+                &sk_window_products,
                 &precomp_h1,
                 &precomp_h2,
                 statement.beta,
@@ -2814,10 +3013,13 @@ pub mod secp_secq {
             let verifier_sk_bits = vec![None; K_BITS + 1];
             let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits)
                 .expect("verifier sk bit decomposition");
+            let sk_window_products = chord_window_products(&mut verifier, &sk_bit_vars)
+                .expect("verifier sk window products");
             chord_exponentiate_r1cs_with_result(
                 &mut verifier,
                 &sk_bit_vars,
                 &pk1_precomp,
+                &sk_window_products,
                 Some((pk1_x, pk1_y)),
                 None,
             )
@@ -2826,6 +3028,7 @@ pub mod secp_secq {
                 &mut verifier,
                 rec,
                 &sk_bit_vars,
+                &sk_window_products,
                 &precomp_h1,
                 &precomp_h2,
                 statement.beta,
@@ -2890,12 +3093,12 @@ pub mod secp_secq {
             let X = Gin::generator() * GinScalar::from(12345u64);
             let precomp = precompute_chord(&X, K_BITS).expect("precompute");
 
-            // bit_vars and precomp agree on λ+1 = 257 entries; build a witness
-            // whose l_coords is one short so the length check fires before any
-            // circuit construction.
+            // bit_vars and precomp agree on λ/2 = 128 windows; build a
+            // witness whose l_coords is one short so the length check fires
+            // before any circuit construction.
             let truncated_witness = ChordWitness {
-                l_coords: vec![(R1csField::ZERO, R1csField::ZERO); K_BITS],
-                slopes: vec![R1csField::ZERO; K_BITS],
+                l_coords: vec![(R1csField::ZERO, R1csField::ZERO); K_BITS / 2],
+                slopes: vec![R1csField::ZERO; K_BITS / 2],
             };
 
             let mut prover =
@@ -2905,17 +3108,20 @@ pub mod secp_secq {
             let mut bit_assignments = vec![None; K_BITS + 1];
             decompose_k(&k, &mut bit_assignments);
             let bit_vars = bit_decompose(&mut prover, var_k, &bit_assignments).expect("bit_decomp");
+            let window_products =
+                chord_window_products(&mut prover, &bit_vars).expect("window products");
             let result = chord_exponentiate_r1cs(
                 &mut prover,
                 &bit_vars,
                 &precomp,
+                &window_products,
                 R1csField::ZERO,
                 R1csField::ZERO,
                 Some(&truncated_witness),
             );
             assert!(
                 result.is_err(),
-                "chord_exponentiate_r1cs must reject witness whose l_coords length != λ+1"
+                "chord_exponentiate_r1cs must reject witness whose l_coords length != λ/2 + 1"
             );
         }
 
@@ -2972,7 +3178,7 @@ pub mod secp_secq {
             mutate_witness: impl FnOnce(&mut ChordWitness),
         ) -> core::result::Result<(), R1CSError> {
             let pc_gens = PedersenGens::<R1csCycle>::default();
-            // bit_decompose: 257 gates, chord_exp: ~1024+ gates.  Pad to 4096.
+            // bit_decompose: 257 gates, chord_exp: 1,098 gates.  Pad to 4096.
             let bp_gens = BulletproofGens::<R1csCycle>::new(4096, 1);
             let mut rng = ChaCha20Rng::seed_from_u64(0x5CA1E000);
 
@@ -3015,10 +3221,13 @@ pub mod secp_secq {
                 Prover::<R1csCycle, _>::new(&pc_gens, Transcript::new(R1CS_TEST_DOMAIN));
             let (v_k, var_k) = prover.commit(k_fp, random_scalar::<R1csCycle>(&mut rng));
             let bit_vars = bit_decompose(&mut prover, var_k, &bit_assignments).expect("bit_decomp");
+            let window_products =
+                chord_window_products(&mut prover, &bit_vars).expect("window products");
             chord_exponentiate_r1cs(
                 &mut prover,
                 &bit_vars,
                 &precomp,
+                &window_products,
                 result_x,
                 result_y,
                 Some(&witness),
@@ -3032,8 +3241,18 @@ pub mod secp_secq {
             let verifier_bits = vec![None; K_BITS + 1];
             let bit_vars =
                 bit_decompose(&mut verifier, v_k_var, &verifier_bits).expect("bit_decomp");
-            chord_exponentiate_r1cs(&mut verifier, &bit_vars, &precomp, result_x, result_y, None)
-                .expect("chord_exp");
+            let window_products =
+                chord_window_products(&mut verifier, &bit_vars).expect("verifier window products");
+            chord_exponentiate_r1cs(
+                &mut verifier,
+                &bit_vars,
+                &precomp,
+                &window_products,
+                result_x,
+                result_y,
+                None,
+            )
+            .expect("chord_exp");
             verifier.verify(&proof, &pc_gens, &bp_gens, &mut rng)
         }
 
@@ -3086,7 +3305,6 @@ pub mod secp_secq {
                 "verifier must reject -T (same x, negated y)"
             );
         }
-
     }
 
     #[cfg(test)]
@@ -3412,10 +3630,10 @@ pub mod secp_secq {
             assert_eq!(
                 checkpoint,
                 [
-                    247, 25, 213, 42, 121, 243, 204, 120, 70, 68, 75, 51, 206, 117, 113, 102, 226,
-                    129, 74, 188, 184, 249, 56, 36, 91, 132, 27, 123, 113, 156, 110, 121, 116, 185,
-                    133, 17, 40, 166, 105, 171, 8, 145, 175, 175, 189, 164, 99, 107, 127, 11, 148,
-                    198, 242, 109, 210, 14, 250, 163, 209, 209, 85, 22, 50, 20,
+                    202, 137, 147, 82, 110, 22, 19, 80, 44, 159, 101, 99, 197, 243, 63, 90, 93,
+                    147, 54, 104, 66, 242, 112, 196, 40, 65, 97, 155, 140, 186, 21, 221, 170, 222,
+                    72, 143, 167, 162, 45, 211, 73, 29, 161, 132, 171, 58, 51, 16, 30, 224, 74,
+                    150, 61, 13, 70, 239, 16, 233, 12, 227, 133, 146, 24, 54,
                 ]
             );
 
