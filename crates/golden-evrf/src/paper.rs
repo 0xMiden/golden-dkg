@@ -113,8 +113,8 @@ pub mod secp_secq {
 
     /// Versioned proof-stream grammar for the standalone one-receiver relation.
     const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v3";
-    /// Proof protocol identifier for the batched dealer relation and v4 stream grammar.
-    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v4";
+    /// Proof protocol identifier for the batched dealer relation and v5 stream grammar.
+    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v5";
 
     type GinStreamCurve = CycleCurve<Secp256k1Cycle>;
     type GoutStreamCurve = CycleCurve<R1csCycle>;
@@ -1841,7 +1841,7 @@ pub mod secp_secq {
     /// Multipliers added by one non-identity Feldman coefficient opening.
     const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 1_099;
     /// Multipliers added by one receiver relation.
-    const BATCHED_RECEIVER_MULTIPLIERS: usize = 4_661;
+    const BATCHED_RECEIVER_MULTIPLIERS: usize = 3_563;
 
     /// Count multipliers from the exact public circuit shape.
     fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
@@ -3483,10 +3483,10 @@ pub mod secp_secq {
             assert_eq!(
                 checkpoint,
                 [
-                    74, 178, 166, 223, 40, 64, 81, 117, 233, 243, 69, 141, 20, 168, 65, 42, 84, 76,
-                    108, 77, 118, 203, 112, 132, 192, 8, 182, 87, 248, 71, 238, 108, 231, 210, 25,
-                    152, 136, 74, 146, 59, 156, 52, 118, 202, 215, 80, 158, 187, 241, 48, 225, 13,
-                    248, 110, 197, 72, 140, 74, 90, 130, 119, 238, 198, 81,
+                    79, 200, 236, 164, 117, 125, 234, 243, 140, 173, 156, 99, 212, 3, 63, 161, 148,
+                    165, 242, 21, 103, 6, 165, 22, 87, 13, 14, 81, 35, 83, 214, 173, 11, 18, 98,
+                    235, 5, 96, 100, 56, 211, 162, 198, 48, 112, 57, 70, 114, 212, 92, 176, 120,
+                    99, 1, 66, 51, 200, 34, 9, 200, 38, 144, 19, 93,
                 ]
             );
 
