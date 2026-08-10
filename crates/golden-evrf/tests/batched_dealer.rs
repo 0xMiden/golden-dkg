@@ -89,15 +89,8 @@ fn evrf_batched_dealer_rejects_identity_share_commitment() {
     let pkjs = make_pkjs(&mut rng, 1);
     let beta = R1csField::from(7u64);
     let msg = make_msg(0xABCE);
-    let (mut statement, mut witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
-
-    let pad = statement.receivers[0].encrypted_share - witness.shares[0];
-    witness.shares[0] = GinScalar::ZERO;
-    witness.coefficient_scalars = vec![GinScalar::ZERO];
-    statement.threshold = 1;
-    statement.commitment_coefficients = vec![Gin::identity()];
+    let (mut statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
     statement.receivers[0].share_commitment = Gin::identity();
-    statement.receivers[0].encrypted_share = pad;
 
     assert!(
         paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)

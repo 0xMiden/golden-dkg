@@ -130,7 +130,6 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
 
         let mut receivers = Vec::with_capacity(statements.len());
         let mut statement_roots = Vec::with_capacity(statements.len());
-        let mut shares = Vec::with_capacity(witnesses.len());
         let coefficient_scalars: Vec<GinScalar> = witnesses[0]
             .polynomial_coefficients
             .iter()
@@ -154,7 +153,6 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
             };
             statement_roots.push(statement.root());
             receivers.push(rec);
-            shares.push(witness.share.0);
         }
 
         let batched_statement = BatchedEvrfStatement {
@@ -169,7 +167,6 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
         let batched_witness = BatchedEvrfWitness {
             sk1,
             coefficient_scalars,
-            shares,
         };
         let params = BatchedEvrfPublicParams::shared(threshold, batched_statement.receivers.len())?;
         evrf_batched_prove(&params, &batched_statement, &batched_witness, rng)
