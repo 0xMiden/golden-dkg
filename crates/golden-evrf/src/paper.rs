@@ -765,8 +765,6 @@ pub mod secp_secq {
         /// `s_i` for `i = 1..=lambda` (slope of the chord between
         /// `L_{i-1}` and `Δ_i`).
         slopes: Vec<R1csField>,
-        /// `(x_{L_{i-1}} - x_{Δ_i})^{-1}` for `i = 1..=lambda`.
-        denom_delta_inverses: Vec<R1csField>,
     }
 
     /// Compute the full chord-rule witness: all intermediate `L_i` points and
@@ -842,7 +840,6 @@ pub mod secp_secq {
         Ok(ChordWitness {
             l_coords: l_coords.to_vec(),
             slopes,
-            denom_delta_inverses: dxs,
         })
     }
 
@@ -883,6 +880,11 @@ pub mod secp_secq {
     /// x-only check cannot distinguish `L_λ` from `-L_λ`, which would allow
     /// non-canonical bit aliases (see [`bit_decompose`] doc).
     ///
+    /// The chord-addition denominator `x_{L_{i-1}} - x_{Δ_i}` is not
+    /// explicitly constrained nonzero: a zero denominator would require the
+    /// prover to know a discrete-log relation between the base point and the
+    /// hash-derived correction generator `G_S`, which is assumed hard.
+    ///
     /// Returns the `(x_{L_λ}, y_{L_λ})` variables.  Uses `3λ` multiplication
     /// gates plus linear constraints.
     fn chord_exponentiate_r1cs_with_result<CS: ConstraintSystem<R1csCycle>>(
@@ -904,10 +906,7 @@ pub mod secp_secq {
             return Err(R1CSError::FormatError);
         }
         if let Some(w) = witness {
-            if w.l_coords.len() != lambda_plus_one
-                || w.slopes.len() != lambda_plus_one - 1
-                || w.denom_delta_inverses.len() != lambda_plus_one - 1
-            {
+            if w.l_coords.len() != lambda_plus_one || w.slopes.len() != lambda_plus_one - 1 {
                 return Err(R1CSError::FormatError);
             }
         }
@@ -927,11 +926,9 @@ pub mod secp_secq {
         for (i, &bit_var) in bit_vars.iter().enumerate().skip(1) {
             // Slope s_i and L_i coordinates (witness values).
             let s_assign = witness.map(|w| w.slopes[i - 1]);
-            let denom_delta_inv_assign = witness.map(|w| w.denom_delta_inverses[i - 1]);
             let (x_l_assign, y_l_assign) = witness.map(|w| w.l_coords[i]).unzip();
 
             let s_var = cs.allocate(s_assign)?;
-            let denom_delta_inv = cs.allocate(denom_delta_inv_assign)?;
             let x_l = cs.allocate(x_l_assign)?;
             let y_l = cs.allocate(y_l_assign)?;
 
@@ -940,9 +937,6 @@ pub mod secp_secq {
             let dy_i = delta_y_lc(bit_var, precomp, i);
             let denom_delta = x_prev - dx_i.clone();
             let denom_result = x_prev - x_l;
-
-            let (_, _, delta_nonzero) = cs.multiply(denom_delta_inv.into(), denom_delta.clone());
-            cs.constrain(delta_nonzero - R1csField::ONE);
 
             // Constraint 1: s_i * (x_{L_{i-1}} - x_{Δ_i}) = y_{L_{i-1}} - y_{Δ_i}
             let (_, _, out1) = cs.multiply(s_var.into(), denom_delta);
@@ -1178,8 +1172,8 @@ pub mod secp_secq {
     // ------------------------------------------------------------------
 
     /// Bulletproofs generator capacity for the one-receiver relation.
-    /// Bit-decomp uses 257 multiplier gates; each chord-rule uses 4*256 = 1024.
-    /// Total 2305, padded to 8192 for the inner-product layer.
+    /// Bit-decomp uses 514 multiplier gates; each chord-rule uses 1153.
+    /// Total 2820, padded to 8192 for the inner-product layer.
     const R1CS_GENS_CAPACITY: usize = 8192;
 
     /// Process-wide cache for the single-receiver `BulletproofGens`.
@@ -1625,11 +1619,11 @@ pub mod secp_secq {
 
     /// Multipliers shared by every batched circuit: the dealer secret's
     /// canonical bit decomposition and the `g^sk = PK_1` exponentiation.
-    const BATCHED_SHARED_MULTIPLIERS: usize = 2_052;
+    const BATCHED_SHARED_MULTIPLIERS: usize = 1_668;
     /// Multipliers added by one non-identity Feldman coefficient opening.
-    const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 2_052;
+    const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 1_668;
     /// Multipliers added by one receiver relation.
-    const BATCHED_RECEIVER_MULTIPLIERS: usize = 11_219;
+    const BATCHED_RECEIVER_MULTIPLIERS: usize = 8_915;
 
     /// Count multipliers from the exact public circuit shape.
     fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
@@ -2863,7 +2857,6 @@ pub mod secp_secq {
             let truncated_witness = ChordWitness {
                 l_coords: vec![(R1csField::ZERO, R1csField::ZERO); K_BITS],
                 slopes: vec![R1csField::ZERO; K_BITS],
-                denom_delta_inverses: vec![R1csField::ZERO; K_BITS],
             };
 
             let mut prover =
@@ -3055,17 +3048,6 @@ pub mod secp_secq {
             );
         }
 
-        #[test]
-        fn chord_exp_rejects_wrong_delta_denominator_inverse() {
-            let X = Gin::generator() * Fq::from(42u64);
-            assert!(
-                run_chord_exp_with_witness(0xDEADBEEFu64, &X, None, |w| {
-                    w.denom_delta_inverses[0] += R1csField::ONE;
-                })
-                .is_err(),
-                "verifier must reject a wrong inverse for x_L_prev - x_Delta"
-            );
-        }
     }
 
     #[cfg(test)]
