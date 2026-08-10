@@ -866,13 +866,23 @@ pub mod secp_secq {
         LinearCombination::from(cy) + k_j_var * (dy - cy)
     }
 
+    /// Interval, in loop iterations, at which the chord-rule gadget
+    /// re-materializes its running point as a fresh allocated variable pair
+    /// instead of an ever-growing linear combination. Bounds the per-step
+    /// evaluation cost of the running point at the cost of one multiplier
+    /// gate (an allocated pair) per interval.
+    const CHORD_CHECKPOINT_INTERVAL: usize = 16;
+
     /// Chord-rule exponentiation R1CS gadget (paper Section 4.3). Given the
     /// bit variables from [`bit_decompose`], the precomputed `C_j`/`D_j`
     /// coordinates, and an optional public result point `(result_x, result_y)`,
     /// constrains:
-    /// - `L_0 = Δ_0` (base case, 2 linear constraints)
+    /// - `L_0 = Δ_0` (base case, expressed directly as a linear combination
+    ///   of `bit_vars[0]`, no allocation)
     /// - `L_i = L_{i-1} + Δ_i` for `i = 1..λ` (3 multiplication gates per
-    ///   iteration via the chord-rule formulas)
+    ///   iteration via the chord-rule formulas; `x_{L_i}`/`y_{L_i}` are
+    ///   themselves linear combinations of the gate outputs rather than
+    ///   separately allocated and constrained)
     /// - when `result` is present, `L_λ = (result_x, result_y)` (final
     ///   full-point binding, 2 linear constraints)
     ///
@@ -885,8 +895,13 @@ pub mod secp_secq {
     /// prover to know a discrete-log relation between the base point and the
     /// hash-derived correction generator `G_S`, which is assumed hard.
     ///
-    /// Returns the `(x_{L_λ}, y_{L_λ})` variables.  Uses `3λ` multiplication
-    /// gates plus linear constraints.
+    /// The running point is re-materialized as an allocated variable pair
+    /// every [`CHORD_CHECKPOINT_INTERVAL`] iterations (see that constant),
+    /// so the gadget costs `3λ` multiplication gates for the chord additions
+    /// plus one allocated pair per checkpoint, rather than one allocated
+    /// pair per iteration.
+    ///
+    /// Returns the `(x_{L_λ}, y_{L_λ})` variables.
     fn chord_exponentiate_r1cs_with_result<CS: ConstraintSystem<R1csCycle>>(
         cs: &mut CS,
         bit_vars: &[Variable<R1csField>],
@@ -911,56 +926,80 @@ pub mod secp_secq {
             }
         }
 
-        // --- Base case: L_0 = Δ_0 ---
-        let (x_l0_assign, y_l0_assign) = witness.map(|w| w.l_coords[0]).unzip();
-        let x_l0 = cs.allocate(x_l0_assign)?;
-        let y_l0 = cs.allocate(y_l0_assign)?;
+        let lambda = lambda_plus_one - 1;
 
-        // x_{L_0} = x_{Δ_0}, y_{L_0} = y_{Δ_0}
-        cs.constrain(x_l0 - delta_x_lc(bit_vars[0], precomp, 0));
-        cs.constrain(y_l0 - delta_y_lc(bit_vars[0], precomp, 0));
-
-        let mut x_prev = x_l0;
-        let mut y_prev = y_l0;
+        // --- Base case: L_0 = Δ_0, expressed directly as a linear
+        // combination of the bit variable rather than an allocated pair
+        // constrained equal to it.
+        let mut x_prev = delta_x_lc(bit_vars[0], precomp, 0);
+        let mut y_prev = delta_y_lc(bit_vars[0], precomp, 0);
+        let mut checkpoint: Option<(Variable<R1csField>, Variable<R1csField>)> = None;
 
         for (i, &bit_var) in bit_vars.iter().enumerate().skip(1) {
-            // Slope s_i and L_i coordinates (witness values).
+            // Slope s_i (witness value).
             let s_assign = witness.map(|w| w.slopes[i - 1]);
-            let (x_l_assign, y_l_assign) = witness.map(|w| w.l_coords[i]).unzip();
-
             let s_var = cs.allocate(s_assign)?;
-            let x_l = cs.allocate(x_l_assign)?;
-            let y_l = cs.allocate(y_l_assign)?;
 
             // Linear combinations for Δ_i in terms of k_i_var.
             let dx_i = delta_x_lc(bit_var, precomp, i);
             let dy_i = delta_y_lc(bit_var, precomp, i);
-            let denom_delta = x_prev - dx_i.clone();
-            let denom_result = x_prev - x_l;
+            let denom_delta = x_prev.clone() - dx_i.clone();
 
             // Constraint 1: s_i * (x_{L_{i-1}} - x_{Δ_i}) = y_{L_{i-1}} - y_{Δ_i}
             let (_, _, out1) = cs.multiply(s_var.into(), denom_delta);
-            cs.constrain(out1 - (y_prev - dy_i.clone()));
+            cs.constrain(out1 - (y_prev.clone() - dy_i));
 
-            // Constraint 2: s_i^2 = x_{L_{i-1}} + x_{L_i} + x_{Δ_i}
+            // Constraint 2 defines x_{L_i} directly as a linear combination
+            // of the gate output, rather than allocating x_{L_i} and
+            // constraining it equal to this same expression:
+            // x_{L_i} = s_i^2 - x_{L_{i-1}} - x_{Δ_i}
             let (_, _, out2) = cs.multiply(s_var.into(), s_var.into());
-            cs.constrain(out2 - (x_prev + x_l + dx_i.clone()));
+            let mut x_l = out2 - x_prev.clone() - dx_i;
 
-            // Constraint 3: s_i * (x_{L_{i-1}} - x_{L_i}) = y_{L_{i-1}} + y_{L_i}
+            // Constraint 3 defines y_{L_i} the same way:
+            // y_{L_i} = s_i * (x_{L_{i-1}} - x_{L_i}) - y_{L_{i-1}}
+            let denom_result = x_prev - x_l.clone();
             let (_, _, out3) = cs.multiply(s_var.into(), denom_result);
-            cs.constrain(out3 - (y_prev + y_l));
+            let mut y_l = out3 - y_prev;
+
+            // An un-checkpointed running point grows the term count of
+            // x_l/y_l by a constant amount every iteration, since each
+            // iteration's definition embeds the previous one. Left
+            // unchecked over the full 256-step chain this makes every
+            // subsequent `multiply()` evaluation (and the final flattened
+            // constraint) increasingly expensive. Every
+            // `CHORD_CHECKPOINT_INTERVAL` steps, and unconditionally on the
+            // last step (so the gadget always has a `Variable` pair to
+            // return), materialize the running point as a fresh allocated
+            // pair and resume accumulating from that 1-term LC.
+            if i % CHORD_CHECKPOINT_INTERVAL == 0 || i == lambda {
+                let (x_ck_assign, y_ck_assign) = witness.map(|w| w.l_coords[i]).unzip();
+                let x_ck = cs.allocate(x_ck_assign)?;
+                let y_ck = cs.allocate(y_ck_assign)?;
+                cs.constrain(x_l - x_ck);
+                cs.constrain(y_l - y_ck);
+                x_l = x_ck.into();
+                y_l = y_ck.into();
+                checkpoint = Some((x_ck, y_ck));
+            }
 
             x_prev = x_l;
             y_prev = y_l;
         }
 
+        // The loop always visits `i == lambda` on its last iteration, which
+        // unconditionally checkpoints, so `checkpoint` is always populated
+        // here (lambda >= 1 is guaranteed by the length check above).
+        let (x_final, y_final) =
+            checkpoint.expect("final loop iteration always checkpoints the running point");
+
         if let Some((result_x, result_y)) = result {
             // Final full-point binding: L_λ = (result_x, result_y).
-            cs.constrain(x_prev - result_x);
-            cs.constrain(y_prev - result_y);
+            cs.constrain(x_final - result_x);
+            cs.constrain(y_final - result_y);
         }
 
-        Ok((x_prev, y_prev))
+        Ok((x_final, y_final))
     }
 
     fn chord_exponentiate_r1cs<CS: ConstraintSystem<R1csCycle>>(
@@ -1172,8 +1211,8 @@ pub mod secp_secq {
     // ------------------------------------------------------------------
 
     /// Bulletproofs generator capacity for the one-receiver relation.
-    /// Bit-decomp uses 514 multiplier gates; each chord-rule uses 1153.
-    /// Total 2820, padded to 8192 for the inner-product layer.
+    /// Bit-decomp uses 514 multiplier gates; each chord-rule uses 912.
+    /// Total 2338, padded to 8192 for the inner-product layer.
     const R1CS_GENS_CAPACITY: usize = 8192;
 
     /// Process-wide cache for the single-receiver `BulletproofGens`.
@@ -1619,11 +1658,11 @@ pub mod secp_secq {
 
     /// Multipliers shared by every batched circuit: the dealer secret's
     /// canonical bit decomposition and the `g^sk = PK_1` exponentiation.
-    const BATCHED_SHARED_MULTIPLIERS: usize = 1_668;
+    const BATCHED_SHARED_MULTIPLIERS: usize = 1_427;
     /// Multipliers added by one non-identity Feldman coefficient opening.
-    const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 1_668;
+    const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 1_427;
     /// Multipliers added by one receiver relation.
-    const BATCHED_RECEIVER_MULTIPLIERS: usize = 8_915;
+    const BATCHED_RECEIVER_MULTIPLIERS: usize = 7_469;
 
     /// Count multipliers from the exact public circuit shape.
     fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
