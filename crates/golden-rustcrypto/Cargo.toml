@@ -1,6 +1,6 @@
 [package]
 name = "golden-rustcrypto"
-version = "0.2.0"
+version = "0.3.0"
 description = "RustCrypto group adapters for Golden distributed key generation"
 edition.workspace = true
 homepage.workspace = true

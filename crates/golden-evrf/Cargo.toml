@@ -1,6 +1,6 @@
 [package]
 name = "golden-evrf"
-version = "0.2.0"
+version = "0.3.0"
 description = "Verifiable random function proof backends for Golden distributed key generation"
 edition.workspace = true
 homepage.workspace = true

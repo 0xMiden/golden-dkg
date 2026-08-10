@@ -368,7 +368,7 @@ fn evrf_batched_dealer_rejects_proof_replay_across_dealer_keys() {
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn evrf_batched_dealer_four_receivers_verifies() {
     // Regression for generator sizing: this two-coefficient, four-receiver
-    // shape uses 51,031 multipliers and therefore needs 65,536 generators.
+    // shape uses 44,883 multipliers and therefore needs 65,536 generators.
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C9);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 4);
