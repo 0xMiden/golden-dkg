@@ -177,6 +177,24 @@ jobs:
       - name: Test golden-evrf Secp/Secq backend
         run: cargo nextest run -p golden-evrf --features "$EVRF_FEATURES"
 
+  fixture-check:
+    name: Bench fixtures still valid
+    runs-on: warp-ubuntu-latest-x64-8x
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Check checked-in dealer-message fixtures still verify
+        run: |
+          cargo run --profile optimized --example check_bench_fixtures \
+            --features golden-evrf/halo2curves-secp256k1,golden-evrf/parallel
+
   doc:
     name: Docs
     runs-on: ubuntu-latest

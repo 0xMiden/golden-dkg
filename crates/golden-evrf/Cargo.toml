@@ -106,5 +106,9 @@ required-features = ["halo2curves-secp256k1", "parallel"]
 name = "warm_bench_fixtures"
 required-features = ["halo2curves-secp256k1", "parallel"]
 
+[[example]]
+name = "check_bench_fixtures"
+required-features = ["halo2curves-secp256k1", "parallel"]
+
 [lints]
 workspace = true
