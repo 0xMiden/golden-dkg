@@ -113,8 +113,8 @@ pub mod secp_secq {
 
     /// Versioned proof-stream grammar for the standalone one-receiver relation.
     const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v3";
-    /// Proof protocol identifier for the batched dealer relation and v4 stream grammar.
-    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v4";
+    /// Proof protocol identifier for the batched dealer relation and v5 stream grammar.
+    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v5";
 
     type GinStreamCurve = CycleCurve<Secp256k1Cycle>;
     type GoutStreamCurve = CycleCurve<R1csCycle>;
@@ -173,8 +173,8 @@ pub mod secp_secq {
     //
     // One dealer message covers all non-self receivers in a single R1CS
     // relation. The dealer identity secret `sk_1` and public key `PK_1` are
-    // shared across the batch; per-receiver eVRF intermediates, pads, and
-    // shares stay private witnesses.
+    // shared across the batch; per-receiver eVRF intermediates and pads stay
+    // private witnesses.
     // ------------------------------------------------------------------
 
     /// Per-receiver public inputs for the batched dealer proof.
@@ -390,8 +390,6 @@ pub mod secp_secq {
         pub sk1: GinScalar,
         /// Dealer polynomial coefficients in ascending degree order.
         pub coefficient_scalars: Vec<GinScalar>,
-        /// Receiver shares in the same order as the public statement.
-        pub shares: Vec<GinScalar>,
     }
 
     impl core::fmt::Debug for BatchedEvrfWitness {
@@ -399,7 +397,6 @@ pub mod secp_secq {
             f.debug_struct("BatchedEvrfWitness")
                 .field("sk1", &"<redacted>")
                 .field("coefficient_scalars", &"<redacted>")
-                .field("shares", &"<redacted>")
                 .finish()
         }
     }
@@ -1844,7 +1841,7 @@ pub mod secp_secq {
     /// Multipliers added by one non-identity Feldman coefficient opening.
     const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 1_099;
     /// Multipliers added by one receiver relation.
-    const BATCHED_RECEIVER_MULTIPLIERS: usize = 4_661;
+    const BATCHED_RECEIVER_MULTIPLIERS: usize = 3_563;
 
     /// Count multipliers from the exact public circuit shape.
     fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
@@ -1857,11 +1854,12 @@ pub mod secp_secq {
         let receivers = receiver_count
             .checked_mul(BATCHED_RECEIVER_MULTIPLIERS)
             .ok_or(Error::ProofVerificationFailed)?;
-        // The shared prefix and each coefficient gadget make an odd number
-        // of `allocate` calls. Each adjacent pair therefore shares one
-        // multiplier slot in the constraint system.
+        // The shared prefix, each coefficient gadget, and each receiver slot
+        // make an odd number of `allocate` calls. Each adjacent pair therefore
+        // shares one multiplier slot in the constraint system.
         let shared_allocations = threshold
-            .checked_add(1)
+            .checked_add(receiver_count)
+            .and_then(|count| count.checked_add(1))
             .ok_or(Error::ProofVerificationFailed)?
             / 2;
         BATCHED_SHARED_MULTIPLIERS
@@ -1899,12 +1897,6 @@ pub mod secp_secq {
         pad: R1csField,
         /// Bits of `pad_j`.
         pad_bits: Vec<Option<R1csField>>,
-        /// Private dealer share `s_j`.
-        share: R1csField,
-        /// Bits of `s_j`.
-        share_bits: Vec<Option<R1csField>>,
-        /// Chord witness for `g_in^s_j`.
-        share_commitment: ChordWitness,
         /// Chord witness for `g_in^pad_j`.
         pad_commitment: ChordWitness,
     }
@@ -2044,8 +2036,6 @@ pub mod secp_secq {
         constrain_bits_lt_bound_when(cs, &pad_bit_vars, pad_bits, &SECP256K1_P_MINUS_Q_LE, reduce)?;
         let pad_window_products = chord_window_products(cs, &pad_bit_vars)?;
 
-        // g_in's chord table is process-wide cached and shared by both
-        // exponentiations against it below (pad and share commitments).
         let precomp_g_in = shared_g_in_chord_precomp();
 
         let (pad_commitment_x, pad_commitment_y) =
@@ -2059,29 +2049,11 @@ pub mod secp_secq {
             witness.map(|w| &w.pad_commitment),
         )?;
 
-        let share_var = cs.allocate(witness.map(|w| w.share))?;
-        let verifier_share_bits = vec![None; K_BITS + 1];
-        let share_bits =
-            witness.map_or(verifier_share_bits.as_slice(), |w| w.share_bits.as_slice());
-        let share_bit_vars = bit_decompose_q(cs, share_var, share_bits)?;
-        let share_window_products = chord_window_products(cs, &share_bit_vars)?;
-        let (share_commitment_x, share_commitment_y) =
-            affine(&rec.share_commitment).map_err(|_| R1CSError::VerificationError)?;
-        chord_exponentiate_r1cs_with_result(
-            cs,
-            &share_bit_vars,
-            precomp_g_in,
-            &share_window_products,
-            Some((share_commitment_x, share_commitment_y)),
-            witness.map(|w| &w.share_commitment),
-        )?;
-
         Ok(())
     }
 
     fn compute_hidden_receiver_witness(
         sk1: &Fq,
-        share: &Fq,
         rec: &BatchedReceiverStatement,
         beta: &Fp,
         h1: &Gin,
@@ -2123,23 +2095,11 @@ pub mod secp_secq {
         {
             return Err(Error::ProofVerificationFailed);
         }
-        let share_commitment = g_in * *share;
-        if Secp256k1Cycle::point_compress(&share_commitment).as_ref()
-            != Secp256k1Cycle::point_compress(&rec.share_commitment).as_ref()
-        {
-            return Err(Error::ProofVerificationFailed);
-        }
-        if g_in * rec.encrypted_share != share_commitment + pad_commitment {
-            return Err(Error::ProofVerificationFailed);
-        }
 
         let mut sk_bits = [false; K_BITS + 1];
         decompose_k_fp(&fq_to_fp(sk1), &mut sk_bits);
         let mut pad_bool_bits = [false; K_BITS + 1];
         decompose_k_fp(&pad, &mut pad_bool_bits);
-        let share_fp = fq_to_fp(share);
-        let mut share_bool_bits = [false; K_BITS + 1];
-        decompose_k_fp(&share_fp, &mut share_bool_bits);
 
         Ok(HiddenReceiverWitness {
             sk_pkj: chord_compute_witness(&sk_bits, &rec.pkj, K_BITS)?,
@@ -2149,9 +2109,6 @@ pub mod secp_secq {
             reduce_q,
             pad,
             pad_bits: bit_options(&pad_bool_bits),
-            share: share_fp,
-            share_bits: bit_options(&share_bool_bits),
-            share_commitment: chord_compute_witness(&share_bool_bits, &g_in, K_BITS)?,
             pad_commitment: chord_compute_witness(&pad_bool_bits, &g_in, K_BITS)?,
         })
     }
@@ -2163,9 +2120,7 @@ pub mod secp_secq {
         rng: &mut impl CryptoRngCore,
         transcript: &mut Transcript,
     ) -> Result<Vec<u8>> {
-        if witness.shares.len() != statement.receivers.len()
-            || witness.coefficient_scalars.len() != statement.commitment_coefficients.len()
-        {
+        if witness.coefficient_scalars.len() != statement.commitment_coefficients.len() {
             return Err(Error::ProofVerificationFailed);
         }
         let g_in = Gin::generator();
@@ -2230,15 +2185,9 @@ pub mod secp_secq {
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
-        for (rec, share) in statement.receivers.iter().zip(witness.shares.iter()) {
-            let rec_witness = compute_hidden_receiver_witness(
-                &witness.sk1,
-                share,
-                rec,
-                &statement.beta,
-                &h1,
-                &h2,
-            )?;
+        for rec in &statement.receivers {
+            let rec_witness =
+                compute_hidden_receiver_witness(&witness.sk1, rec, &statement.beta, &h1, &h2)?;
             build_hidden_receiver_slot(
                 &mut prover,
                 rec,
@@ -2560,7 +2509,6 @@ pub mod secp_secq {
                 .map(|coefficient| g_in * *coefficient)
                 .collect::<Vec<_>>();
 
-            let mut shares = Vec::with_capacity(pkjs.len());
             let receivers: Vec<BatchedReceiverStatement> = pkjs
                 .iter()
                 .enumerate()
@@ -2578,7 +2526,6 @@ pub mod secp_secq {
                     let receiver =
                         ParticipantIndex::new((j as u32) + 1).expect("nonzero receiver index");
                     let share = GinScalar::from((j as u64) + 11);
-                    shares.push(share);
                     BatchedReceiverStatement {
                         receiver,
                         pkj,
@@ -2607,7 +2554,6 @@ pub mod secp_secq {
             let witness = BatchedEvrfWitness {
                 sk1,
                 coefficient_scalars,
-                shares,
             };
             (statement, witness)
         }
@@ -2749,12 +2695,15 @@ pub mod secp_secq {
         #[test]
         fn batched_parameter_setup_matches_verifier_metrics() {
             let threshold = 3;
-            let receiver_count = 1;
-            let pkj = Gin::generator() * GinScalar::from(3u64);
+            let receiver_count = 2;
+            let pkjs = [
+                Gin::generator() * GinScalar::from(3u64),
+                Gin::generator() * GinScalar::from(5u64),
+            ];
             let (mut statement, _) = testing::build_batched(
                 &[0x42; MESSAGE_BYTES],
                 GinScalar::from(7u64),
-                &[pkj],
+                &pkjs,
                 R1csField::from(11u64),
             );
             statement.threshold = threshold;
@@ -2944,117 +2893,6 @@ pub mod secp_secq {
             assert!(
                 run_conditional_pad_bound(wrapped_pad, R1csField::ONE).is_err(),
                 "reduce=1 must reject pad values where pad + q wraps modulo p"
-            );
-        }
-
-        #[test]
-        #[ignore = "slow: builds a full batched-dealer R1CS proof"]
-        fn batched_receiver_slot_rejects_share_not_opening_commitment() {
-            let mut rng = ChaCha20Rng::seed_from_u64(0x5A11_0F00);
-            let sk1 = GinScalar::from(3u64);
-            let pkj = Gin::generator() * GinScalar::from(5u64);
-            let msg = [0x42u8; MESSAGE_BYTES];
-            let beta = R1csField::from(7u64);
-            let (statement, witness) = testing::build_batched(&msg, sk1, &[pkj], beta);
-            let rec = &statement.receivers[0];
-            let g_in = Gin::generator();
-            let h1 = h_gin_1(&statement.msg);
-            let h2 = h_gin_2(&statement.msg);
-            let precomp_h1 = precompute_chord(&h1, K_BITS).expect("H1 precompute");
-            let precomp_h2 = precompute_chord(&h2, K_BITS).expect("H2 precompute");
-
-            let mut rec_witness = compute_hidden_receiver_witness(
-                &witness.sk1,
-                &witness.shares[0],
-                rec,
-                &statement.beta,
-                &h1,
-                &h2,
-            )
-            .expect("honest hidden receiver witness");
-
-            let wrong_share = witness.shares[0] + GinScalar::ONE;
-            let wrong_share_fp = fq_to_fp(&wrong_share);
-            let mut wrong_share_bits = [false; K_BITS + 1];
-            decompose_k_fp(&wrong_share_fp, &mut wrong_share_bits);
-            rec_witness.share = wrong_share_fp;
-            rec_witness.share_bits = bit_options(&wrong_share_bits);
-            rec_witness.share_commitment = chord_compute_witness(&wrong_share_bits, &g_in, K_BITS)
-                .expect("wrong share commitment witness");
-
-            let params = BatchedEvrfPublicParams::setup(1, 1).expect("public parameter setup");
-            let pc_gens = PedersenGens::<R1csCycle>::default();
-            let mut prover_stream = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
-            observe_batched_statement(&mut prover_stream, &statement).expect("statement");
-            let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, prover_stream.transcript_mut());
-            let sk_fp = fq_to_fp(&witness.sk1);
-            let mut sk_bits = [false; K_BITS + 1];
-            decompose_k_fp(&sk_fp, &mut sk_bits);
-            let sk_var = prover.allocate(Some(sk_fp)).expect("allocate sk");
-            let sk_bit_vars = bit_decompose_q(&mut prover, sk_var, &bit_options(&sk_bits))
-                .expect("sk bit decomposition");
-            let sk_window_products =
-                chord_window_products(&mut prover, &sk_bit_vars).expect("sk window products");
-
-            let pk1_precomp = precompute_chord(&g_in, K_BITS).expect("PK1 precompute");
-            let (pk1_x, pk1_y) = affine(&statement.pk1).expect("PK1 affine");
-            chord_exponentiate_r1cs_with_result(
-                &mut prover,
-                &sk_bit_vars,
-                &pk1_precomp,
-                &sk_window_products,
-                Some((pk1_x, pk1_y)),
-                Some(&chord_compute_witness(&sk_bits, &g_in, K_BITS).expect("PK1 witness")),
-            )
-            .expect("PK1 constraint");
-            build_hidden_receiver_slot(
-                &mut prover,
-                rec,
-                &sk_bit_vars,
-                &sk_window_products,
-                &precomp_h1,
-                &precomp_h2,
-                statement.beta,
-                Some(&rec_witness),
-            )
-            .expect("receiver slot");
-
-            let proof = prover.prove(&params.bp_gens, &mut rng).expect("prove");
-            let mut verifier_stream = ProverProofStream::new(BATCHED_PROOF_ID).expect("stream");
-            observe_batched_statement(&mut verifier_stream, &statement).expect("statement");
-            let mut verifier = Verifier::<R1csCycle, _>::new(verifier_stream.transcript_mut());
-            let sk_var = verifier.allocate(None).expect("allocate verifier sk");
-            let verifier_sk_bits = vec![None; K_BITS + 1];
-            let sk_bit_vars = bit_decompose_q(&mut verifier, sk_var, &verifier_sk_bits)
-                .expect("verifier sk bit decomposition");
-            let sk_window_products = chord_window_products(&mut verifier, &sk_bit_vars)
-                .expect("verifier sk window products");
-            chord_exponentiate_r1cs_with_result(
-                &mut verifier,
-                &sk_bit_vars,
-                &pk1_precomp,
-                &sk_window_products,
-                Some((pk1_x, pk1_y)),
-                None,
-            )
-            .expect("verifier PK1 constraint");
-            build_hidden_receiver_slot(
-                &mut verifier,
-                rec,
-                &sk_bit_vars,
-                &sk_window_products,
-                &precomp_h1,
-                &precomp_h2,
-                statement.beta,
-                None,
-            )
-            .expect("verifier receiver slot");
-
-            assert!(
-                verifier
-                    .verify(&proof, &pc_gens, &params.bp_gens, &mut rng)
-                    .is_err(),
-                "R1CS must reject a hidden share that does not open share_commitment"
             );
         }
 
@@ -3645,10 +3483,10 @@ pub mod secp_secq {
             assert_eq!(
                 checkpoint,
                 [
-                    74, 178, 166, 223, 40, 64, 81, 117, 233, 243, 69, 141, 20, 168, 65, 42, 84, 76,
-                    108, 77, 118, 203, 112, 132, 192, 8, 182, 87, 248, 71, 238, 108, 231, 210, 25,
-                    152, 136, 74, 146, 59, 156, 52, 118, 202, 215, 80, 158, 187, 241, 48, 225, 13,
-                    248, 110, 197, 72, 140, 74, 90, 130, 119, 238, 198, 81,
+                    79, 200, 236, 164, 117, 125, 234, 243, 140, 173, 156, 99, 212, 3, 63, 161, 148,
+                    165, 242, 21, 103, 6, 165, 22, 87, 13, 14, 81, 35, 83, 214, 173, 11, 18, 98,
+                    235, 5, 96, 100, 56, 211, 162, 198, 48, 112, 57, 70, 114, 212, 92, 176, 120,
+                    99, 1, 66, 51, 200, 34, 9, 200, 38, 144, 19, 93,
                 ]
             );
 

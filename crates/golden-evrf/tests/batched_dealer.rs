@@ -33,7 +33,7 @@ fn public_params(
 
 #[test]
 #[ignore = "slow: pins the complete batched dealer proof stream"]
-fn evrf_batched_dealer_matches_v4_vector() {
+fn evrf_batched_dealer_matches_v5_vector() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0002);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 1);
@@ -47,7 +47,7 @@ fn evrf_batched_dealer_matches_v4_vector() {
 
     assert_eq!(
         proof.as_slice(),
-        include_bytes!("vectors/paper-batched-dealer-v4.bin")
+        include_bytes!("vectors/paper-batched-dealer-v5.bin")
     );
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_batched_verify(
@@ -89,15 +89,8 @@ fn evrf_batched_dealer_rejects_identity_share_commitment() {
     let pkjs = make_pkjs(&mut rng, 1);
     let beta = R1csField::from(7u64);
     let msg = make_msg(0xABCE);
-    let (mut statement, mut witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
-
-    let pad = statement.receivers[0].encrypted_share - witness.shares[0];
-    witness.shares[0] = GinScalar::ZERO;
-    witness.coefficient_scalars = vec![GinScalar::ZERO];
-    statement.threshold = 1;
-    statement.commitment_coefficients = vec![Gin::identity()];
+    let (mut statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
     statement.receivers[0].share_commitment = Gin::identity();
-    statement.receivers[0].encrypted_share = pad;
 
     assert!(
         paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)
@@ -368,7 +361,7 @@ fn evrf_batched_dealer_rejects_proof_replay_across_dealer_keys() {
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn evrf_batched_dealer_four_receivers_verifies() {
     // Regression for generator sizing: this two-coefficient, four-receiver
-    // shape uses 21,940 multipliers and therefore needs 32,768 generators.
+    // shape uses 17,546 multipliers and therefore needs 32,768 generators.
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C9);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 4);
