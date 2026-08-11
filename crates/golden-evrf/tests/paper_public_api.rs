@@ -49,10 +49,10 @@ fn minimal_evrf_statement() -> EvrfStatement<Secp256k1GoldenGroup> {
 }
 
 #[test]
-fn batched_backend_uses_v6_proof_protocol_identifier() {
+fn batched_backend_uses_v7_proof_protocol_identifier() {
     assert_eq!(
         <SecpSecqBackend as EvrfProofBackend<Secp256k1GoldenGroup>>::PROOF_ID,
-        b"golden-paper-evrf-batched-v6"
+        b"golden-paper-evrf-batched-v7"
     );
 }
 

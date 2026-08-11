@@ -127,12 +127,22 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
             .map(|coefficient| coefficient.0)
             .collect();
         let sk1 = witnesses[0].identity_secret.0;
+        let polynomial_coefficients = &witnesses[0].polynomial_coefficients;
+        if polynomial_coefficients.len() != threshold {
+            return Err(Error::ProofVerificationFailed);
+        }
+        let polynomial_constant = polynomial_coefficients
+            .first()
+            .ok_or(Error::ProofVerificationFailed)?
+            .0;
 
         let mut receivers = Vec::with_capacity(statements.len());
         let mut statement_roots = Vec::with_capacity(statements.len());
         for (statement, witness) in statements.iter().zip(witnesses.iter()) {
             ensure_same_batch_context(statement, first)?;
-            if witness.identity_secret.0 != sk1 {
+            if witness.identity_secret.0 != sk1
+                || witness.polynomial_coefficients.as_slice() != polynomial_coefficients.as_slice()
+            {
                 return Err(Error::ProofVerificationFailed);
             }
 
@@ -157,7 +167,10 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
             statement_roots,
             receivers,
         };
-        let batched_witness = BatchedEvrfWitness { sk1 };
+        let batched_witness = BatchedEvrfWitness {
+            sk1,
+            polynomial_constant,
+        };
         let params = BatchedEvrfPublicParams::shared(threshold, batched_statement.receivers.len())?;
         evrf_batched_prove(&params, &batched_statement, &batched_witness, rng)
     }

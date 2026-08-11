@@ -33,7 +33,7 @@ fn public_params(
 
 #[test]
 #[ignore = "slow: pins the complete batched dealer proof stream"]
-fn evrf_batched_dealer_matches_v6_vector() {
+fn evrf_batched_dealer_matches_v7_vector() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0002);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 1);
@@ -47,7 +47,7 @@ fn evrf_batched_dealer_matches_v6_vector() {
 
     assert_eq!(
         proof.as_slice(),
-        include_bytes!("vectors/paper-batched-dealer-v6.bin")
+        include_bytes!("vectors/paper-batched-dealer-v7.bin")
     );
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_batched_verify(
@@ -107,14 +107,15 @@ fn evrf_batched_dealer_accepts_identity_coefficient_commitment() {
     let pkjs = make_pkjs(&mut rng, 1);
     let beta = R1csField::from(7u64);
     let msg = make_msg(0xABCF);
-    let (mut statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+    let (mut statement, mut witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
 
     statement.commitment_coefficients =
         vec![Gin::identity(), Gin::generator() * GinScalar::from(11u64)];
+    witness.polynomial_constant = GinScalar::ZERO;
 
     let proof =
         paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)
-            .expect("prove without coefficient scalar witnesses");
+            .expect("prove zero constant coefficient");
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_batched_verify(
         &public_params(&statement),
