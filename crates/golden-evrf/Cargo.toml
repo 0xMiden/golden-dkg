@@ -102,5 +102,9 @@ name = "batched_setup"
 harness = false
 required-features = ["halo2curves-secp256k1", "parallel"]
 
+[[example]]
+name = "warm_bench_fixtures"
+required-features = ["halo2curves-secp256k1", "parallel"]
+
 [lints]
 workspace = true

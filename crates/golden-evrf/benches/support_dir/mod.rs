@@ -14,10 +14,9 @@
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
 #![allow(dead_code)]
+#![allow(unused_imports)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::type_complexity)]
-
-use std::collections::BTreeMap;
 
 use golden_core::{
     DkgConfig, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
@@ -157,26 +156,5 @@ pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfPublicParams, BatchedEvrfSta
     (params, statement, proof)
 }
 
-/// Run a full DKG Round 0 for `n` participants and return all `n` dealings.
-/// Each dealing carries one batched eVRF proof over `n - 1` receivers.
-pub fn round0_all_dealings(
-    config: &DkgConfig<Secp256k1GoldenGroup>,
-) -> BTreeMap<ParticipantIndex, golden_core::DkgDealing<Secp256k1GoldenGroup>> {
-    use golden_core::create_dealing;
-    use golden_evrf::paper::secp_secq::SecpSecqBackend;
-    let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
-    config
-        .registry
-        .indexes()
-        .map(|dealer| {
-            let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                dealer,
-                &identity_secret(dealer),
-                config,
-                &mut rng,
-            )
-            .unwrap();
-            (dealer, dealing)
-        })
-        .collect()
-}
+mod fixture_cache;
+pub use fixture_cache::{cached_dealer_messages, cached_round1_setup};

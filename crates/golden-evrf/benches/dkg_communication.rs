@@ -28,11 +28,8 @@
 mod support;
 
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
-use golden_core::{create_dealing, wire::WireEncode};
-use golden_evrf::paper::secp_secq::SecpSecqBackend;
-use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
-use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-use support::{build_config, identity_secret, idx, BENCH_SEED, SLOW_SAMPLE_SIZE};
+use golden_core::wire::WireEncode;
+use support::{build_config, idx, SLOW_SAMPLE_SIZE};
 
 /// Subset of `N_VALUES` for which setup is cheap enough to run eagerly.
 /// Building one dealer message at `n = 100` takes ~36s; the wire-size curve
@@ -43,15 +40,8 @@ fn dkg_communication(c: &mut Criterion) {
     for &n in N_COMM_SWEEP {
         let config = build_config(n, n - 1);
         let dealer = idx(1);
-        let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
-        let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-            dealer,
-            &identity_secret(dealer),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let bytes = dealing.message.to_nested_wire_bytes().len();
+        let messages = support::cached_dealer_messages(&config);
+        let bytes = messages[&dealer].to_nested_wire_bytes().len();
         let mut group = c.benchmark_group(format!("dkg-communication/secp256k1/{n}"));
         group.sample_size(SLOW_SAMPLE_SIZE);
         group.sampling_mode(SamplingMode::Flat);

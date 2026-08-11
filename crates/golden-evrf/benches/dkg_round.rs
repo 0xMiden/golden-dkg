@@ -26,11 +26,11 @@
 //! separate diagnostic measurements. `GOLDEN_TABLE5_N_VALUES` may select a
 //! comma-separated row subset.
 //!
-//! Setup (`round0_all_dealings` builds `n` proofs for Round 1) runs inside
-//! `bench_with_input`'s routine body so criterion's regex filter can skip
-//! the expensive setup for benchmarks the user did not select. At `n = 100`
-//! Round 1 setup is roughly 100x the Round 0 cost, i.e. about an hour; use
-//! the filter to run only small `n` unless you have time.
+//! Setup (building `n` proofs for Round 1) runs inside `bench_with_input`'s
+//! routine body so criterion's regex filter can skip the expensive setup
+//! for benchmarks the user did not select. It is backed by the on-disk
+//! fixture cache in `support_dir/fixture_cache.rs`, so only the first run
+//! for a given `(n, seed)` pays the full ~100x-Round-0 cost.
 
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
@@ -39,18 +39,13 @@
 #[path = "support_dir/mod.rs"]
 mod support;
 
-use std::collections::BTreeMap;
-
 use codspeed_criterion_compat as criterion;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode};
-use golden_core::{complete, create_dealing, DealerMessage};
+use golden_core::{complete, create_dealing};
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-use support::{
-    build_config, identity_secret, idx, round0_all_dealings, table5_n_values, BENCH_SEED,
-    SLOW_SAMPLE_SIZE,
-};
+use support::{build_config, identity_secret, idx, table5_n_values, BENCH_SEED, SLOW_SAMPLE_SIZE};
 
 /// Per-participant Round 0: one dealer builds its dealing.
 fn dkg_round0(c: &mut Criterion) {
@@ -87,27 +82,14 @@ fn dkg_round1(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     for n in table5_n_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
-            // Expensive setup: build all `n` dealer messages. At n=100 this
-            // is ~100x the per-dealer Round 0 cost. Runs only when criterion
-            // selects this bench.
+            // Expensive setup: build all `n` dealer messages. Backed by the
+            // fixture cache (see `support_dir/fixture_cache.rs`), so this is
+            // only "expensive" on the first run for a given `(n, seed)`.
+            // Runs only when criterion selects this bench.
             let config = build_config(n, n - 1);
-            let dealings = round0_all_dealings(&config);
             let receiver = idx(n as u32);
             let secret = identity_secret(receiver);
-            let own_dealing = dealings.get(&receiver).cloned().unwrap();
-            let peer_dealings: BTreeMap<
-                golden_core::ParticipantIndex,
-                DealerMessage<Secp256k1GoldenGroup>,
-            > = dealings
-                .iter()
-                .filter_map(|(dealer, dealing)| {
-                    if *dealer == receiver {
-                        None
-                    } else {
-                        Some((*dealer, dealing.message.clone()))
-                    }
-                })
-                .collect();
+            let (own_dealing, peer_dealings) = support::cached_round1_setup(&config, receiver);
             // Sanity: receiver must complete successfully before timing.
             complete::<Secp256k1GoldenGroup, SecpSecqBackend>(
                 receiver,
@@ -148,22 +130,8 @@ fn dkg_total(c: &mut Criterion) {
         let config = build_config(n, n - 1);
         let participant = idx(n as u32);
         let secret = identity_secret(participant);
-        let mut setup_rng = ChaCha20Rng::from_seed(BENCH_SEED);
-        let peer_dealings: BTreeMap<_, _> = config
-            .registry
-            .indexes()
-            .filter(|dealer| *dealer != participant)
-            .map(|dealer| {
-                let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                    dealer,
-                    &identity_secret(dealer),
-                    &config,
-                    &mut setup_rng,
-                )
-                .unwrap();
-                (dealer, dealing.message)
-            })
-            .collect();
+        let mut peer_dealings = support::cached_dealer_messages(&config);
+        peer_dealings.remove(&participant);
 
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter_batched(

@@ -1,4 +1,6 @@
-//! Table 4 proof-size columns.
+//! Table 4 proof-size columns: wire byte count of one batched eVRF proof
+//! ("|pi|") and the concatenated size of `n_e` independent proofs ("n_e
+//! proofs"), reported via criterion's `Throughput::Bytes`.
 //!
 //! Reports the wire byte count of one batched eVRF proof (the "|pi|"
 //! column) and the concatenated size of `n_e` independent proofs (the
@@ -33,11 +35,7 @@
 mod support;
 
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
-use golden_core::create_dealing;
-use golden_evrf::paper::secp_secq::SecpSecqBackend;
-use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
-use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-use support::{build_config, identity_secret, idx, BENCH_SEED, SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD};
+use support::{build_config, idx, SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD};
 
 /// Subset of `NE_VALUES` for which we actually build proofs. Larger `n_e`
 /// takes minutes per proof and adds little size information because the
@@ -48,38 +46,21 @@ const NE_SIZE_SWEEP: &[usize] = &[1, 9];
 /// covers `n - 1` receivers.
 fn one_dealer_proof_bytes(n: usize) -> usize {
     let config = build_config(n, TABLE4_THRESHOLD);
-    let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
     let dealer = idx(1);
-    let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-        dealer,
-        &identity_secret(dealer),
-        &config,
-        &mut rng,
-    )
-    .unwrap();
-    dealing.message.proof.len()
+    support::cached_dealer_messages(&config)[&dealer]
+        .proof
+        .len()
 }
 
 /// Build `n_e` independent dealer proofs in an `(n_e + 1)`-participant DKG.
 fn n_independent_proof_byte_sizes_total(n_e: usize) -> usize {
     let n = n_e + 1;
     let config = build_config(n, TABLE4_THRESHOLD);
-    let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
     let receiver = idx(n as u32);
-    config
-        .registry
-        .indexes()
-        .filter(|dealer| *dealer != receiver)
-        .map(|dealer| {
-            let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                dealer,
-                &identity_secret(dealer),
-                &config,
-                &mut rng,
-            )
-            .unwrap();
-            dealing.message.proof.len()
-        })
+    support::cached_dealer_messages(&config)
+        .into_iter()
+        .filter(|(dealer, _)| *dealer != receiver)
+        .map(|(_, message)| message.proof.len())
         .sum()
 }
 
