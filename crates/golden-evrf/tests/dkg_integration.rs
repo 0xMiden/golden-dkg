@@ -76,6 +76,21 @@ fn two_participant_config() -> DkgConfig<Secp256k1GoldenGroup> {
     .unwrap()
 }
 
+fn single_participant_config() -> DkgConfig<Secp256k1GoldenGroup> {
+    let registry = ParticipantRegistry::new(vec![(
+        idx(1),
+        Secp256k1GoldenGroup::mul_generator(&identity_secret(idx(1))),
+    )])
+    .unwrap();
+    DkgConfig::new(
+        1,
+        SessionId([42u8; 32]),
+        Secp256k1Scalar::from_u64(77).unwrap(),
+        registry,
+    )
+    .unwrap()
+}
+
 fn tamper_element(
     point: &<Secp256k1GoldenGroup as GoldenGroup>::Element,
 ) -> <Secp256k1GoldenGroup as GoldenGroup>::Element {
@@ -213,6 +228,39 @@ fn assert_dkg_completes(config: DkgConfig<Secp256k1GoldenGroup>, decode_messages
         Secp256k1GoldenGroup::mul_generator(&output.secret_share.value)
     );
     assert_eq!(output.public_key_shares.len(), participant_count);
+}
+
+#[test]
+fn single_participant_dkg_completes_without_proving() {
+    let config = single_participant_config();
+    let dealer = idx(1);
+    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+
+    let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
+        dealer,
+        &identity_secret(dealer),
+        &config,
+        &mut rng,
+    )
+    .unwrap();
+    assert!(dealing.message.proof.is_empty());
+    assert!(dealing.message.encrypted_shares.is_empty());
+
+    verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config).unwrap();
+
+    let output = complete::<Secp256k1GoldenGroup, SecpSecqBackend>(
+        dealer,
+        &identity_secret(dealer),
+        &dealing,
+        &BTreeMap::new(),
+        &config,
+    )
+    .unwrap();
+    assert_eq!(
+        output.public_key,
+        Secp256k1GoldenGroup::mul_generator(&output.secret_share.value)
+    );
+    assert_eq!(output.public_key_shares.len(), 1);
 }
 
 #[test]
