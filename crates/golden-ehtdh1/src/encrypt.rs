@@ -8,7 +8,8 @@ use chacha20::{
 };
 use golden_core::{GoldenGroup, GoldenHashToGroup, GoldenScalar, TranscriptBuilder};
 use hkdf::Hkdf;
-use rand_core::{CryptoRng, RngCore};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{CryptoRng, RngCore, SeedableRng};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -52,10 +53,61 @@ impl<G: GoldenHashToGroup> SealingKey<G> {
         plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<Ciphertext<G>, Error> {
-        // Paper scalars `r, r' in Zq`.
         let r = random_nonzero_scalar::<G, _>(rng);
         let r_prime = random_nonzero_scalar::<G, _>(rng);
+        self.seal_bytes_with_scalars(plaintext, associated_data, r, r_prime)
+    }
 
+    /// Seal bytes with associated data, deriving `r` from a 32-byte seed.
+    ///
+    /// For a given sealing key, the seed determines `R` independently of the
+    /// plaintext, associated data, and caller RNG. Golden binds the backend and
+    /// joint public key into its internal `r` derivation, but it does not bind the
+    /// application transaction, disclosure-scope ID, associated data, plaintext,
+    /// or setup epoch. Callers should derive the supplied seed with an
+    /// application/protocol/version domain and inputs including the transaction or
+    /// disclosure-scope identity, a high-entropy nonce, a private-payload
+    /// commitment where appropriate, and the application setup epoch or identity
+    /// where relevant. Validators cannot verify caller-provided entropy, and public
+    /// `R = rG` permits offline testing of low-entropy seed candidates.
+    ///
+    /// Reusing the same seed and key reuses both `R` and the payload mask. For
+    /// siblings `c_1 = m_1 XOR mask` and `c_2 = m_2 XOR mask`, an observer learns
+    /// `c_1 XOR c_2 = m_1 XOR m_2`. Disclosure-scope mode does not make this safe
+    /// for arbitrary structured or correlated plaintexts. Its motivating use
+    /// requires independently uniform, fixed-length content keys, whose XOR does
+    /// not reveal useful plaintext structure to a ciphertext-only observer.
+    ///
+    /// This does not protect against known plaintext: a party that knows one
+    /// plaintext and wrapped payload can recover the common mask and open every
+    /// same-seed sibling. Anyone who learns or guesses the seed can derive `r`,
+    /// compute `rX`, and do the same without threshold shares. Use seed reuse only
+    /// within one intentional disclosure scope satisfying this payload contract.
+    ///
+    /// The caller RNG must provide a fresh `r'` for every encryption. Reusing this
+    /// Schnorr nonce across distinct proof statements reveals `r` when their
+    /// challenges differ. Anyone learning `r` can compute `rX` from the public key
+    /// and open every payload using that seeded `r`; nonce reuse is therefore a
+    /// confidentiality failure, not merely a proof failure.
+    pub fn seal_bytes_with_associated_data_and_seed<R: RngCore + CryptoRng>(
+        &self,
+        rng: &mut R,
+        plaintext: &[u8],
+        associated_data: &[u8],
+        seed: &[u8; 32],
+    ) -> Result<Ciphertext<G>, Error> {
+        let r = seeded_ephemeral_scalar::<G>(&self.joint_public_key, seed)?;
+        let r_prime = random_nonzero_scalar::<G, _>(rng);
+        self.seal_bytes_with_scalars(plaintext, associated_data, r, r_prime)
+    }
+
+    fn seal_bytes_with_scalars(
+        &self,
+        plaintext: &[u8],
+        associated_data: &[u8],
+        r: G::Scalar,
+        r_prime: G::Scalar,
+    ) -> Result<Ciphertext<G>, Error> {
         // `R = rG`, `U = rX`, `k = Hkd(R, U)`, and `c = Es(k, m)`.
         let ephemeral_public = G::mul_generator(&r);
         let dh_point = G::mul(&self.joint_public_key, &r);
@@ -247,6 +299,22 @@ fn derive_payload_mask_material<G: GoldenGroup, const N: usize>(
     hkdf.expand(b"golden-ehtdh1-xchacha20-mask-v1", material.as_mut())
         .map_err(|_| Error::InvalidEncoding)?;
     Ok(material)
+}
+
+fn seeded_ephemeral_scalar<G: GoldenGroup>(
+    joint_public_key: &G::Element,
+    seed: &[u8; 32],
+) -> Result<G::Scalar, Error> {
+    let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"seeded-r");
+    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
+    transcript.element::<G>(b"X", joint_public_key);
+
+    let hkdf = Hkdf::<Sha256>::new(Some(b"golden-ehtdh1-r-seed-v1"), seed);
+    let mut rng_seed = Zeroizing::new([0u8; 32]);
+    hkdf.expand(&transcript.root(), rng_seed.as_mut())
+        .map_err(|_| Error::InvalidEncoding)?;
+    let mut rng = ChaCha20Rng::from_seed(*rng_seed);
+    Ok(random_nonzero_scalar::<G, _>(&mut rng))
 }
 
 /// Samples paper scalars such as `r, r' in Zq`, resampling to avoid zero.

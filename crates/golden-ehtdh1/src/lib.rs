@@ -6,14 +6,64 @@
 //! joint public key `X`, public shares `(X_i, Z_i)`, secret shares `(x_i, z_i)`,
 //! and a setup context.
 //!
-//! # Protocol shape
+//! # Seeded sealing
 //!
-//! EHTDH1 uses two independent threshold sharings. The first sharing has
-//! decryption secret `x`. The second sharing has secret zero and binds shares
-//! to context. A validator returns `W_i = x_i R + z_i S`. Here, `R` comes from
-//! the ciphertext, and `S` comes from the setup context and decryption context.
-//! The combiner checks each share against `(X_i, Z_i)` and combines a threshold
-//! set to recover `xR`. It then uses `xR` to unmask the payload.
+//! Sealing normally samples independent encryption scalar `r` and proof nonce
+//! `r'`. [`SealingKey::seal_bytes_with_associated_data_and_seed`] instead derives
+//! `r` from a caller-provided seed, backend, and joint public key while continuing
+//! to sample a fresh `r'` from the caller RNG. Reusing one seed under one sealing
+//! key gives distinct ciphertexts the same `R = rG` and payload mask.
+//!
+//! Common `R` does not make exact-ciphertext shares interchangeable because exact
+//! EHTDH1 still binds each share to the complete ciphertext. The disclosure-scope
+//! extension below separately changes share-binding granularity for applications
+//! that accept the common-`R` capability and repeated-mask contract.
+//!
+//! # Exact-ciphertext EHTDH1
+//!
+//! The paper scheme uses two independent threshold sharings. The first sharing
+//! has decryption secret `x`. The second sharing has secret zero and binds shares
+//! to context. A validator returns `W_i = x_i R + z_i S`, where `R` comes from
+//! the ciphertext and `S = Hdgd(ad, dc, ctxt)` binds the complete ciphertext.
+//! The combiner checks each share against `(X_i, Z_i)`, combines a threshold set
+//! to recover `xR`, and opens that exact ciphertext. Existing [`DecryptionShare`]
+//! and [`Combiner::combine_exact`] / [`Combiner::combine_quorum`] APIs retain
+//! these exact-ciphertext semantics.
+//!
+//! # Disclosure-scope EHTDH1 extension
+//!
+//! [`DisclosureScope`] is a separate extension, not the exact paper scheme. It
+//! holds stable common `R`, associated data, and an application-defined scope ID.
+//! A later [`DisclosureRequest`] borrows that scope and adds one request-specific
+//! decryption context. Request construction describes transcript inputs; it does
+//! not authorize release. Participants may cache secret-bearing `x_iR` in a
+//! [`DecryptionPrecomputation`] before a request exists, reuse it across permitted
+//! requests for that stable scope, and issue fresh [`DisclosureDecryptionShare`]
+//! values with `W_i = x_iR + z_iS_scope,request` and fresh proof nonces.
+//!
+//! Each domain-separated `S_scope,request` must behave as an independent random
+//! group element with no exploitable relation to the generator, `R`, or another
+//! selected point; implementations must not replace hash-to-group with publicly
+//! computable `hash_to_scalar(...) * G`. Security across repeated adaptive requests
+//! is extension intuition and an explicit review assumption, not a claim that the
+//! original EHTDH1 proof directly covers the modified statement.
+//!
+//! Combining a threshold returns an opaque, reusable [`DisclosureKey`] containing
+//! `xR`. **Scope ID and request context determine which shares can reconstruct
+//! `xR`; they do not restrict what `xR` can open after reconstruction.** The key
+//! opens every valid ciphertext with the same `R` and expected associated data,
+//! including ciphertexts Golden cannot know were intended scope members. The
+//! associated-data check in [`DisclosureKey::open`] is defensive API policy, not a
+//! cryptographic restriction on raw `xR`.
+//!
+//! **Scope membership and release authorization are application-layer
+//! responsibilities.** The application release authorizer must authenticate
+//! complete ciphertext envelopes and decide whether participants may issue shares.
+//! Keep precomputed `x_iR` in protected participant storage only for the legitimate
+//! disclosure window; a threshold of those values reconstructs `xR`.
+//!
+//! See the [disclosure-scope protocol and security model](https://github.com/0xMiden/golden-dkg/blob/main/crates/golden-ehtdh1/DISCLOSURE_SCOPE_SECURITY.md)
+//! for transcript compatibility, assumptions, lifecycle, and blast-radius details.
 //!
 //! # Golden setup bridge
 //!
@@ -51,15 +101,28 @@
 //! | `S = Hdgd(ad, dc, ctxt)` | internal `decryption_group` over [`SetupContext::root`] |
 //! | `W_i = x_i R + z_i S` | [`DecryptionShare::share`] |
 //!
+//! The disclosure-scope types are an explicitly separate extension and are not
+//! part of this paper mapping.
+//!
 //! This crate also binds [`SetupContext::root`] into `Hdgd`. That root commits
 //! to the Golden backend id, participant registry root, both DKG session ids,
 //! both DKG transcript roots, and the caller provided epoch.
 //!
 //! # Security goals
 //!
-//! A payload stays hidden unless the combiner receives a threshold of valid
-//! EHTDH1 decryption shares. This assumes sound Golden DKG outputs, group
-//! operations, hash to group, and randomness.
+//! A normally randomized exact-mode payload stays hidden unless the combiner
+//! receives a threshold of valid EHTDH1 decryption shares. This assumes sound
+//! Golden DKG outputs, group operations, random-oracle-style hash to group with
+//! unknown discrete-log relations, and randomness.
+//!
+//! Seeded sealing reuses one payload mask. For siblings `c_1 = m_1 XOR mask` and
+//! `c_2 = m_2 XOR mask`, observers learn `c_1 XOR c_2 = m_1 XOR m_2`; this is
+//! unsafe for arbitrary structured or correlated plaintexts. The motivating
+//! disclosure-scope use requires independently uniform, fixed-length content
+//! keys, for which their XOR reveals no useful structure to ciphertext-only
+//! observers. It does not protect against known plaintext: anyone who derives
+//! `r`, guesses the seed, or learns one wrapped plaintext and its mask can open
+//! every sibling without threshold shares.
 //!
 //! Ciphertext checks reject malformed EHTDH1 encryption proofs. Share checks
 //! reject malformed shares and shares made for the wrong context.
@@ -74,7 +137,25 @@
 //! - supplying the same associated data to encryption and verification paths;
 //! - checking [`Ciphertext::associated_data`] or using the `*_with_associated_data`
 //!   methods when the application expects a specific associated data value;
-//! - supplying the intended decryption context to validators and combiners;
+//! - supplying the intended request-specific decryption context to validators
+//!   and combiners;
+//! - deriving each supplied 32-byte sealing seed with an application/protocol/
+//!   version domain and inputs that include the transaction or disclosure-scope
+//!   identity, a high-entropy nonce, a private-payload commitment where appropriate,
+//!   and the application setup epoch or identity where relevant; Golden binds the
+//!   backend and joint public key internally, but not these application values;
+//! - recognizing that validators cannot verify caller-provided seed entropy and
+//!   that public `R = rG` permits offline testing of low-entropy seed candidates;
+//! - limiting intentional mask reuse to independently uniform, fixed-length
+//!   content keys, never arbitrary structured or correlated plaintexts;
+//! - using a fresh encryption proof nonce `r'` for every encryption, including
+//!   encryptions sharing a seeded `r`; repeating `r'` can reveal `r` and bypass
+//!   threshold decryption for every payload sharing it;
+//! - using fresh disclosure-share proof nonces for every release; repeating them
+//!   across distinct challenges reveals the participant's `x_i` and `z_i`;
+//! - authenticating disclosure-scope membership and externally authorizing release
+//!   before issuing request-bound disclosure shares;
+//! - keeping [`DecryptionPrecomputation`] values in protected participant storage;
 //! - handling replay, validator identity, transport authentication, and
 //!   malformed share reporting outside this crate.
 //!
@@ -98,9 +179,12 @@
 //! networking, accountable decryption, refresh, resharing, TEE custody, replay
 //! prevention.
 //!
-//! [`wire`] defines canonical bytes for setup material, keys, ciphertexts, and
-//! decryption shares. The `miden-serde` and `serde` features adapt those same
-//! bytes to their respective serialization traits.
+//! [`wire`] defines canonical bytes for setup material, keys, ciphertexts, exact
+//! decryption shares, and released disclosure shares. The `miden-serde`
+//! and `serde` features adapt those same bytes to their respective serialization
+//! traits. [`DisclosureScope`], [`DisclosureRequest`], secret-bearing
+//! [`DecryptionPrecomputation`], and [`DisclosureKey`] intentionally have no
+//! public wire encoding.
 //!
 //! # Provided APIs
 //!
@@ -219,6 +303,7 @@
 
 pub mod context;
 pub mod decrypt;
+pub mod disclosure;
 pub mod dkg_bridge;
 pub mod encrypt;
 pub mod wire;
@@ -228,6 +313,10 @@ pub use context::{
     SetupContext,
 };
 pub use decrypt::{Combiner, DecryptionShare, UnsealingShare};
+pub use disclosure::{
+    DecryptionPrecomputation, DisclosureDecryptionShare, DisclosureError, DisclosureKey,
+    DisclosureRequest, DisclosureScope,
+};
 pub use dkg_bridge::{material_from_dkg_outputs, Ehtdh1Material};
 pub use encrypt::{Ciphertext, SealingKey};
 
@@ -440,6 +529,56 @@ mod tests {
 
         let result = combiner.combine_exact(&second, decryption_context, &shares[..2]);
         assert!(matches!(result, Err(CombineError::MalformedShares(ids)) if ids == vec![1, 2]));
+    }
+
+    #[test]
+    fn seed_determines_r_independently_of_encryption_inputs() {
+        let (sealing_key, _, _, _) = material();
+        let mut first_rng = ChaCha20Rng::from_seed([7u8; 32]);
+        let mut second_rng = ChaCha20Rng::from_seed([8u8; 32]);
+        let seed = [42u8; 32];
+
+        let first = sealing_key
+            .seal_bytes_with_associated_data_and_seed(
+                &mut first_rng,
+                &[1u8; 32],
+                b"first associated data",
+                &seed,
+            )
+            .unwrap();
+        let second = sealing_key
+            .seal_bytes_with_associated_data_and_seed(
+                &mut second_rng,
+                &[2u8; 32],
+                b"second associated data",
+                &seed,
+            )
+            .unwrap();
+
+        assert_eq!(first.ephemeral_public, second.ephemeral_public);
+    }
+
+    #[test]
+    fn seeded_encryption_opens_with_threshold_shares() {
+        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
+        let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+        let content_key = [3u8; 32];
+        let message = sealing_key
+            .seal_bytes_with_associated_data_and_seed(
+                &mut rng,
+                &content_key,
+                b"transaction context",
+                &[42u8; 32],
+            )
+            .unwrap();
+        let shares = shares_for(&secret_shares, &setup_context, &message, b"request");
+
+        let opened = Combiner::new(public_key_set, setup_context)
+            .unwrap()
+            .combine_exact(&message, b"request", &shares[..2])
+            .unwrap();
+
+        assert_eq!(opened, content_key);
     }
 
     #[test]

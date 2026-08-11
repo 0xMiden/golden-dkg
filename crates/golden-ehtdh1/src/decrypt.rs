@@ -19,7 +19,7 @@ use crate::encrypt::{apply_payload_mask, random_nonzero_scalar, verify_ciphertex
 /// Validator wrapper around `sk_i = (x_i, z_i)` from paper Section 3.
 #[derive(Clone)]
 pub struct UnsealingShare<G: GoldenHashToGroup> {
-    share: SecretShare<G>,
+    pub(crate) share: SecretShare<G>,
 }
 
 impl<G: GoldenHashToGroup> fmt::Debug for UnsealingShare<G> {
@@ -145,8 +145,8 @@ pub struct DecryptionShare<G: GoldenHashToGroup> {
 /// Combiner for paper `pkc`, checking shares and opening plaintext.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Combiner<G: GoldenHashToGroup> {
-    public_key_set: PublicKeySet<G>,
-    setup_context: SetupContext,
+    pub(crate) public_key_set: PublicKeySet<G>,
+    pub(crate) setup_context: SetupContext,
 }
 
 impl<G: GoldenHashToGroup> Combiner<G> {
@@ -445,7 +445,7 @@ fn share_challenge<G: GoldenGroup>(
 }
 
 /// Paper coefficients `lambda_j^(J)` at 0, used to recover `xR`.
-fn lagrange_at_zero<G: GoldenGroup>(
+pub(crate) fn lagrange_at_zero<G: GoldenGroup>(
     participant: ParticipantIndex,
     participants: impl IntoIterator<Item = ParticipantIndex>,
 ) -> Result<G::Scalar, Error> {
