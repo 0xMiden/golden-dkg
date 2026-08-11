@@ -191,10 +191,19 @@ where
     }
 }
 
-/// Batch size per parallel task in [`Cycle::points_hash_from_uniform`].
-/// Amortizes any one-time hash-to-curve setup cost per chunk; kept small so
-/// smaller generator counts still split into enough chunks for load balancing.
-const HASH_CHUNK_SIZE: usize = 64;
+/// Upper bound on the batch size per parallel task in
+/// [`Cycle::points_hash_from_uniform`]. Amortizes any one-time hash-to-curve
+/// setup cost per chunk.
+const MAX_HASH_CHUNK_SIZE: usize = 64;
+
+/// Splits `count` uniform seeds into chunks for [`hash_chunk_size`]'s caller,
+/// scaling with the thread pool so small generator counts still produce
+/// enough chunks to load-balance across all threads, while large counts are
+/// capped at [`MAX_HASH_CHUNK_SIZE`] to keep amortizing per-chunk setup cost.
+fn hash_chunk_size(count: usize) -> usize {
+    let threads = current_num_threads().max(1);
+    count.div_ceil(4 * threads).clamp(1, MAX_HASH_CHUNK_SIZE)
+}
 
 /// Process-wide cache of derived generator prefixes, keyed by [`Cycle`] type
 /// and chain label. A label's generators are a fixed function of position
@@ -219,30 +228,50 @@ pub fn clear_generator_cache() {
 }
 
 impl<C: Cycle> BulletproofGens<C> {
-    fn derive(label: &[u8], offset: usize, count: usize) -> Vec<C::Affine> {
-        let end = offset + count;
+    fn derive(label: &[u8], capacity: usize) -> Arc<Vec<C::Affine>> {
         let key = (TypeId::of::<C>(), label.to_vec());
-        let mut cache = generator_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cached: &mut Vec<C::Affine> = cache
-            .entry(key)
-            .or_insert_with(|| Box::new(Vec::<C::Affine>::new()))
-            .downcast_mut()
-            .expect("cache entry type matches C::Affine");
-        if cached.len() < end {
-            let have = cached.len();
+
+        loop {
+            let have = {
+                let cache = generator_cache()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match cache.get(&key) {
+                    Some(entry) => Arc::clone(
+                        entry
+                            .downcast_ref::<Arc<Vec<C::Affine>>>()
+                            .expect("cache entry type matches C::Affine"),
+                    ),
+                    None => Arc::new(Vec::new()),
+                }
+            };
+            if have.len() >= capacity {
+                return have;
+            }
+
             let uniforms: Vec<[u8; 64]> = GeneratorsChain::new(label)
-                .fast_forward(have)
-                .take(end - have)
+                .fast_forward(have.len())
+                .take(capacity - have.len())
                 .collect();
             let points: Vec<C::Point> = uniforms
-                .par_chunks(HASH_CHUNK_SIZE)
+                .par_chunks(hash_chunk_size(uniforms.len()))
                 .flat_map(C::points_hash_from_uniform)
                 .collect();
-            cached.extend(C::batch_normalize(&points));
+            let mut extended = (*have).clone();
+            extended.extend(C::batch_normalize(&points));
+
+            let mut cache = generator_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let slot: &mut Arc<Vec<C::Affine>> = cache
+                .entry(key.clone())
+                .or_insert_with(|| Box::new(Arc::new(Vec::<C::Affine>::new())))
+                .downcast_mut()
+                .expect("cache entry type matches C::Affine");
+            if slot.len() == have.len() {
+                *slot = Arc::new(extended);
+            }
         }
-        cached[offset..end].to_vec()
     }
 
     /// Create a new generator set with the given capacities.
@@ -274,19 +303,11 @@ impl<C: Cycle> BulletproofGens<C> {
             let party_index = i as u32;
             let mut label_g = [b'G', 0, 0, 0, 0];
             label_g[1..5].copy_from_slice(&party_index.to_le_bytes());
-            Arc::make_mut(&mut self.G_vec[i]).extend(Self::derive(
-                &label_g,
-                self.gens_capacity,
-                new_capacity - self.gens_capacity,
-            ));
+            self.G_vec[i] = Self::derive(&label_g, new_capacity);
 
             let mut label_h = [b'H', 0, 0, 0, 0];
             label_h[1..5].copy_from_slice(&party_index.to_le_bytes());
-            Arc::make_mut(&mut self.H_vec[i]).extend(Self::derive(
-                &label_h,
-                self.gens_capacity,
-                new_capacity - self.gens_capacity,
-            ));
+            self.H_vec[i] = Self::derive(&label_h, new_capacity);
         }
         self.gens_capacity = new_capacity;
     }
@@ -342,6 +363,8 @@ mod tests {
     #[test]
     fn smaller_instance_is_a_prefix_of_a_larger_one_sharing_the_cache() {
         type C = RistrettoCycle;
+
+        clear_generator_cache();
 
         let small = BulletproofGens::<C>::new(8, 1);
         let large = BulletproofGens::<C>::new(96, 1);

@@ -22,7 +22,7 @@ fn bench_batched_setup(c: &mut Criterion) {
                     BatchedEvrfPublicParams::setup(black_box(2), black_box(receiver_count))
                         .expect("valid public parameter shape")
                 },
-                BatchSize::SmallInput,
+                BatchSize::PerIteration,
             );
         });
     }
