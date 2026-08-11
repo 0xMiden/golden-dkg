@@ -1844,7 +1844,7 @@ pub mod secp_secq {
     /// Multipliers added by one non-identity Feldman coefficient opening.
     const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 1_099;
     /// Multipliers added by one receiver relation.
-    const BATCHED_RECEIVER_MULTIPLIERS: usize = 5_117;
+    const BATCHED_RECEIVER_MULTIPLIERS: usize = 4_661;
 
     /// Count multipliers from the exact public circuit shape.
     fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
@@ -3647,10 +3647,10 @@ pub mod secp_secq {
             assert_eq!(
                 checkpoint,
                 [
-                    202, 137, 147, 82, 110, 22, 19, 80, 44, 159, 101, 99, 197, 243, 63, 90, 93,
-                    147, 54, 104, 66, 242, 112, 196, 40, 65, 97, 155, 140, 186, 21, 221, 170, 222,
-                    72, 143, 167, 162, 45, 211, 73, 29, 161, 132, 171, 58, 51, 16, 30, 224, 74,
-                    150, 61, 13, 70, 239, 16, 233, 12, 227, 133, 146, 24, 54,
+                    74, 178, 166, 223, 40, 64, 81, 117, 233, 243, 69, 141, 20, 168, 65, 42, 84, 76,
+                    108, 77, 118, 203, 112, 132, 192, 8, 182, 87, 248, 71, 238, 108, 231, 210, 25,
+                    152, 136, 74, 146, 59, 156, 52, 118, 202, 215, 80, 158, 187, 241, 48, 225, 13,
+                    248, 110, 197, 72, 140, 74, 90, 130, 119, 238, 198, 81,
                 ]
             );
 
