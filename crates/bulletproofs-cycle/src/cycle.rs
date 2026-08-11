@@ -95,6 +95,12 @@ pub trait Cycle: Clone + Eq + Debug + 'static {
     /// independent Bulletproofs generators from a SHAKE256 stream.
     fn point_hash_from_uniform(bytes: &[u8; 64]) -> Self::Point;
 
+    /// Batch form of [`Cycle::point_hash_from_uniform`]. Override when the
+    /// hash-to-curve map has a one-time setup cost, to pay it once per batch.
+    fn points_hash_from_uniform(bytes: &[[u8; 64]]) -> Vec<Self::Point> {
+        bytes.iter().map(Self::point_hash_from_uniform).collect()
+    }
+
     /// Convert a projective point to affine form.
     fn point_to_affine(point: &Self::Point) -> Self::Affine;
 

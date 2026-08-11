@@ -38,6 +38,9 @@ jobs:
             table4_rows: "9"
             table5_rows: "10"
             table5_metric: total
+          - name: Paper eVRF batched parameter setup
+            bench: batched_setup
+            timeout: 15
     permissions:
       contents: read
       id-token: write # CodSpeed uses OIDC to associate measurements with this repository.
