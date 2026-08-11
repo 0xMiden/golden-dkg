@@ -16,7 +16,7 @@ use halo2curves::{secq256k1::Secq256k1, CurveAffine};
 use merlin::Transcript;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
-const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v2";
+const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v3";
 
 fn append_point<C: Cycle>(transcript: &mut Transcript, label: &'static [u8], point: &C::Point) {
     let compressed = C::point_compress(point);
@@ -84,17 +84,17 @@ fn evrf_one_receiver_honest_proof_verifies() {
     let proof = paper::evrf_prove(&statement, &witness, &mut rng).expect("prove");
     assert_eq!(
         proof.as_slice(),
-        include_bytes!("vectors/paper-one-receiver-v2.bin")
+        include_bytes!("vectors/paper-one-receiver-v3.bin")
     );
     let checkpoint =
         cp_challenge_checkpoint(ONE_RECEIVER_PROOF_ID, &statement, &proof, b"cp.r1", false);
     assert_eq!(
         checkpoint,
         [
-            222, 248, 232, 123, 15, 152, 48, 49, 16, 48, 125, 227, 238, 69, 86, 18, 249, 213, 255,
-            207, 58, 51, 71, 90, 116, 29, 79, 102, 31, 168, 121, 73, 138, 143, 118, 234, 226, 12,
-            174, 245, 14, 217, 107, 107, 151, 117, 225, 235, 149, 63, 10, 186, 85, 21, 220, 208,
-            70, 220, 42, 83, 94, 104, 79, 107,
+            75, 242, 184, 196, 227, 223, 65, 44, 213, 154, 70, 100, 171, 174, 131, 110, 106, 121,
+            136, 33, 241, 93, 249, 48, 132, 234, 91, 227, 222, 95, 4, 72, 101, 30, 178, 130, 252,
+            182, 238, 140, 247, 142, 90, 83, 102, 146, 89, 209, 220, 73, 164, 8, 144, 23, 131, 162,
+            115, 19, 230, 238, 188, 15, 242, 128,
         ]
     );
 
