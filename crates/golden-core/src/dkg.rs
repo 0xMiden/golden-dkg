@@ -583,6 +583,11 @@ where
 {
     let statements = dealing_statements::<G>(message, config)?;
     if statements.is_empty() {
+        // A dealer with no other receivers (n=1) has no eVRF statements to
+        // prove, so an empty proof is accepted without verifying knowledge of
+        // the dealer's registered key. See
+        // `single_participant_dkg_completes_without_proving` for why this is
+        // safe in the single-participant case.
         return if message.proof.is_empty() {
             Ok(())
         } else {
@@ -612,6 +617,10 @@ where
         .map(|message| dealing_statements::<G>(message, config))
         .collect::<Result<_>>()?;
     if statement_batches.iter().all(Vec::is_empty) {
+        // Every message is from a dealer with no other receivers (n=1), so
+        // none has an eVRF statement to prove; see `verify_dealing` and
+        // `single_participant_dkg_completes_without_proving` for why an empty
+        // proof is accepted here.
         for message in messages {
             if !message.proof.is_empty() {
                 return Err(Error::DealerProofVerificationFailed(message.dealer.get()));

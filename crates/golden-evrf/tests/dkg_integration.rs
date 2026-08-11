@@ -3,8 +3,11 @@
 //! Drives the public `golden_core::{create_dealing, verify_dealing, complete}`
 //! surface bound to `SecpSecqBackend`, then tampers with the dealer message
 //! to pin rejection of malformed ciphertexts, commitments, and proof bytes.
-//! All tests are `#[ignore]` because the backend proves a full R1CS instance
+//! Most tests are `#[ignore]` because the backend proves a full R1CS instance
 //! per dealing; run via `cargo nextest --run-ignored only`.
+//! `single_participant_dkg_completes_without_proving` is the exception: a
+//! single-participant (n=1) dealing has no eVRF statement to prove, so it
+//! runs unignored.
 
 #![allow(clippy::unwrap_used)]
 
