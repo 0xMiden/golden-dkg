@@ -122,6 +122,12 @@ macro_rules! impl_cycle {
                 hash(&bytes[..])
             }
 
+            fn points_hash_from_uniform(bytes: &[[u8; 64]]) -> Vec<Self::Point> {
+                // Build the SVDW-constant closure once per batch, not per point.
+                let hash = <Self::Point as CurveExt>::hash_to_curve($domain);
+                bytes.iter().map(|b| hash(&b[..])).collect()
+            }
+
             fn point_to_affine(point: &Self::Point) -> Self::Affine {
                 use group::Curve;
                 point.to_affine()

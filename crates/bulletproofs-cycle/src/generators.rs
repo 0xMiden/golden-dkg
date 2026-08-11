@@ -188,6 +188,13 @@ where
     }
 }
 
+/// Uniform-bytes batch size handed to [`Cycle::points_hash_from_uniform`] per
+/// parallel task. Backends with a one-time hash-to-curve setup cost (see
+/// `golden-halo2curves`) pay it once per chunk instead of once per point;
+/// large enough to amortize that cost, small enough to keep chunks plentiful
+/// relative to the thread pool.
+const HASH_CHUNK_SIZE: usize = 256;
+
 impl<C: Cycle> BulletproofGens<C> {
     fn derive(label: &[u8], offset: usize, count: usize) -> Vec<C::Affine> {
         let uniforms: Vec<[u8; 64]> = GeneratorsChain::new(label)
@@ -195,8 +202,8 @@ impl<C: Cycle> BulletproofGens<C> {
             .take(count)
             .collect();
         let points: Vec<C::Point> = uniforms
-            .into_par_iter()
-            .map(|uniform| C::point_hash_from_uniform(&uniform))
+            .par_chunks(HASH_CHUNK_SIZE)
+            .flat_map(C::points_hash_from_uniform)
             .collect();
         C::batch_normalize(&points)
     }
