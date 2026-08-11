@@ -48,9 +48,15 @@ pub trait WireEncode {
     /// Write this value without a top-level magic or tag prefix.
     fn write_wire(&self, out: &mut Vec<u8>);
 
+    /// Byte length `write_wire` will append, used to pre-size the output
+    /// buffer; the default `0` falls back to `Vec`'s own growth.
+    fn wire_size_hint(&self) -> usize {
+        0
+    }
+
     /// Return this value's nested wire bytes.
     fn to_nested_wire_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.wire_size_hint());
         self.write_wire(&mut out);
         out
     }
@@ -83,7 +89,7 @@ pub trait WireMessage: WireEncode + WireDecode {
 
 /// Return a standalone canonical wire value.
 pub fn to_wire_bytes<T: WireMessage>(value: &T) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(MAGIC.len() + 1 + value.wire_size_hint());
     out.extend_from_slice(MAGIC);
     out.push(T::TAG);
     T::write_wire_context(&mut out);
@@ -443,6 +449,17 @@ impl<G: GoldenGroup> WireEncode for DealerMessage<G> {
         }
         write_len(out, self.proof.len());
         out.extend_from_slice(&self.proof);
+    }
+
+    fn wire_size_hint(&self) -> usize {
+        let encrypted_share_len = 4 + G::ELEMENT_REPR_BYTES + G::Scalar::REPR_BYTES;
+        32 // session_id
+            + 32 // registry_root
+            + 4 // dealer
+            + 32 // msg_i
+            + 8 + self.commitment.coefficients().len() * G::ELEMENT_REPR_BYTES // commitment
+            + 8 + self.encrypted_shares.len() * encrypted_share_len // encrypted_shares
+            + 8 + self.proof.len() // proof
     }
 }
 
