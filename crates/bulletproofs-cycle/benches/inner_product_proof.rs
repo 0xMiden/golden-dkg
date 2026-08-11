@@ -45,6 +45,8 @@ fn q_base<C: Cycle>() -> C::Point {
 /// All IPA inputs for length `n`: generators, bases, witnesses, factors, and
 /// the commitment `P`.
 struct IppInputs<C: Cycle> {
+    G_affine: Vec<C::Affine>,
+    H_affine: Vec<C::Affine>,
     G: Vec<C::Point>,
     H: Vec<C::Point>,
     Q: C::Point,
@@ -59,8 +61,10 @@ fn ipp_setup<C: Cycle>(n: usize) -> IppInputs<C> {
     let mut rng = ChaCha20Rng::from_seed([42; 32]);
 
     let bp_gens = BulletproofGens::<C>::new(n, 1);
-    let G: Vec<C::Point> = bp_gens.share(0).G(n).map(C::affine_to_point).collect();
-    let H: Vec<C::Point> = bp_gens.share(0).H(n).map(C::affine_to_point).collect();
+    let G_affine: Vec<C::Affine> = bp_gens.share(0).G(n).copied().collect();
+    let H_affine: Vec<C::Affine> = bp_gens.share(0).H(n).copied().collect();
+    let G: Vec<C::Point> = G_affine.iter().map(C::affine_to_point).collect();
+    let H: Vec<C::Point> = H_affine.iter().map(C::affine_to_point).collect();
     let Q = q_base::<C>();
 
     let a: Vec<C::Scalar> = (0..n).map(|_| random_scalar::<C>(&mut rng)).collect();
@@ -87,6 +91,8 @@ fn ipp_setup<C: Cycle>(n: usize) -> IppInputs<C> {
     let P = C::vartime_msm(&p_scalars, &p_points);
 
     IppInputs {
+        G_affine,
+        H_affine,
         G,
         H,
         Q,
@@ -110,23 +116,19 @@ fn ipp_create<C: Cycle>(c: &mut Criterion, curve: &str) {
                 || {
                     (
                         Transcript::new(b"innerproducttest"),
-                        inputs.G.clone(),
-                        inputs.H.clone(),
                         inputs.a.clone(),
                         inputs.b.clone(),
-                        inputs.g_factors.clone(),
-                        inputs.h_factors.clone(),
                         inputs.Q,
                     )
                 },
-                |(mut transcript, G, H, a, b, g_factors, h_factors, Q)| {
+                |(mut transcript, a, b, Q)| {
                     black_box(InnerProductProof::<C>::create(
                         &mut transcript,
                         &Q,
-                        &g_factors,
-                        &h_factors,
-                        G,
-                        H,
+                        &inputs.g_factors,
+                        &inputs.h_factors,
+                        &inputs.G_affine,
+                        &inputs.H_affine,
                         a,
                         b,
                     ))
@@ -152,8 +154,8 @@ fn ipp_verify<C: Cycle>(c: &mut Criterion, curve: &str) {
             &inputs.Q,
             &inputs.g_factors,
             &inputs.h_factors,
-            inputs.G.clone(),
-            inputs.H.clone(),
+            &inputs.G_affine,
+            &inputs.H_affine,
             inputs.a.clone(),
             inputs.b.clone(),
         );
