@@ -181,7 +181,11 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
             BatchedEvrfPublicParams::shared(statement.threshold, statement.receivers.len())?;
         evrf_batched_verify_many(&params, &[(&statement, proof)])
     }
-
+    // SAFETY: The underlying `evrf_batched_verify_many` derives its batching
+    // RNG seed from a Fiat-Shamir transcript bound to the complete ordered
+    // statements and proof bytes. Because the seed is transcript-derived
+    // (not a fixed input-independent constant), the dealer cannot predict
+    // or manipulate the batching coefficients used by Bulletproofs.
     fn verify_proof_batch(
         batches: &[(&[EvrfStatement<Secp256k1GoldenGroup>], &[u8])],
     ) -> Result<()> {
