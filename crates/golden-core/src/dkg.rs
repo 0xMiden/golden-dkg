@@ -476,7 +476,13 @@ where
         }
     }
 
-    let proof = B::prove_batch(&statements, &witnesses, rng)?;
+    // A dealer with no other receivers has nothing for the eVRF proof to
+    // attest to; the sole share is checked directly below instead.
+    let proof = if statements.is_empty() {
+        Vec::new()
+    } else {
+        B::prove_batch(&statements, &witnesses, rng)?
+    };
 
     let private_share = Share {
         participant: dealer,
@@ -576,6 +582,18 @@ where
     B: EvrfProofBackend<G>,
 {
     let statements = dealing_statements::<G>(message, config)?;
+    if statements.is_empty() {
+        // A dealer with no other receivers (n=1) has no eVRF statements to
+        // prove, so an empty proof is accepted without verifying knowledge of
+        // the dealer's registered key. See
+        // `single_participant_dkg_completes_without_proving` for why this is
+        // safe in the single-participant case.
+        return if message.proof.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::ProofVerificationFailed)
+        };
+    }
     B::verify_batch(&statements, &message.proof)
 }
 
@@ -598,6 +616,18 @@ where
         .iter()
         .map(|message| dealing_statements::<G>(message, config))
         .collect::<Result<_>>()?;
+    if statement_batches.iter().all(Vec::is_empty) {
+        // Every message is from a dealer with no other receivers (n=1), so
+        // none has an eVRF statement to prove; see `verify_dealing` and
+        // `single_participant_dkg_completes_without_proving` for why an empty
+        // proof is accepted here.
+        for message in messages {
+            if !message.proof.is_empty() {
+                return Err(Error::DealerProofVerificationFailed(message.dealer.get()));
+            }
+        }
+        return Ok(());
+    }
     let proof_batches: Vec<_> = statement_batches
         .iter()
         .zip(messages.iter())
@@ -1101,6 +1131,25 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    enum UnreachableEvrfBackend {}
+
+    impl EvrfProofBackend<TinyGroup> for UnreachableEvrfBackend {
+        const PROOF_ID: &'static [u8] = FAKE_PROOF_ID;
+
+        fn prove_batch(
+            _statements: &[EvrfStatement<TinyGroup>],
+            _witnesses: &[EvrfWitness<TinyGroup>],
+            _rng: &mut impl CryptoRngCore,
+        ) -> Result<Vec<u8>> {
+            Err(Error::ProofVerificationFailed)
+        }
+
+        fn verify_batch(_statements: &[EvrfStatement<TinyGroup>], _proof: &[u8]) -> Result<()> {
+            Err(Error::ProofVerificationFailed)
+        }
+    }
+
     fn fake_proof_bytes(statements: &[EvrfStatement<TinyGroup>]) -> Result<Vec<u8>> {
         let id_len =
             u32::try_from(FAKE_PROOF_ID.len()).map_err(|_| Error::ProofVerificationFailed)?;
@@ -1400,6 +1449,65 @@ mod tests {
         assert_eq!(
             verify_dealings::<TinyGroup, FakeEvrfBackend>(&[], &config).unwrap_err(),
             Error::ProofVerificationFailed
+        );
+    }
+
+    #[test]
+    fn single_participant_dealing_skips_the_proof_backend() {
+        let config = config_for(1, 1, 77);
+        let dealer = idx(1);
+        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
+
+        let dealing = create_dealing::<TinyGroup, UnreachableEvrfBackend>(
+            dealer,
+            &identity_secret(dealer),
+            &config,
+            &mut rng,
+        )
+        .unwrap();
+        assert!(dealing.message.proof.is_empty());
+
+        verify_dealing::<TinyGroup, UnreachableEvrfBackend>(&dealing.message, &config).unwrap();
+        verify_dealings::<TinyGroup, UnreachableEvrfBackend>(&[&dealing.message], &config).unwrap();
+
+        let output = complete::<TinyGroup, UnreachableEvrfBackend>(
+            dealer,
+            &identity_secret(dealer),
+            &dealing,
+            &BTreeMap::new(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            TinyGroup::mul_generator(&output.secret_share.value),
+            output.public_key
+        );
+    }
+
+    #[test]
+    fn single_participant_dealing_rejects_a_forged_proof() {
+        let config = config_for(1, 1, 78);
+        let dealer = idx(1);
+        let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
+
+        let mut dealing = create_dealing::<TinyGroup, UnreachableEvrfBackend>(
+            dealer,
+            &identity_secret(dealer),
+            &config,
+            &mut rng,
+        )
+        .unwrap();
+        dealing.message.proof = vec![1];
+
+        assert_eq!(
+            verify_dealing::<TinyGroup, UnreachableEvrfBackend>(&dealing.message, &config)
+                .unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+        assert_eq!(
+            verify_dealings::<TinyGroup, UnreachableEvrfBackend>(&[&dealing.message], &config)
+                .unwrap_err(),
+            Error::DealerProofVerificationFailed(dealer.get())
         );
     }
 

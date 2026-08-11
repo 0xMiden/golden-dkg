@@ -3,8 +3,11 @@
 //! Drives the public `golden_core::{create_dealing, verify_dealing, complete}`
 //! surface bound to `SecpSecqBackend`, then tampers with the dealer message
 //! to pin rejection of malformed ciphertexts, commitments, and proof bytes.
-//! All tests are `#[ignore]` because the backend proves a full R1CS instance
+//! Most tests are `#[ignore]` because the backend proves a full R1CS instance
 //! per dealing; run via `cargo nextest --run-ignored only`.
+//! `single_participant_dkg_completes_without_proving` is the exception: a
+//! single-participant (n=1) dealing has no eVRF statement to prove, so it
+//! runs unignored.
 
 #![allow(clippy::unwrap_used)]
 
@@ -66,6 +69,21 @@ fn two_participant_config() -> DkgConfig<Secp256k1GoldenGroup> {
             })
             .collect(),
     )
+    .unwrap();
+    DkgConfig::new(
+        1,
+        SessionId([42u8; 32]),
+        Secp256k1Scalar::from_u64(77).unwrap(),
+        registry,
+    )
+    .unwrap()
+}
+
+fn single_participant_config() -> DkgConfig<Secp256k1GoldenGroup> {
+    let registry = ParticipantRegistry::new(vec![(
+        idx(1),
+        Secp256k1GoldenGroup::mul_generator(&identity_secret(idx(1))),
+    )])
     .unwrap();
     DkgConfig::new(
         1,
@@ -213,6 +231,39 @@ fn assert_dkg_completes(config: DkgConfig<Secp256k1GoldenGroup>, decode_messages
         Secp256k1GoldenGroup::mul_generator(&output.secret_share.value)
     );
     assert_eq!(output.public_key_shares.len(), participant_count);
+}
+
+#[test]
+fn single_participant_dkg_completes_without_proving() {
+    let config = single_participant_config();
+    let dealer = idx(1);
+    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+
+    let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
+        dealer,
+        &identity_secret(dealer),
+        &config,
+        &mut rng,
+    )
+    .unwrap();
+    assert!(dealing.message.proof.is_empty());
+    assert!(dealing.message.encrypted_shares.is_empty());
+
+    verify_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(&dealing.message, &config).unwrap();
+
+    let output = complete::<Secp256k1GoldenGroup, SecpSecqBackend>(
+        dealer,
+        &identity_secret(dealer),
+        &dealing,
+        &BTreeMap::new(),
+        &config,
+    )
+    .unwrap();
+    assert_eq!(
+        output.public_key,
+        Secp256k1GoldenGroup::mul_generator(&output.secret_share.value)
+    );
+    assert_eq!(output.public_key_shares.len(), 1);
 }
 
 #[test]
