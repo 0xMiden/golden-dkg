@@ -200,30 +200,10 @@ impl<G: GoldenHashToGroup> Combiner<G> {
         shares: &[DecryptionShare<G>],
     ) -> Result<Vec<u8>, CombineError> {
         verify_ciphertext(message).map_err(CombineError::Ciphertext)?;
-        let mut seen = BTreeSet::new();
-        let mut malformed = Vec::new();
-        let mut valid = Vec::new();
-
-        for share in shares {
-            if !seen.insert(share.participant) {
-                malformed.push(share.participant.get());
-                continue;
-            }
-            let Some(public_share) = self.public_key_set.public_share(share.participant) else {
-                malformed.push(share.participant.get());
-                continue;
-            };
-            match verify_decryption_share(
-                &self.setup_context,
-                message,
-                decryption_context,
-                share,
-                public_share,
-            ) {
-                Ok(()) => valid.push(share.clone()),
-                Err(_) => malformed.push(share.participant.get()),
-            }
-        }
+        let decryption_group =
+            decryption_group::<G>(&self.setup_context, message, decryption_context)
+                .map_err(CombineError::Ciphertext)?;
+        let (valid, malformed) = self.verify_shares(message, &decryption_group, shares);
 
         if valid.len() < self.public_key_set.threshold {
             if !malformed.is_empty() {
@@ -235,11 +215,9 @@ impl<G: GoldenHashToGroup> Combiner<G> {
             });
         }
 
-        self.combine_selected(
-            message,
-            decryption_context,
-            &valid[..self.public_key_set.threshold],
-        )
+        // `valid` already passed verification, so combine directly instead
+        // of re-verifying through `combine_selected`.
+        self.combine_verified(message, &valid[..self.public_key_set.threshold])
     }
 
     /// Search for a valid threshold set, require associated data, and open plaintext.
@@ -257,6 +235,9 @@ impl<G: GoldenHashToGroup> Combiner<G> {
     }
 
     /// Computes `U = sum_j lambda_j^(J) W_j = xR`, then `m = Ds(Hkd(R, U), c)`.
+    ///
+    /// Unlike [`Self::verify_shares`], an unknown participant fails the
+    /// whole combine immediately instead of being folded into `malformed`.
     fn combine_selected(
         &self,
         message: &Ciphertext<G>,
@@ -264,6 +245,9 @@ impl<G: GoldenHashToGroup> Combiner<G> {
         shares: &[DecryptionShare<G>],
     ) -> Result<Vec<u8>, CombineError> {
         verify_ciphertext(message).map_err(CombineError::Ciphertext)?;
+        let decryption_group =
+            decryption_group::<G>(&self.setup_context, message, decryption_context)
+                .map_err(CombineError::Ciphertext)?;
         let mut seen = BTreeSet::new();
         let mut malformed = Vec::new();
 
@@ -279,8 +263,8 @@ impl<G: GoldenHashToGroup> Combiner<G> {
                 .map_err(CombineError::Ciphertext)?;
             if verify_decryption_share(
                 &self.setup_context,
+                &decryption_group,
                 message,
-                decryption_context,
                 share,
                 public_share,
             )
@@ -294,14 +278,61 @@ impl<G: GoldenHashToGroup> Combiner<G> {
             return Err(CombineError::MalformedShares(malformed));
         }
 
-        let mut dh_point = G::identity();
+        self.combine_verified(message, shares)
+    }
+
+    /// Verifies each share once, deduplicating by participant and folding
+    /// unknown participants into `malformed` (used by
+    /// [`Self::combine_quorum`]'s valid-subset search). Returns the valid
+    /// shares and the malformed participant ids.
+    fn verify_shares(
+        &self,
+        message: &Ciphertext<G>,
+        decryption_group: &G::Element,
+        shares: &[DecryptionShare<G>],
+    ) -> (Vec<DecryptionShare<G>>, Vec<u32>) {
+        let mut seen = BTreeSet::new();
+        let mut malformed = Vec::new();
+        let mut valid = Vec::new();
+
         for share in shares {
-            let lambda = lagrange_at_zero::<G>(
-                share.participant,
-                shares.iter().map(|entry| entry.participant),
-            )
-            .map_err(CombineError::Ciphertext)?;
-            dh_point = G::add(&dh_point, &G::mul(&share.share, &lambda));
+            if !seen.insert(share.participant) {
+                malformed.push(share.participant.get());
+                continue;
+            }
+            let Some(public_share) = self.public_key_set.public_share(share.participant) else {
+                malformed.push(share.participant.get());
+                continue;
+            };
+            match verify_decryption_share(
+                &self.setup_context,
+                decryption_group,
+                message,
+                share,
+                public_share,
+            ) {
+                Ok(()) => valid.push(share.clone()),
+                Err(_) => malformed.push(share.participant.get()),
+            }
+        }
+
+        (valid, malformed)
+    }
+
+    /// Computes `U = sum_j lambda_j^(J) W_j = xR`, then `m = Ds(Hkd(R, U), c)`
+    /// from shares the caller already verified via [`Self::verify_shares`].
+    fn combine_verified(
+        &self,
+        message: &Ciphertext<G>,
+        shares: &[DecryptionShare<G>],
+    ) -> Result<Vec<u8>, CombineError> {
+        let participants: Vec<_> = shares.iter().map(|share| share.participant).collect();
+        let lambdas =
+            lagrange_coefficients_at_zero::<G>(&participants).map_err(CombineError::Ciphertext)?;
+
+        let mut dh_point = G::identity();
+        for (share, lambda) in shares.iter().zip(&lambdas) {
+            dh_point = G::add(&dh_point, &G::mul(&share.share, lambda));
         }
 
         let mut plaintext = message.encrypted_payload.clone();
@@ -340,16 +371,15 @@ fn validate_combiner_setup<G: GoldenHashToGroup>(
 /// Paper equation (2): reconstruct `X_i'`, `Z_i'`, and `W_i'`.
 ///
 /// This verifies the double Schnorr proof for `W_i = x_i R + z_i S`.
+/// `decryption_group` (`S = Hdgd(ad, dc, ctxt)`) is computed once by the
+/// caller and shared across shares instead of re-derived per share.
 fn verify_decryption_share<G: GoldenHashToGroup>(
     setup_context: &SetupContext,
+    decryption_group: &G::Element,
     message: &Ciphertext<G>,
-    decryption_context: &[u8],
     share: &DecryptionShare<G>,
     public_share: &PublicShare<G>,
 ) -> Result<(), Error> {
-    // `S = Hdgd(ad, dc, ctxt)`.
-    let decryption_group = decryption_group::<G>(setup_context, message, decryption_context)?;
-
     // `X_i' = x_i''G - e_i X_i`.
     let public_decryption_commitment = G::sub(
         &G::mul_generator(&share.decryption_response),
@@ -366,7 +396,7 @@ fn verify_decryption_share<G: GoldenHashToGroup>(
     let share_commitment = G::sub(
         &G::add(
             &G::mul(&message.ephemeral_public, &share.decryption_response),
-            &G::mul(&decryption_group, &share.context_response),
+            &G::mul(decryption_group, &share.context_response),
         ),
         &G::mul(&share.share, &share.challenge),
     );
@@ -374,7 +404,7 @@ fn verify_decryption_share<G: GoldenHashToGroup>(
     // Accept only when `e_i = Hdcd(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
     let expected = share_challenge::<G>(ShareChallengeInputs {
         setup_context,
-        decryption_group: &decryption_group,
+        decryption_group,
         public_decryption_share: &public_share.decryption,
         public_context_share: &public_share.context,
         share: &share.share,
@@ -444,25 +474,15 @@ fn share_challenge<G: GoldenGroup>(
     hash_to_nonzero_scalar::<G>(b"golden-ehtdh1-hdcd-v1", &transcript.root())
 }
 
-/// Paper coefficients `lambda_j^(J)` at 0, used to recover `xR`.
-fn lagrange_at_zero<G: GoldenGroup>(
-    participant: ParticipantIndex,
-    participants: impl IntoIterator<Item = ParticipantIndex>,
-) -> Result<G::Scalar, Error> {
-    let i = participant.to_scalar::<G::Scalar>()?;
-    let mut numerator = G::Scalar::one();
-    let mut denominator = G::Scalar::one();
+/// Paper coefficients `lambda_j^(J)` at 0 for every participant, computed
+/// with one batch field inversion via [`golden_core::batch_invert`].
+fn lagrange_coefficients_at_zero<G: GoldenGroup>(
+    participants: &[ParticipantIndex],
+) -> Result<Vec<G::Scalar>, Error> {
+    let xs: Vec<G::Scalar> = participants
+        .iter()
+        .map(|participant| participant.to_scalar::<G::Scalar>())
+        .collect::<Result<_, _>>()?;
 
-    // `lambda_i^(J)(0) = product_j (0 - j) / product_j (i - j)`.
-    for other in participants {
-        if other == participant {
-            continue;
-        }
-        let j = other.to_scalar::<G::Scalar>()?;
-        numerator = numerator.mul(&j.neg());
-        denominator = denominator.mul(&i.sub(&j));
-    }
-
-    let inverse = denominator.invert().ok_or(Error::InvalidThreshold)?;
-    Ok(numerator.mul(&inverse))
+    golden_core::lagrange_coefficients_at_zero(&xs).map_err(|_| Error::InvalidThreshold)
 }

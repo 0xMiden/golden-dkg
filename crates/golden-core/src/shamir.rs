@@ -149,28 +149,72 @@ pub fn lagrange_interpolate_at_zero<S: GoldenScalar>(shares: &[Share<S>]) -> Res
     let participants: Vec<_> = shares.iter().map(|share| share.participant).collect();
     ensure_unique_participants(&participants)?;
 
+    let xs: Vec<S> = shares
+        .iter()
+        .map(|share| share.participant.to_scalar::<S>())
+        .collect::<Result<_>>()?;
+
+    let coefficients = lagrange_coefficients_at_zero(&xs)?;
+
     let mut result = S::zero();
-    for (i, share_i) in shares.iter().enumerate() {
-        let xi = share_i.participant.to_scalar::<S>()?;
-        let mut basis = S::one();
-
-        for (j, share_j) in shares.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-
-            let xj = share_j.participant.to_scalar::<S>()?;
-            let denominator = xj.sub(&xi);
-            let inverse = denominator
-                .invert()
-                .ok_or(Error::NonInvertibleDenominator)?;
-            basis = basis.mul(&xj.mul(&inverse));
-        }
-
-        result = result.add(&share_i.value.mul(&basis));
+    for (share, coefficient) in shares.iter().zip(coefficients.iter()) {
+        result = result.add(&share.value.mul(coefficient));
     }
 
     Ok(result)
+}
+
+/// Lagrange coefficients `lambda_i(0)` for each `x_i` in `xs`, computed with
+/// `O(k)` scratch space and one batch field inversion via [`batch_invert`].
+pub fn lagrange_coefficients_at_zero<S: GoldenScalar>(xs: &[S]) -> Result<Vec<S>> {
+    let mut numerators = Vec::with_capacity(xs.len());
+    let mut denominators = Vec::with_capacity(xs.len());
+    for (i, xi) in xs.iter().enumerate() {
+        let mut numerator = S::one();
+        let mut denominator = S::one();
+        for (j, xj) in xs.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            numerator = numerator.mul(&xj.neg());
+            denominator = denominator.mul(&xi.sub(xj));
+        }
+        numerators.push(numerator);
+        denominators.push(denominator);
+    }
+
+    batch_invert(&mut denominators).ok_or(Error::NonInvertibleDenominator)?;
+
+    Ok(numerators
+        .into_iter()
+        .zip(denominators)
+        .map(|(numerator, inverse)| numerator.mul(&inverse))
+        .collect())
+}
+
+/// Batch-inverts `values` in place with one field inversion (the Montgomery
+/// trick) instead of `values.len()` individual inversions. Returns `None`
+/// if the product is zero, leaving `values` partially overwritten.
+pub fn batch_invert<S: GoldenScalar>(values: &mut [S]) -> Option<()> {
+    if values.is_empty() {
+        return Some(());
+    }
+
+    let mut prefix = Vec::with_capacity(values.len());
+    let mut acc = S::one();
+    for value in values.iter() {
+        prefix.push(acc.clone());
+        acc = acc.mul(value);
+    }
+
+    let mut acc_inv = acc.invert()?;
+    for (value, prefix_product) in values.iter_mut().zip(prefix.iter()).rev() {
+        let inverse = acc_inv.mul(prefix_product);
+        acc_inv = acc_inv.mul(value);
+        *value = inverse;
+    }
+
+    Some(())
 }
 
 fn ensure_unique_participants(participants: &[ParticipantIndex]) -> Result<()> {
@@ -445,5 +489,34 @@ mod tests {
         let repr = scalar.to_repr();
         assert_eq!(TinyScalar::from_repr(&repr).unwrap(), scalar);
         assert!(TinyScalar::from_repr(&[97]).is_err());
+    }
+
+    #[test]
+    fn batch_invert_matches_individual_inversions() {
+        let mut values: Vec<TinyScalar> = (1u64..12)
+            .map(|value| TinyScalar::from_u64(value).unwrap())
+            .collect();
+        let expected: Vec<TinyScalar> = values.iter().map(|v| v.invert().unwrap()).collect();
+
+        batch_invert(&mut values).unwrap();
+
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn batch_invert_empty_slice_is_a_noop() {
+        let mut values: Vec<TinyScalar> = Vec::new();
+        assert!(batch_invert(&mut values).is_some());
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn batch_invert_rejects_a_zero_element() {
+        let mut values = vec![
+            TinyScalar::from_u64(3).unwrap(),
+            TinyScalar::zero(),
+            TinyScalar::from_u64(5).unwrap(),
+        ];
+        assert!(batch_invert(&mut values).is_none());
     }
 }

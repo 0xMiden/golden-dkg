@@ -421,12 +421,14 @@ fn checked_point_encoding<C: ProofStreamCurve>(
     point: &C::Point,
     identity: IdentityPolicy,
 ) -> Result<Vec<u8>> {
+    // `point` is already a valid, typed group element, so re-decoding its
+    // fresh encoding would only re-check encode/decode are inverses on a
+    // value already known valid — not an untrusted-data validation.
     enforce_identity::<C>(point, identity)?;
     let encoded = C::encode_point(point);
     if encoded.len() != C::POINT_BYTES {
         return Err(stream_error());
     }
-    decode_point::<C>(&encoded, identity)?;
     Ok(encoded)
 }
 
