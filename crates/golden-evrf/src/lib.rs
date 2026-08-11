@@ -7,8 +7,8 @@
 //! `verify_batch` return `Error::ProofVerificationFailed` so a misconfigured
 //! caller fails closed instead of silently skipping the proof.
 //!
-//! [`prototype`] is a lighter Schnorr/Chaum-Pedersen backend that proves the
-//! scalar opening of each public share commitment and pad/DH commitment.
+//! [`prototype`] is a lighter Schnorr backend that proves the scalar opening
+//! of each public share and pad commitment.
 //! It is not the Golden eVRF proof; it exists as a self-contained,
 //! curve-agnostic fallback for testing the DKG transport without pulling
 //! in the curve-cycle R1CS layer.
@@ -26,15 +26,15 @@ pub mod paper;
 
 mod proof_stream;
 
-/// Curve-agnostic Schnorr/Chaum-Pedersen backend for DKG share/pad/DH
-/// openings. Not the Golden eVRF proof; see [`paper`] for that.
+/// Curve-agnostic Schnorr backend for DKG share and pad openings.
+/// Not the Golden eVRF proof; see [`paper`] for that.
 pub mod prototype {
     use super::*;
     use crate::proof_stream::{
         GoldenCurve, IdentityPolicy, Observe, ProverProofStream, VerifierProofStream,
     };
 
-    /// Generic proof backend for DKG share, pad, and DH commitments.
+    /// Generic proof backend for DKG share and pad commitments.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum ShareOpeningBackend {}
 
@@ -43,7 +43,7 @@ pub mod prototype {
         G: GoldenGroup,
         G::ElementRepr: TryFrom<Vec<u8>>,
     {
-        const PROOF_ID: &'static [u8] = b"golden-evrf/prototype-share-opening/v2";
+        const PROOF_ID: &'static [u8] = b"golden-evrf/prototype-share-opening/v3";
 
         fn prove_batch(
             statements: &[EvrfStatement<G>],
@@ -56,12 +56,11 @@ pub mod prototype {
 
             let mut stream = ProverProofStream::new(<Self as EvrfProofBackend<G>>::PROOF_ID)?;
             observe_batch::<G>(&mut stream, statements)?;
-            for (statement, witness) in statements.iter().zip(witnesses) {
+            for witness in witnesses {
                 let share_nonce = random_nonzero_scalar::<G>(rng);
                 let pad_nonce = random_nonzero_scalar::<G>(rng);
                 let share_nonce_point = G::mul_generator(&share_nonce);
                 let pad_nonce_point = G::mul_generator(&pad_nonce);
-                let dh_nonce_point = G::mul(&statement.receiver_public_key, &pad_nonce);
 
                 stream.send_point::<GoldenCurve<G>>(
                     b"share-nonce-point",
@@ -73,12 +72,6 @@ pub mod prototype {
                     &pad_nonce_point,
                     IdentityPolicy::Reject,
                 )?;
-                stream.send_point::<GoldenCurve<G>>(
-                    b"dh-nonce-point",
-                    &dh_nonce_point,
-                    IdentityPolicy::Reject,
-                )?;
-
                 let challenge = challenge::<G>(&mut stream)?;
                 let share_response = share_nonce.add(&challenge.mul(&witness.share));
                 let pad_response = pad_nonce.add(&challenge.mul(&witness.pad));
@@ -100,8 +93,6 @@ pub mod prototype {
                 )?;
                 let pad_nonce_point = stream
                     .receive_point::<GoldenCurve<G>>(b"pad-nonce-point", IdentityPolicy::Reject)?;
-                let dh_nonce_point = stream
-                    .receive_point::<GoldenCurve<G>>(b"dh-nonce-point", IdentityPolicy::Reject)?;
                 let challenge = challenge::<G>(&mut stream)?;
                 let share_response = stream.receive_scalar::<GoldenCurve<G>>(b"share-response")?;
                 let pad_response = stream.receive_scalar::<GoldenCurve<G>>(b"pad-response")?;
@@ -116,13 +107,7 @@ pub mod prototype {
                     &pad_nonce_point,
                     &G::mul(&statement.pad_commitment, &challenge),
                 );
-                let dh_left = G::mul(&statement.receiver_public_key, &pad_response);
-                let dh_right = G::add(
-                    &dh_nonce_point,
-                    &G::mul(&statement.dh_commitment, &challenge),
-                );
-
-                if share_left != share_right || pad_left != pad_right || dh_left != dh_right {
+                if share_left != share_right || pad_left != pad_right {
                     return Err(Error::ProofVerificationFailed);
                 }
             }
@@ -206,7 +191,7 @@ pub mod prototype {
     fn challenge<G: GoldenGroup>(stream: &mut impl Observe) -> Result<G::Scalar> {
         let mut challenge_bytes = [0u8; 32];
         stream.challenge(b"opening-challenge", &mut challenge_bytes);
-        G::Scalar::hash_to_scalar(b"golden-share-opening-challenge-v2", &challenge_bytes)
+        G::Scalar::hash_to_scalar(b"golden-share-opening-challenge-v3", &challenge_bytes)
     }
 
     fn random_nonzero_scalar<G: GoldenGroup>(rng: &mut impl CryptoRngCore) -> G::Scalar {

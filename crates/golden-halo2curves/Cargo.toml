@@ -1,6 +1,6 @@
 [package]
 name = "golden-halo2curves"
-version = "0.2.0"
+version = "0.3.0"
 description = "Halo2 curve adapters for Golden distributed key generation"
 edition.workspace = true
 homepage.workspace = true

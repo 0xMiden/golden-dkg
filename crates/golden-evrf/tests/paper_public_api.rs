@@ -43,17 +43,16 @@ fn minimal_evrf_statement() -> EvrfStatement<Secp256k1GoldenGroup> {
         commitment_coefficients: vec![Secp256k1GoldenGroup::mul_generator(&share)],
         share_commitment: Secp256k1GoldenGroup::mul_generator(&share),
         pad_commitment: Secp256k1GoldenGroup::mul_generator(&pad),
-        dh_commitment: Secp256k1GoldenGroup::mul(&receiver_public_key, &pad),
         encrypted_share: Secp256k1Scalar::add(&share, &pad),
         transcript_root: [3u8; 32],
     }
 }
 
 #[test]
-fn batched_backend_uses_v3_proof_protocol_identifier() {
+fn batched_backend_uses_v4_proof_protocol_identifier() {
     assert_eq!(
         <SecpSecqBackend as EvrfProofBackend<Secp256k1GoldenGroup>>::PROOF_ID,
-        b"golden-paper-evrf-batched-v3"
+        b"golden-paper-evrf-batched-v4"
     );
 }
 

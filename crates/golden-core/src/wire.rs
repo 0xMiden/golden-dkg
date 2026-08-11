@@ -258,7 +258,6 @@ impl WireDecode for TranscriptRoot {
 impl<G: GoldenGroup> WireEncode for EncryptedShare<G> {
     fn write_wire(&self, out: &mut Vec<u8>) {
         write_element::<G>(out, &self.pad_commitment);
-        write_element::<G>(out, &self.dh_commitment);
         write_scalar::<G>(out, &self.encrypted_share);
     }
 }
@@ -271,7 +270,6 @@ where
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         Ok(Self {
             pad_commitment: read_element::<G>(reader)?,
-            dh_commitment: read_element::<G>(reader)?,
             encrypted_share: read_scalar::<G>(reader)?,
         })
     }
@@ -283,7 +281,7 @@ where
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_ENCRYPTED_SHARE;
-    const CODEC_ID: &'static str = "encrypted-share-v1";
+    const CODEC_ID: &'static str = "encrypted-share-v2";
 
     fn write_wire_context(out: &mut Vec<u8>) {
         write_context_field(out, Self::CODEC_ID.as_bytes());
@@ -460,7 +458,7 @@ where
         let msg_i = DealerMessageNonce::read_wire(reader)?;
         let commitment = FeldmanCommitment::<G>::read_wire(reader)?;
         let len = reader.read_len()?;
-        let encrypted_share_len = 4 + 2 * G::ELEMENT_REPR_BYTES + G::Scalar::REPR_BYTES;
+        let encrypted_share_len = 4 + G::ELEMENT_REPR_BYTES + G::Scalar::REPR_BYTES;
         reader.ensure_remaining_items(len, encrypted_share_len)?;
         let mut encrypted_shares = BTreeMap::new();
         let mut last = None;
@@ -492,7 +490,7 @@ where
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_DEALER_MESSAGE;
-    const CODEC_ID: &'static str = "dealer-message-v2";
+    const CODEC_ID: &'static str = "dealer-message-v3";
 
     fn write_wire_context(out: &mut Vec<u8>) {
         write_context_field(out, Self::CODEC_ID.as_bytes());
@@ -1003,7 +1001,6 @@ mod tests {
         .unwrap();
         let encrypted_share = EncryptedShare::<TinyGroup> {
             pad_commitment: TinyScalar::from_u64(2).unwrap(),
-            dh_commitment: TinyScalar::from_u64(3).unwrap(),
             encrypted_share: TinyScalar::from_u64(4).unwrap(),
         };
         let mut message = DealerMessage::<TinyGroup> {
@@ -1074,7 +1071,6 @@ mod tests {
     fn encrypted_share_round_trips() {
         let share = EncryptedShare::<TinyGroup> {
             pad_commitment: TinyScalar::from_u64(2).unwrap(),
-            dh_commitment: TinyScalar::from_u64(3).unwrap(),
             encrypted_share: TinyScalar::from_u64(4).unwrap(),
         };
 
@@ -1087,7 +1083,6 @@ mod tests {
     fn encrypted_share_rejects_noncanonical_scalar() {
         let share = EncryptedShare::<TinyGroup> {
             pad_commitment: TinyScalar::from_u64(2).unwrap(),
-            dh_commitment: TinyScalar::from_u64(3).unwrap(),
             encrypted_share: TinyScalar::from_u64(4).unwrap(),
         };
         let mut bytes = to_wire_bytes(&share);
@@ -1138,7 +1133,6 @@ mod tests {
         .unwrap();
         let encrypted_share = EncryptedShare::<TinyGroup> {
             pad_commitment: TinyScalar::from_u64(2).unwrap(),
-            dh_commitment: TinyScalar::from_u64(3).unwrap(),
             encrypted_share: TinyScalar::from_u64(4).unwrap(),
         };
         let message = DealerMessage::<TinyGroup> {
@@ -1177,7 +1171,6 @@ mod tests {
         .unwrap();
         let encrypted_share = EncryptedShare::<TinyGroup> {
             pad_commitment: TinyScalar::from_u64(2).unwrap(),
-            dh_commitment: TinyScalar::from_u64(3).unwrap(),
             encrypted_share: TinyScalar::from_u64(4).unwrap(),
         };
         let message = DealerMessage::<TinyGroup> {
@@ -1207,7 +1200,7 @@ mod tests {
 
         assert_eq!(
             <DealerMessage<TinyGroup> as WireMessage>::CODEC_ID,
-            "dealer-message-v2"
+            "dealer-message-v3"
         );
         assert_eq!(bytes, expected);
         assert_eq!(bytes[prefix.len()], message.session_id.0[0]);
@@ -1246,7 +1239,6 @@ mod tests {
         .unwrap();
         let encrypted_share = EncryptedShare::<TinyGroup> {
             pad_commitment: TinyScalar::from_u64(2).unwrap(),
-            dh_commitment: TinyScalar::from_u64(3).unwrap(),
             encrypted_share: TinyScalar::from_u64(4).unwrap(),
         };
         let message = DealerMessage::<TinyGroup> {
