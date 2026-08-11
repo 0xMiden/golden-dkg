@@ -2042,8 +2042,6 @@ pub mod secp_secq {
         let pad_bits = witness.map_or(verifier_pad_bits.as_slice(), |w| w.pad_bits.as_slice());
         let pad_bit_vars = bit_decompose_q(cs, pad_var, pad_bits)?;
         constrain_bits_lt_bound_when(cs, &pad_bit_vars, pad_bits, &SECP256K1_P_MINUS_Q_LE, reduce)?;
-        // pad's window AND products are shared by both exponentiations below
-        // (pad commitment against g_in, DH commitment against PK_j).
         let pad_window_products = chord_window_products(cs, &pad_bit_vars)?;
 
         // g_in's chord table is process-wide cached and shared by both
