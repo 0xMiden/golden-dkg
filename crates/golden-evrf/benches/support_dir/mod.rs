@@ -14,7 +14,6 @@
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
 #![allow(dead_code)]
-#![allow(unused_imports)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::type_complexity)]
 
@@ -157,4 +156,5 @@ pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfPublicParams, BatchedEvrfSta
 }
 
 mod fixture_cache;
+#[allow(unused_imports)]
 pub use fixture_cache::{cached_dealer_messages, cached_round1_setup, regenerate_dealer_messages};
