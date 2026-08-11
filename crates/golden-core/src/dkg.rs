@@ -435,7 +435,9 @@ where
     let mut statements = Vec::new();
     let mut witnesses = Vec::new();
     for (receiver, share_value) in shares.iter().filter(|(receiver, _)| **receiver != dealer) {
-        let share_commitment = commitment.public_key_share(*receiver)?;
+        // The dealer knows f(receiver) directly, so this fixed-base mul
+        // equals `commitment.public_key_share(*receiver)` without evaluating it twice.
+        let share_commitment = G::mul_generator(share_value);
         let encrypted_share = encrypted_shares
             .get(receiver)
             .cloned()
@@ -466,14 +468,6 @@ where
         };
         statements.push(statement);
         witnesses.push(witness);
-
-        let share = Share {
-            participant: *receiver,
-            value: share_value.clone(),
-        };
-        if !commitment.verify_share(&share)? {
-            return Err(Error::CommitmentVerificationFailed);
-        }
     }
 
     // A dealer with no other receivers has nothing for the eVRF proof to
@@ -702,8 +696,8 @@ where
         });
     }
 
-    let mut all_dealings = BTreeMap::new();
-    all_dealings.insert(own_dealing.message.dealer, own_dealing.message.clone());
+    let mut all_dealings: BTreeMap<ParticipantIndex, &DealerMessage<G>> = BTreeMap::new();
+    all_dealings.insert(own_dealing.message.dealer, &own_dealing.message);
     for (dealer, message) in peer_dealings {
         if *dealer != message.dealer {
             return Err(Error::DealerKeyMismatch {
@@ -711,10 +705,7 @@ where
                 message_dealer: message.dealer.get(),
             });
         }
-        if all_dealings
-            .insert(message.dealer, message.clone())
-            .is_some()
-        {
+        if all_dealings.insert(message.dealer, message).is_some() {
             return Err(Error::DuplicateParticipantIndex(message.dealer.get()));
         }
     }
@@ -725,12 +716,16 @@ where
         .map(|dealer| {
             all_dealings
                 .get(&dealer)
+                .copied()
                 .ok_or(Error::MissingDealing(dealer.get()))
         })
         .collect::<Result<_>>()?;
     verify_dealings::<G, B>(&messages, config)?;
 
+    // Aggregate coefficients while walking dealings, then evaluate once per
+    // participant below: `n * t` muls instead of `n^2 * t`.
     let mut secret_share_value = G::Scalar::zero();
+    let mut aggregate_coefficients = vec![G::identity(); config.threshold];
     for message in all_dealings.values() {
         let share = if message.dealer == receiver {
             own_dealing.private_share.clone()
@@ -741,23 +736,24 @@ where
             return Err(Error::CommitmentVerificationFailed);
         }
         secret_share_value = secret_share_value.add(&share.value);
-    }
 
-    let mut public_key = G::identity();
-    for message in all_dealings.values() {
-        public_key = G::add(&public_key, &message.commitment.public_key());
+        for (aggregate, coefficient) in aggregate_coefficients
+            .iter_mut()
+            .zip(message.commitment.coefficients())
+        {
+            *aggregate = G::add(aggregate, coefficient);
+        }
     }
+    let aggregate_commitment = FeldmanCommitment::<G>::from_coefficients(aggregate_coefficients)?;
+
+    let public_key = aggregate_commitment.public_key();
 
     let mut public_key_shares = BTreeMap::new();
     for participant in config.registry.indexes() {
-        let mut share_key = G::identity();
-        for message in all_dealings.values() {
-            share_key = G::add(
-                &share_key,
-                &message.commitment.public_key_share(participant)?,
-            );
-        }
-        public_key_shares.insert(participant, share_key);
+        public_key_shares.insert(
+            participant,
+            aggregate_commitment.public_key_share(participant)?,
+        );
     }
 
     Ok(DkgOutput {
@@ -896,7 +892,7 @@ where
 }
 
 fn completion_root<G: GoldenGroup>(
-    dealings: &BTreeMap<ParticipantIndex, DealerMessage<G>>,
+    dealings: &BTreeMap<ParticipantIndex, &DealerMessage<G>>,
 ) -> TranscriptRoot {
     let mut transcript = TranscriptBuilder::new(b"completion");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());

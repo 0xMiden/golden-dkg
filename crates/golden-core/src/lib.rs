@@ -28,5 +28,7 @@ pub use error::{Error, Result};
 pub use feldman::FeldmanCommitment;
 pub use group::{FieldByteOrder, GoldenEvrfCurve, GoldenGroup, GoldenHashToGroup, GoldenScalar};
 pub use participant::ParticipantIndex;
-pub use shamir::{lagrange_interpolate_at_zero, reconstruct_secret, Polynomial, Share};
+pub use shamir::{
+    batch_invert, lagrange_interpolate_at_zero, reconstruct_secret, Polynomial, Share,
+};
 pub use transcript::{TranscriptBuilder, TranscriptRoot};
