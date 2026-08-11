@@ -5,6 +5,9 @@
 extern crate alloc;
 
 use alloc::{sync::Arc, vec::Vec};
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use digest::{ExtendableOutput, Update, XofReader};
 #[cfg(all(feature = "cycle-pedersen", not(feature = "bulletproofs-compat")))]
@@ -188,24 +191,58 @@ where
     }
 }
 
-/// Uniform-bytes batch size handed to [`Cycle::points_hash_from_uniform`] per
-/// parallel task. Backends with a one-time hash-to-curve setup cost (see
-/// `golden-halo2curves`) pay it once per chunk instead of once per point;
-/// large enough to amortize that cost, small enough to keep chunks plentiful
-/// relative to the thread pool.
-const HASH_CHUNK_SIZE: usize = 256;
+/// Batch size per parallel task in [`Cycle::points_hash_from_uniform`].
+/// Amortizes any one-time hash-to-curve setup cost per chunk; kept small so
+/// smaller generator counts still split into enough chunks for load balancing.
+const HASH_CHUNK_SIZE: usize = 64;
+
+/// Process-wide cache of derived generator prefixes, keyed by [`Cycle`] type
+/// and chain label. A label's generators are a fixed function of position
+/// (`GeneratorsChain` + `fast_forward`), so different shapes sharing the same
+/// labels (e.g. all `party_capacity = 1` circuits) reuse each other's prefix
+/// instead of re-deriving it. Grows monotonically, never shrinks.
+type GeneratorCache = HashMap<(TypeId, Vec<u8>), Box<dyn Any + Send + Sync>>;
+
+fn generator_cache() -> &'static Mutex<GeneratorCache> {
+    static CACHE: OnceLock<Mutex<GeneratorCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Test/benchmark-only: clears the cache so the next derivation is cold.
+/// Production code should let it grow monotonically.
+#[doc(hidden)]
+pub fn clear_generator_cache() {
+    generator_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
 
 impl<C: Cycle> BulletproofGens<C> {
     fn derive(label: &[u8], offset: usize, count: usize) -> Vec<C::Affine> {
-        let uniforms: Vec<[u8; 64]> = GeneratorsChain::new(label)
-            .fast_forward(offset)
-            .take(count)
-            .collect();
-        let points: Vec<C::Point> = uniforms
-            .par_chunks(HASH_CHUNK_SIZE)
-            .flat_map(C::points_hash_from_uniform)
-            .collect();
-        C::batch_normalize(&points)
+        let end = offset + count;
+        let key = (TypeId::of::<C>(), label.to_vec());
+        let mut cache = generator_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached: &mut Vec<C::Affine> = cache
+            .entry(key)
+            .or_insert_with(|| Box::new(Vec::<C::Affine>::new()))
+            .downcast_mut()
+            .expect("cache entry type matches C::Affine");
+        if cached.len() < end {
+            let have = cached.len();
+            let uniforms: Vec<[u8; 64]> = GeneratorsChain::new(label)
+                .fast_forward(have)
+                .take(end - have)
+                .collect();
+            let points: Vec<C::Point> = uniforms
+                .par_chunks(HASH_CHUNK_SIZE)
+                .flat_map(C::points_hash_from_uniform)
+                .collect();
+            cached.extend(C::batch_normalize(&points));
+        }
+        cached[offset..end].to_vec()
     }
 
     /// Create a new generator set with the given capacities.
@@ -299,6 +336,30 @@ mod tests {
         let actual_g: Vec<<C as Cycle>::Point> =
             gens.share(0).G(64).map(C::affine_to_point).collect();
 
+        assert_eq!(actual_g, expected_g);
+    }
+
+    #[test]
+    fn smaller_instance_is_a_prefix_of_a_larger_one_sharing_the_cache() {
+        type C = RistrettoCycle;
+
+        let small = BulletproofGens::<C>::new(8, 1);
+        let large = BulletproofGens::<C>::new(96, 1);
+
+        let small_g: Vec<_> = small.share(0).G(8).copied().collect();
+        let large_g_prefix: Vec<_> = large.share(0).G(8).copied().collect();
+        assert_eq!(small_g, large_g_prefix);
+
+        let small_h: Vec<_> = small.share(0).H(8).copied().collect();
+        let large_h_prefix: Vec<_> = large.share(0).H(8).copied().collect();
+        assert_eq!(small_h, large_h_prefix);
+
+        let expected_g: Vec<<C as Cycle>::Point> = GeneratorsChain::new(b"G\0\0\0\0")
+            .take(96)
+            .map(|uniform| C::point_hash_from_uniform(&uniform))
+            .collect();
+        let actual_g: Vec<<C as Cycle>::Point> =
+            large.share(0).G(96).map(C::affine_to_point).collect();
         assert_eq!(actual_g, expected_g);
     }
 
