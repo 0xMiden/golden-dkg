@@ -788,13 +788,17 @@ pub mod secp_secq {
     // Chord-rule R1CS exponentiation gadget (paper Section 4.3).
     // ------------------------------------------------------------------
 
-    /// Witness values for one chord-rule exponentiation: all intermediate
-    /// `L_i` coordinates and slopes `s_i` needed by the R1CS gadget.
+    /// Witness values for one chord-rule exponentiation: `L_w` at every
+    /// checkpoint boundary (see [`chord_is_checkpoint_window`]) and the
+    /// window addition slopes `s_w` needed by the R1CS gadget.
     #[derive(Clone, Debug)]
     struct ChordWitness {
-        /// `(x_{L_w}, y_{L_w})` for `w = 0..=lambda/2` (`w = 0` is the base
-        /// case).
-        l_coords: Vec<(R1csField, R1csField)>,
+        /// `(x_{L_w}, y_{L_w})` for each checkpoint window `w`, in
+        /// increasing order. The gadget only ever reads the running point at
+        /// checkpoint boundaries (every intermediate window's coordinates
+        /// are consumed immediately as a linear combination, not read back
+        /// from the witness), so only those boundary points are retained.
+        checkpoint_coords: Vec<(R1csField, R1csField)>,
         /// `s_w` for `w = 1..=lambda/2` (slope of the chord between
         /// `L_{w-1}` and the windowed `Δ_w`).
         slopes: Vec<R1csField>,
@@ -890,8 +894,13 @@ pub mod secp_secq {
             .map(|(dy, dx_inv)| *dy * dx_inv)
             .collect();
 
+        let checkpoint_coords = (1..=num_windows)
+            .filter(|&w| chord_is_checkpoint_window(w, num_windows))
+            .map(|w| l_coords[w])
+            .collect();
+
         Ok(ChordWitness {
-            l_coords: l_coords.to_vec(),
+            checkpoint_coords,
             slopes,
         })
     }
@@ -988,8 +997,30 @@ pub mod secp_secq {
     /// gate (an allocated pair) per interval.
     const CHORD_CHECKPOINT_INTERVAL: usize = 16;
 
+    /// Whether window `w` (`w = 1..=num_windows`) is a checkpoint boundary:
+    /// the chord-rule gadget re-materializes its running point here, and
+    /// [`chord_compute_witness`] retains only these boundary coordinates in
+    /// [`ChordWitness::checkpoint_coords`]. The final window is always a
+    /// checkpoint so the gadget has a concrete result to return.
+    fn chord_is_checkpoint_window(w: usize, num_windows: usize) -> bool {
+        w.is_multiple_of(CHORD_CHECKPOINT_INTERVAL) || w == num_windows
+    }
+
+    /// Number of checkpoint windows in `1..=num_windows` (the length
+    /// [`ChordWitness::checkpoint_coords`] must have for a given chord).
+    fn chord_checkpoint_count(num_windows: usize) -> usize {
+        let full_intervals = num_windows / CHORD_CHECKPOINT_INTERVAL;
+        if num_windows.is_multiple_of(CHORD_CHECKPOINT_INTERVAL) {
+            full_intervals
+        } else {
+            full_intervals + 1
+        }
+    }
+
     /// Chord-rule exponentiation R1CS gadget (paper Section 4.3), using 2-bit
-    /// windowed selection. Given the bit variables from [`bit_decompose`],
+    /// windowed selection (Boneh et al. 2024/397, Remark 1 / Section 6.3:
+    /// the recurrence can process two key bits per iteration). Given the
+    /// bit variables from [`bit_decompose`],
     /// the windowed precomputed coordinates, the shared window AND products
     /// from [`chord_window_products`], and an optional public result point
     /// `(result_x, result_y)`, constrains:
@@ -1013,7 +1044,9 @@ pub mod secp_secq {
     /// The chord-addition denominator `x_{L_{w-1}} - x_{Δ_w}` is not
     /// explicitly constrained nonzero: a zero denominator would require the
     /// prover to know a discrete-log relation between the base point and the
-    /// hash-derived correction generator `G_S`, which is assumed hard.
+    /// hash-derived correction generator `G_S`, which is assumed hard (Boneh
+    /// et al. 2024/397, proof of Theorem 14, pp. 32-33 — the exceptional
+    /// addition case).
     ///
     /// The running point is re-materialized as an allocated variable pair
     /// every [`CHORD_CHECKPOINT_INTERVAL`] windows (see that constant), so
@@ -1032,7 +1065,7 @@ pub mod secp_secq {
     ) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
         // The chord-rule gadget consumes bit_vars[0..=λ] (λ even, so bits
         // 1..=λ pair into λ/2 windows), precomp.windows[0..λ/2],
-        // window_products[0..λ/2], and witness.l_coords[0..=λ/2]/
+        // window_products[0..λ/2], and witness.checkpoint_coords/
         // slopes[0..λ/2]. Reject mismatches before building the circuit so a
         // caller mistake surfaces as a format error rather than a truncated
         // exponentiation that silently binds L_λ.
@@ -1045,7 +1078,9 @@ pub mod secp_secq {
             return Err(R1CSError::FormatError);
         }
         if let Some(w) = witness {
-            if w.l_coords.len() != num_windows + 1 || w.slopes.len() != num_windows {
+            if w.checkpoint_coords.len() != chord_checkpoint_count(num_windows)
+                || w.slopes.len() != num_windows
+            {
                 return Err(R1CSError::FormatError);
             }
         }
@@ -1056,6 +1091,7 @@ pub mod secp_secq {
         let mut x_prev = delta0_x_lc(bit_vars[0], precomp);
         let mut y_prev = delta0_y_lc(bit_vars[0], precomp);
         let mut checkpoint: Option<(Variable<R1csField>, Variable<R1csField>)> = None;
+        let mut checkpoint_idx = 0;
 
         for w in 1..=num_windows {
             let s0_var = bit_vars[2 * w - 1];
@@ -1100,8 +1136,10 @@ pub mod secp_secq {
             // gadget always has a `Variable` pair to return), materialize
             // the running point as a fresh allocated pair and resume
             // accumulating from that 1-term LC.
-            if w % CHORD_CHECKPOINT_INTERVAL == 0 || w == num_windows {
-                let (x_ck_assign, y_ck_assign) = witness.map(|wit| wit.l_coords[w]).unzip();
+            if chord_is_checkpoint_window(w, num_windows) {
+                let (x_ck_assign, y_ck_assign) = witness
+                    .map(|wit| wit.checkpoint_coords[checkpoint_idx])
+                    .unzip();
                 let x_ck = cs.allocate(x_ck_assign)?;
                 let y_ck = cs.allocate(y_ck_assign)?;
                 cs.constrain(x_l - x_ck);
@@ -1109,6 +1147,7 @@ pub mod secp_secq {
                 x_l = x_ck.into();
                 y_l = y_ck.into();
                 checkpoint = Some((x_ck, y_ck));
+                checkpoint_idx += 1;
             }
 
             x_prev = x_l;
@@ -2083,8 +2122,16 @@ pub mod secp_secq {
         // instead of separately re-deriving T_1/T_2 via chord_evaluate_point.
         let t1_witness = chord_compute_witness(&k_bool_bits, h1, K_BITS)?;
         let t2_witness = chord_compute_witness(&k_bool_bits, h2, K_BITS)?;
-        let (t1_x, _) = t1_witness.l_coords[K_BITS / 2];
-        let (t2_x, _) = t2_witness.l_coords[K_BITS / 2];
+        // The final window is always a checkpoint (see
+        // chord_is_checkpoint_window), so the last entry is L_λ.
+        let (t1_x, _) = *t1_witness
+            .checkpoint_coords
+            .last()
+            .ok_or(Error::ProofVerificationFailed)?;
+        let (t2_x, _) = *t2_witness
+            .checkpoint_coords
+            .last()
+            .ok_or(Error::ProofVerificationFailed)?;
         let r = *beta * t1_x + t2_x;
         let pad_fq = fp_to_fq(&r);
         let pad = fq_to_fp(&pad_fq);
@@ -3093,11 +3140,14 @@ pub mod secp_secq {
             let X = Gin::generator() * GinScalar::from(12345u64);
             let precomp = precompute_chord(&X, K_BITS).expect("precompute");
 
-            // bit_vars and precomp agree on λ/2 = 128 windows; build a
-            // witness whose l_coords is one short so the length check fires
-            // before any circuit construction.
+            // bit_vars and precomp agree on λ/2 = 128 windows (8 checkpoints);
+            // build a witness whose checkpoint_coords is one short so the
+            // length check fires before any circuit construction.
             let truncated_witness = ChordWitness {
-                l_coords: vec![(R1csField::ZERO, R1csField::ZERO); K_BITS / 2],
+                checkpoint_coords: vec![
+                    (R1csField::ZERO, R1csField::ZERO);
+                    chord_checkpoint_count(K_BITS / 2) - 1
+                ],
                 slopes: vec![R1csField::ZERO; K_BITS / 2],
             };
 
