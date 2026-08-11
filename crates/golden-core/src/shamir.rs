@@ -154,33 +154,42 @@ pub fn lagrange_interpolate_at_zero<S: GoldenScalar>(shares: &[Share<S>]) -> Res
         .map(|share| share.participant.to_scalar::<S>())
         .collect::<Result<_>>()?;
 
-    let k = xs.len();
-    let mut denominators = Vec::with_capacity(k.saturating_sub(1) * k);
-    for (i, xi) in xs.iter().enumerate() {
-        for (j, xj) in xs.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            denominators.push(xj.sub(xi));
-        }
-    }
-    batch_invert(&mut denominators).ok_or(Error::NonInvertibleDenominator)?;
+    let coefficients = lagrange_coefficients_at_zero(&xs)?;
 
     let mut result = S::zero();
-    let mut cursor = denominators.iter();
-    for (i, share) in shares.iter().enumerate() {
-        let mut basis = S::one();
-        for (j, xj) in xs.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            let inverse = cursor.next().expect("one inverse per (i, j) pair");
-            basis = basis.mul(&xj.mul(inverse));
-        }
-        result = result.add(&share.value.mul(&basis));
+    for (share, coefficient) in shares.iter().zip(coefficients.iter()) {
+        result = result.add(&share.value.mul(coefficient));
     }
 
     Ok(result)
+}
+
+/// Lagrange coefficients `lambda_i(0)` for each `x_i` in `xs`, computed with
+/// `O(k)` scratch space and one batch field inversion via [`batch_invert`].
+pub fn lagrange_coefficients_at_zero<S: GoldenScalar>(xs: &[S]) -> Result<Vec<S>> {
+    let mut numerators = Vec::with_capacity(xs.len());
+    let mut denominators = Vec::with_capacity(xs.len());
+    for (i, xi) in xs.iter().enumerate() {
+        let mut numerator = S::one();
+        let mut denominator = S::one();
+        for (j, xj) in xs.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            numerator = numerator.mul(&xj.neg());
+            denominator = denominator.mul(&xi.sub(xj));
+        }
+        numerators.push(numerator);
+        denominators.push(denominator);
+    }
+
+    batch_invert(&mut denominators).ok_or(Error::NonInvertibleDenominator)?;
+
+    Ok(numerators
+        .into_iter()
+        .zip(denominators)
+        .map(|(numerator, inverse)| numerator.mul(&inverse))
+        .collect())
 }
 
 /// Batch-inverts `values` in place with one field inversion (the Montgomery

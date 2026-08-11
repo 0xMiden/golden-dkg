@@ -29,6 +29,7 @@ pub use feldman::FeldmanCommitment;
 pub use group::{FieldByteOrder, GoldenEvrfCurve, GoldenGroup, GoldenHashToGroup, GoldenScalar};
 pub use participant::ParticipantIndex;
 pub use shamir::{
-    batch_invert, lagrange_interpolate_at_zero, reconstruct_secret, Polynomial, Share,
+    batch_invert, lagrange_coefficients_at_zero, lagrange_interpolate_at_zero, reconstruct_secret,
+    Polynomial, Share,
 };
 pub use transcript::{TranscriptBuilder, TranscriptRoot};

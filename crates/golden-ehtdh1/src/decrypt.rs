@@ -484,28 +484,5 @@ fn lagrange_coefficients_at_zero<G: GoldenGroup>(
         .map(|participant| participant.to_scalar::<G::Scalar>())
         .collect::<Result<_, _>>()?;
 
-    let mut numerators = Vec::with_capacity(xs.len());
-    let mut denominators = Vec::with_capacity(xs.len());
-    // `lambda_i^(J)(0) = product_j (0 - j) / product_j (i - j)`.
-    for (i, xi) in xs.iter().enumerate() {
-        let mut numerator = G::Scalar::one();
-        let mut denominator = G::Scalar::one();
-        for (j, xj) in xs.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            numerator = numerator.mul(&xj.neg());
-            denominator = denominator.mul(&xi.sub(xj));
-        }
-        numerators.push(numerator);
-        denominators.push(denominator);
-    }
-
-    golden_core::batch_invert(&mut denominators).ok_or(Error::InvalidThreshold)?;
-
-    Ok(numerators
-        .into_iter()
-        .zip(denominators)
-        .map(|(numerator, inverse)| numerator.mul(&inverse))
-        .collect())
+    golden_core::lagrange_coefficients_at_zero(&xs).map_err(|_| Error::InvalidThreshold)
 }
