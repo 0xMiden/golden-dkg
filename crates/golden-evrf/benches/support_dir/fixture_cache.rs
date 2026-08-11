@@ -6,18 +6,22 @@
 //! shape from `benches/fixtures/dealer-messages/` (wire-codec encoded and
 //! git-tracked), so the cost is paid once and shared via git history.
 //!
-//! [`cached_dealer_messages`] (used by the benches) is read-only: a missing,
-//! corrupt, or stale (fails `verify_dealings` against the current config)
-//! fixture is a hard error with instructions to regenerate, never a silent
-//! rebuild — a bench run should not be able to paper over a real bug by
-//! quietly re-proving a fixture that no longer matches the code under test.
+//! [`cached_dealer_messages`] (used by the benches) is read-only: a
+//! missing, corrupt, or stale fixture panics with regeneration
+//! instructions instead of silently re-proving, so a real bug can't get
+//! papered over by quietly rebuilding a still-valid-looking proof.
 //!
 //! [`regenerate_dealer_messages`] (used by the `warm_bench_fixtures`
-//! example, the only place that writes) rebuilds and overwrites a fixture
-//! in place when it is missing or invalid, and leaves it untouched
-//! otherwise, so a `cargo run --example warm_bench_fixtures` after a code
-//! change replaces just the fixtures whose proof bytes actually moved
-//! instead of piling up new files.
+//! example, the only writer) rebuilds a fixture only when it's missing or
+//! invalid, so regenerating after a code change replaces just the files
+//! whose proof bytes moved instead of piling up new ones.
+//!
+//! `verify_dealings` is real per-proof crypto work — tens of minutes at the
+//! largest shape (`n = 100`). A `.sha256` sidecar next to each fixture
+//! memoizes it: once a byte-identical file has verified, later loads trust
+//! the sidecar and skip re-verifying. Editing a fixture without updating
+//! its sidecar changes the digest and falls back to a real verify, so this
+//! can't mask a fixture that actually changed.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +32,7 @@ use golden_core::{create_dealing, verify_dealings, DealerMessage, DkgConfig, Par
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+use sha2::{Digest, Sha256};
 
 use super::{identity_secret, BENCH_SEED};
 
@@ -42,6 +47,32 @@ fn cache_dir() -> PathBuf {
 
 fn cache_path(threshold: usize, n: usize) -> PathBuf {
     cache_dir().join(format!("t{threshold}-n{n}.bin"))
+}
+
+/// Sidecar path recording a fixture's last-verified SHA-256 digest.
+fn stamp_path(threshold: usize, n: usize) -> PathBuf {
+    cache_dir().join(format!("t{threshold}-n{n}.bin.sha256"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Write `stamp_path(threshold, n)` recording `digest` as verified.
+/// Best-effort: a failed write only costs the next load a fresh
+/// `verify_dealings`, it does not affect correctness.
+fn write_stamp(threshold: usize, n: usize, digest: &str) {
+    let path = stamp_path(threshold, n);
+    let tmp_path = path.with_extension("sha256.tmp");
+    if fs::write(&tmp_path, digest).is_ok() {
+        let _ = fs::rename(&tmp_path, &path);
+    }
 }
 
 /// Build all `n` dealer messages for `config` from scratch, sequentially
@@ -66,7 +97,12 @@ fn build_dealer_messages(
         .collect()
 }
 
-fn write_cache(path: &Path, messages: &[DealerMessage<Secp256k1GoldenGroup>]) -> io::Result<()> {
+fn write_cache(
+    threshold: usize,
+    n: usize,
+    messages: &[DealerMessage<Secp256k1GoldenGroup>],
+) -> io::Result<()> {
+    let path = cache_path(threshold, n);
     fs::create_dir_all(path.parent().unwrap())?;
     let mut buf = Vec::new();
     buf.extend_from_slice(&(messages.len() as u32).to_le_bytes());
@@ -79,13 +115,16 @@ fn write_cache(path: &Path, messages: &[DealerMessage<Secp256k1GoldenGroup>]) ->
     // the tracked path (which `git status` would otherwise flag as dirty).
     let tmp_path = path.with_extension("tmp");
     fs::write(&tmp_path, &buf)?;
-    fs::rename(&tmp_path, path)
+    fs::rename(&tmp_path, &path)?;
+    // Freshly built messages are correct by construction (just proved
+    // against `config`), so stamp them without re-verifying.
+    write_stamp(threshold, n, &sha256_hex(&buf));
+    Ok(())
 }
 
-/// Decode a cache file. Returns `None` on any structural problem (missing
-/// file, truncated length prefixes, trailing bytes, bad wire encoding).
-fn read_cache(path: &Path) -> Option<Vec<DealerMessage<Secp256k1GoldenGroup>>> {
-    let buf = fs::read(path).ok()?;
+/// Decode a cache file. Returns `None` on any structural problem (truncated
+/// length prefixes, trailing bytes, bad wire encoding).
+fn decode_cache(buf: &[u8]) -> Option<Vec<DealerMessage<Secp256k1GoldenGroup>>> {
     let count = u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) as usize;
     let mut offset = 4;
     let mut messages = Vec::with_capacity(count);
@@ -99,22 +138,32 @@ fn read_cache(path: &Path) -> Option<Vec<DealerMessage<Secp256k1GoldenGroup>>> {
     (offset == buf.len()).then_some(messages)
 }
 
-/// Load `path` and check it decodes to exactly `n` messages that verify
-/// against `config`. `None` covers every way a fixture can be unusable:
-/// missing, truncated, wrong count, or cryptographically invalid/stale.
+/// Load and validate the fixture for `(threshold, n)`. `None` covers every
+/// way it can be unusable: missing, truncated, wrong count, or
+/// cryptographically invalid/stale. Skips `verify_dealings` when the
+/// bytes match the `.sha256` sidecar, and stamps it after a fresh verify.
 fn load_valid(
-    path: &Path,
-    config: &DkgConfig<Secp256k1GoldenGroup>,
+    threshold: usize,
     n: usize,
+    config: &DkgConfig<Secp256k1GoldenGroup>,
 ) -> Option<BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>>> {
-    let messages = read_cache(path)?;
+    let raw = fs::read(cache_path(threshold, n)).ok()?;
+    let messages = decode_cache(&raw)?;
     if messages.len() != n {
         return None;
     }
-    let refs: Vec<_> = messages.iter().collect();
-    verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(&refs, config)
-        .ok()
-        .map(|()| messages.into_iter().map(|m| (m.dealer, m)).collect())
+
+    let digest = sha256_hex(&raw);
+    let already_verified =
+        fs::read_to_string(stamp_path(threshold, n)).is_ok_and(|stamped| stamped.trim() == digest);
+
+    if !already_verified {
+        let refs: Vec<_> = messages.iter().collect();
+        verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(&refs, config).ok()?;
+        write_stamp(threshold, n, &digest);
+    }
+
+    Some(messages.into_iter().map(|m| (m.dealer, m)).collect())
 }
 
 /// Return all `n` dealer messages for `config`, loaded from the checked-in
@@ -128,14 +177,13 @@ pub fn cached_dealer_messages(
     config: &DkgConfig<Secp256k1GoldenGroup>,
 ) -> BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>> {
     let n = config.registry.indexes().count();
-    let path = cache_path(config.threshold, n);
     let message = format!(
         "bench fixture missing or invalid at {}\n\
          Regenerate it with:\n  {REGENERATE_HINT}\n\
          then `git add` and commit the result.",
-        path.display()
+        cache_path(config.threshold, n).display()
     );
-    load_valid(&path, config, n).expect(&message)
+    load_valid(config.threshold, n, config).expect(&message)
 }
 
 /// (Re)build the fixture for `config` and overwrite it on disk, but only if
@@ -143,13 +191,15 @@ pub fn cached_dealer_messages(
 /// rebuilt, `false` if the existing fixture was already up to date.
 pub fn regenerate_dealer_messages(config: &DkgConfig<Secp256k1GoldenGroup>) -> bool {
     let n = config.registry.indexes().count();
-    let path = cache_path(config.threshold, n);
-    if load_valid(&path, config, n).is_some() {
+    if load_valid(config.threshold, n, config).is_some() {
         return false;
     }
     let messages = build_dealer_messages(config);
-    let message = format!("failed to write bench fixture at {}", path.display());
-    write_cache(&path, &messages).expect(&message);
+    let message = format!(
+        "failed to write bench fixture at {}",
+        cache_path(config.threshold, n).display()
+    );
+    write_cache(config.threshold, n, &messages).expect(&message);
     true
 }
 

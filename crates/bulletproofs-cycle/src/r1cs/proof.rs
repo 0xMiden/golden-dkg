@@ -48,6 +48,27 @@ pub struct R1CSProof<C: Cycle> {
 }
 
 impl<C: Cycle> R1CSProof<C> {
+    /// [`Self::to_bytes`]'s wire length for a single-phase proof (the
+    /// `ONE_PHASE_COMMITMENTS` branch: no `specify_randomized_constraints`
+    /// deferred constraints) with an inner-product-proof fold of `lg_n`
+    /// rounds, without constructing a proof.
+    ///
+    /// Fixed part: the version tag, the three phase-1 commitments (`A_I1`,
+    /// `A_O1`, `S1`), the five `t(x)`-coefficient commitments (`T_1`, `T_3`,
+    /// `T_4`, `T_5`, `T_6`), and the three canonical scalars (`t_x`,
+    /// `t_x_blinding`, `e_blinding`, each [`Cycle::scalar_to_canonical`]'s
+    /// fixed 32-byte width).
+    pub fn single_phase_wire_len(lg_n: usize) -> usize {
+        const VERSION_TAG_BYTES: usize = 1;
+        const ONE_PHASE_POINTS: usize = 3 + 5;
+        const SCALARS: usize = 3;
+        const SCALAR_BYTES: usize = 32;
+        VERSION_TAG_BYTES
+            + ONE_PHASE_POINTS * C::COMPRESSED_BYTES
+            + SCALARS * SCALAR_BYTES
+            + InnerProductProof::<C>::serialized_size_for_rounds(lg_n)
+    }
+
     /// Heuristic: detect "no phase-2 multiplier commitments emitted" by
     /// checking that all three phase-2 commitments compressed to the
     /// identity encoding.
