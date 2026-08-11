@@ -157,4 +157,4 @@ pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfPublicParams, BatchedEvrfSta
 }
 
 mod fixture_cache;
-pub use fixture_cache::{cached_dealer_messages, cached_round1_setup};
+pub use fixture_cache::{cached_dealer_messages, cached_round1_setup, regenerate_dealer_messages};

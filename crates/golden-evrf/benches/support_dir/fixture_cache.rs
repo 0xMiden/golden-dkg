@@ -1,18 +1,23 @@
-//! Disk cache for dealer-message fixtures shared across benches.
+//! Checked-in dealer-message fixtures shared across benches.
 //!
 //! Building `n` real dealer proofs is pure benchmark-harness cost, not what
 //! `evrf_verify`, `dkg_round`, `evrf_proof_size`, or `dkg_communication`
-//! measure, but every one of them has to pay it before it can start timing.
-//! This module builds the `n` dealer messages for a `(threshold, n)` shape
-//! once, serializes them with the existing wire codec
-//! (`golden_core::wire::to_wire_bytes` / `from_wire_bytes`), and reloads
-//! them on later runs instead of re-proving.
+//! measure. This module reads those `n` messages for a `(threshold, n)`
+//! shape from `benches/fixtures/dealer-messages/` (wire-codec encoded and
+//! git-tracked), so the cost is paid once and shared via git history.
 //!
-//! The cache is keyed on `(threshold, n, BENCH_SEED, FORMAT_VERSION)` and
-//! lives under `target/`, so it is local-only and never checked in. It is
-//! self-healing: a missing, truncated, or otherwise invalid cache file is
-//! treated as a miss and rebuilt, and a decoded-but-corrupt cache is caught
-//! by running the messages through `verify_dealings` before trusting them.
+//! [`cached_dealer_messages`] (used by the benches) is read-only: a missing,
+//! corrupt, or stale (fails `verify_dealings` against the current config)
+//! fixture is a hard error with instructions to regenerate, never a silent
+//! rebuild — a bench run should not be able to paper over a real bug by
+//! quietly re-proving a fixture that no longer matches the code under test.
+//!
+//! [`regenerate_dealer_messages`] (used by the `warm_bench_fixtures`
+//! example, the only place that writes) rebuilds and overwrites a fixture
+//! in place when it is missing or invalid, and leaves it untouched
+//! otherwise, so a `cargo run --example warm_bench_fixtures` after a code
+//! change replaces just the fixtures whose proof bytes actually moved
+//! instead of piling up new files.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,19 +31,17 @@ use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
 use super::{identity_secret, BENCH_SEED};
 
-/// Bumped whenever the cache file layout below changes shape; the wire
-/// codec's own `MAGIC` already guards against `DealerMessage` format drift.
-const FORMAT_VERSION: u32 = 1;
+/// The command printed in panic/log messages so a stale or missing fixture
+/// tells the reader exactly how to fix it.
+const REGENERATE_HINT: &str = "cargo run --profile optimized --example warm_bench_fixtures \
+    --features golden-evrf/halo2curves-secp256k1,golden-evrf/parallel";
 
 fn cache_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bench-fixtures/dealer-messages")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/fixtures/dealer-messages")
 }
 
 fn cache_path(threshold: usize, n: usize) -> PathBuf {
-    let seed_hex: String = BENCH_SEED[..8].iter().map(|b| format!("{b:02x}")).collect();
-    cache_dir().join(format!(
-        "t{threshold}-n{n}-seed{seed_hex}-v{FORMAT_VERSION}.bin"
-    ))
+    cache_dir().join(format!("t{threshold}-n{n}.bin"))
 }
 
 /// Build all `n` dealer messages for `config` from scratch, sequentially
@@ -72,16 +75,15 @@ fn write_cache(path: &Path, messages: &[DealerMessage<Secp256k1GoldenGroup>]) ->
         buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
         buf.extend_from_slice(&encoded);
     }
-    // Write-then-rename so a crash or a concurrent bench run never leaves a
-    // partially written file at the real path.
+    // Write-then-rename so a crash never leaves a partially written file at
+    // the tracked path (which `git status` would otherwise flag as dirty).
     let tmp_path = path.with_extension("tmp");
     fs::write(&tmp_path, &buf)?;
     fs::rename(&tmp_path, path)
 }
 
 /// Decode a cache file. Returns `None` on any structural problem (missing
-/// file, truncated length prefixes, trailing bytes, bad wire encoding) so
-/// the caller can fall back to rebuilding.
+/// file, truncated length prefixes, trailing bytes, bad wire encoding).
 fn read_cache(path: &Path) -> Option<Vec<DealerMessage<Secp256k1GoldenGroup>>> {
     let buf = fs::read(path).ok()?;
     let count = u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) as usize;
@@ -97,44 +99,63 @@ fn read_cache(path: &Path) -> Option<Vec<DealerMessage<Secp256k1GoldenGroup>>> {
     (offset == buf.len()).then_some(messages)
 }
 
-/// Return all `n` dealer messages for `config`, loading them from the disk
-/// cache when a valid entry exists and rebuilding (then caching) otherwise.
+/// Load `path` and check it decodes to exactly `n` messages that verify
+/// against `config`. `None` covers every way a fixture can be unusable:
+/// missing, truncated, wrong count, or cryptographically invalid/stale.
+fn load_valid(
+    path: &Path,
+    config: &DkgConfig<Secp256k1GoldenGroup>,
+    n: usize,
+) -> Option<BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>>> {
+    let messages = read_cache(path)?;
+    if messages.len() != n {
+        return None;
+    }
+    let refs: Vec<_> = messages.iter().collect();
+    verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(&refs, config)
+        .ok()
+        .map(|()| messages.into_iter().map(|m| (m.dealer, m)).collect())
+}
+
+/// Return all `n` dealer messages for `config`, loaded from the checked-in
+/// fixture at `benches/fixtures/dealer-messages/t{threshold}-n{n}.bin`.
 ///
-/// Validity is checked by running the decoded messages through
-/// `verify_dealings` against `config` before returning them, so a stale or
-/// corrupt cache entry is never handed back silently.
+/// Panics if the fixture is missing, corrupt, or no longer verifies against
+/// `config` (e.g. the wire format or protocol changed) — callers regenerate
+/// explicitly with the `warm_bench_fixtures` example rather than have this
+/// silently re-prove and potentially mask a real regression.
 pub fn cached_dealer_messages(
     config: &DkgConfig<Secp256k1GoldenGroup>,
 ) -> BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>> {
     let n = config.registry.indexes().count();
     let path = cache_path(config.threshold, n);
+    let message = format!(
+        "bench fixture missing or invalid at {}\n\
+         Regenerate it with:\n  {REGENERATE_HINT}\n\
+         then `git add` and commit the result.",
+        path.display()
+    );
+    load_valid(&path, config, n).expect(&message)
+}
 
-    if let Some(messages) = read_cache(&path) {
-        let refs: Vec<_> = messages.iter().collect();
-        if messages.len() == n
-            && verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(&refs, config).is_ok()
-        {
-            return messages.into_iter().map(|m| (m.dealer, m)).collect();
-        }
-        eprintln!(
-            "bench fixture cache at {} is stale or invalid; rebuilding",
-            path.display()
-        );
+/// (Re)build the fixture for `config` and overwrite it on disk, but only if
+/// the tracked file is missing or no longer valid. Returns `true` if it was
+/// rebuilt, `false` if the existing fixture was already up to date.
+pub fn regenerate_dealer_messages(config: &DkgConfig<Secp256k1GoldenGroup>) -> bool {
+    let n = config.registry.indexes().count();
+    let path = cache_path(config.threshold, n);
+    if load_valid(&path, config, n).is_some() {
+        return false;
     }
-
     let messages = build_dealer_messages(config);
-    if let Err(err) = write_cache(&path, &messages) {
-        eprintln!(
-            "failed to write bench fixture cache at {}: {err}",
-            path.display()
-        );
-    }
-    messages.into_iter().map(|m| (m.dealer, m)).collect()
+    let message = format!("failed to write bench fixture at {}", path.display());
+    write_cache(&path, &messages).expect(&message);
+    true
 }
 
 /// Build the setup for one participant's Round 1: its own full dealing
 /// (message plus `private_share`, which cannot be cached because it is
-/// never put on the wire) alongside every peer's cached message.
+/// never put on the wire) alongside every peer's fixture message.
 ///
 /// Only `receiver`'s dealing is proved fresh; the other `n - 1` messages
 /// come from [`cached_dealer_messages`].
