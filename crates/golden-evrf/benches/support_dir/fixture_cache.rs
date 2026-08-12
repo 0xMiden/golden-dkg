@@ -6,7 +6,8 @@
 //! shape from `benches/fixtures/dealer-messages/` (wire-codec encoded and
 //! git-tracked), so the cost is paid once and shared via git history.
 //!
-//! [`cached_dealer_messages`] (used by the benches) is read-only: a
+//! [`cached_dealer_messages`] and [`verify_dealer_messages`] (used by the
+//! benches and CI's fixture-check job, respectively) are read-only: a
 //! missing, corrupt, or stale fixture panics with regeneration
 //! instructions instead of silently re-proving, so a real bug can't get
 //! papered over by quietly rebuilding a still-valid-looking proof.
@@ -21,9 +22,12 @@
 //! memoizes it: once a byte-identical file has verified, later loads trust
 //! the sidecar and skip re-verifying. Editing a fixture without updating
 //! its sidecar changes the digest and falls back to a real verify, so this
-//! can't mask a fixture that actually changed.
+//! can't mask a fixture that actually changed. The shortcut is reserved for
+//! [`cached_dealer_messages`] (bench loads); [`verify_dealer_messages`] and
+//! [`regenerate_dealer_messages`] always re-verify, so a verifier
+//! regression can't hide behind a stale-but-byte-identical fixture.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
@@ -139,13 +143,18 @@ fn decode_cache(buf: &[u8]) -> Option<Vec<DealerMessage<Secp256k1GoldenGroup>>> 
 }
 
 /// Load and validate the fixture for `(threshold, n)`. `None` covers every
-/// way it can be unusable: missing, truncated, wrong count, or
-/// cryptographically invalid/stale. Skips `verify_dealings` when the
-/// bytes match the `.sha256` sidecar, and stamps it after a fresh verify.
+/// way it can be unusable: missing, truncated, wrong count, wrong dealer
+/// set, or cryptographically invalid/stale.
+///
+/// Skips `verify_dealings` when the bytes match the `.sha256` sidecar,
+/// unless `force_verify` is set — callers where a verifier regression must
+/// not hide behind a stale-but-matching digest pass `true`. Either way, a
+/// fresh verify updates the sidecar.
 fn load_valid(
     threshold: usize,
     n: usize,
     config: &DkgConfig<Secp256k1GoldenGroup>,
+    force_verify: bool,
 ) -> Option<BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>>> {
     let raw = fs::read(cache_path(threshold, n)).ok()?;
     let messages = decode_cache(&raw)?;
@@ -154,8 +163,9 @@ fn load_valid(
     }
 
     let digest = sha256_hex(&raw);
-    let already_verified =
-        fs::read_to_string(stamp_path(threshold, n)).is_ok_and(|stamped| stamped.trim() == digest);
+    let already_verified = !force_verify
+        && fs::read_to_string(stamp_path(threshold, n))
+            .is_ok_and(|stamped| stamped.trim() == digest);
 
     if !already_verified {
         let refs: Vec<_> = messages.iter().collect();
@@ -163,7 +173,27 @@ fn load_valid(
         write_stamp(threshold, n, &digest);
     }
 
-    Some(messages.into_iter().map(|m| (m.dealer, m)).collect())
+    let expected_dealers: BTreeSet<_> = config.registry.indexes().collect();
+    let by_dealer: BTreeMap<_, _> = messages.into_iter().map(|m| (m.dealer, m)).collect();
+    (by_dealer.keys().copied().collect::<BTreeSet<_>>() == expected_dealers).then_some(by_dealer)
+}
+
+/// Panics with regeneration instructions; shared by every fixture-loading
+/// entry point below so a missing, corrupt, or stale fixture fails the same
+/// way regardless of caller.
+fn expect_valid(
+    threshold: usize,
+    n: usize,
+    config: &DkgConfig<Secp256k1GoldenGroup>,
+    force_verify: bool,
+) -> BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>> {
+    let message = format!(
+        "bench fixture missing or invalid at {}\n\
+         Regenerate it with:\n  {REGENERATE_HINT}\n\
+         then `git add` and commit the result.",
+        cache_path(threshold, n).display()
+    );
+    load_valid(threshold, n, config, force_verify).expect(&message)
 }
 
 /// Return all `n` dealer messages for `config`, loaded from the checked-in
@@ -172,18 +202,27 @@ fn load_valid(
 /// Panics if the fixture is missing, corrupt, or no longer verifies against
 /// `config` (e.g. the wire format or protocol changed) — callers regenerate
 /// explicitly with the `warm_bench_fixtures` example rather than have this
-/// silently re-prove and potentially mask a real regression.
+/// silently re-prove and potentially mask a real regression. Trusts the
+/// `.sha256` sidecar to skip `verify_dealings` on a byte-identical fixture;
+/// use [`verify_dealer_messages`] where that shortcut isn't wanted.
 pub fn cached_dealer_messages(
     config: &DkgConfig<Secp256k1GoldenGroup>,
 ) -> BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>> {
     let n = config.registry.indexes().count();
-    let message = format!(
-        "bench fixture missing or invalid at {}\n\
-         Regenerate it with:\n  {REGENERATE_HINT}\n\
-         then `git add` and commit the result.",
-        cache_path(config.threshold, n).display()
-    );
-    load_valid(config.threshold, n, config).expect(&message)
+    expect_valid(config.threshold, n, config, false)
+}
+
+/// Like [`cached_dealer_messages`], but always re-runs `verify_dealings`
+/// instead of trusting the `.sha256` sidecar.
+///
+/// Used by CI's fixture-check job, where trusting a stale-but-matching
+/// digest would let a verifier regression stay hidden as long as the
+/// fixture bytes hadn't changed.
+pub fn verify_dealer_messages(
+    config: &DkgConfig<Secp256k1GoldenGroup>,
+) -> BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>> {
+    let n = config.registry.indexes().count();
+    expect_valid(config.threshold, n, config, true)
 }
 
 /// (Re)build the fixture for `config` and overwrite it on disk, but only if
@@ -191,7 +230,7 @@ pub fn cached_dealer_messages(
 /// rebuilt, `false` if the existing fixture was already up to date.
 pub fn regenerate_dealer_messages(config: &DkgConfig<Secp256k1GoldenGroup>) -> bool {
     let n = config.registry.indexes().count();
-    if load_valid(config.threshold, n, config).is_some() {
+    if load_valid(config.threshold, n, config, true).is_some() {
         return false;
     }
     let messages = build_dealer_messages(config);
