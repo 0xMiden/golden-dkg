@@ -11,8 +11,8 @@ use rand_core::CryptoRngCore;
 
 use super::{
     affine, evrf_batched_prove, evrf_batched_verify_many, fp_to_fq, h_gin_1, h_gin_2,
-    BatchedEvrfPublicParams, BatchedEvrfStatement, BatchedEvrfWitness, BatchedReceiverStatement,
-    Gin, BATCHED_PROOF_ID, MESSAGE_BYTES,
+    validate_batched_statement_shape, BatchedEvrfPublicParams, BatchedEvrfStatement,
+    BatchedEvrfWitness, BatchedReceiverStatement, Gin, BATCHED_PROOF_ID, MESSAGE_BYTES,
 };
 
 pub(super) fn ensure_same_batch_context(
@@ -171,6 +171,7 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
             sk1,
             polynomial_constant,
         };
+        validate_batched_statement_shape(&batched_statement)?;
         let params = BatchedEvrfPublicParams::shared(threshold, batched_statement.receivers.len())?;
         evrf_batched_prove(&params, &batched_statement, &batched_witness, rng)
     }
@@ -180,6 +181,7 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
         proof: &[u8],
     ) -> Result<()> {
         let statement = batched_statement(statements)?;
+        validate_batched_statement_shape(&statement)?;
         let params =
             BatchedEvrfPublicParams::shared(statement.threshold, statement.receivers.len())?;
         evrf_batched_verify_many(&params, &[(&statement, proof)])
@@ -195,6 +197,9 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
             .iter()
             .map(|(batch, _)| batched_statement(batch))
             .collect::<Result<Vec<_>>>()?;
+        for statement in &statements {
+            validate_batched_statement_shape(statement)?;
+        }
         let first = statements.first().ok_or(Error::ProofVerificationFailed)?;
         let params = BatchedEvrfPublicParams::shared(first.threshold, first.receivers.len())?;
         let instances = statements

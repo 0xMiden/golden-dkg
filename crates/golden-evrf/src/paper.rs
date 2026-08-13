@@ -1798,13 +1798,29 @@ pub mod secp_secq {
     // Batched statement validation and transcript binding.
     // ------------------------------------------------------------------
 
-    fn validate_batched_public_relations(statement: &BatchedEvrfStatement) -> Result<()> {
+    fn validate_batched_statement_shape(statement: &BatchedEvrfStatement) -> Result<()> {
         if statement.receivers.is_empty()
+            || statement.receivers.len() < statement.threshold.saturating_sub(1)
             || statement.commitment_coefficients.is_empty()
             || statement.commitment_coefficients.len() != statement.threshold
             || statement.statement_roots.len() != statement.receivers.len()
-            || is_identity(&statement.pk1)
         {
+            return Err(Error::ProofVerificationFailed);
+        }
+        for (receiver_index, rec) in statement.receivers.iter().enumerate() {
+            if statement.receivers[..receiver_index]
+                .iter()
+                .any(|previous| previous.receiver == rec.receiver)
+            {
+                return Err(Error::ProofVerificationFailed);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_batched_public_relations(statement: &BatchedEvrfStatement) -> Result<()> {
+        validate_batched_statement_shape(statement)?;
+        if is_identity(&statement.pk1) {
             return Err(Error::ProofVerificationFailed);
         }
         for rec in &statement.receivers {
@@ -1893,7 +1909,7 @@ pub mod secp_secq {
 
     /// Count multipliers from the exact public circuit shape.
     fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
-        if threshold == 0 || receiver_count == 0 {
+        if threshold == 0 || receiver_count == 0 || receiver_count < threshold.saturating_sub(1) {
             return Err(Error::ProofVerificationFailed);
         }
         let receivers = receiver_count
@@ -3591,6 +3607,27 @@ pub mod secp_secq {
                 evrf_batched_verify_many(&params, &[(&statement, &[])]).unwrap_err(),
                 Error::ProofVerificationFailed
             );
+        }
+
+        #[test]
+        fn batched_statement_rejects_duplicate_receiver_indices() {
+            let mut statement = context_statement();
+            statement.receivers.push(statement.receivers[0].clone());
+            statement.statement_roots.push([2u8; 32]);
+
+            assert_eq!(
+                validate_batched_public_relations(&statement).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        #[test]
+        fn batched_parameter_setup_requires_enough_receiver_evaluations() {
+            assert!(BatchedEvrfPublicParams::setup(2, 1).is_ok());
+            assert!(matches!(
+                BatchedEvrfPublicParams::setup(3, 1),
+                Err(Error::ProofVerificationFailed)
+            ));
         }
 
         #[test]
