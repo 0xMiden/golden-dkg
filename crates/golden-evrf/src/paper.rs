@@ -1807,13 +1807,12 @@ pub mod secp_secq {
         {
             return Err(Error::ProofVerificationFailed);
         }
-        for (receiver_index, rec) in statement.receivers.iter().enumerate() {
-            if statement.receivers[..receiver_index]
-                .iter()
-                .any(|previous| previous.receiver == rec.receiver)
-            {
-                return Err(Error::ProofVerificationFailed);
-            }
+        if statement
+            .receivers
+            .windows(2)
+            .any(|pair| pair[0].receiver >= pair[1].receiver)
+        {
+            return Err(Error::ProofVerificationFailed);
         }
         Ok(())
     }
@@ -3610,13 +3609,31 @@ pub mod secp_secq {
         }
 
         #[test]
-        fn batched_statement_rejects_duplicate_receiver_indices() {
-            let mut statement = context_statement();
-            statement.receivers.push(statement.receivers[0].clone());
-            statement.statement_roots.push([2u8; 32]);
-
+        fn batched_statement_rejects_non_increasing_receiver_indices() {
+            let mut duplicate = context_statement();
+            duplicate.receivers.push(duplicate.receivers[0].clone());
+            duplicate.statement_roots.push([2u8; 32]);
             assert_eq!(
-                validate_batched_public_relations(&statement).unwrap_err(),
+                validate_batched_statement_shape(&duplicate).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+
+            let mut out_of_order = duplicate;
+            out_of_order.receivers[0].receiver = ParticipantIndex::new(2).unwrap();
+            out_of_order.receivers[1].receiver = ParticipantIndex::new(1).unwrap();
+            assert_eq!(
+                validate_batched_statement_shape(&out_of_order).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        #[test]
+        fn batched_statement_requires_enough_receiver_evaluations() {
+            let mut statement = context_statement();
+            statement.threshold = 3;
+            statement.commitment_coefficients.resize(3, Gin::identity());
+            assert_eq!(
+                validate_batched_statement_shape(&statement).unwrap_err(),
                 Error::ProofVerificationFailed
             );
         }

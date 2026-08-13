@@ -57,33 +57,6 @@ fn batched_backend_uses_v7_proof_protocol_identifier() {
 }
 
 #[test]
-fn backend_rejects_too_few_receiver_evaluations() {
-    let mut statement = minimal_evrf_statement();
-    statement.threshold = 3;
-    statement.commitment_coefficients = vec![
-        statement.commitment_coefficients[0],
-        Secp256k1GoldenGroup::identity(),
-        Secp256k1GoldenGroup::identity(),
-    ];
-
-    assert_eq!(
-        SecpSecqBackend::verify_batch(core::slice::from_ref(&statement), &[]).unwrap_err(),
-        Error::ProofVerificationFailed
-    );
-}
-
-#[test]
-fn backend_rejects_duplicate_receiver_indices() {
-    let statement = minimal_evrf_statement();
-    let statements = [statement.clone(), statement];
-
-    assert_eq!(
-        SecpSecqBackend::verify_batch(&statements, &[]).unwrap_err(),
-        Error::ProofVerificationFailed
-    );
-}
-
-#[test]
 fn backend_rejects_malformed_proof_stream_framing() {
     let statement = minimal_evrf_statement();
     let proof_id = <SecpSecqBackend as EvrfProofBackend<Secp256k1GoldenGroup>>::PROOF_ID;
