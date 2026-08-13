@@ -113,8 +113,8 @@ pub mod secp_secq {
 
     /// Versioned proof-stream grammar for the standalone one-receiver relation.
     const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v3";
-    /// Proof protocol identifier for the batched dealer relation and v5 stream grammar.
-    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v5";
+    /// Proof protocol identifier for the batched dealer relation and v7 stream grammar.
+    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v7";
 
     type GinStreamCurve = CycleCurve<Secp256k1Cycle>;
     type GoutStreamCurve = CycleCurve<R1csCycle>;
@@ -214,10 +214,10 @@ pub mod secp_secq {
 
     /// Reusable transparent parameters for one batched dealer circuit shape.
     ///
-    /// Setup derives the exact multiplier count from the DKG threshold and
-    /// receiver count, then expands the deterministic Bulletproof generators
-    /// once. The same value can be shared by every dealer proof with that
-    /// shape. With the `serde` feature, serialized parameters contain the
+    /// Setup validates the DKG threshold and derives the exact multiplier count
+    /// from the receiver count, then expands the deterministic Bulletproof
+    /// generators once. The same value can be shared by every dealer proof with
+    /// that statement shape. With the `serde` feature, serialized parameters contain the
     /// prepared bases and must be authenticated before loading; deserialization
     /// validates encodings and dimensions but does not rederive every base.
     pub struct BatchedEvrfPublicParams {
@@ -353,7 +353,7 @@ pub mod secp_secq {
             Ok(std::sync::Arc::clone(params))
         }
 
-        /// DKG threshold used to size these parameters.
+        /// DKG threshold retained for statement-shape validation.
         pub fn threshold(&self) -> usize {
             self.threshold
         }
@@ -388,15 +388,15 @@ pub mod secp_secq {
     pub struct BatchedEvrfWitness {
         /// Dealer identity secret `sk_1` in `Fq` (shared across the batch).
         pub sk1: GinScalar,
-        /// Dealer polynomial coefficients in ascending degree order.
-        pub coefficient_scalars: Vec<GinScalar>,
+        /// Opening `a_0` of the constant Feldman commitment `A_0 = a_0 * G_in`.
+        pub polynomial_constant: GinScalar,
     }
 
     impl core::fmt::Debug for BatchedEvrfWitness {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.debug_struct("BatchedEvrfWitness")
                 .field("sk1", &"<redacted>")
-                .field("coefficient_scalars", &"<redacted>")
+                .field("polynomial_constant", &"<redacted>")
                 .finish()
         }
     }
@@ -1261,6 +1261,57 @@ pub mod secp_secq {
     }
 
     // ------------------------------------------------------------------
+    // Constant-term proof of knowledge for A_0 = a_0 * G_in.
+    //
+    // This native Schnorr proof follows the nested batched R1CS proof on the
+    // same proof-stream transcript. It supplies the missing scalar opening in
+    // the n-of-n case without adding polynomial coefficients to the circuit.
+    // ------------------------------------------------------------------
+
+    /// Send a Schnorr proof of knowledge of the constant Feldman coefficient.
+    fn constant_term_prove(
+        stream: &mut ProverProofStream,
+        constant_commitment: &Gin,
+        polynomial_constant: &GinScalar,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<()> {
+        let generator = Gin::generator();
+        if generator * *polynomial_constant != *constant_commitment {
+            return Err(Error::ProofVerificationFailed);
+        }
+
+        let nonce = random_nonzero_scalar::<Secp256k1Cycle>(rng);
+        let nonce_commitment = generator * nonce;
+        stream.send_point::<GinStreamCurve>(
+            b"constant-term.a",
+            &nonce_commitment,
+            IdentityPolicy::Reject,
+        )?;
+        let challenge =
+            stream_challenge_scalar::<Secp256k1Cycle>(stream, b"constant-term.challenge");
+        let response = nonce + challenge * *polynomial_constant;
+        stream.send_scalar::<GinStreamCurve>(b"constant-term.t", &response)
+    }
+
+    /// Receive and verify the constant Feldman coefficient proof of knowledge.
+    fn constant_term_verify(
+        stream: &mut VerifierProofStream<'_>,
+        constant_commitment: &Gin,
+    ) -> Result<()> {
+        let nonce_commitment =
+            stream.receive_point::<GinStreamCurve>(b"constant-term.a", IdentityPolicy::Reject)?;
+        let challenge =
+            stream_challenge_scalar::<Secp256k1Cycle>(stream, b"constant-term.challenge");
+        let response = stream.receive_scalar::<GinStreamCurve>(b"constant-term.t")?;
+
+        if Gin::generator() * response != nonce_commitment + *constant_commitment * challenge {
+            return Err(Error::ProofVerificationFailed);
+        }
+
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Discrete-log proof of knowledge for step 9 (R = g_out^r).
     //
     // The R1CS commits to the eVRF output randomness `r` (an `Fp` element,
@@ -1405,10 +1456,9 @@ pub mod secp_secq {
     /// Process-wide cache for `g_in`'s chord-rule precompute table.
     ///
     /// `g_in = Gin::generator()` is a compile-time constant, so
-    /// `precompute_chord` produces the same table on every call. PK_1, the
-    /// Feldman coefficient openings, and every receiver's pad/share
-    /// commitments all exponentiate against `g_in`, so this is computed once
-    /// per process instead of repeatedly per proof.
+    /// `precompute_chord` produces the same table on every call. PK_1 and every
+    /// receiver's pad commitment exponentiate against `g_in`, so this is
+    /// computed once per process instead of repeatedly per proof.
     fn shared_g_in_chord_precomp() -> &'static ChordPrecomp {
         static PRECOMP: std::sync::OnceLock<ChordPrecomp> = std::sync::OnceLock::new();
         PRECOMP.get_or_init(|| {
@@ -1748,13 +1798,28 @@ pub mod secp_secq {
     // Batched statement validation and transcript binding.
     // ------------------------------------------------------------------
 
-    fn validate_batched_public_relations(statement: &BatchedEvrfStatement) -> Result<()> {
+    fn validate_batched_statement_shape(statement: &BatchedEvrfStatement) -> Result<()> {
         if statement.receivers.is_empty()
+            || statement.receivers.len() < statement.threshold.saturating_sub(1)
             || statement.commitment_coefficients.is_empty()
             || statement.commitment_coefficients.len() != statement.threshold
             || statement.statement_roots.len() != statement.receivers.len()
-            || is_identity(&statement.pk1)
         {
+            return Err(Error::ProofVerificationFailed);
+        }
+        if statement
+            .receivers
+            .windows(2)
+            .any(|pair| pair[0].receiver >= pair[1].receiver)
+        {
+            return Err(Error::ProofVerificationFailed);
+        }
+        Ok(())
+    }
+
+    fn validate_batched_public_relations(statement: &BatchedEvrfStatement) -> Result<()> {
+        validate_batched_statement_shape(statement)?;
+        if is_identity(&statement.pk1) {
             return Err(Error::ProofVerificationFailed);
         }
         for rec in &statement.receivers {
@@ -1838,33 +1903,26 @@ pub mod secp_secq {
     /// Multipliers shared by every batched circuit: the dealer secret's
     /// canonical bit decomposition and the `g^sk = PK_1` exponentiation.
     const BATCHED_SHARED_MULTIPLIERS: usize = 1_099;
-    /// Multipliers added by one non-identity Feldman coefficient opening.
-    const BATCHED_COEFFICIENT_MULTIPLIERS: usize = 1_099;
     /// Multipliers added by one receiver relation.
     const BATCHED_RECEIVER_MULTIPLIERS: usize = 3_563;
 
     /// Count multipliers from the exact public circuit shape.
     fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
-        if threshold == 0 || receiver_count == 0 {
+        if threshold == 0 || receiver_count == 0 || receiver_count < threshold.saturating_sub(1) {
             return Err(Error::ProofVerificationFailed);
         }
-        let coefficients = threshold
-            .checked_mul(BATCHED_COEFFICIENT_MULTIPLIERS)
-            .ok_or(Error::ProofVerificationFailed)?;
         let receivers = receiver_count
             .checked_mul(BATCHED_RECEIVER_MULTIPLIERS)
             .ok_or(Error::ProofVerificationFailed)?;
-        // The shared prefix, each coefficient gadget, and each receiver slot
-        // make an odd number of `allocate` calls. Each adjacent pair therefore
-        // shares one multiplier slot in the constraint system.
-        let shared_allocations = threshold
-            .checked_add(receiver_count)
-            .and_then(|count| count.checked_add(1))
+        // The shared prefix and each receiver slot make an odd number of
+        // `allocate` calls. Each adjacent pair therefore shares one multiplier
+        // slot in the constraint system.
+        let shared_allocations = receiver_count
+            .checked_add(1)
             .ok_or(Error::ProofVerificationFailed)?
             / 2;
         BATCHED_SHARED_MULTIPLIERS
-            .checked_add(coefficients)
-            .and_then(|count| count.checked_add(receivers))
+            .checked_add(receivers)
             .and_then(|count| count.checked_sub(shared_allocations))
             .ok_or(Error::ProofVerificationFailed)
     }
@@ -1899,78 +1957,6 @@ pub mod secp_secq {
         pad_bits: Vec<Option<R1csField>>,
         /// Chord witness for `g_in^pad_j`.
         pad_commitment: ChordWitness,
-    }
-
-    fn prove_feldman_coefficients<CS: ConstraintSystem<R1csCycle>>(
-        cs: &mut CS,
-        coefficients: &[Gin],
-        coefficient_scalars: Option<&[GinScalar]>,
-    ) -> core::result::Result<(), R1CSError> {
-        let g_in = Gin::generator();
-        let precomp = shared_g_in_chord_precomp();
-
-        for (i, coefficient) in coefficients.iter().enumerate() {
-            let scalar_fp = coefficient_scalars.map(|scalars| fq_to_fp(&scalars[i]));
-            let scalar_bits = if let Some(scalar_fp) = scalar_fp.as_ref() {
-                let mut bits = [false; K_BITS + 1];
-                decompose_k_fp(scalar_fp, &mut bits);
-                bit_options(&bits)
-            } else {
-                vec![None; K_BITS + 1]
-            };
-            let scalar_var = cs.allocate(scalar_fp)?;
-            let scalar_bit_vars = bit_decompose_q(cs, scalar_var, &scalar_bits)?;
-            if is_identity(coefficient) {
-                for &bit_var in &scalar_bit_vars {
-                    cs.constrain(bit_var.into());
-                }
-            } else {
-                let (coefficient_x, coefficient_y) =
-                    affine(coefficient).map_err(|_| R1CSError::VerificationError)?;
-                let witness = if let Some(scalar_fp) = scalar_fp.as_ref() {
-                    let mut bits = [false; K_BITS + 1];
-                    decompose_k_fp(scalar_fp, &mut bits);
-                    Some(
-                        chord_compute_witness(&bits, &g_in, K_BITS)
-                            .map_err(|_| R1CSError::VerificationError)?,
-                    )
-                } else {
-                    None
-                };
-                let window_products = chord_window_products(cs, &scalar_bit_vars)?;
-                chord_exponentiate_r1cs_with_result(
-                    cs,
-                    &scalar_bit_vars,
-                    precomp,
-                    &window_products,
-                    Some((coefficient_x, coefficient_y)),
-                    witness.as_ref(),
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn ensure_feldman_coefficient_openings(
-        coefficients: &[Gin],
-        coefficient_scalars: &[GinScalar],
-    ) -> Result<()> {
-        if coefficients.len() != coefficient_scalars.len() {
-            return Err(Error::ProofVerificationFailed);
-        }
-
-        let g_in = Gin::generator();
-        for (coefficient, scalar) in coefficients.iter().zip(coefficient_scalars.iter()) {
-            let opened = g_in * *scalar;
-            if Secp256k1Cycle::point_compress(&opened).as_ref()
-                != Secp256k1Cycle::point_compress(coefficient).as_ref()
-            {
-                return Err(Error::ProofVerificationFailed);
-            }
-        }
-
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2120,15 +2106,7 @@ pub mod secp_secq {
         rng: &mut impl CryptoRngCore,
         transcript: &mut Transcript,
     ) -> Result<Vec<u8>> {
-        if witness.coefficient_scalars.len() != statement.commitment_coefficients.len() {
-            return Err(Error::ProofVerificationFailed);
-        }
         let g_in = Gin::generator();
-
-        ensure_feldman_coefficient_openings(
-            &statement.commitment_coefficients,
-            &witness.coefficient_scalars,
-        )?;
 
         // Verify PK_1 = g_in^sk_1.
         let pk1_computed = g_in * witness.sk1;
@@ -2178,13 +2156,6 @@ pub mod secp_secq {
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
-        prove_feldman_coefficients(
-            &mut prover,
-            &statement.commitment_coefficients,
-            Some(&witness.coefficient_scalars),
-        )
-        .map_err(|_| Error::ProofVerificationFailed)?;
-
         for rec in &statement.receivers {
             let rec_witness =
                 compute_hidden_receiver_witness(&witness.sk1, rec, &statement.beta, &h1, &h2)?;
@@ -2208,7 +2179,8 @@ pub mod secp_secq {
         Ok(r1cs_proof.to_bytes())
     }
 
-    /// Generate a Batched Dealer Proof as a Proof Stream containing one nested R1CS proof.
+    /// Generate a Batched Dealer Proof containing a nested R1CS proof followed
+    /// by a native constant-term Schnorr proof on the same transcript.
     pub fn evrf_batched_prove(
         params: &BatchedEvrfPublicParams,
         statement: &BatchedEvrfStatement,
@@ -2222,6 +2194,12 @@ pub mod secp_secq {
         stream.send_nested(|transcript| {
             prove_batched_r1cs(params, statement, witness, rng, transcript)
         })?;
+        constant_term_prove(
+            &mut stream,
+            &statement.commitment_coefficients[0],
+            &witness.polynomial_constant,
+            rng,
+        )?;
         Ok(stream.finish())
     }
 
@@ -2263,9 +2241,6 @@ pub mod secp_secq {
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
 
-        prove_feldman_coefficients(&mut verifier, &statement.commitment_coefficients, None)
-            .map_err(|_| Error::ProofVerificationFailed)?;
-
         for rec in &statement.receivers {
             build_hidden_receiver_slot(
                 &mut verifier,
@@ -2296,20 +2271,25 @@ pub mod secp_secq {
             .map_err(|_| Error::ProofVerificationFailed)
     }
 
-    fn parse_batched_proof_stream(
+    fn prepare_batched_proof(
+        params: &BatchedEvrfPublicParams,
         statement: &BatchedEvrfStatement,
         proof: &[u8],
-    ) -> Result<(R1CSProof<R1csCycle>, Transcript)> {
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<VerificationEquation<R1csCycle>> {
         let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
         observe_batched_statement(&mut stream, statement)?;
-        let parsed = stream.receive_nested(|transcript, payload| {
-            Ok((parse_canonical_r1cs_proof(payload)?, transcript.clone()))
+        let equation = stream.receive_nested(|transcript, payload| {
+            let r1cs_proof = parse_canonical_r1cs_proof(payload)?;
+            prepare_batched_r1cs(params, statement, &r1cs_proof, rng, transcript)
         })?;
+        constant_term_verify(&mut stream, &statement.commitment_coefficients[0])?;
         stream.finish()?;
-        Ok(parsed)
+        Ok(equation)
     }
 
-    /// Verify a Batched Dealer Proof represented as a Proof Stream with one nested R1CS proof.
+    /// Verify a Batched Dealer Proof represented as a nested R1CS proof and a
+    /// trailing native constant-term Schnorr proof.
     pub fn evrf_batched_verify(
         params: &BatchedEvrfPublicParams,
         statement: &BatchedEvrfStatement,
@@ -2318,8 +2298,7 @@ pub mod secp_secq {
     ) -> Result<()> {
         params.validate_statement(statement)?;
         validate_batched_public_relations(statement)?;
-        let (r1cs_proof, mut transcript) = parse_batched_proof_stream(statement, proof)?;
-        let equation = prepare_batched_r1cs(params, statement, &r1cs_proof, rng, &mut transcript)?;
+        let equation = prepare_batched_proof(params, statement, proof, rng)?;
         equation
             .verify()
             .map_err(|_| Error::ProofVerificationFailed)
@@ -2337,11 +2316,6 @@ pub mod secp_secq {
             params.validate_statement(statement)?;
             validate_batched_public_relations(statement)?;
         }
-        let parsed_proofs = instances
-            .iter()
-            .map(|(statement, proof)| parse_batched_proof_stream(statement, proof))
-            .collect::<Result<Vec<_>>>()?;
-
         // Derive the batching entropy from the complete ordered statements and
         // proof bytes. The lower layer samples a fresh nonzero coefficient for
         // each equation from this transcript-derived RNG.
@@ -2358,10 +2332,10 @@ pub mod secp_secq {
         let mut rng = ChaCha20Rng::from_seed(seed);
 
         let mut equations = Vec::with_capacity(instances.len());
-        for ((statement, _), (r1cs_proof, mut transcript)) in instances.iter().zip(parsed_proofs) {
-            let equation =
-                prepare_batched_r1cs(params, statement, &r1cs_proof, &mut rng, &mut transcript)?;
-            equations.push(equation);
+        for (statement, proof) in instances {
+            // Constant-term Schnorr proofs are deliberately verified one at a
+            // time; only the expensive R1CS equations use the shared MSM.
+            equations.push(prepare_batched_proof(params, statement, proof, &mut rng)?);
         }
 
         VerificationEquation::verify_batch(equations, &mut rng)
@@ -2503,11 +2477,7 @@ pub mod secp_secq {
             let pk1 = g_in * sk1;
             let h1 = h_gin_1(msg);
             let h2 = h_gin_2(msg);
-            let coefficient_scalars = vec![GinScalar::from(10u64), GinScalar::ONE];
-            let commitment_coefficients = coefficient_scalars
-                .iter()
-                .map(|coefficient| g_in * *coefficient)
-                .collect::<Vec<_>>();
+            let commitment_coefficients = vec![g_in * GinScalar::from(10u64), g_in];
 
             let receivers: Vec<BatchedReceiverStatement> = pkjs
                 .iter()
@@ -2553,7 +2523,7 @@ pub mod secp_secq {
             };
             let witness = BatchedEvrfWitness {
                 sk1,
-                coefficient_scalars,
+                polynomial_constant: GinScalar::from(10u64),
             };
             (statement, witness)
         }
@@ -2694,28 +2664,42 @@ pub mod secp_secq {
 
         #[test]
         fn batched_parameter_setup_matches_verifier_metrics() {
-            let threshold = 3;
+            let threshold = 2;
             let receiver_count = 2;
             let pkjs = [
                 Gin::generator() * GinScalar::from(3u64),
                 Gin::generator() * GinScalar::from(5u64),
             ];
-            let (mut statement, _) = testing::build_batched(
+            let (statement, _) = testing::build_batched(
                 &[0x42; MESSAGE_BYTES],
                 GinScalar::from(7u64),
                 &pkjs,
                 R1csField::from(11u64),
             );
-            statement.threshold = threshold;
-            statement.commitment_coefficients = (1..=threshold)
-                .map(|coefficient| Gin::generator() * GinScalar::from(coefficient as u64 + 20))
-                .collect();
 
             let verifier = build_batched_verifier(&statement, Transcript::new(R1CS_TEST_DOMAIN))
                 .expect("valid verifier circuit");
-            let multiplier_count =
-                batched_multiplier_count(threshold, receiver_count).expect("valid shape");
-            assert_eq!(multiplier_count, verifier.metrics().multipliers);
+            assert_eq!(verifier.metrics().multipliers, 8_224);
+            assert_eq!(
+                batched_multiplier_count(threshold, receiver_count).expect("valid shape"),
+                verifier.metrics().multipliers
+            );
+        }
+
+        #[test]
+        fn batched_parameter_dimensions_do_not_scale_with_threshold() {
+            for (threshold, receiver_count, multipliers, padded) in [
+                (2, 1, 4_661, 8_192),
+                (2, 2, 8_224, 16_384),
+                (2, 9, 33_161, 65_536),
+                (49, 49, 175_661, 262_144),
+                (99, 99, 353_786, 524_288),
+            ] {
+                let actual = batched_multiplier_count(threshold, receiver_count)
+                    .expect("valid batched circuit shape");
+                assert_eq!(actual, multipliers);
+                assert_eq!(actual.next_power_of_two(), padded);
+            }
         }
 
         /// Build a canonical bit decomposition of `k` (little-endian).
@@ -3252,6 +3236,92 @@ pub mod secp_secq {
     }
 
     #[cfg(test)]
+    mod constant_term_tests {
+        use super::*;
+        use rand_chacha::rand_core::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        const CONSTANT_TERM_TEST_PROOF_ID: &[u8] = b"golden-paper-evrf-constant-term-tests-v1";
+
+        fn observe_context(
+            stream: &mut impl Observe,
+            constant_commitment: &Gin,
+            statement_tag: u8,
+        ) -> Result<()> {
+            stream.observe_bytes(b"test.statement", &[statement_tag]);
+            stream.observe_point::<GinStreamCurve>(
+                b"test.statement.constant-term",
+                constant_commitment,
+                IdentityPolicy::Allow,
+            )?;
+            // Models the already-consumed nested R1CS transcript prefix.
+            stream.observe_bytes(b"test.r1cs-prefix", b"nested-r1cs");
+            Ok(())
+        }
+
+        fn prove(
+            constant_commitment: &Gin,
+            polynomial_constant: &GinScalar,
+            statement_tag: u8,
+            rng: &mut impl CryptoRngCore,
+        ) -> Result<Vec<u8>> {
+            let mut stream = ProverProofStream::new(CONSTANT_TERM_TEST_PROOF_ID)?;
+            observe_context(&mut stream, constant_commitment, statement_tag)?;
+            constant_term_prove(&mut stream, constant_commitment, polynomial_constant, rng)?;
+            Ok(stream.finish())
+        }
+
+        fn verify(proof: &[u8], constant_commitment: &Gin, statement_tag: u8) -> Result<()> {
+            let mut stream = VerifierProofStream::new(CONSTANT_TERM_TEST_PROOF_ID, proof)?;
+            observe_context(&mut stream, constant_commitment, statement_tag)?;
+            constant_term_verify(&mut stream, constant_commitment)?;
+            stream.finish()
+        }
+
+        #[test]
+        fn constant_term_round_trips_nonzero_and_zero_openings() {
+            let mut rng = ChaCha20Rng::seed_from_u64(0x0C05_7A07);
+            for polynomial_constant in [GinScalar::from(19u64), GinScalar::ZERO] {
+                let constant_commitment = Gin::generator() * polynomial_constant;
+                let proof =
+                    prove(&constant_commitment, &polynomial_constant, 1, &mut rng).expect("prove");
+                verify(&proof, &constant_commitment, 1).expect("verify");
+            }
+        }
+
+        #[test]
+        fn constant_term_prover_rejects_mismatched_opening() {
+            let mut rng = ChaCha20Rng::seed_from_u64(0x0C05_7A08);
+            let constant_commitment = Gin::generator() * GinScalar::from(19u64);
+            assert_eq!(
+                prove(&constant_commitment, &GinScalar::from(20u64), 1, &mut rng).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        #[test]
+        fn constant_term_proof_is_statement_bound_and_tamper_evident() {
+            let mut rng = ChaCha20Rng::seed_from_u64(0x0C05_7A09);
+            let polynomial_constant = GinScalar::from(19u64);
+            let constant_commitment = Gin::generator() * polynomial_constant;
+            let proof =
+                prove(&constant_commitment, &polynomial_constant, 1, &mut rng).expect("prove");
+
+            assert!(
+                verify(&proof, &constant_commitment, 2).is_err(),
+                "proof must not replay under different statement context"
+            );
+
+            let mut tampered = proof;
+            *tampered.last_mut().expect("response byte") ^= 0x01;
+            assert!(
+                verify(&tampered, &constant_commitment, 1).is_err(),
+                "tampered response must be rejected"
+            );
+        }
+    }
+
+    #[cfg(test)]
     mod dlog_tests {
         use super::*;
         use bulletproofs_cycle::generators::PedersenGens;
@@ -3398,7 +3468,7 @@ pub mod secp_secq {
     mod dkg_unit_tests {
         use super::*;
 
-        use golden_core::GoldenGroup;
+        use golden_core::{EvrfProofBackend, EvrfWitness, GoldenGroup};
         use halo2curves::secp256k1::Fp;
 
         #[test]
@@ -3470,6 +3540,17 @@ pub mod secp_secq {
             }
         }
 
+        fn evrf_witness(
+            polynomial_coefficients: Vec<Secp256k1Scalar>,
+        ) -> EvrfWitness<Secp256k1GoldenGroup> {
+            EvrfWitness {
+                identity_secret: Secp256k1Scalar(GinScalar::from(3u64)),
+                polynomial_coefficients,
+                share: Secp256k1Scalar(GinScalar::from(13u64)),
+                pad: Secp256k1Scalar(GinScalar::from(7u64)),
+            }
+        }
+
         #[test]
         fn batched_stream_pins_statement_boundary_checkpoint() {
             let statement = context_statement();
@@ -3480,13 +3561,14 @@ pub mod secp_secq {
             observe_batched_statement(&mut stream, &statement).expect("statement");
             let mut checkpoint = [0u8; 64];
             stream.challenge(b"r1cs-boundary", &mut checkpoint);
+
             assert_eq!(
                 checkpoint,
                 [
-                    79, 200, 236, 164, 117, 125, 234, 243, 140, 173, 156, 99, 212, 3, 63, 161, 148,
-                    165, 242, 21, 103, 6, 165, 22, 87, 13, 14, 81, 35, 83, 214, 173, 11, 18, 98,
-                    235, 5, 96, 100, 56, 211, 162, 198, 48, 112, 57, 70, 114, 212, 92, 176, 120,
-                    99, 1, 66, 51, 200, 34, 9, 200, 38, 144, 19, 93,
+                    174, 145, 81, 225, 163, 232, 141, 128, 9, 28, 118, 168, 147, 183, 141, 142, 37,
+                    84, 219, 236, 182, 250, 126, 250, 178, 210, 202, 127, 87, 62, 12, 135, 239,
+                    184, 85, 175, 69, 100, 65, 34, 123, 189, 20, 151, 62, 248, 168, 76, 1, 206, 85,
+                    40, 192, 157, 114, 65, 20, 235, 81, 211, 179, 145, 232, 20,
                 ]
             );
 
@@ -3524,6 +3606,45 @@ pub mod secp_secq {
                 evrf_batched_verify_many(&params, &[(&statement, &[])]).unwrap_err(),
                 Error::ProofVerificationFailed
             );
+        }
+
+        #[test]
+        fn batched_statement_rejects_non_increasing_receiver_indices() {
+            let mut duplicate = context_statement();
+            duplicate.receivers.push(duplicate.receivers[0].clone());
+            duplicate.statement_roots.push([2u8; 32]);
+            assert_eq!(
+                validate_batched_statement_shape(&duplicate).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+
+            let mut out_of_order = duplicate;
+            out_of_order.receivers[0].receiver = ParticipantIndex::new(2).unwrap();
+            out_of_order.receivers[1].receiver = ParticipantIndex::new(1).unwrap();
+            assert_eq!(
+                validate_batched_statement_shape(&out_of_order).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        #[test]
+        fn batched_statement_requires_enough_receiver_evaluations() {
+            let mut statement = context_statement();
+            statement.threshold = 3;
+            statement.commitment_coefficients.resize(3, Gin::identity());
+            assert_eq!(
+                validate_batched_statement_shape(&statement).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        #[test]
+        fn batched_parameter_setup_requires_enough_receiver_evaluations() {
+            assert!(BatchedEvrfPublicParams::setup(2, 1).is_ok());
+            assert!(matches!(
+                BatchedEvrfPublicParams::setup(3, 1),
+                Err(Error::ProofVerificationFailed)
+            ));
         }
 
         #[test]
@@ -3603,6 +3724,36 @@ pub mod secp_secq {
             changed.msg_i.0[0] ^= 0x80;
             assert_eq!(
                 dkg_backend::ensure_same_batch_context(&changed, &first).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        #[test]
+        fn dkg_batch_rejects_inconsistent_polynomial_witnesses_before_proving() {
+            let statement = evrf_statement();
+            let constant = Secp256k1Scalar(GinScalar::from(13u64));
+            let first = evrf_witness(vec![constant]);
+            let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
+
+            let missing = evrf_witness(Vec::new());
+            assert_eq!(
+                dkg_backend::SecpSecqBackend::prove_batch(
+                    core::slice::from_ref(&statement),
+                    core::slice::from_ref(&missing),
+                    &mut rng,
+                )
+                .unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+
+            let changed = evrf_witness(vec![Secp256k1Scalar(GinScalar::from(14u64))]);
+            assert_eq!(
+                dkg_backend::SecpSecqBackend::prove_batch(
+                    &[statement.clone(), statement],
+                    &[first, changed],
+                    &mut rng,
+                )
+                .unwrap_err(),
                 Error::ProofVerificationFailed
             );
         }
