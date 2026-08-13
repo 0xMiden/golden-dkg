@@ -64,10 +64,10 @@ concatenated size of `n_e` independent proofs.
 
 | n_e | Prover     | Verifier  | Batch verification | \|π\| (single) | n_e proofs (concat) |
 |-----|------------|-----------|--------------------|----------------|---------------------|
-| 1   | 406 ms     | 36.2 ms   | 39.4 ms            | 1.4 kb         | 1.4 kb              |
-| 9   | 1.63 s     | 149 ms    | 757 ms             | 1.5 kb         | 13.7 kb             |
-| 49  | 11.5 s     | 975 ms    | 23.2 s             | 1.7 kb         | 81.0 kb             |
-| 99  | 22.8 s     | 1.77 s    | —                  | 1.7 kb         | 170.2 kb            |
+| 1   | 119 ms     | 15.7 ms   | 16.1 ms            | 1.4 kb         | 1.4 kb              |
+| 9   | 885 ms     | 103 ms    | 572 ms             | 1.6 kb         | 14.3 kb             |
+| 49  | 3.12 s     | 420 ms    | 14.8 s             | 1.7 kb         | 84.2 kb             |
+| 99  | 7.33 s     | 846 ms    | 59.2 s             | 1.8 kb         | 176.6 kb            |
 
 Every batched-eVRF proof is single-phase (the relation never defers
 constraints via `specify_randomized_constraints`), so its wire length is an
@@ -76,8 +76,6 @@ next-power-of-two step that sizes the Bulletproof generators. `|π|` and
 `n_e proofs` are computed by `BatchedEvrfPublicParams::batched_proof_wire_len`
 without building a proof, and checked byte-for-byte against a real proof in
 `tests/batched_dealer.rs::batched_proof_wire_len_matches_v5_vector`.
-Batch-verification at `n_e = 99` was omitted because its setup builds 99
-independent proofs (~23 s each).
 
 ### Table 5 — DKG performance (Secp256k1/Secq256k1, n-of-n)
 
@@ -89,15 +87,10 @@ Round 0 + Round 1.  Communication is the per-participant bandwidth
 
 | n   | Round 0  | Round 1  | Per-participant runtime | Comm. (per participant) |
 |-----|----------|----------|------------------------|------------------------|
-| 2   | 246 ms   | 35.8 ms  | 282 ms                 | 3.2 kb                 |
-| 10  | 1.69 s   | 1.12 s   | 2.81 s                 | 28.6 kb                |
-| 50  | 12.5 s   | —        | —                      | —                      |
-| 100 | 26.1 s   | —        | —                      | —                      |
-
-Round 1 entries marked “—” were not collected because the setup builds
-`n` independent proofs (one per dealer), which at `n ≥ 50` takes hours.
-Communication at `n ≥ 50` was extrapolated from the linear fit at
-`n = 2, 10` (the per-dealer wire size grows linearly in `n`).
+| 2   | 120 ms   | 24.6 ms  | 145 ms                 | 3.2 kb                 |
+| 10  | 932 ms   | 788 ms   | 1.72 s                 | 26.3 kb                |
+| 50  | 3.42 s   | 37.9 s   | 41.3 s                 | 342.0 kb               |
+| 100 | 8.12 s   | 246 s    | 255 s                  | 1.2 MB                 |
 
 ## Useful checks
 
