@@ -128,8 +128,14 @@ fn write_cache(
 
 /// Decode a cache file. Returns `None` on any structural problem (truncated
 /// length prefixes, trailing bytes, bad wire encoding).
-fn decode_cache(buf: &[u8]) -> Option<Vec<DealerMessage<Secp256k1GoldenGroup>>> {
+fn decode_cache(
+    buf: &[u8],
+    expected_count: usize,
+) -> Option<Vec<DealerMessage<Secp256k1GoldenGroup>>> {
     let count = u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) as usize;
+    if count != expected_count {
+        return None;
+    }
     let mut offset = 4;
     let mut messages = Vec::with_capacity(count);
     for _ in 0..count {
@@ -157,10 +163,7 @@ fn load_valid(
     force_verify: bool,
 ) -> Option<BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>>> {
     let raw = fs::read(cache_path(threshold, n)).ok()?;
-    let messages = decode_cache(&raw)?;
-    if messages.len() != n {
-        return None;
-    }
+    let messages = decode_cache(&raw, n)?;
 
     let digest = sha256_hex(&raw);
     let already_verified = !force_verify

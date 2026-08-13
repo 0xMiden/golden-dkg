@@ -285,7 +285,7 @@ impl<C: Cycle> InnerProductProof<C> {
 
     /// [`Self::serialized_size`] for a fold of `lg_n` rounds, without
     /// requiring a constructed proof.
-    pub fn serialized_size_for_rounds(lg_n: usize) -> usize {
+    pub(crate) fn serialized_size_for_rounds(lg_n: usize) -> usize {
         (lg_n * 2) * C::COMPRESSED_BYTES + 2 * 32
     }
 
