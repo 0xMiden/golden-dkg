@@ -373,6 +373,38 @@ pub mod secp_secq {
             self.bp_gens.gens_capacity
         }
 
+        /// Exact wire length, in bytes, of one batched dealer proof at this
+        /// shape — without building it.
+        ///
+        /// The batched eVRF relation never calls
+        /// `ConstraintSystem::specify_randomized_constraints`, so every
+        /// proof it produces is single-phase and this is exact, not an
+        /// estimate: pinned against a real proof's byte length in
+        /// `batched_proof_wire_len_matches_v7_vector`
+        /// (`tests/batched_dealer.rs`). Only `gens_capacity` (hence the
+        /// inner-product-proof fold count) depends on the shape; every
+        /// other field is fixed-width.
+        pub fn batched_proof_wire_len(threshold: usize, receiver_count: usize) -> Result<usize> {
+            let (_, gens_capacity) = Self::validated_shape(threshold, receiver_count)?;
+            let lg_n = gens_capacity.trailing_zeros() as usize;
+
+            // Proof-stream envelope: proof-id length prefix (u32 BE) +
+            // proof-id bytes + nested-payload length prefix (u64 BE). See
+            // `proof_stream.rs::{ProverProofStream::new, send_nested}`.
+            const PROOF_ID_LEN_PREFIX_BYTES: usize = 4;
+            const PAYLOAD_LEN_PREFIX_BYTES: usize = 8;
+            let envelope =
+                PROOF_ID_LEN_PREFIX_BYTES + BATCHED_PROOF_ID.len() + PAYLOAD_LEN_PREFIX_BYTES;
+            let constant_term_proof = <GinStreamCurve as ProofStreamCurve>::POINT_BYTES
+                + <GinStreamCurve as ProofStreamCurve>::SCALAR_BYTES;
+
+            Ok(
+                envelope
+                    + R1CSProof::<R1csCycle>::single_phase_wire_len(lg_n)
+                    + constant_term_proof,
+            )
+        }
+
         fn validate_statement(&self, statement: &BatchedEvrfStatement) -> Result<()> {
             if self.threshold != statement.threshold
                 || self.receiver_count != statement.receivers.len()

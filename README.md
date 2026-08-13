@@ -65,13 +65,17 @@ concatenated size of `n_e` independent proofs.
 | n_e | Prover     | Verifier  | Batch verification | \|π\| (single) | n_e proofs (concat) |
 |-----|------------|-----------|--------------------|----------------|---------------------|
 | 1   | 406 ms     | 36.2 ms   | 39.4 ms            | 1.4 kb         | 1.4 kb              |
-| 9   | 1.63 s     | 149 ms    | 757 ms             | 1.5 kb         | 13.9 kb             |
-| 49  | 11.5 s     | 975 ms    | 23.2 s             | —              | —                   |
-| 99  | 22.8 s     | 1.77 s    | —                  | —              | —                   |
+| 9   | 1.63 s     | 149 ms    | 757 ms             | 1.5 kb         | 13.7 kb             |
+| 49  | 11.5 s     | 975 ms    | 23.2 s             | 1.7 kb         | 81.0 kb             |
+| 99  | 22.8 s     | 1.77 s    | —                  | 1.7 kb         | 170.2 kb            |
 
-Proof-size entries marked “—” were not collected because each data point
-requires running the Bulletproofs prover (the size grows only
-logarithmically in `n_e`; two points suffice to show the curve).
+Every batched-eVRF proof is single-phase (the relation never defers
+constraints via `specify_randomized_constraints`), so its wire length is an
+exact function of the padded circuit size alone — the same
+next-power-of-two step that sizes the Bulletproof generators. `|π|` and
+`n_e proofs` are computed by `BatchedEvrfPublicParams::batched_proof_wire_len`
+without building a proof, and checked byte-for-byte against a real proof in
+`tests/batched_dealer.rs::batched_proof_wire_len_matches_v5_vector`.
 Batch-verification at `n_e = 99` was omitted because its setup builds 99
 independent proofs (~23 s each).
 

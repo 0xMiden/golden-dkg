@@ -280,7 +280,13 @@ impl<C: Cycle> InnerProductProof<C> {
     /// where `lg_n = L_vec.len()` (one L/R compressed point pair per round,
     /// plus the two final scalars `a` and `b`).
     pub fn serialized_size(&self) -> usize {
-        (self.L_vec.len() * 2) * C::COMPRESSED_BYTES + 2 * 32
+        Self::serialized_size_for_rounds(self.L_vec.len())
+    }
+
+    /// [`Self::serialized_size`] for a fold of `lg_n` rounds, without
+    /// requiring a constructed proof.
+    pub(crate) fn serialized_size_for_rounds(lg_n: usize) -> usize {
+        (lg_n * 2) * C::COMPRESSED_BYTES + 2 * 32
     }
 
     /// Serialize the proof to bytes.

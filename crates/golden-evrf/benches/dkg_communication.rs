@@ -7,10 +7,9 @@
 //! broadcast. Per-participant receive cost is `n - 1` peer broadcasts plus
 //! the participant's own broadcast (i.e. multiply by `n`).
 //!
-//! Each parameter requires building one `DealerMessage` via `create_dealing`
-//! (the Round 0 cost). Sweep is limited to `n in {2, 10}`; larger `n` takes
-//! minutes per setup and adds little because the per-dealer wire size grows
-//! linearly in `n`. Extrapolate to larger `n` from the linear fit.
+//! Each parameter needs one `DealerMessage`, read from the checked-in
+//! fixture cache (`support::cached_dealer_messages`) instead of proving
+//! fresh.
 //!
 //! Compare against Table 5 (BLS12-381, optimized variant, per participant):
 //! n=2 -> 1.7kb, n=10 -> 22kb, n=50 -> 223kb, n=100 -> 699kb.
@@ -28,30 +27,15 @@
 mod support;
 
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
-use golden_core::{create_dealing, wire::WireEncode};
-use golden_evrf::paper::secp_secq::SecpSecqBackend;
-use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
-use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-use support::{build_config, identity_secret, idx, BENCH_SEED, SLOW_SAMPLE_SIZE};
-
-/// Subset of `N_VALUES` for which setup is cheap enough to run eagerly.
-/// Building one dealer message at `n = 100` takes ~36s; the wire-size curve
-/// is linear in `n`, so two points suffice.
-const N_COMM_SWEEP: &[usize] = &[2, 10];
+use golden_core::wire::WireEncode;
+use support::{build_config, idx, table5_n_values, SLOW_SAMPLE_SIZE};
 
 fn dkg_communication(c: &mut Criterion) {
-    for &n in N_COMM_SWEEP {
+    for n in table5_n_values() {
         let config = build_config(n, n - 1);
         let dealer = idx(1);
-        let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
-        let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-            dealer,
-            &identity_secret(dealer),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let bytes = dealing.message.to_nested_wire_bytes().len();
+        let messages = support::cached_dealer_messages(&config);
+        let bytes = messages[&dealer].to_nested_wire_bytes().len();
         let mut group = c.benchmark_group(format!("dkg-communication/secp256k1/{n}"));
         group.sample_size(SLOW_SAMPLE_SIZE);
         group.sampling_mode(SamplingMode::Flat);

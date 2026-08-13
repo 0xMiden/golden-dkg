@@ -32,13 +32,13 @@ use std::collections::BTreeMap;
 
 use codspeed_criterion_compat as criterion;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode};
-use golden_core::{create_dealing, verify_dealings, DealerMessage, DkgConfig};
+use golden_core::{verify_dealings, DealerMessage, DkgConfig};
 use golden_evrf::paper::secp_secq::{evrf_batched_verify, SecpSecqBackend};
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use support::{
-    build_config, identity_secret, idx, prove_one_batched, table4_ne_values, BENCH_SEED,
-    SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD,
+    build_config, idx, prove_one_batched, table4_ne_values, BENCH_SEED, SLOW_SAMPLE_SIZE,
+    TABLE4_THRESHOLD,
 };
 
 /// Time `evrf_batched_verify` on one precomputed proof covering `n_e`
@@ -77,23 +77,9 @@ fn build_n_independent_messages(
 ) {
     let n = n_e + 1;
     let config = build_config(n, TABLE4_THRESHOLD);
-    let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
     let receiver = idx(n as u32);
-    let messages: BTreeMap<_, _> = config
-        .registry
-        .indexes()
-        .filter(|dealer| *dealer != receiver)
-        .map(|dealer| {
-            let dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                dealer,
-                &identity_secret(dealer),
-                &config,
-                &mut rng,
-            )
-            .unwrap();
-            (dealer, dealing.message)
-        })
-        .collect();
+    let mut messages = support::cached_dealer_messages(&config);
+    messages.remove(&receiver);
     assert_eq!(messages.len(), n_e);
     (config, messages)
 }
