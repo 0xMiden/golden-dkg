@@ -8,29 +8,27 @@
 //!
 //! # Protocol shape
 //!
-//! EHTDH1 uses two independent threshold sharings. The first sharing has
-//! decryption secret `x`. The second sharing has secret zero and binds shares
-//! to context. A validator returns `W_i = x_i R + z_i S`. Here, `R` comes from
+//! EHTDH1 uses two ordered threshold sharings created by one atomic DKG batch.
+//! The first sharing has decryption secret `x`. The second sharing has secret
+//! zero and binds shares to context. A validator returns `W_i = x_i R + z_i S`. Here, `R` comes from
 //! the ciphertext, and `S` comes from the setup context and decryption context.
 //! The combiner checks each share against `(X_i, Z_i)` and combines a threshold
 //! set to recover `xR`. It then uses `xR` to unmask the payload.
 //!
 //! # Golden setup bridge
 //!
-//! [`material_from_dkg_outputs`] converts two completed Golden DKG runs into
-//! EHTDH1 material:
+//! [`material_from_dkg_output`] converts one completed Golden DKG batch into
+//! EHTDH1 material. The batch configuration must contain, in order:
 //!
-//! - a normal decryption run for `x`;
-//! - a zero sharing run for `z`, whose session id is derived with
-//!   [`derive_context_session_id`].
+//! - a random decryption sharing for `x`;
+//! - a zero context sharing for `z`.
 //!
-//! The bridge rejects mismatched thresholds, registries, participants, local
-//! share owners, nonzero zero sharing output, and identity decryption keys. It
-//! binds both DKG transcript roots into [`SetupContext`].
+//! The bridge rejects the wrong instance order or an output from another
+//! configuration. It binds the batch session, configuration root, and atomic
+//! completion root into [`SetupContext`].
 //!
 //! [`Combiner::new`] checks that a manually supplied [`PublicKeySet`] and
-//! [`SetupContext`] agree on backend id, threshold, participant order, and
-//! context session derivation.
+//! [`SetupContext`] agree on backend id, threshold, and participant order.
 //!
 //! # Paper mapping
 //!
@@ -52,8 +50,8 @@
 //! | `W_i = x_i R + z_i S` | [`DecryptionShare::share`] |
 //!
 //! This crate also binds [`SetupContext::root`] into `Hdgd`. That root commits
-//! to the Golden backend id, participant registry root, both DKG session ids,
-//! both DKG transcript roots, and the caller provided epoch.
+//! to the Golden backend id, participant registry root, batch session,
+//! configuration root, completion root, and the caller provided epoch.
 //!
 //! # Security goals
 //!
@@ -105,7 +103,7 @@
 //! # Provided APIs
 //!
 //! This crate provides client sealing, validator decryption shares, exact
-//! combining, quorum search, and a bridge from two Golden DKG runs.
+//! combining, quorum search, and a bridge from one Golden DKG batch.
 //!
 //! Run the full three party threshold record example with:
 //!
@@ -116,15 +114,15 @@
 //! # Example
 //!
 //! This example builds a two of three EHTDH1 setup without running Golden DKG.
-//! Production callers should normally use [`material_from_dkg_outputs`].
+//! Production callers should normally use [`material_from_dkg_output`].
 //!
 //! ```rust
 //! use std::collections::BTreeMap;
 //!
 //! use golden_core::{GoldenGroup, GoldenScalar, ParticipantIndex, SessionId};
 //! use golden_ehtdh1::{
-//!     derive_context_session_id, Combiner, PublicKeySet, PublicShare, SealingKey,
-//!     SecretShare, SetupContext, UnsealingShare,
+//!     Combiner, PublicKeySet, PublicShare, SealingKey, SecretShare, SetupContext,
+//!     UnsealingShare,
 //! };
 //! use golden_rustcrypto::{P256Backend, P256Scalar};
 //! use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
@@ -179,10 +177,9 @@
 //!     threshold: 2,
 //!     registry_root: [1u8; 32],
 //!     participants: participants.to_vec(),
-//!     decryption_session_id: SessionId([2u8; 32]),
-//!     context_session_id: derive_context_session_id(SessionId([2u8; 32])),
-//!     decryption_transcript_root: [3u8; 32],
-//!     context_transcript_root: [4u8; 32],
+//!     session_id: SessionId([2u8; 32]),
+//!     configuration_root: [3u8; 32],
+//!     completion_root: [4u8; 32],
 //!     epoch: [5u8; 32],
 //! };
 //!
@@ -223,12 +220,9 @@ pub mod dkg_bridge;
 pub mod encrypt;
 pub mod wire;
 
-pub use context::{
-    derive_context_session_id, CombineError, Error, PublicKeySet, PublicShare, SecretShare,
-    SetupContext,
-};
+pub use context::{CombineError, Error, PublicKeySet, PublicShare, SecretShare, SetupContext};
 pub use decrypt::{Combiner, DecryptionShare, UnsealingShare};
-pub use dkg_bridge::{material_from_dkg_outputs, Ehtdh1Material};
+pub use dkg_bridge::{material_from_dkg_output, Ehtdh1Material};
 pub use encrypt::{Ciphertext, SealingKey};
 
 #[cfg(test)]
@@ -266,10 +260,9 @@ mod tests {
             threshold: 2,
             registry_root: [1u8; 32],
             participants: participants().to_vec(),
-            decryption_session_id: SessionId([2u8; 32]),
-            context_session_id: derive_context_session_id(SessionId([2u8; 32])),
-            decryption_transcript_root: [3u8; 32],
-            context_transcript_root: [4u8; 32],
+            session_id: SessionId([2u8; 32]),
+            configuration_root: [3u8; 32],
+            completion_root: [4u8; 32],
             epoch: [5u8; 32],
         }
     }
@@ -602,8 +595,8 @@ mod tests {
         wrong_threshold.threshold += 1;
         let mut wrong_participants = setup_context.clone();
         wrong_participants.participants.reverse();
-        let mut wrong_context_session = setup_context;
-        wrong_context_session.context_session_id = SessionId([99u8; 32]);
+        let mut wrong_backend = setup_context;
+        wrong_backend.backend_id = "wrong-backend".to_owned();
 
         assert_eq!(
             Combiner::<G>::new(public_key_set.clone(), wrong_threshold),
@@ -614,8 +607,8 @@ mod tests {
             Err(Error::InvalidBridge("setup participant mismatch"))
         );
         assert_eq!(
-            Combiner::<G>::new(public_key_set, wrong_context_session),
-            Err(Error::InvalidBridge("setup context session mismatch"))
+            Combiner::<G>::new(public_key_set, wrong_backend),
+            Err(Error::InvalidBridge("setup backend mismatch"))
         );
     }
 

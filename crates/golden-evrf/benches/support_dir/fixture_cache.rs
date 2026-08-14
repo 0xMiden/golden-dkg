@@ -86,7 +86,7 @@ fn build_dealer_messages(
 ) -> Vec<DealerMessage<Secp256k1GoldenGroup>> {
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
     config
-        .registry
+        .registry()
         .indexes()
         .map(|dealer| {
             create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
@@ -96,7 +96,8 @@ fn build_dealer_messages(
                 &mut rng,
             )
             .unwrap()
-            .message
+            .message()
+            .clone()
         })
         .collect()
 }
@@ -176,7 +177,7 @@ fn load_valid(
         write_stamp(threshold, n, &digest);
     }
 
-    let expected_dealers: BTreeSet<_> = config.registry.indexes().collect();
+    let expected_dealers: BTreeSet<_> = config.registry().indexes().collect();
     let by_dealer: BTreeMap<_, _> = messages.into_iter().map(|m| (m.dealer, m)).collect();
     (by_dealer.keys().copied().collect::<BTreeSet<_>>() == expected_dealers).then_some(by_dealer)
 }
@@ -211,8 +212,8 @@ fn expect_valid(
 pub fn cached_dealer_messages(
     config: &DkgConfig<Secp256k1GoldenGroup>,
 ) -> BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>> {
-    let n = config.registry.indexes().count();
-    expect_valid(config.threshold, n, config, false)
+    let n = config.registry().indexes().count();
+    expect_valid(config.threshold(), n, config, false)
 }
 
 /// Like [`cached_dealer_messages`], but always re-runs `verify_dealings`
@@ -224,24 +225,24 @@ pub fn cached_dealer_messages(
 pub fn verify_dealer_messages(
     config: &DkgConfig<Secp256k1GoldenGroup>,
 ) -> BTreeMap<ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>> {
-    let n = config.registry.indexes().count();
-    expect_valid(config.threshold, n, config, true)
+    let n = config.registry().indexes().count();
+    expect_valid(config.threshold(), n, config, true)
 }
 
 /// (Re)build the fixture for `config` and overwrite it on disk, but only if
 /// the tracked file is missing or no longer valid. Returns `true` if it was
 /// rebuilt, `false` if the existing fixture was already up to date.
 pub fn regenerate_dealer_messages(config: &DkgConfig<Secp256k1GoldenGroup>) -> bool {
-    let n = config.registry.indexes().count();
-    if load_valid(config.threshold, n, config, true).is_some() {
+    let n = config.registry().indexes().count();
+    if load_valid(config.threshold(), n, config, true).is_some() {
         return false;
     }
     let messages = build_dealer_messages(config);
     let message = format!(
         "failed to write bench fixture at {}",
-        cache_path(config.threshold, n).display()
+        cache_path(config.threshold(), n).display()
     );
-    write_cache(config.threshold, n, &messages).expect(&message);
+    write_cache(config.threshold(), n, &messages).expect(&message);
     true
 }
 

@@ -7,7 +7,8 @@ use crate::{Error, GoldenGroup, GoldenScalar, ParticipantIndex, Polynomial, Resu
 /// Feldman commitment to a Shamir polynomial.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeldmanCommitment<G: GoldenGroup> {
-    coefficients: Vec<G::Element>,
+    constant: Option<G::Element>,
+    nonconstant_coefficients: Vec<G::Element>,
 }
 
 impl<G: GoldenGroup> FeldmanCommitment<G> {
@@ -17,31 +18,66 @@ impl<G: GoldenGroup> FeldmanCommitment<G> {
         Self::from_coefficients(coefficients)
     }
 
-    /// Construct from explicit committed coefficients.
-    pub fn from_coefficients(coefficients: Vec<G::Element>) -> Result<Self> {
-        if coefficients.is_empty() {
-            return Err(Error::EmptyCommitment);
+    /// Commit to a polynomial whose constant coefficient is fixed to zero.
+    pub fn commit_zero(poly: &Polynomial<G::Scalar>) -> Result<Self> {
+        if !bool::from(poly.coefficients()[0].is_zero()) {
+            return Err(Error::CommitmentVerificationFailed);
         }
-        Ok(Self { coefficients })
+        Ok(Self::from_zero_tail(
+            poly.coefficients()[1..]
+                .iter()
+                .map(G::mul_generator)
+                .collect(),
+        ))
     }
 
-    /// Return committed coefficients in ascending degree order.
-    pub fn coefficients(&self) -> &[G::Element] {
-        &self.coefficients
+    /// Construct a commitment with an explicit constant coefficient.
+    pub fn from_coefficients(coefficients: Vec<G::Element>) -> Result<Self> {
+        let mut coefficients = coefficients.into_iter();
+        let constant = coefficients.next().ok_or(Error::EmptyCommitment)?;
+        Ok(Self {
+            constant: Some(constant),
+            nonconstant_coefficients: coefficients.collect(),
+        })
+    }
+
+    /// Construct a fixed-zero commitment from coefficients `A_1, ..., A_(t-1)`.
+    pub(crate) fn from_zero_tail(nonconstant_coefficients: Vec<G::Element>) -> Self {
+        Self {
+            constant: None,
+            nonconstant_coefficients,
+        }
+    }
+
+    /// Return the explicit constant commitment, or `None` when fixed to identity.
+    pub fn constant(&self) -> Option<&G::Element> {
+        self.constant.as_ref()
+    }
+
+    /// Return all logical coefficients in ascending degree order.
+    pub fn coefficients(&self) -> Vec<G::Element> {
+        core::iter::once(self.public_key())
+            .chain(self.nonconstant_coefficients.iter().cloned())
+            .collect()
+    }
+
+    /// Return the logical coefficient count, including the fixed zero constant.
+    pub fn threshold(&self) -> usize {
+        self.nonconstant_coefficients.len() + 1
     }
 
     /// Return the aggregate public key, `g^f(0)`.
     pub fn public_key(&self) -> G::Element {
-        self.coefficients[0].clone()
+        self.constant.clone().unwrap_or_else(G::identity)
     }
 
     /// Compute the expected public key share for a participant.
     pub fn public_key_share(&self, participant: ParticipantIndex) -> Result<G::Element> {
         let x = participant.to_scalar::<G::Scalar>()?;
-        let mut result = G::identity();
-        let mut x_pow = G::Scalar::one();
+        let mut result = self.public_key();
+        let mut x_pow = x.clone();
 
-        for coefficient in &self.coefficients {
+        for coefficient in &self.nonconstant_coefficients {
             result = G::add(&result, &G::mul(coefficient, &x_pow));
             x_pow = x_pow.mul(&x);
         }
@@ -85,6 +121,26 @@ mod tests {
     }
 
     #[test]
+    fn fixed_zero_commitment_omits_constant_without_changing_share_relation() {
+        let polynomial = Polynomial::from_coefficients(vec![
+            TinyScalar::zero(),
+            TinyScalar::from_u64(7).unwrap(),
+            TinyScalar::from_u64(9).unwrap(),
+        ])
+        .unwrap();
+        let full = FeldmanCommitment::<TinyGroup>::commit(&polynomial).unwrap();
+        let fixed_zero = FeldmanCommitment::<TinyGroup>::commit_zero(&polynomial).unwrap();
+
+        assert_eq!(fixed_zero.constant(), None);
+        assert_eq!(fixed_zero.threshold(), 3);
+        assert_eq!(fixed_zero.coefficients(), full.coefficients());
+        assert_eq!(
+            fixed_zero.public_key_share(participants(&[2])[0]).unwrap(),
+            full.public_key_share(participants(&[2])[0]).unwrap()
+        );
+    }
+
+    #[test]
     fn altered_share_is_rejected() {
         let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
         let secret = TinyScalar::from_u64(13).unwrap();
@@ -102,7 +158,7 @@ mod tests {
         let secret = TinyScalar::from_u64(13).unwrap();
         let poly = Polynomial::random_with_secret(secret, 3, &mut rng).unwrap();
         let commitment = FeldmanCommitment::<TinyGroup>::commit(&poly).unwrap();
-        let mut coefficients = commitment.coefficients().to_vec();
+        let mut coefficients = commitment.coefficients();
         coefficients[1] = TinyGroup::add(&coefficients[1], &TinyGroup::generator());
         let altered = FeldmanCommitment::<TinyGroup>::from_coefficients(coefficients).unwrap();
         let share = poly.evaluate(ParticipantIndex::new(2).unwrap()).unwrap();

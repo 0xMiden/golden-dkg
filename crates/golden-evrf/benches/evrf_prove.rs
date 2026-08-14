@@ -35,7 +35,7 @@ fn evrf_prove_bench(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     for n_e in table4_ne_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
-            let params = BatchedEvrfPublicParams::setup(support::TABLE4_THRESHOLD, n_e).unwrap();
+            let params = BatchedEvrfPublicParams::setup(support::TABLE4_THRESHOLD, 1, n_e).unwrap();
             b.iter_batched(
                 || {
                     let (statement, witness, _pkjs, _beta) = build_batched_at_ne(n_e);

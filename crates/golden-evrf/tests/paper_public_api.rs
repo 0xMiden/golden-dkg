@@ -6,8 +6,8 @@
 #![allow(clippy::unwrap_used)]
 
 use golden_core::{
-    DealerMessageNonce, Error, EvrfProofBackend, EvrfStatement, GoldenGroup, GoldenScalar,
-    ParticipantIndex, SessionId, PROTOCOL_VERSION,
+    Error, EvrfDealingStatement, EvrfMessage, EvrfProofBackend, EvrfReceiverStatement,
+    EvrfStatement, FeldmanCommitment, GoldenGroup, GoldenScalar, ParticipantIndex,
 };
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
@@ -20,7 +20,6 @@ fn idx(value: u32) -> ParticipantIndex {
 }
 
 fn minimal_evrf_statement() -> EvrfStatement<Secp256k1GoldenGroup> {
-    let dealer = idx(1);
     let receiver = idx(2);
     let dealer_secret = Secp256k1Scalar::from_u64(3).unwrap();
     let receiver_secret = Secp256k1Scalar::from_u64(5).unwrap();
@@ -29,22 +28,23 @@ fn minimal_evrf_statement() -> EvrfStatement<Secp256k1GoldenGroup> {
     let receiver_public_key = Secp256k1GoldenGroup::mul_generator(&receiver_secret);
 
     EvrfStatement {
-        protocol_version: PROTOCOL_VERSION,
-        backend_id: <Secp256k1GoldenGroup as GoldenGroup>::BACKEND_ID,
-        session_id: SessionId([1u8; 32]),
-        registry_root: [2u8; 32],
-        threshold: 1,
-        dealer,
-        receiver,
-        msg_i: DealerMessageNonce([9u8; 32]),
-        beta: Secp256k1Scalar::from_u64(17).unwrap(),
         dealer_public_key: Secp256k1GoldenGroup::mul_generator(&dealer_secret),
-        receiver_public_key,
-        commitment_coefficients: vec![Secp256k1GoldenGroup::mul_generator(&share)],
-        share_commitment: Secp256k1GoldenGroup::mul_generator(&share),
-        pad_commitment: Secp256k1GoldenGroup::mul_generator(&pad),
-        encrypted_share: Secp256k1Scalar::add(&share, &pad),
-        transcript_root: [3u8; 32],
+        beta: Secp256k1Scalar::from_u64(17).unwrap(),
+        dealer_message_root: [3u8; 32],
+        dealings: vec![EvrfDealingStatement {
+            message: EvrfMessage([9u8; 32]),
+            commitment: FeldmanCommitment::from_coefficients(vec![
+                Secp256k1GoldenGroup::mul_generator(&share),
+            ])
+            .unwrap(),
+            receivers: vec![EvrfReceiverStatement {
+                receiver,
+                receiver_public_key,
+                share_commitment: Secp256k1GoldenGroup::mul_generator(&share),
+                pad_commitment: Secp256k1GoldenGroup::mul_generator(&pad),
+                encrypted_share: Secp256k1Scalar::add(&share, &pad),
+            }],
+        }],
     }
 }
 
@@ -84,7 +84,7 @@ fn backend_rejects_malformed_proof_stream_framing() {
         truncated_nested_payload,
     ] {
         assert_eq!(
-            SecpSecqBackend::verify_batch(core::slice::from_ref(&statement), &bytes).unwrap_err(),
+            SecpSecqBackend::verify_batch(&statement, &bytes).unwrap_err(),
             Error::ProofVerificationFailed
         );
     }

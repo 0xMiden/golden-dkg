@@ -2,13 +2,10 @@
 //! ("|pi|") and the concatenated size of `n_e` independent proofs ("n_e
 //! proofs"), reported via criterion's `Throughput::Bytes`.
 //!
-//! Every batched-eVRF proof is single-phase, so its wire length is an exact
-//! function of the padded circuit size alone —
-//! `BatchedEvrfPublicParams::batched_proof_wire_len` computes it without
-//! building a proof or statement (checked against a real proof in
-//! `tests/batched_dealer.rs::batched_proof_wire_len_matches_v5_vector`).
-//! That lets this bench report all four paper rows instead of
-//! extrapolating from the two cheapest to prove.
+//! Proof bytes come from the batch-native `DealerMessage` values in the
+//! checked-in fixture cache. This measures the actual proof representation,
+//! including its dealing-batch shape and constant-term policy, without running
+//! the prover eagerly, so the bench can report all four paper rows.
 
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
@@ -18,13 +15,24 @@
 mod support;
 
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
-use golden_evrf::paper::secp_secq::BatchedEvrfPublicParams;
-use support::{table4_ne_values, SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD};
+use support::{build_config, idx, table4_ne_values, SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD};
 
-/// Wire byte count of one dealer's proof covering `n_e` receivers.
+/// Wire byte count of one dealer's batch-native proof covering `n_e` receivers.
 fn one_dealer_proof_bytes(n_e: usize) -> usize {
-    BatchedEvrfPublicParams::batched_proof_wire_len(TABLE4_THRESHOLD, n_e)
-        .expect("valid batched circuit shape")
+    let config = build_config(n_e + 1, TABLE4_THRESHOLD);
+    let messages = support::cached_dealer_messages(&config);
+    messages[&idx(1)].proof.len()
+}
+
+/// Total wire byte count of `n_e` independent dealer proofs.
+fn n_independent_proof_byte_sizes_total(n_e: usize) -> usize {
+    let n = n_e + 1;
+    let config = build_config(n, TABLE4_THRESHOLD);
+    let receiver = idx(n as u32);
+    let mut messages = support::cached_dealer_messages(&config);
+    messages.remove(&receiver);
+    assert_eq!(messages.len(), n_e);
+    messages.values().map(|message| message.proof.len()).sum()
 }
 
 fn evrf_proof_size_single(c: &mut Criterion) {
@@ -41,7 +49,7 @@ fn evrf_proof_size_single(c: &mut Criterion) {
 
 fn evrf_proof_size_concat(c: &mut Criterion) {
     for n_e in table4_ne_values() {
-        let total = n_e * one_dealer_proof_bytes(n_e);
+        let total = n_independent_proof_byte_sizes_total(n_e);
         let mut group = c.benchmark_group(format!("eVRF proof-size-concat/secp256k1/{n_e}"));
         group.sample_size(SLOW_SAMPLE_SIZE);
         group.sampling_mode(SamplingMode::Flat);

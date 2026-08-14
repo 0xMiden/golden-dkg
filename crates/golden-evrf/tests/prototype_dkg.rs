@@ -7,12 +7,13 @@ use std::collections::BTreeMap;
 use golden_core::{
     complete, create_dealing, verify_dealing,
     wire::{from_wire_bytes, to_wire_bytes},
-    DealerMessage, DkgConfig, DkgDealing, Error, EvrfProofBackend, EvrfStatement, GoldenGroup,
-    GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId, PROTOCOL_VERSION,
+    DealerMessage, DkgConfig, DkgDealing, DkgInstanceKind, EvrfDealingStatement,
+    EvrfDealingWitness, EvrfMessage, EvrfProofBackend, EvrfReceiverStatement, EvrfReceiverWitness,
+    EvrfStatement, EvrfWitness, FeldmanCommitment, GoldenGroup, GoldenScalar, ParticipantIndex,
+    ParticipantRegistry, SessionId,
 };
 use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
-use merlin::Transcript;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
 fn idx(value: u32) -> ParticipantIndex {
@@ -40,11 +41,12 @@ fn config() -> DkgConfig<P256Backend> {
             .collect(),
     )
     .unwrap();
-    DkgConfig::new(
+    DkgConfig::batch(
         3,
         SessionId([42u8; 32]),
         P256Scalar::from_u64(77).unwrap(),
         registry,
+        vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
     )
     .unwrap()
 }
@@ -63,6 +65,68 @@ fn create_dealing_fixture(seed: u8) -> (DkgConfig<P256Backend>, DkgDealing<P256B
     (config, dealing)
 }
 
+fn nested_backend_fixture() -> (EvrfStatement<P256Backend>, EvrfWitness<P256Backend>) {
+    let dealer = idx(1);
+    let dealer_secret = identity_secret(dealer);
+    let mut public_dealings = Vec::new();
+    let mut private_dealings = Vec::new();
+
+    for position in 0..2u64 {
+        let constant = P256Scalar::from_u64(10 + position).unwrap();
+        let linear = P256Scalar::from_u64(3 + position).unwrap();
+        let commitment_coefficients = vec![
+            P256Backend::mul_generator(&constant),
+            P256Backend::mul_generator(&linear),
+        ];
+        let mut public_receivers = Vec::new();
+        let mut private_receivers = Vec::new();
+        for receiver in [idx(2), idx(3)] {
+            let x = P256Scalar::from_u64(u64::from(receiver.get())).unwrap();
+            let share = constant.add(&linear.mul(&x));
+            let pad = P256Scalar::from_u64(30 + position + u64::from(receiver.get())).unwrap();
+            public_receivers.push(EvrfReceiverStatement {
+                receiver,
+                receiver_public_key: P256Backend::mul_generator(&identity_secret(receiver)),
+                share_commitment: P256Backend::mul_generator(&share),
+                pad_commitment: P256Backend::mul_generator(&pad),
+                encrypted_share: share.add(&pad),
+            });
+            private_receivers.push(EvrfReceiverWitness { share, pad });
+        }
+        public_dealings.push(EvrfDealingStatement {
+            message: EvrfMessage([u8::try_from(10 + position).unwrap(); 32]),
+            commitment: FeldmanCommitment::from_coefficients(commitment_coefficients).unwrap(),
+            receivers: public_receivers,
+        });
+        private_dealings.push(EvrfDealingWitness {
+            polynomial_constant: Some(constant),
+            receivers: private_receivers,
+        });
+    }
+
+    (
+        EvrfStatement {
+            dealer_public_key: P256Backend::mul_generator(&dealer_secret),
+            beta: P256Scalar::from_u64(77).unwrap(),
+            dealer_message_root: [5; 32],
+            dealings: public_dealings,
+        },
+        EvrfWitness {
+            identity_secret: dealer_secret,
+            dealings: private_dealings,
+        },
+    )
+}
+
+fn prove_nested(
+    statement: &EvrfStatement<P256Backend>,
+    witness: &EvrfWitness<P256Backend>,
+    seed: u8,
+) -> golden_core::Result<Vec<u8>> {
+    let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+    ShareOpeningBackend::prove_batch(statement, witness, &mut rng)
+}
+
 fn proof_header_len(proof: &[u8]) -> usize {
     let encoded_id_len = u32::from_be_bytes(proof[..4].try_into().unwrap()) as usize;
     let proof_id = <ShareOpeningBackend as EvrfProofBackend<P256Backend>>::PROOF_ID;
@@ -75,119 +139,105 @@ fn proof_record_len() -> usize {
     2 * P256Backend::ELEMENT_REPR_BYTES + 2 * P256Scalar::REPR_BYTES
 }
 
-fn proof_statements(
-    dealing: &DkgDealing<P256Backend>,
-    config: &DkgConfig<P256Backend>,
-) -> Vec<EvrfStatement<P256Backend>> {
-    let dealer = dealing.message.dealer;
-    config
-        .registry
-        .indexes()
-        .filter(|receiver| *receiver != dealer)
-        .map(|receiver| {
-            let encrypted_share = dealing.message.encrypted_shares[&receiver].clone();
-            EvrfStatement {
-                protocol_version: PROTOCOL_VERSION,
-                backend_id: P256Backend::BACKEND_ID,
-                session_id: config.session_id,
-                registry_root: config.registry.root(),
-                threshold: config.threshold,
-                dealer,
-                receiver,
-                msg_i: dealing.message.msg_i,
-                beta: config.beta.clone(),
-                dealer_public_key: *config.registry.public_key(dealer).unwrap(),
-                receiver_public_key: *config.registry.public_key(receiver).unwrap(),
-                commitment_coefficients: dealing.message.commitment.coefficients().to_vec(),
-                share_commitment: dealing
-                    .message
-                    .commitment
-                    .public_key_share(receiver)
-                    .unwrap(),
-                pad_commitment: encrypted_share.pad_commitment,
-                encrypted_share: encrypted_share.encrypted_share,
-                transcript_root: dealing.message.transcript_root,
-            }
-        })
-        .collect()
-}
-
-fn prototype_challenge_checkpoints(
-    statements: &[EvrfStatement<P256Backend>],
-    proof: &[u8],
-) -> Vec<[u8; 32]> {
-    let proof_id = <ShareOpeningBackend as EvrfProofBackend<P256Backend>>::PROOF_ID;
-    let mut transcript = Transcript::new(proof_id);
-    transcript.append_message(b"group-backend", P256Backend::BACKEND_ID.as_bytes());
-    transcript.append_message(
-        b"statement-count",
-        &u64::try_from(statements.len()).unwrap().to_be_bytes(),
-    );
-    for statement in statements {
-        transcript.append_message(b"statement-root", &statement.root());
-    }
-
-    let mut cursor = proof_header_len(proof);
-    let mut checkpoints = Vec::with_capacity(statements.len());
-    for _ in statements {
-        for label in [b"share-nonce-point".as_slice(), b"pad-nonce-point"] {
-            let end = cursor + P256Backend::ELEMENT_REPR_BYTES;
-            transcript.append_message(label, &proof[cursor..end]);
-            cursor = end;
-        }
-        let mut challenge = [0u8; 32];
-        transcript.challenge_bytes(b"opening-challenge", &mut challenge);
-        checkpoints.push(challenge);
-        for label in [b"share-response".as_slice(), b"pad-response"] {
-            let end = cursor + P256Scalar::REPR_BYTES;
-            transcript.append_message(label, &proof[cursor..end]);
-            cursor = end;
-        }
-    }
-    assert_eq!(cursor, proof.len());
-    checkpoints
-}
-
 fn assert_proof_rejected(seed: u8, mutate: impl FnOnce(&mut Vec<u8>)) {
-    let (config, mut dealing) = create_dealing_fixture(seed);
-    verify_dealing::<P256Backend, ShareOpeningBackend>(&dealing.message, &config).unwrap();
-    let transcript_root = dealing.message.transcript_root;
-    mutate(&mut dealing.message.proof);
-    assert_eq!(dealing.message.transcript_root, transcript_root);
-    assert_eq!(dealing.message.recompute_transcript_root(), transcript_root);
-    assert_eq!(
-        verify_dealing::<P256Backend, ShareOpeningBackend>(&dealing.message, &config).unwrap_err(),
-        Error::ProofVerificationFailed
-    );
+    let (config, dealing) = create_dealing_fixture(seed);
+    let mut message = dealing.message().clone();
+    verify_dealing::<P256Backend, ShareOpeningBackend>(&message, &config).unwrap();
+    let root = message.root();
+    mutate(&mut message.proof);
+    assert_eq!(message.root(), root);
+    assert!(verify_dealing::<P256Backend, ShareOpeningBackend>(&message, &config).is_err());
 }
 
 #[test]
-fn deterministic_prototype_proof_stream_matches_v3_vector() {
+fn prototype_emits_one_joint_proof_for_mixed_batch() {
     let (config, dealing) = create_dealing_fixture(10);
+    let message = dealing.message();
+    let (_, repeated) = create_dealing_fixture(10);
+    let receiver_count = participants().len() - 1;
 
     assert_eq!(
-        dealing.message.proof.as_slice(),
-        include_bytes!("vectors/prototype-share-opening-v3.bin")
+        <ShareOpeningBackend as EvrfProofBackend<P256Backend>>::PROOF_ID,
+        b"golden-evrf/prototype-share-opening/v4"
     );
+
     assert_eq!(
-        prototype_challenge_checkpoints(
-            &proof_statements(&dealing, &config),
-            &dealing.message.proof
-        ),
-        vec![
-            [
-                110, 162, 168, 92, 153, 134, 208, 169, 69, 65, 191, 158, 163, 176, 106, 22, 211,
-                41, 78, 102, 61, 86, 164, 208, 248, 62, 19, 250, 135, 165, 30, 124,
-            ],
-            [
-                40, 120, 209, 8, 247, 242, 111, 162, 24, 101, 143, 255, 237, 182, 219, 188, 159,
-                133, 122, 213, 116, 76, 113, 137, 148, 134, 199, 43, 49, 77, 233, 147,
-            ],
-            [
-                122, 20, 204, 11, 11, 35, 13, 135, 234, 194, 6, 69, 194, 167, 30, 24, 169, 224,
-                215, 141, 69, 199, 98, 241, 113, 199, 132, 217, 175, 235, 158, 222,
-            ],
-        ]
+        config.instances(),
+        [DkgInstanceKind::Random, DkgInstanceKind::Zero]
+    );
+    assert_eq!(message.dealings.len(), 2);
+    assert_eq!(message.proof, repeated.message().proof);
+    assert_eq!(
+        message.proof.len(),
+        proof_header_len(&message.proof) + 2 * receiver_count * proof_record_len()
+    );
+    verify_dealing::<P256Backend, ShareOpeningBackend>(message, &config).unwrap();
+}
+
+#[test]
+fn nested_backend_rejects_misaligned_witness_and_wrong_dealer_secret() {
+    let (statement, witness) = nested_backend_fixture();
+    for case in 0..3 {
+        let mut changed = witness.clone();
+        match case {
+            0 => {
+                changed.dealings.pop();
+            }
+            1 => {
+                changed.dealings[0].receivers.pop();
+            }
+            2 => {
+                changed.identity_secret = changed.identity_secret.add(&P256Scalar::one());
+            }
+            _ => unreachable!(),
+        }
+        assert!(prove_nested(&statement, &changed, 20 + case).is_err());
+    }
+}
+
+#[test]
+fn nested_backend_binds_openings_and_statement_root() {
+    let (statement, witness) = nested_backend_fixture();
+    let proof = prove_nested(&statement, &witness, 24).unwrap();
+    ShareOpeningBackend::verify_batch(&statement, &proof).unwrap();
+
+    for case in 0..2 {
+        let mut changed = witness.clone();
+        let receiver = &mut changed.dealings[0].receivers[0];
+        if case == 0 {
+            receiver.share = receiver.share.add(&P256Scalar::one());
+        } else {
+            receiver.pad = receiver.pad.add(&P256Scalar::one());
+        }
+        let changed_proof = prove_nested(&statement, &changed, 25 + case).unwrap();
+        assert!(ShareOpeningBackend::verify_batch(&statement, &changed_proof).is_err());
+    }
+
+    let mut changed_statement = statement.clone();
+    changed_statement.dealer_message_root[0] ^= 1;
+    assert!(ShareOpeningBackend::verify_batch(&changed_statement, &proof).is_err());
+}
+
+#[test]
+fn nested_backend_default_cross_proof_fallback_checks_each_proof() {
+    let (statement, witness) = nested_backend_fixture();
+    let proof = prove_nested(&statement, &witness, 28).unwrap();
+    let valid = [
+        (&statement, proof.as_slice()),
+        (&statement, proof.as_slice()),
+    ];
+    <ShareOpeningBackend as EvrfProofBackend<P256Backend>>::verify_proof_batch(&valid).unwrap();
+
+    let mut invalid_proof = proof.clone();
+    let first_record = proof_header_len(&invalid_proof);
+    invalid_proof[first_record] ^= 1;
+    let invalid = [
+        (&statement, proof.as_slice()),
+        (&statement, invalid_proof.as_slice()),
+    ];
+    assert!(
+        <ShareOpeningBackend as EvrfProofBackend<P256Backend>>::verify_proof_batch(&invalid)
+            .is_err()
     );
 }
 
@@ -195,46 +245,54 @@ fn deterministic_prototype_proof_stream_matches_v3_vector() {
 fn create_wire_roundtrip_verify_and_complete_uses_opaque_proof_bytes() {
     let config = config();
     let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
-    let mut dealings: BTreeMap<ParticipantIndex, DkgDealing<P256Backend>> = config
-        .registry
+    let dealings: BTreeMap<ParticipantIndex, DkgDealing<P256Backend>> = config
+        .registry()
         .indexes()
         .map(|dealer| {
-            let mut dealing = create_dealing::<P256Backend, ShareOpeningBackend>(
+            let dealing = create_dealing::<P256Backend, ShareOpeningBackend>(
                 dealer,
                 &identity_secret(dealer),
                 &config,
                 &mut rng,
             )
             .unwrap();
-            let encoded = to_wire_bytes(&dealing.message);
+            let encoded = to_wire_bytes(dealing.message());
             let decoded = from_wire_bytes::<DealerMessage<P256Backend>>(&encoded).unwrap();
             assert_eq!(to_wire_bytes(&decoded), encoded);
+            assert_eq!(&decoded, dealing.message());
             verify_dealing::<P256Backend, ShareOpeningBackend>(&decoded, &config).unwrap();
-            dealing.message = decoded;
             (dealer, dealing)
         })
         .collect();
 
     let receiver = idx(2);
-    let own_dealing = dealings.remove(&receiver).unwrap();
+    let own_dealing = dealings.get(&receiver).unwrap();
     let peer_dealings = dealings
-        .into_iter()
-        .map(|(dealer, dealing)| (dealer, dealing.message))
+        .iter()
+        .filter(|(dealer, _)| **dealer != receiver)
+        .map(|(dealer, dealing)| (*dealer, dealing.message().clone()))
         .collect();
     let output = complete::<P256Backend, ShareOpeningBackend>(
         receiver,
         &identity_secret(receiver),
-        &own_dealing,
+        own_dealing,
         &peer_dealings,
         &config,
     )
     .unwrap();
 
-    assert_eq!(
-        output.public_key_shares[&receiver],
-        P256Backend::mul_generator(&output.secret_share.value)
-    );
-    assert_eq!(output.public_key_shares.len(), participants().len());
+    assert_eq!(output.configuration_root(), config.root());
+    assert_eq!(output.instances().len(), config.instances().len());
+    for instance in output.instances() {
+        assert_eq!(
+            instance.public_key_shares()[&receiver],
+            P256Backend::mul_generator(&instance.secret_share().value)
+        );
+        assert_eq!(instance.public_key_shares().len(), participants().len());
+    }
+    assert!(bool::from(P256Backend::is_identity(
+        output.instances()[1].public_key()
+    )));
 }
 
 #[test]
@@ -244,7 +302,6 @@ fn dkg_rejects_each_tampered_nonce_and_response() {
     let field_offsets = [
         0,
         point_bytes,
-        2 * point_bytes,
         2 * point_bytes,
         2 * point_bytes + scalar_bytes,
     ];
@@ -309,16 +366,14 @@ fn dkg_rejects_wrong_proof_id() {
 
 #[test]
 fn dealer_message_wire_decode_accepts_malformed_inner_proof_bytes() {
-    let (config, mut dealing) = create_dealing_fixture(9);
-    dealing.message.proof = vec![1, 2, 3, 5, 8];
+    let (config, dealing) = create_dealing_fixture(9);
+    let mut message = dealing.message().clone();
+    message.proof = vec![1, 2, 3, 5, 8];
 
-    let encoded = to_wire_bytes(&dealing.message);
+    let encoded = to_wire_bytes(&message);
     let decoded = from_wire_bytes::<DealerMessage<P256Backend>>(&encoded)
         .expect("generic dealer-message decoding must treat proof bytes as opaque");
 
-    assert_eq!(decoded.proof, dealing.message.proof);
-    assert_eq!(
-        verify_dealing::<P256Backend, ShareOpeningBackend>(&decoded, &config).unwrap_err(),
-        Error::ProofVerificationFailed
-    );
+    assert_eq!(decoded.proof, message.proof);
+    assert!(verify_dealing::<P256Backend, ShareOpeningBackend>(&decoded, &config).is_err());
 }

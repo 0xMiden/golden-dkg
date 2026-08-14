@@ -19,8 +19,12 @@ fn bench_batched_setup(c: &mut Criterion) {
             b.iter_batched(
                 bulletproofs_cycle::generators::clear_generator_cache,
                 |()| {
-                    BatchedEvrfPublicParams::setup(black_box(2), black_box(receiver_count))
-                        .expect("valid public parameter shape")
+                    BatchedEvrfPublicParams::setup(
+                        black_box(2),
+                        black_box(1),
+                        black_box(receiver_count),
+                    )
+                    .expect("valid public parameter shape")
                 },
                 BatchSize::PerIteration,
             );

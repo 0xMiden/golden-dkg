@@ -2,6 +2,7 @@
 
 use core::marker::PhantomData;
 
+use golden_core::wire::MAX_DEALER_PROOF_BYTES;
 use golden_core::{Error, GoldenGroup, GoldenScalar, Result};
 use merlin::Transcript;
 
@@ -271,8 +272,17 @@ impl ProverProofStream {
     }
 
     /// Finishes proving and returns the complete proof bytes.
+    #[cfg(test)]
     pub(crate) fn finish(self) -> Vec<u8> {
         self.proof
+    }
+
+    /// Finishes proving after enforcing the protocol's dealer-proof byte limit.
+    pub(crate) fn finish_checked(self) -> Result<Vec<u8>> {
+        if self.proof.len() > MAX_DEALER_PROOF_BYTES {
+            return Err(stream_error());
+        }
+        Ok(self.proof)
     }
 }
 
@@ -292,6 +302,9 @@ pub(crate) struct VerifierProofStream<'proof> {
 impl<'proof> VerifierProofStream<'proof> {
     /// Starts a verifier stream after validating the exact proof-ID header.
     pub(crate) fn new(proof_id: &'static [u8], proof: &'proof [u8]) -> Result<Self> {
+        if proof.len() > MAX_DEALER_PROOF_BYTES {
+            return Err(stream_error());
+        }
         let length_bytes: [u8; PROOF_ID_LEN_BYTES] = proof
             .get(..PROOF_ID_LEN_BYTES)
             .ok_or_else(stream_error)?
@@ -781,6 +794,16 @@ mod tests {
         let mut oversized = u32::MAX.to_be_bytes().to_vec();
         oversized.extend_from_slice(PROOF_ID);
         assert_rejected(VerifierProofStream::new(PROOF_ID, &oversized));
+    }
+
+    #[test]
+    fn proof_stream_enforces_dealer_proof_byte_limit() {
+        let oversized = vec![0u8; MAX_DEALER_PROOF_BYTES + 1];
+        assert_rejected(VerifierProofStream::new(PROOF_ID, &oversized));
+
+        let mut prover = ProverProofStream::new(PROOF_ID).unwrap();
+        prover.proof.resize(MAX_DEALER_PROOF_BYTES + 1, 0);
+        assert_rejected(prover.finish_checked());
     }
 
     #[test]
