@@ -1873,13 +1873,29 @@ pub mod secp_secq {
         Ok(())
     }
 
+    /// Variable-time double-and-add multiplication by a small scalar.
+    fn mul_by_small_scalar(point: &Gin, scalar: u32) -> Gin {
+        if scalar == 0 {
+            return Gin::identity();
+        }
+        let mut acc = Gin::identity();
+        for bit in (0..u32::BITS - scalar.leading_zeros()).rev() {
+            acc = acc.double();
+            if (scalar >> bit) & 1 == 1 {
+                acc += *point;
+            }
+        }
+        acc
+    }
+
+    /// Evaluate the Feldman commitment at `receiver` via Horner's method, so
+    /// every step multiplies by the (always small) receiver index instead of
+    /// by an increasingly full-width power of it.
     fn feldman_share_commitment(coefficients: &[Gin], receiver: ParticipantIndex) -> Gin {
-        let x = Fq::from(u64::from(receiver.get()));
-        let mut x_pow = Fq::ONE;
+        let x = receiver.get();
         let mut result = Gin::identity();
-        for coefficient in coefficients {
-            result += *coefficient * x_pow;
-            x_pow *= x;
+        for coefficient in coefficients.iter().rev() {
+            result = mul_by_small_scalar(&result, x) + *coefficient;
         }
         result
     }
