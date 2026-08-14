@@ -540,18 +540,15 @@ where
 
     let mut statements = Vec::new();
     for receiver in public_share_receivers(config, message.dealer) {
-        let share_commitment = message.commitment.public_key_share(receiver)?;
         let encrypted_share = message
             .encrypted_shares
             .get(&receiver)
             .cloned()
             .ok_or(Error::MissingShare(receiver.get()))?;
+        // `share_commitment = g^encrypted_share - pad_commitment` rather than
+        // evaluating the Feldman polynomial at `receiver`.
         let encrypted_share_commitment = G::mul_generator(&encrypted_share.encrypted_share);
-        let expected_encrypted_share_commitment =
-            G::add(&share_commitment, &encrypted_share.pad_commitment);
-        if encrypted_share_commitment != expected_encrypted_share_commitment {
-            return Err(Error::CommitmentVerificationFailed);
-        }
+        let share_commitment = G::sub(&encrypted_share_commitment, &encrypted_share.pad_commitment);
 
         let statement = statement_for_receiver::<G>(
             config,
@@ -2265,7 +2262,7 @@ mod tests {
 
         assert_eq!(
             verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::CommitmentVerificationFailed
+            Error::ProofVerificationFailed
         );
     }
 
