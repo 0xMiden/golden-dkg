@@ -19,10 +19,11 @@ pub mod wire;
 mod test_support;
 
 pub use dkg::{
-    complete, create_dealing, create_dealing_with_secret, verify_dealing,
-    verify_dealing_for_receiver, verify_dealings, DealerMessage, DealerMessageNonce, DkgConfig,
-    DkgDealing, DkgOutput, EncryptedShare, EvrfProofBackend, EvrfStatement, EvrfWitness,
-    ParticipantRegistry, SessionId, DEALER_MESSAGE_NONCE_BYTES, PROTOCOL_VERSION,
+    complete, create_dealing, verify_dealing, verify_dealings, DealerMessage, DealerMessageNonce,
+    DealingBody, DkgConfig, DkgDealing, DkgInstanceKind, DkgInstanceOutput, DkgOutput,
+    EncryptedShare, EvrfDealingStatement, EvrfDealingWitness, EvrfMessage, EvrfProofBackend,
+    EvrfReceiverStatement, EvrfReceiverWitness, EvrfStatement, EvrfWitness, ParticipantRegistry,
+    SessionId, DEALER_MESSAGE_NONCE_BYTES, PROTOCOL_VERSION,
 };
 pub use error::{Error, Result};
 pub use feldman::FeldmanCommitment;

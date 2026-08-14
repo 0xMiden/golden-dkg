@@ -1,8 +1,6 @@
 //! Golden DKG adapter for the Secp/Secq paper eVRF.
 
-use golden_core::{
-    DealerMessageNonce, Error, EvrfProofBackend, EvrfStatement, EvrfWitness, Result,
-};
+use golden_core::{Error, EvrfMessage, EvrfProofBackend, EvrfStatement, EvrfWitness, Result};
 use golden_halo2curves::golden_group::{
     scalar_to_r1cs_field, Secp256k1Element, Secp256k1GoldenGroup, Secp256k1Scalar,
 };
@@ -11,31 +9,10 @@ use rand_core::CryptoRngCore;
 
 use super::{
     affine, evrf_batched_prove, evrf_batched_verify_many, fp_to_fq, h_gin_1, h_gin_2,
-    validate_batched_statement_shape, BatchedEvrfPublicParams, BatchedEvrfStatement,
-    BatchedEvrfWitness, BatchedReceiverStatement, Gin, BATCHED_PROOF_ID, MESSAGE_BYTES,
+    parse_batched_proof_stream, validate_batched_public_relations, BatchedDealingStatement,
+    BatchedEvrfPublicParams, BatchedEvrfStatement, BatchedEvrfWitness, BatchedReceiverStatement,
+    Gin, BATCHED_PROOF_ID, MESSAGE_BYTES,
 };
-
-pub(super) fn ensure_same_batch_context(
-    statement: &EvrfStatement<Secp256k1GoldenGroup>,
-    first: &EvrfStatement<Secp256k1GoldenGroup>,
-) -> Result<()> {
-    if statement.protocol_version != first.protocol_version
-        || statement.backend_id != first.backend_id
-        || statement.session_id != first.session_id
-        || statement.registry_root != first.registry_root
-        || statement.threshold != first.threshold
-        || statement.dealer != first.dealer
-        || statement.msg_i != first.msg_i
-        || statement.beta != first.beta
-        || statement.dealer_public_key != first.dealer_public_key
-        || statement.commitment_coefficients != first.commitment_coefficients
-        || statement.transcript_root != first.transcript_root
-    {
-        return Err(Error::ProofVerificationFailed);
-    }
-
-    Ok(())
-}
 
 /// Compute the paper eVRF pad `r = beta * T_1.x + T_2.x` as an `Fp`
 /// element, where `T_1 = H_{G_in,1}(msg)^k`, `T_2 = H_{G_in,2}(msg)^k`,
@@ -58,155 +35,225 @@ fn compute_pad_fp(msg: &[u8; MESSAGE_BYTES], sk1: &Fq, pkj: &Gin, beta: &Fp) -> 
 pub struct SecpSecqBackend;
 
 fn batched_statement(
-    statements: &[EvrfStatement<Secp256k1GoldenGroup>],
+    statement: &EvrfStatement<Secp256k1GoldenGroup>,
 ) -> Result<BatchedEvrfStatement> {
-    let first = statements.first().ok_or(Error::ProofVerificationFailed)?;
-    let beta = scalar_to_r1cs_field(&first.beta).ok_or(Error::ProofVerificationFailed)?;
-    let commitment_coefficients = first
-        .commitment_coefficients
+    preflight_statement_shape(statement)?;
+    let beta = scalar_to_r1cs_field(&statement.beta).ok_or(Error::ProofVerificationFailed)?;
+    let dealings = statement
+        .dealings
         .iter()
-        .map(|coefficient| coefficient.0)
+        .map(|dealing| BatchedDealingStatement {
+            msg: dealing.message.0,
+            commitment: dealing.commitment.clone(),
+            receivers: dealing
+                .receivers
+                .iter()
+                .map(|receiver| BatchedReceiverStatement {
+                    receiver: receiver.receiver,
+                    pkj: receiver.receiver_public_key.0,
+                    share_commitment: receiver.share_commitment.0,
+                    pad_commitment: receiver.pad_commitment.0,
+                    encrypted_share: receiver.encrypted_share.0,
+                })
+                .collect(),
+        })
         .collect();
-
-    let mut receivers = Vec::with_capacity(statements.len());
-    let mut statement_roots = Vec::with_capacity(statements.len());
-    for statement in statements {
-        ensure_same_batch_context(statement, first)?;
-        statement_roots.push(statement.root());
-        receivers.push(BatchedReceiverStatement {
-            receiver: statement.receiver,
-            pkj: statement.receiver_public_key.0,
-            share_commitment: statement.share_commitment.0,
-            pad_commitment: statement.pad_commitment.0,
-            encrypted_share: statement.encrypted_share.0,
-        });
-    }
-
+    let threshold = statement
+        .dealings
+        .first()
+        .ok_or(Error::ProofVerificationFailed)?
+        .commitment
+        .threshold();
     Ok(BatchedEvrfStatement {
-        msg: first.msg_i.0,
-        pk1: first.dealer_public_key.0,
+        pk1: statement.dealer_public_key.0,
         beta,
-        threshold: first.threshold,
-        commitment_coefficients,
-        statement_roots,
-        receivers,
+        threshold,
+        dealer_message_root: statement.dealer_message_root,
+        dealings,
     })
+}
+
+fn preflight_statement_shape(statement: &EvrfStatement<Secp256k1GoldenGroup>) -> Result<()> {
+    let first_dealing = statement
+        .dealings
+        .first()
+        .ok_or(Error::ProofVerificationFailed)?;
+    let threshold = first_dealing.commitment.threshold();
+    let receiver_count = first_dealing.receivers.len();
+    BatchedEvrfPublicParams::validated_shape(threshold, statement.dealings.len(), receiver_count)?;
+    if statement.dealings.iter().any(|dealing| {
+        dealing.commitment.threshold() != threshold || dealing.receivers.len() != receiver_count
+    }) {
+        return Err(Error::ProofVerificationFailed);
+    }
+    Ok(())
+}
+
+fn same_shape(left: &BatchedEvrfStatement, right: &BatchedEvrfStatement) -> bool {
+    left.threshold == right.threshold
+        && left.dealings.len() == right.dealings.len()
+        && left.dealings.first().map(|dealing| dealing.receivers.len())
+            == right
+                .dealings
+                .first()
+                .map(|dealing| dealing.receivers.len())
+}
+
+fn public_params(
+    statement: &BatchedEvrfStatement,
+) -> Result<std::sync::Arc<BatchedEvrfPublicParams>> {
+    #[cfg(test)]
+    PUBLIC_PARAMS_REQUESTS.with(|requests| requests.set(requests.get() + 1));
+
+    let first_dealing = statement
+        .dealings
+        .first()
+        .ok_or(Error::ProofVerificationFailed)?;
+    BatchedEvrfPublicParams::shared(
+        statement.threshold,
+        statement.dealings.len(),
+        first_dealing.receivers.len(),
+    )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PUBLIC_PARAMS_REQUESTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
     const PROOF_ID: &'static [u8] = BATCHED_PROOF_ID;
 
     fn derive_pad(
-        msg_i: DealerMessageNonce,
+        message: EvrfMessage,
         beta: &Secp256k1Scalar,
         identity_secret: &Secp256k1Scalar,
         peer_public_key: &Secp256k1Element,
         _receiver_public_key: &Secp256k1Element,
     ) -> Result<Secp256k1Scalar> {
         let beta_fp = scalar_to_r1cs_field(beta).ok_or(Error::ProofVerificationFailed)?;
-        let r = compute_pad_fp(&msg_i.0, &identity_secret.0, &peer_public_key.0, &beta_fp)?;
+        let r = compute_pad_fp(&message.0, &identity_secret.0, &peer_public_key.0, &beta_fp)?;
         Ok(Secp256k1Scalar(fp_to_fq(&r)))
     }
 
     fn prove_batch(
-        statements: &[EvrfStatement<Secp256k1GoldenGroup>],
-        witnesses: &[EvrfWitness<Secp256k1GoldenGroup>],
+        statement: &EvrfStatement<Secp256k1GoldenGroup>,
+        witness: &EvrfWitness<Secp256k1GoldenGroup>,
         rng: &mut impl CryptoRngCore,
     ) -> Result<Vec<u8>> {
-        if statements.is_empty() || statements.len() != witnesses.len() {
-            return Err(Error::ProofVerificationFailed);
-        }
-        let first = &statements[0];
-        let msg = first.msg_i.0;
-        let pk1 = first.dealer_public_key.0;
-        let beta = scalar_to_r1cs_field(&first.beta).ok_or(Error::ProofVerificationFailed)?;
-        let threshold = first.threshold;
-        let commitment_coefficients: Vec<Gin> = first
-            .commitment_coefficients
-            .iter()
-            .map(|coefficient| coefficient.0)
-            .collect();
-        let sk1 = witnesses[0].identity_secret.0;
-        let polynomial_coefficients = &witnesses[0].polynomial_coefficients;
-        if polynomial_coefficients.len() != threshold {
-            return Err(Error::ProofVerificationFailed);
-        }
-        let polynomial_constant = polynomial_coefficients
-            .first()
-            .ok_or(Error::ProofVerificationFailed)?
-            .0;
-
-        let mut receivers = Vec::with_capacity(statements.len());
-        let mut statement_roots = Vec::with_capacity(statements.len());
-        for (statement, witness) in statements.iter().zip(witnesses.iter()) {
-            ensure_same_batch_context(statement, first)?;
-            if witness.identity_secret.0 != sk1
-                || witness.polynomial_coefficients.as_slice() != polynomial_coefficients.as_slice()
-            {
-                return Err(Error::ProofVerificationFailed);
-            }
-
-            let pkj = statement.receiver_public_key.0;
-            let rec = BatchedReceiverStatement {
-                receiver: statement.receiver,
-                pkj,
-                share_commitment: statement.share_commitment.0,
-                pad_commitment: statement.pad_commitment.0,
-                encrypted_share: statement.encrypted_share.0,
-            };
-            statement_roots.push(statement.root());
-            receivers.push(rec);
-        }
-
-        let batched_statement = BatchedEvrfStatement {
-            msg,
-            pk1,
-            beta,
-            threshold,
-            commitment_coefficients,
-            statement_roots,
-            receivers,
+        witness.validate_shape(statement)?;
+        let statement = batched_statement(statement)?;
+        validate_batched_public_relations(&statement)?;
+        let witness = BatchedEvrfWitness {
+            sk1: witness.identity_secret.0,
+            polynomial_constants: witness
+                .dealings
+                .iter()
+                .map(|dealing| dealing.polynomial_constant.map(|constant| constant.0))
+                .collect(),
         };
-        let batched_witness = BatchedEvrfWitness {
-            sk1,
-            polynomial_constant,
-        };
-        validate_batched_statement_shape(&batched_statement)?;
-        let params = BatchedEvrfPublicParams::shared(threshold, batched_statement.receivers.len())?;
-        evrf_batched_prove(&params, &batched_statement, &batched_witness, rng)
+        let params = public_params(&statement)?;
+        evrf_batched_prove(&params, &statement, &witness, rng)
     }
 
-    fn verify_batch(
-        statements: &[EvrfStatement<Secp256k1GoldenGroup>],
-        proof: &[u8],
-    ) -> Result<()> {
-        let statement = batched_statement(statements)?;
-        validate_batched_statement_shape(&statement)?;
-        let params =
-            BatchedEvrfPublicParams::shared(statement.threshold, statement.receivers.len())?;
+    fn verify_batch(statement: &EvrfStatement<Secp256k1GoldenGroup>, proof: &[u8]) -> Result<()> {
+        let statement = batched_statement(statement)?;
+        validate_batched_public_relations(&statement)?;
+        parse_batched_proof_stream(&statement, proof)?;
+        let params = public_params(&statement)?;
         evrf_batched_verify_many(&params, &[(&statement, proof)])
     }
 
-    fn verify_proof_batch(
-        batches: &[(&[EvrfStatement<Secp256k1GoldenGroup>], &[u8])],
-    ) -> Result<()> {
+    fn verify_proof_batch(batches: &[(&EvrfStatement<Secp256k1GoldenGroup>, &[u8])]) -> Result<()> {
         if batches.is_empty() {
             return Err(Error::ProofVerificationFailed);
         }
         let statements = batches
             .iter()
-            .map(|(batch, _)| batched_statement(batch))
+            .map(|(statement, _)| batched_statement(statement))
             .collect::<Result<Vec<_>>>()?;
-        for statement in &statements {
-            validate_batched_statement_shape(statement)?;
-        }
         let first = statements.first().ok_or(Error::ProofVerificationFailed)?;
-        let params = BatchedEvrfPublicParams::shared(first.threshold, first.receivers.len())?;
+        for (statement, (_, proof)) in statements.iter().zip(batches) {
+            if !same_shape(first, statement) {
+                return Err(Error::ProofVerificationFailed);
+            }
+            validate_batched_public_relations(statement)?;
+            parse_batched_proof_stream(statement, proof)?;
+        }
+        let params = public_params(first)?;
         let instances = statements
             .iter()
-            .zip(batches.iter())
+            .zip(batches)
             .map(|(statement, (_, proof))| (statement, *proof))
             .collect::<Vec<_>>();
         evrf_batched_verify_many(&params, &instances)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use golden_core::{
+        EvrfDealingStatement, EvrfReceiverStatement, FeldmanCommitment, GoldenGroup, GoldenScalar,
+        ParticipantIndex,
+    };
+
+    use super::*;
+
+    fn minimal_statement() -> EvrfStatement<Secp256k1GoldenGroup> {
+        let receiver = ParticipantIndex::new(2).unwrap();
+        let dealer_secret = Secp256k1Scalar::from_u64(3).unwrap();
+        let receiver_secret = Secp256k1Scalar::from_u64(5).unwrap();
+        let share = Secp256k1Scalar::from_u64(13).unwrap();
+        let pad = Secp256k1Scalar::from_u64(7).unwrap();
+
+        EvrfStatement {
+            dealer_public_key: Secp256k1GoldenGroup::mul_generator(&dealer_secret),
+            beta: Secp256k1Scalar::from_u64(17).unwrap(),
+            dealer_message_root: [3u8; 32],
+            dealings: vec![EvrfDealingStatement {
+                message: EvrfMessage([9u8; MESSAGE_BYTES]),
+                commitment: FeldmanCommitment::from_coefficients(vec![
+                    Secp256k1GoldenGroup::mul_generator(&share),
+                ])
+                .unwrap(),
+                receivers: vec![EvrfReceiverStatement {
+                    receiver,
+                    receiver_public_key: Secp256k1GoldenGroup::mul_generator(&receiver_secret),
+                    share_commitment: Secp256k1GoldenGroup::mul_generator(&share),
+                    pad_commitment: Secp256k1GoldenGroup::mul_generator(&pad),
+                    encrypted_share: Secp256k1Scalar::add(&share, &pad),
+                }],
+            }],
+        }
+    }
+
+    fn public_params_requests() -> usize {
+        PUBLIC_PARAMS_REQUESTS.with(core::cell::Cell::get)
+    }
+
+    #[test]
+    fn malformed_proof_is_rejected_before_public_parameter_lookup() {
+        let statement = minimal_statement();
+        let before = public_params_requests();
+
+        assert_eq!(
+            SecpSecqBackend::verify_batch(&statement, &[]).unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+        assert_eq!(public_params_requests(), before);
+    }
+
+    #[test]
+    fn oversized_repeated_receiver_shape_is_rejected_before_conversion_or_params() {
+        let mut statement = minimal_statement();
+        let receiver = statement.dealings[0].receivers[0].clone();
+        statement.dealings[0].receivers = vec![receiver; 295];
+        let before = public_params_requests();
+
+        assert_eq!(
+            SecpSecqBackend::verify_batch(&statement, &[]).unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+        assert_eq!(public_params_requests(), before);
     }
 }

@@ -110,7 +110,7 @@ pub fn build_config(n: usize, t: usize) -> DkgConfig<Secp256k1GoldenGroup> {
             .collect(),
     )
     .unwrap();
-    DkgConfig::new(
+    DkgConfig::random(
         t,
         SessionId([42u8; 32]),
         Secp256k1Scalar::from_u64(77).unwrap(),
@@ -145,8 +145,12 @@ pub fn build_batched_at_ne(
 /// `(params, statement, proof)` so callers can verify or measure size.
 pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfPublicParams, BatchedEvrfStatement, Vec<u8>) {
     let (statement, witness, _pkjs, _beta) = build_batched_at_ne(n_e);
-    let params = BatchedEvrfPublicParams::setup(statement.threshold, statement.receivers.len())
-        .expect("valid public parameter shape");
+    let params = BatchedEvrfPublicParams::setup(
+        statement.threshold,
+        statement.dealings.len(),
+        statement.dealings[0].receivers.len(),
+    )
+    .expect("valid public parameter shape");
     let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
     let proof = evrf_batched_prove(&params, &statement, &witness, &mut rng).unwrap();
     // Sanity: the proof must verify before any bench iterates on it.

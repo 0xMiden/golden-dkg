@@ -1,19 +1,20 @@
-//! DKG message skeleton over a generic Golden group.
+//! Batch-native DKG orchestration over a generic Golden group.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rand_core::CryptoRngCore;
 
 use crate::transcript::{TranscriptBuilder, TranscriptRoot};
+use crate::wire::MAX_DEALER_PROOF_BYTES;
 use crate::{
     Error, FeldmanCommitment, GoldenGroup, GoldenScalar, ParticipantIndex, Polynomial, Result,
     Share,
 };
 
 /// Protocol version used in transcript binding.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
-/// Byte length of the paper's `lambda`-bit dealer message `msg_i`.
+/// Byte length of a raw dealer nonce and an effective eVRF message.
 pub const DEALER_MESSAGE_NONCE_BYTES: usize = 32;
 
 /// Session identifier for replay protection.
@@ -29,18 +30,22 @@ impl SessionId {
     }
 }
 
-/// Paper `lambda`-bit dealer message `msg_i`.
+/// Independently sampled raw nonce carried by one dealing body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DealerMessageNonce(pub [u8; DEALER_MESSAGE_NONCE_BYTES]);
 
 impl DealerMessageNonce {
-    /// Create a random dealer message nonce.
+    /// Create a random dealer-message nonce.
     pub fn random(rng: &mut impl CryptoRngCore) -> Self {
         let mut bytes = [0u8; DEALER_MESSAGE_NONCE_BYTES];
         rng.fill_bytes(&mut bytes);
         Self(bytes)
     }
 }
+
+/// Domain-separated message passed to an eVRF backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvrfMessage(pub [u8; DEALER_MESSAGE_NONCE_BYTES]);
 
 /// Public participant registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,26 +119,34 @@ impl<G: GoldenGroup> ParticipantRegistry<G> {
     }
 }
 
-/// DKG configuration.
+/// Constant-term policy for one sharing in an ordered DKG batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DkgInstanceKind {
+    /// Independently sampled random constant term.
+    Random,
+    /// Identity/zero constant term.
+    Zero,
+}
+
+/// Immutable, validated DKG configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DkgConfig<G: GoldenGroup> {
-    /// Threshold.
-    pub threshold: usize,
-    /// Session ID.
-    pub session_id: SessionId,
-    /// Public eVRF leftover-hash-lemma coefficient from setup.
-    pub beta: G::Scalar,
-    /// Participant registry.
-    pub registry: ParticipantRegistry<G>,
+    threshold: usize,
+    session_id: SessionId,
+    beta: G::Scalar,
+    registry: ParticipantRegistry<G>,
+    instances: Vec<DkgInstanceKind>,
+    root: TranscriptRoot,
 }
 
 impl<G: GoldenGroup> DkgConfig<G> {
-    /// Create a new DKG configuration.
-    pub fn new(
+    /// Construct an arbitrary ordered, nonempty batch.
+    pub fn batch(
         threshold: usize,
         session_id: SessionId,
         beta: G::Scalar,
         registry: ParticipantRegistry<G>,
+        instances: Vec<DkgInstanceKind>,
     ) -> Result<Self> {
         if threshold == 0 || threshold > registry.len() {
             return Err(Error::InvalidThreshold {
@@ -141,50 +154,120 @@ impl<G: GoldenGroup> DkgConfig<G> {
                 participants: registry.len(),
             });
         }
+        if instances.is_empty() {
+            return Err(Error::EmptyDkgBatch);
+        }
+        let root = config_root::<G>(threshold, session_id, &beta, &registry, &instances);
         Ok(Self {
             threshold,
             session_id,
             beta,
             registry,
+            instances,
+            root,
         })
+    }
+
+    /// Construct one random sharing.
+    pub fn random(
+        threshold: usize,
+        session_id: SessionId,
+        beta: G::Scalar,
+        registry: ParticipantRegistry<G>,
+    ) -> Result<Self> {
+        Self::batch(
+            threshold,
+            session_id,
+            beta,
+            registry,
+            vec![DkgInstanceKind::Random],
+        )
+    }
+
+    /// Construct one zero sharing.
+    pub fn zero(
+        threshold: usize,
+        session_id: SessionId,
+        beta: G::Scalar,
+        registry: ParticipantRegistry<G>,
+    ) -> Result<Self> {
+        Self::batch(
+            threshold,
+            session_id,
+            beta,
+            registry,
+            vec![DkgInstanceKind::Zero],
+        )
+    }
+
+    /// Return the threshold.
+    pub fn threshold(&self) -> usize {
+        self.threshold
+    }
+
+    /// Return the session identifier.
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// Return the public eVRF coefficient.
+    pub fn beta(&self) -> &G::Scalar {
+        &self.beta
+    }
+
+    /// Return the participant registry.
+    pub fn registry(&self) -> &ParticipantRegistry<G> {
+        &self.registry
+    }
+
+    /// Return configured instance kinds in protocol order.
+    pub fn instances(&self) -> &[DkgInstanceKind] {
+        &self.instances
+    }
+
+    /// Return the canonical configuration root.
+    pub fn root(&self) -> TranscriptRoot {
+        self.root
     }
 }
 
-/// Public statement proven for one receiver.
+/// Public inputs for one receiver relation inside one dealing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EvrfStatement<G: GoldenGroup> {
-    /// Protocol version.
-    pub protocol_version: u32,
-    /// Backend identifier.
-    pub backend_id: &'static str,
-    /// Session ID.
-    pub session_id: SessionId,
-    /// Registry root.
-    pub registry_root: TranscriptRoot,
-    /// DKG threshold.
-    pub threshold: usize,
-    /// Dealer.
-    pub dealer: ParticipantIndex,
-    /// Receiver.
+pub struct EvrfReceiverStatement<G: GoldenGroup> {
+    /// Receiver participant index.
     pub receiver: ParticipantIndex,
-    /// Paper dealer message `msg_i`.
-    pub msg_i: DealerMessageNonce,
-    /// Public eVRF leftover-hash-lemma coefficient from setup.
-    pub beta: G::Scalar,
-    /// Dealer identity public key.
-    pub dealer_public_key: G::Element,
     /// Receiver identity public key.
     pub receiver_public_key: G::Element,
-    /// Ordered Feldman commitment coefficients for the dealer polynomial.
-    pub commitment_coefficients: Vec<G::Element>,
     /// Public commitment to the receiver share.
     pub share_commitment: G::Element,
     /// Public commitment to the pad scalar.
     pub pad_commitment: G::Element,
     /// Encrypted share scalar, `pad + share`.
     pub encrypted_share: G::Scalar,
-    /// Dealing transcript root.
-    pub transcript_root: TranscriptRoot,
+}
+
+/// Public inputs for one dealing in a joint dealer proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvrfDealingStatement<G: GoldenGroup> {
+    /// Effective, domain-separated eVRF message.
+    pub message: EvrfMessage,
+    /// Feldman commitment to the shared polynomial.
+    pub commitment: FeldmanCommitment<G>,
+    /// Receiver relations in canonical participant order.
+    pub receivers: Vec<EvrfReceiverStatement<G>>,
+}
+
+/// Public statement for one dealer's complete ordered batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvrfStatement<G: GoldenGroup> {
+    /// Dealer identity public key.
+    pub dealer_public_key: G::Element,
+    /// Public eVRF coefficient.
+    pub beta: G::Scalar,
+    /// Canonical proof-independent dealer-message root.
+    pub dealer_message_root: TranscriptRoot,
+    /// Dealings in configuration order.
+    pub dealings: Vec<EvrfDealingStatement<G>>,
 }
 
 impl<G: GoldenGroup> EvrfStatement<G> {
@@ -194,98 +277,100 @@ impl<G: GoldenGroup> EvrfStatement<G> {
     }
 }
 
-/// Private witness used by an eVRF proof backend for one receiver.
+/// Private receiver openings in canonical order.
+#[derive(Clone, Eq, PartialEq)]
+pub struct EvrfReceiverWitness<G: GoldenGroup> {
+    /// Receiver share scalar.
+    pub share: G::Scalar,
+    /// Pad scalar.
+    pub pad: G::Scalar,
+}
+
+/// Private openings for one dealing, in its statement receiver order.
+#[derive(Clone, Eq, PartialEq)]
+pub struct EvrfDealingWitness<G: GoldenGroup> {
+    /// Opening of an explicit constant Feldman commitment.
+    pub polynomial_constant: Option<G::Scalar>,
+    /// Receiver openings in canonical order.
+    pub receivers: Vec<EvrfReceiverWitness<G>>,
+}
+
+/// Private witness for one dealer's complete ordered batch.
 #[derive(Clone, Eq, PartialEq)]
 pub struct EvrfWitness<G: GoldenGroup> {
     /// Dealer identity secret opening the dealer identity public key.
     pub identity_secret: G::Scalar,
-    /// Polynomial coefficients in ascending degree order.
-    pub polynomial_coefficients: Vec<G::Scalar>,
-    /// Scalar share opening the public share commitment.
-    pub share: G::Scalar,
-    /// Scalar pad opening the public pad commitment.
-    pub pad: G::Scalar,
+    /// Per-dealing receiver openings in statement order.
+    pub dealings: Vec<EvrfDealingWitness<G>>,
+}
+
+impl<G: GoldenGroup> EvrfWitness<G> {
+    /// Validate that private witness dimensions match the public statement.
+    pub fn validate_shape(&self, statement: &EvrfStatement<G>) -> Result<()> {
+        if self.dealings.len() != statement.dealings.len()
+            || self
+                .dealings
+                .iter()
+                .zip(&statement.dealings)
+                .any(|(private, public)| {
+                    private.receivers.len() != public.receivers.len()
+                        || private.polynomial_constant.is_some()
+                            != public.commitment.constant().is_some()
+                })
+        {
+            return Err(Error::ProofVerificationFailed);
+        }
+        Ok(())
+    }
 }
 
 impl<G: GoldenGroup> core::fmt::Debug for EvrfWitness<G> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EvrfWitness")
             .field("identity_secret", &"<redacted>")
-            .field("polynomial_coefficients", &"<redacted>")
-            .field("share", &"<redacted>")
-            .field("pad", &"<redacted>")
+            .field("dealings", &"<redacted>")
             .finish()
     }
 }
 
 /// eVRF proof backend boundary.
-///
-/// One proof object covers every non-self receiver in a dealer message. The
-/// dealer produces a single batched proof via [`EvrfProofBackend::prove_batch`]
-/// and the public verifier checks it once via [`EvrfProofBackend::verify_batch`]
-/// against the full ordered receiver statement list. Per-receiver pad
-/// derivation stays a separate method because the dealer computes pads while
-/// building encrypted shares, before the batched statement list exists.
 pub trait EvrfProofBackend<G: GoldenGroup> {
     /// Stable, versioned identity of this proof protocol and byte grammar.
     const PROOF_ID: &'static [u8];
 
-    /// Evaluate the per-recipient pad scalar for the paper eVRF input shape.
-    ///
-    /// `peer_public_key` is the DH peer the dealer computes a shared secret
-    /// against. In the dealer-side `create_dealing` path the peer is the
-    /// receiver (so the receiver can decrypt with `receiver_identity_secret`),
-    /// so callers pass `receiver_public_key` for both arguments there. A
-    /// paper-faithful backend that follows the `(msg_i, PK_j)` input shape
-    /// keeps the same argument; the split exists so a future receiver-side
-    /// re-derivation can swap in a different peer without changing the trait.
-    ///
-    /// The default preserves the prototype DH-transcript derivation. A
-    /// paper-faithful backend overrides this so pad generation and proof
-    /// generation use the same eVRF relation.
+    /// Evaluate a per-recipient pad from an already domain-separated message.
     fn derive_pad(
-        msg_i: DealerMessageNonce,
+        message: EvrfMessage,
         _beta: &G::Scalar,
         identity_secret: &G::Scalar,
         peer_public_key: &G::Element,
         receiver_public_key: &G::Element,
     ) -> Result<G::Scalar> {
         let shared_secret = G::mul(peer_public_key, identity_secret);
-        derive_default_pad::<G>(msg_i, receiver_public_key, &shared_secret)
+        derive_default_pad::<G>(message, receiver_public_key, &shared_secret)
     }
 
-    /// Produce one batched proof covering every receiver statement.
-    ///
-    /// `statements` and `witnesses` are in the canonical ordered receiver list
-    /// (excluding the dealer). The backend must bind the full ordered list into
-    /// the proof transcript.
+    /// Produce one proof for the complete nested dealer statement.
     fn prove_batch(
-        statements: &[EvrfStatement<G>],
-        witnesses: &[EvrfWitness<G>],
+        statement: &EvrfStatement<G>,
+        witness: &EvrfWitness<G>,
         rng: &mut impl CryptoRngCore,
     ) -> Result<Vec<u8>>;
 
-    /// Verify one batched proof against the full ordered receiver statement
-    /// list. Implementations may use verifier-side randomness for multiexp
-    /// (e.g. to pool scalars across the batch); when they do, soundness still
-    /// follows from the standard small-subgroup-checked Schnorr argument as
-    /// long as the per-statement challenge is derived from the transcript
-    /// independent of that batching randomness. Verifier randomness affects
-    /// only the amortized cost, not whether a bad proof is accepted.
-    fn verify_batch(statements: &[EvrfStatement<G>], proof: &[u8]) -> Result<()>;
+    /// Verify one proof for the complete nested dealer statement.
+    fn verify_batch(statement: &EvrfStatement<G>, proof: &[u8]) -> Result<()>;
 
     /// Verify several independent dealer proofs.
     ///
-    /// Each entry contains the ordered receiver statements and proof bytes for
-    /// one dealer. Backends may combine the proof equations into one MSM. The
-    /// combining coefficients must be nonzero and unpredictable to the
-    /// dealers, using fresh verifier entropy or a domain-separated transcript
-    /// that binds the complete ordered batch. Fixed or input-independent
+    /// Backends may combine the proof equations into one MSM. The combining
+    /// coefficients must be nonzero and unpredictable to the dealers, using
+    /// fresh verifier entropy or a domain-separated transcript that binds the
+    /// complete ordered statements and proofs. Fixed or input-independent
     /// coefficients do not provide sound batch verification. The default
     /// preserves correctness for backends without that optimization.
-    fn verify_proof_batch(batches: &[(&[EvrfStatement<G>], &[u8])]) -> Result<()> {
-        for (statements, proof) in batches {
-            Self::verify_batch(statements, proof)?;
+    fn verify_proof_batch(batches: &[(&EvrfStatement<G>, &[u8])]) -> Result<()> {
+        for (statement, proof) in batches {
+            Self::verify_batch(statement, proof)?;
         }
         Ok(())
     }
@@ -300,83 +385,135 @@ pub struct EncryptedShare<G: GoldenGroup> {
     pub encrypted_share: G::Scalar,
 }
 
-/// Dealer broadcast message.
+/// One proof-independent dealing body in a dealer broadcast.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DealingBody<G: GoldenGroup> {
+    /// Independently sampled raw nonce.
+    pub nonce: DealerMessageNonce,
+    /// Feldman commitment for this instance's independently sampled polynomial.
+    pub commitment: FeldmanCommitment<G>,
+    /// Public encrypted shares keyed by every non-dealer receiver.
+    pub encrypted_shares: BTreeMap<ParticipantIndex, EncryptedShare<G>>,
+}
+
+/// Dealer broadcast for the complete configured batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DealerMessage<G: GoldenGroup> {
-    /// Session ID.
-    pub session_id: SessionId,
-    /// Registry root.
-    pub registry_root: TranscriptRoot,
-    /// Dealer.
+    /// Claimed configuration root, validated before proof verification.
+    pub configuration_root: TranscriptRoot,
+    /// Dealer participant index.
     pub dealer: ParticipantIndex,
-    /// Paper dealer message `msg_i`.
-    pub msg_i: DealerMessageNonce,
-    /// Dealer Feldman commitment.
-    pub commitment: FeldmanCommitment<G>,
-    /// Public encrypted-share data, keyed by receiver.
-    pub encrypted_shares: BTreeMap<ParticipantIndex, EncryptedShare<G>>,
-    /// Batched proof covering every non-self receiver in this message.
+    /// Dealing bodies in configuration order.
+    pub dealings: Vec<DealingBody<G>>,
+    /// One proof covering every dealing and non-dealer receiver.
     pub proof: Vec<u8>,
-    /// Transcript root for the dealing.
-    pub transcript_root: TranscriptRoot,
 }
 
-/// Local output from creating a dealing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl<G: GoldenGroup> DealerMessage<G> {
+    /// Derive the canonical proof-independent root from the current fields.
+    pub fn root(&self) -> TranscriptRoot {
+        dealer_message_root(self)
+    }
+}
+
+/// Immutable local output from creating a dealer message.
+#[derive(Clone, Eq, PartialEq)]
 pub struct DkgDealing<G: GoldenGroup> {
-    /// Broadcast message.
-    pub message: DealerMessage<G>,
-    /// Dealer private share for itself.
-    pub private_share: Share<G::Scalar>,
+    message: DealerMessage<G>,
+    private_shares: Vec<G::Scalar>,
 }
 
-/// DKG output for one participant.
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl<G: GoldenGroup> DkgDealing<G> {
+    /// Return the public dealer broadcast.
+    pub fn message(&self) -> &DealerMessage<G> {
+        &self.message
+    }
+}
+
+impl<G: GoldenGroup> core::fmt::Debug for DkgDealing<G> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DkgDealing")
+            .field("message", &self.message)
+            .field("private_shares", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Completed participant state for one batch position.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DkgInstanceOutput<G: GoldenGroup> {
+    public_key: G::Element,
+    secret_share: Share<G::Scalar>,
+    public_key_shares: BTreeMap<ParticipantIndex, G::Element>,
+}
+
+impl<G: GoldenGroup> DkgInstanceOutput<G> {
+    /// Return the shared public key.
+    pub fn public_key(&self) -> &G::Element {
+        &self.public_key
+    }
+
+    /// Return this participant's secret share.
+    pub fn secret_share(&self) -> &Share<G::Scalar> {
+        &self.secret_share
+    }
+
+    /// Return public key shares in canonical participant order.
+    pub fn public_key_shares(&self) -> &BTreeMap<ParticipantIndex, G::Element> {
+        &self.public_key_shares
+    }
+}
+
+impl<G: GoldenGroup> core::fmt::Debug for DkgInstanceOutput<G> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DkgInstanceOutput")
+            .field("public_key", &self.public_key)
+            .field("secret_share", &"<redacted>")
+            .field("public_key_shares", &self.public_key_shares)
+            .finish()
+    }
+}
+
+/// Immutable atomic output for the complete ordered DKG batch.
+#[derive(Clone, Eq, PartialEq)]
 pub struct DkgOutput<G: GoldenGroup> {
-    /// Shared public key.
-    pub public_key: G::Element,
-    /// This participant's secret share.
-    pub secret_share: Share<G::Scalar>,
-    /// Public key shares for each participant.
-    pub public_key_shares: BTreeMap<ParticipantIndex, G::Element>,
-    /// Transcript root over verified dealings.
-    pub transcript_root: TranscriptRoot,
+    configuration_root: TranscriptRoot,
+    instances: Vec<DkgInstanceOutput<G>>,
+    completion_root: TranscriptRoot,
 }
 
-/// Create one dealer message.
+impl<G: GoldenGroup> DkgOutput<G> {
+    /// Return the proof-policy-independent configuration root accepted during
+    /// completion.
+    pub fn configuration_root(&self) -> TranscriptRoot {
+        self.configuration_root
+    }
+
+    /// Return completed instances in configuration order.
+    pub fn instances(&self) -> &[DkgInstanceOutput<G>] {
+        &self.instances
+    }
+
+    /// Return the atomic completion identity, including the proof policy used.
+    pub fn completion_root(&self) -> TranscriptRoot {
+        self.completion_root
+    }
+}
+
+impl<G: GoldenGroup> core::fmt::Debug for DkgOutput<G> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DkgOutput")
+            .field("configuration_root", &self.configuration_root)
+            .field("instances", &self.instances)
+            .field("completion_root", &self.completion_root)
+            .finish()
+    }
+}
+
+/// Create one dealer message for the complete configured batch.
 pub fn create_dealing<G, B>(
     dealer: ParticipantIndex,
     dealer_identity_secret: &G::Scalar,
-    config: &DkgConfig<G>,
-    rng: &mut impl CryptoRngCore,
-) -> Result<DkgDealing<G>>
-where
-    G: GoldenGroup,
-    B: EvrfProofBackend<G>,
-{
-    create_dealing_with_secret::<G, B>(
-        dealer,
-        dealer_identity_secret,
-        G::Scalar::random(rng),
-        config,
-        rng,
-    )
-}
-
-/// Create one dealer message with a caller chosen polynomial constant.
-///
-/// This is the same dealing flow as [`create_dealing`], except the caller sets
-/// the dealer polynomial's constant term. Ordinary DKG callers should keep
-/// using [`create_dealing`].
-///
-/// EHTDH1 uses this helper for its zero sharing run. First, run normal DKG for
-/// `x`. Then run a second DKG where every dealer passes `G::Scalar::zero()` as
-/// `polynomial_secret`. The EHTDH1 adapter derives the second session id. It
-/// rejects the result unless the aggregate public key is the group identity.
-pub fn create_dealing_with_secret<G, B>(
-    dealer: ParticipantIndex,
-    dealer_identity_secret: &G::Scalar,
-    polynomial_secret: G::Scalar,
     config: &DkgConfig<G>,
     rng: &mut impl CryptoRngCore,
 ) -> Result<DkgDealing<G>>
@@ -389,215 +526,224 @@ where
         return Err(Error::IdentityKeyMismatch);
     }
 
-    let polynomial = Polynomial::random_with_secret(polynomial_secret, config.threshold, rng)?;
-    let commitment = FeldmanCommitment::<G>::commit(&polynomial)?;
-    let msg_i = DealerMessageNonce::random(rng);
+    let mut bodies = Vec::with_capacity(config.instances.len());
+    let mut private_shares = Vec::with_capacity(config.instances.len());
+    let mut proof_dealings = Vec::with_capacity(config.instances.len());
+    let mut witness_dealings = Vec::with_capacity(config.instances.len());
 
-    let mut shares = BTreeMap::new();
-    for receiver in config.registry.indexes() {
-        let share = polynomial.evaluate(receiver)?;
-        shares.insert(receiver, share.value);
-    }
+    for (position, kind) in config.instances.iter().copied().enumerate() {
+        let (polynomial, commitment, polynomial_constant) = match kind {
+            DkgInstanceKind::Random => {
+                let constant = G::Scalar::random(rng);
+                let polynomial =
+                    Polynomial::random_with_secret(constant.clone(), config.threshold, rng)?;
+                let commitment = FeldmanCommitment::<G>::commit(&polynomial)?;
+                (polynomial, commitment, Some(constant))
+            }
+            DkgInstanceKind::Zero => {
+                let polynomial =
+                    Polynomial::random_with_secret(G::Scalar::zero(), config.threshold, rng)?;
+                let commitment = FeldmanCommitment::<G>::commit_zero(&polynomial)?;
+                (polynomial, commitment, None)
+            }
+        };
+        let nonce = DealerMessageNonce::random(rng);
+        let message = effective_evrf_message(config.root, dealer, position, nonce);
 
-    let mut encrypted_shares = BTreeMap::new();
-    let mut pads = BTreeMap::new();
-    for (receiver, share) in shares.iter().filter(|(receiver, _)| **receiver != dealer) {
-        let receiver_public_key = config.registry.public_key(*receiver)?;
-        // Dealer-side pad: DH peer is the receiver, so they can re-derive the
-        // same pad with `dealer_public_key` + their own identity secret. See
-        // `EvrfProofBackend::derive_pad` for why the two PK arguments match.
-        let pad = B::derive_pad(
-            msg_i,
-            &config.beta,
-            dealer_identity_secret,
-            receiver_public_key,
-            receiver_public_key,
-        )?;
-        encrypted_shares.insert(
-            *receiver,
-            EncryptedShare {
+        let mut shares = BTreeMap::new();
+        for receiver in config.registry.indexes() {
+            shares.insert(receiver, polynomial.evaluate(receiver)?.value);
+        }
+
+        let mut encrypted_shares = BTreeMap::new();
+        let mut proof_receivers = Vec::with_capacity(config.registry.len().saturating_sub(1));
+        let mut witness_receivers = Vec::with_capacity(config.registry.len().saturating_sub(1));
+        for receiver in public_share_receivers(config, dealer) {
+            let receiver_public_key = config.registry.public_key(receiver)?;
+            let share = shares
+                .get(&receiver)
+                .cloned()
+                .ok_or(Error::MissingShare(receiver.get()))?;
+            let pad = B::derive_pad(
+                message,
+                &config.beta,
+                dealer_identity_secret,
+                receiver_public_key,
+                receiver_public_key,
+            )?;
+            let encrypted_share = EncryptedShare::<G> {
                 pad_commitment: G::mul_generator(&pad),
                 encrypted_share: share.add(&pad),
-            },
-        );
-        pads.insert(*receiver, pad);
-    }
+            };
+            proof_receivers.push(EvrfReceiverStatement {
+                receiver,
+                receiver_public_key: receiver_public_key.clone(),
+                share_commitment: G::mul_generator(&share),
+                pad_commitment: encrypted_share.pad_commitment.clone(),
+                encrypted_share: encrypted_share.encrypted_share.clone(),
+            });
+            witness_receivers.push(EvrfReceiverWitness { share, pad });
+            encrypted_shares.insert(receiver, encrypted_share);
+        }
 
-    let transcript_root = dealing_root::<G>(
-        config.session_id,
-        config.registry.root(),
-        dealer,
-        msg_i,
-        &commitment,
-        &encrypted_shares,
-    );
-
-    let mut statements = Vec::new();
-    let mut witnesses = Vec::new();
-    for (receiver, share_value) in shares.iter().filter(|(receiver, _)| **receiver != dealer) {
-        // The dealer knows f(receiver) directly, so this fixed-base mul
-        // equals `commitment.public_key_share(*receiver)` without evaluating it twice.
-        let share_commitment = G::mul_generator(share_value);
-        let encrypted_share = encrypted_shares
-            .get(receiver)
-            .cloned()
-            .ok_or(Error::MissingShare(receiver.get()))?;
-        let statement = statement_for_receiver::<G>(
-            config,
-            dealer,
-            *receiver,
-            msg_i,
-            share_commitment,
-            commitment.coefficients().to_vec(),
-            encrypted_share,
-            transcript_root,
-        )?;
-        let witness = EvrfWitness {
-            identity_secret: dealer_identity_secret.clone(),
-            polynomial_coefficients: polynomial.coefficients().to_vec(),
-            share: share_value.clone(),
-            // Reuse the authoritative pad we just derived above instead of
-            // back-solving it from `encrypted_share - share`. The two are
-            // equal by construction, but routing the source of truth forward
-            // keeps the witness honest if `EncryptedShare::encrypted_share`
-            // ever picks up extra padding contributors.
-            pad: pads
-                .get(receiver)
+        private_shares.push(
+            shares
+                .get(&dealer)
                 .cloned()
-                .ok_or(Error::MissingShare(receiver.get()))?,
-        };
-        statements.push(statement);
-        witnesses.push(witness);
-    }
-
-    // A dealer with no other receivers has nothing for the eVRF proof to
-    // attest to; the sole share is checked directly below instead.
-    let proof = if statements.is_empty() {
-        Vec::new()
-    } else {
-        B::prove_batch(&statements, &witnesses, rng)?
-    };
-
-    let private_share = Share {
-        participant: dealer,
-        value: shares
-            .get(&dealer)
-            .cloned()
-            .ok_or(Error::MissingShare(dealer.get()))?,
-    };
-    if !commitment.verify_share(&private_share)? {
-        return Err(Error::CommitmentVerificationFailed);
-    }
-
-    Ok(DkgDealing {
-        message: DealerMessage {
-            session_id: config.session_id,
-            registry_root: config.registry.root(),
-            dealer,
-            msg_i,
+                .ok_or(Error::MissingShare(dealer.get()))?,
+        );
+        proof_dealings.push(EvrfDealingStatement {
+            message,
+            commitment: commitment.clone(),
+            receivers: proof_receivers,
+        });
+        witness_dealings.push(EvrfDealingWitness {
+            polynomial_constant,
+            receivers: witness_receivers,
+        });
+        bodies.push(DealingBody {
+            nonce,
             commitment,
             encrypted_shares,
-            proof,
-            transcript_root,
-        },
-        private_share,
-    })
-}
-
-fn dealing_statements<G>(
-    message: &DealerMessage<G>,
-    config: &DkgConfig<G>,
-) -> Result<Vec<EvrfStatement<G>>>
-where
-    G: GoldenGroup,
-{
-    if message.session_id != config.session_id {
-        return Err(Error::SessionMismatch);
-    }
-    if message.registry_root != config.registry.root() {
-        return Err(Error::RegistryMismatch);
-    }
-    config.registry.public_key(message.dealer)?;
-    if message.commitment.coefficients().len() != config.threshold {
-        return Err(Error::InvalidCommitmentDegree {
-            expected: config.threshold,
-            actual: message.commitment.coefficients().len(),
         });
     }
 
-    let expected_root = dealing_root::<G>(
-        message.session_id,
-        message.registry_root,
-        message.dealer,
-        message.msg_i,
-        &message.commitment,
-        &message.encrypted_shares,
-    );
-    if expected_root != message.transcript_root {
-        return Err(Error::ProofVerificationFailed);
+    let mut message = DealerMessage {
+        configuration_root: config.root,
+        dealer,
+        dealings: bodies,
+        proof: Vec::new(),
+    };
+    let statement = EvrfStatement {
+        dealer_public_key: dealer_public_key.clone(),
+        beta: config.beta.clone(),
+        dealer_message_root: message.root(),
+        dealings: proof_dealings,
+    };
+    let witness = EvrfWitness {
+        identity_secret: dealer_identity_secret.clone(),
+        dealings: witness_dealings,
+    };
+    // A dealer with no other receivers (n=1) has no public receiver relation
+    // to attest to; the sole share remains local.
+    let proof = if statement
+        .dealings
+        .iter()
+        .all(|dealing| dealing.receivers.is_empty())
+    {
+        Vec::new()
+    } else {
+        B::prove_batch(&statement, &witness, rng)?
+    };
+    if proof.len() > MAX_DEALER_PROOF_BYTES {
+        return Err(Error::InvalidEncoding);
     }
-    ensure_public_share_keys(message, config)?;
+    message.proof = proof;
 
-    let mut statements = Vec::new();
-    for receiver in public_share_receivers(config, message.dealer) {
-        let share_commitment = message.commitment.public_key_share(receiver)?;
-        let encrypted_share = message
-            .encrypted_shares
-            .get(&receiver)
-            .cloned()
-            .ok_or(Error::MissingShare(receiver.get()))?;
-        let encrypted_share_commitment = G::mul_generator(&encrypted_share.encrypted_share);
-        let expected_encrypted_share_commitment =
-            G::add(&share_commitment, &encrypted_share.pad_commitment);
-        if encrypted_share_commitment != expected_encrypted_share_commitment {
-            return Err(Error::CommitmentVerificationFailed);
-        }
-
-        let statement = statement_for_receiver::<G>(
-            config,
-            message.dealer,
-            receiver,
-            message.msg_i,
-            share_commitment,
-            message.commitment.coefficients().to_vec(),
-            encrypted_share,
-            message.transcript_root,
-        )?;
-        statements.push(statement);
-    }
-
-    Ok(statements)
+    Ok(DkgDealing {
+        message,
+        private_shares,
+    })
 }
 
-/// Verify one dealer message.
+fn dealing_statement<G>(
+    message: &DealerMessage<G>,
+    config: &DkgConfig<G>,
+) -> Result<EvrfStatement<G>>
+where
+    G: GoldenGroup,
+{
+    if message.proof.len() > MAX_DEALER_PROOF_BYTES {
+        return Err(Error::InvalidEncoding);
+    }
+    if message.configuration_root != config.root {
+        return Err(Error::ConfigurationMismatch);
+    }
+    let dealer_public_key = config.registry.public_key(message.dealer)?;
+    if message.dealings.len() != config.instances.len() {
+        return Err(Error::InvalidDealingCount {
+            expected: config.instances.len(),
+            actual: message.dealings.len(),
+        });
+    }
+
+    let mut dealings = Vec::with_capacity(message.dealings.len());
+    for (position, (body, kind)) in message
+        .dealings
+        .iter()
+        .zip(config.instances.iter().copied())
+        .enumerate()
+    {
+        if body.commitment.threshold() != config.threshold {
+            return Err(Error::InvalidCommitmentDegree {
+                expected: config.threshold,
+                actual: body.commitment.threshold(),
+            });
+        }
+        if body.commitment.constant().is_some() != (kind == DkgInstanceKind::Random) {
+            return Err(Error::CommitmentKindMismatch(position));
+        }
+        ensure_public_share_keys(body, message.dealer, config)?;
+
+        let mut receivers = Vec::with_capacity(config.registry.len().saturating_sub(1));
+        for receiver in public_share_receivers(config, message.dealer) {
+            let share_commitment = body.commitment.public_key_share(receiver)?;
+            let encrypted_share = body
+                .encrypted_shares
+                .get(&receiver)
+                .ok_or(Error::MissingShare(receiver.get()))?;
+            let encrypted_share_commitment = G::mul_generator(&encrypted_share.encrypted_share);
+            let expected = G::add(&share_commitment, &encrypted_share.pad_commitment);
+            if encrypted_share_commitment != expected {
+                return Err(Error::CommitmentVerificationFailed);
+            }
+            receivers.push(EvrfReceiverStatement {
+                receiver,
+                receiver_public_key: config.registry.public_key(receiver)?.clone(),
+                share_commitment,
+                pad_commitment: encrypted_share.pad_commitment.clone(),
+                encrypted_share: encrypted_share.encrypted_share.clone(),
+            });
+        }
+        dealings.push(EvrfDealingStatement {
+            message: effective_evrf_message(config.root, message.dealer, position, body.nonce),
+            commitment: body.commitment.clone(),
+            receivers,
+        });
+    }
+
+    Ok(EvrfStatement {
+        dealer_public_key: dealer_public_key.clone(),
+        beta: config.beta.clone(),
+        dealer_message_root: message.root(),
+        dealings,
+    })
+}
+
+/// Verify one complete dealer message.
 pub fn verify_dealing<G, B>(message: &DealerMessage<G>, config: &DkgConfig<G>) -> Result<()>
 where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
 {
-    let statements = dealing_statements::<G>(message, config)?;
-    if statements.is_empty() {
-        // A dealer with no other receivers (n=1) has no eVRF statements to
-        // prove, so an empty proof is accepted without verifying knowledge of
-        // the dealer's registered key. See
-        // `single_participant_dkg_completes_without_proving` for why this is
-        // safe in the single-participant case.
+    let statement = dealing_statement(message, config)?;
+    if statement
+        .dealings
+        .iter()
+        .all(|dealing| dealing.receivers.is_empty())
+    {
+        // For n=1, the sole share is local and there is no public receiver
+        // relation to verify. Accept only the canonical empty-proof representation.
         return if message.proof.is_empty() {
             Ok(())
         } else {
             Err(Error::ProofVerificationFailed)
         };
     }
-    B::verify_batch(&statements, &message.proof)
+    B::verify_batch(&statement, &message.proof)
 }
 
 /// Verify several independent dealer messages in one backend call.
-///
-/// Every message is checked against `config` before any proof equations are
-/// combined. Backends without a cross-proof optimization use the trait's
-/// linear fallback. If combined verification fails, each proof is retried so
-/// the returned error can identify an invalid dealer. The original batch error
-/// is preserved if every individual proof passes.
 pub fn verify_dealings<G, B>(messages: &[&DealerMessage<G>], config: &DkgConfig<G>) -> Result<()>
 where
     G: GoldenGroup,
@@ -606,15 +752,24 @@ where
     if messages.is_empty() {
         return Err(Error::ProofVerificationFailed);
     }
-    let statement_batches: Vec<Vec<EvrfStatement<G>>> = messages
+    let mut dealers = BTreeSet::new();
+    for message in messages {
+        if !dealers.insert(message.dealer) {
+            return Err(Error::DuplicateParticipantIndex(message.dealer.get()));
+        }
+    }
+
+    // Complete structural preflight for every message before combining proofs.
+    let statements = messages
         .iter()
-        .map(|message| dealing_statements::<G>(message, config))
-        .collect::<Result<_>>()?;
-    if statement_batches.iter().all(Vec::is_empty) {
-        // Every message is from a dealer with no other receivers (n=1), so
-        // none has an eVRF statement to prove; see `verify_dealing` and
-        // `single_participant_dkg_completes_without_proving` for why an empty
-        // proof is accepted here.
+        .map(|message| dealing_statement(message, config))
+        .collect::<Result<Vec<_>>>()?;
+    if statements.iter().all(|statement| {
+        statement
+            .dealings
+            .iter()
+            .all(|dealing| dealing.receivers.is_empty())
+    }) {
         for message in messages {
             if !message.proof.is_empty() {
                 return Err(Error::DealerProofVerificationFailed(message.dealer.get()));
@@ -622,52 +777,24 @@ where
         }
         return Ok(());
     }
-    let proof_batches: Vec<_> = statement_batches
+    let proof_batches = statements
         .iter()
         .zip(messages.iter())
-        .map(|(statements, message)| (statements.as_slice(), message.proof.as_slice()))
-        .collect();
+        .map(|(statement, message)| (statement, message.proof.as_slice()))
+        .collect::<Vec<_>>();
     let batch_error = match B::verify_proof_batch(&proof_batches) {
         Ok(()) => return Ok(()),
         Err(error) => error,
     };
-    for ((statements, proof), message) in proof_batches.iter().zip(messages) {
-        if B::verify_batch(statements, proof).is_err() {
+    for ((statement, proof), message) in proof_batches.iter().zip(messages) {
+        if B::verify_batch(statement, proof).is_err() {
             return Err(Error::DealerProofVerificationFailed(message.dealer.get()));
         }
     }
     Err(batch_error)
 }
 
-/// Verify one dealer message for a concrete receiver before accepting it.
-///
-/// This performs public verification and, for non-dealer receivers, checks that
-/// the receiver can derive and decrypt its own share from the dealing.
-pub fn verify_dealing_for_receiver<G, B>(
-    receiver: ParticipantIndex,
-    receiver_identity_secret: &G::Scalar,
-    message: &DealerMessage<G>,
-    config: &DkgConfig<G>,
-) -> Result<()>
-where
-    G: GoldenGroup,
-    B: EvrfProofBackend<G>,
-{
-    let receiver_public_key = config.registry.public_key(receiver)?;
-    if G::mul_generator(receiver_identity_secret) != *receiver_public_key {
-        return Err(Error::IdentityKeyMismatch);
-    }
-    verify_dealing::<G, B>(message, config)?;
-    if receiver != message.dealer {
-        decrypt_share_for_receiver::<G, B>(receiver, receiver_identity_secret, message, config)?;
-    }
-    Ok(())
-}
-
-/// Complete the DKG for one receiver after all dealings were verified.
-///
-/// The receiver's contribution from its own dealing comes from the local
-/// `private_share`; peer contributions are decrypted from public dealer messages.
+/// Complete every configured sharing atomically for one receiver.
 pub fn complete<G, B>(
     receiver: ParticipantIndex,
     receiver_identity_secret: &G::Scalar,
@@ -689,12 +816,6 @@ where
             message_dealer: own_dealing.message.dealer.get(),
         });
     }
-    if own_dealing.private_share.participant != receiver {
-        return Err(Error::PrivateShareParticipantMismatch {
-            expected: receiver.get(),
-            actual: own_dealing.private_share.participant.get(),
-        });
-    }
 
     let mut all_dealings: BTreeMap<ParticipantIndex, &DealerMessage<G>> = BTreeMap::new();
     all_dealings.insert(own_dealing.message.dealer, &own_dealing.message);
@@ -705,12 +826,13 @@ where
                 message_dealer: message.dealer.get(),
             });
         }
+        config.registry.public_key(*dealer)?;
         if all_dealings.insert(message.dealer, message).is_some() {
             return Err(Error::DuplicateParticipantIndex(message.dealer.get()));
         }
     }
 
-    let messages: Vec<_> = config
+    let messages = config
         .registry
         .indexes()
         .map(|dealer| {
@@ -719,52 +841,100 @@ where
                 .copied()
                 .ok_or(Error::MissingDealing(dealer.get()))
         })
-        .collect::<Result<_>>()?;
+        .collect::<Result<Vec<_>>>()?;
     verify_dealings::<G, B>(&messages, config)?;
 
-    // Aggregate coefficients while walking dealings, then evaluate once per
-    // participant below: `n * t` muls instead of `n^2 * t`.
-    let mut secret_share_value = G::Scalar::zero();
-    let mut aggregate_coefficients = vec![G::identity(); config.threshold];
-    for message in all_dealings.values() {
-        let share = if message.dealer == receiver {
-            own_dealing.private_share.clone()
-        } else {
-            decrypt_share_for_receiver::<G, B>(receiver, receiver_identity_secret, message, config)?
+    let mut outputs = Vec::with_capacity(config.instances.len());
+    for (position, kind) in config.instances.iter().copied().enumerate() {
+        let mut secret_share_value = G::Scalar::zero();
+        let mut aggregate_coefficients = vec![G::identity(); config.threshold];
+        for message in all_dealings.values() {
+            let body = &message.dealings[position];
+            let share = if message.dealer == receiver {
+                Share {
+                    participant: receiver,
+                    value: own_dealing.private_shares[position].clone(),
+                }
+            } else {
+                decrypt_share_for_receiver::<G, B>(
+                    receiver,
+                    receiver_identity_secret,
+                    message,
+                    body,
+                    position,
+                    config,
+                )?
+            };
+            if !body.commitment.verify_share(&share)? {
+                return Err(Error::CommitmentVerificationFailed);
+            }
+            secret_share_value = secret_share_value.add(&share.value);
+
+            for (aggregate, coefficient) in aggregate_coefficients
+                .iter_mut()
+                .zip(body.commitment.coefficients())
+            {
+                *aggregate = G::add(aggregate, &coefficient);
+            }
+        }
+        let aggregate_commitment = match kind {
+            DkgInstanceKind::Random => {
+                FeldmanCommitment::<G>::from_coefficients(aggregate_coefficients)?
+            }
+            DkgInstanceKind::Zero => FeldmanCommitment::<G>::from_zero_tail(
+                aggregate_coefficients.into_iter().skip(1).collect(),
+            ),
         };
-        if !message.commitment.verify_share(&share)? {
-            return Err(Error::CommitmentVerificationFailed);
+
+        let mut public_key_shares = BTreeMap::new();
+        for participant in config.registry.indexes() {
+            public_key_shares.insert(
+                participant,
+                aggregate_commitment.public_key_share(participant)?,
+            );
         }
-        secret_share_value = secret_share_value.add(&share.value);
-
-        for (aggregate, coefficient) in aggregate_coefficients
-            .iter_mut()
-            .zip(message.commitment.coefficients())
-        {
-            *aggregate = G::add(aggregate, coefficient);
-        }
-    }
-    let aggregate_commitment = FeldmanCommitment::<G>::from_coefficients(aggregate_coefficients)?;
-
-    let public_key = aggregate_commitment.public_key();
-
-    let mut public_key_shares = BTreeMap::new();
-    for participant in config.registry.indexes() {
-        public_key_shares.insert(
-            participant,
-            aggregate_commitment.public_key_share(participant)?,
-        );
+        outputs.push(DkgInstanceOutput {
+            public_key: aggregate_commitment.public_key(),
+            secret_share: Share {
+                participant: receiver,
+                value: secret_share_value,
+            },
+            public_key_shares,
+        });
     }
 
     Ok(DkgOutput {
-        public_key,
-        secret_share: Share {
-            participant: receiver,
-            value: secret_share_value,
-        },
-        public_key_shares,
-        transcript_root: completion_root::<G>(&all_dealings),
+        configuration_root: config.root,
+        instances: outputs,
+        completion_root: completion_root::<G, B>(config.root, &all_dealings),
     })
+}
+
+fn config_root<G: GoldenGroup>(
+    threshold: usize,
+    session_id: SessionId,
+    beta: &G::Scalar,
+    registry: &ParticipantRegistry<G>,
+    instances: &[DkgInstanceKind],
+) -> TranscriptRoot {
+    let mut transcript = TranscriptBuilder::new(b"dkg-config");
+    transcript.u32(b"version", PROTOCOL_VERSION);
+    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
+    transcript.bytes(b"session", &session_id.0);
+    transcript.usize(b"threshold", threshold);
+    transcript.scalar::<G>(b"beta", beta);
+    transcript.bytes(b"registry", &registry.root());
+    transcript.usize(b"instances-len", instances.len());
+    for kind in instances {
+        transcript.u32(
+            b"instance-kind",
+            match kind {
+                DkgInstanceKind::Random => 0,
+                DkgInstanceKind::Zero => 1,
+            },
+        );
+    }
+    transcript.root()
 }
 
 fn registry_root<G: GoldenGroup>(
@@ -780,55 +950,91 @@ fn registry_root<G: GoldenGroup>(
     transcript.root()
 }
 
-impl<G: GoldenGroup> DealerMessage<G> {
-    /// Recompute the dealing transcript root from the current message fields.
-    ///
-    /// This is the same root `create_dealing` embedded at construction. It
-    /// exists so callers can rebuild the root after constructing a message
-    /// from fields that do not carry it, such as wire decode.
-    ///
-    /// Do not call this after mutating fields that will be verified. A message
-    /// whose fields changed and whose root was just recomputed is no longer
-    /// the message the dealer signed. Tests may use this helper when they need
-    /// a stable root for a constructed fixture.
-    pub fn recompute_transcript_root(&self) -> TranscriptRoot {
-        dealing_root(
-            self.session_id,
-            self.registry_root,
-            self.dealer,
-            self.msg_i,
-            &self.commitment,
-            &self.encrypted_shares,
-        )
-    }
-}
-
-fn dealing_root<G: GoldenGroup>(
-    session_id: SessionId,
-    registry_root: TranscriptRoot,
-    dealer: ParticipantIndex,
-    msg_i: DealerMessageNonce,
-    commitment: &FeldmanCommitment<G>,
-    encrypted_shares: &BTreeMap<ParticipantIndex, EncryptedShare<G>>,
-) -> TranscriptRoot {
-    let mut transcript = TranscriptBuilder::new(b"dealing");
-    transcript.u32(b"version", PROTOCOL_VERSION);
-    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
-    transcript.bytes(b"session", &session_id.0);
-    transcript.bytes(b"registry", &registry_root);
-    transcript.participant(b"dealer", dealer);
-    transcript.bytes(b"msg-i", &msg_i.0);
-    transcript.usize(b"commitment-len", commitment.coefficients().len());
-    for coefficient in commitment.coefficients() {
-        transcript.element::<G>(b"commitment", coefficient);
-    }
-    transcript.usize(b"encrypted-shares-len", encrypted_shares.len());
-    for (receiver, encrypted_share) in encrypted_shares {
-        transcript.participant(b"encrypted-receiver", *receiver);
-        transcript.element::<G>(b"pad-commitment", &encrypted_share.pad_commitment);
-        transcript.scalar::<G>(b"encrypted-share", &encrypted_share.encrypted_share);
+fn dealer_message_root<G: GoldenGroup>(message: &DealerMessage<G>) -> TranscriptRoot {
+    let mut transcript = TranscriptBuilder::new(b"dealer-message");
+    transcript.bytes(b"configuration", &message.configuration_root);
+    transcript.participant(b"dealer", message.dealer);
+    transcript.usize(b"dealings-len", message.dealings.len());
+    for body in &message.dealings {
+        transcript.bytes(b"nonce", &body.nonce.0);
+        transcript.bytes(
+            b"constant-present",
+            &[u8::from(body.commitment.constant().is_some())],
+        );
+        transcript.usize(b"commitment-len", body.commitment.threshold());
+        for coefficient in body.commitment.coefficients() {
+            transcript.element::<G>(b"commitment", &coefficient);
+        }
+        transcript.usize(b"encrypted-shares-len", body.encrypted_shares.len());
+        for (receiver, encrypted_share) in &body.encrypted_shares {
+            transcript.participant(b"receiver", *receiver);
+            transcript.element::<G>(b"pad-commitment", &encrypted_share.pad_commitment);
+            transcript.scalar::<G>(b"encrypted-share", &encrypted_share.encrypted_share);
+        }
     }
     transcript.root()
+}
+
+fn statement_root<G: GoldenGroup>(statement: &EvrfStatement<G>) -> TranscriptRoot {
+    let mut transcript = TranscriptBuilder::new(b"evrf-statement");
+    transcript.u32(b"version", PROTOCOL_VERSION);
+    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
+    transcript.element::<G>(b"dealer-pk", &statement.dealer_public_key);
+    transcript.scalar::<G>(b"beta", &statement.beta);
+    transcript.bytes(b"dealer-message-root", &statement.dealer_message_root);
+    transcript.usize(b"dealings-len", statement.dealings.len());
+    for dealing in &statement.dealings {
+        transcript.bytes(b"message", &dealing.message.0);
+        transcript.bytes(
+            b"constant-present",
+            &[u8::from(dealing.commitment.constant().is_some())],
+        );
+        transcript.usize(b"commitment-len", dealing.commitment.threshold());
+        for coefficient in dealing.commitment.coefficients() {
+            transcript.element::<G>(b"commitment", &coefficient);
+        }
+        transcript.usize(b"receivers-len", dealing.receivers.len());
+        for receiver in &dealing.receivers {
+            transcript.participant(b"receiver", receiver.receiver);
+            transcript.element::<G>(b"receiver-pk", &receiver.receiver_public_key);
+            transcript.element::<G>(b"share-commitment", &receiver.share_commitment);
+            transcript.element::<G>(b"pad-commitment", &receiver.pad_commitment);
+            transcript.scalar::<G>(b"encrypted-share", &receiver.encrypted_share);
+        }
+    }
+    transcript.root()
+}
+
+fn completion_root<G, B>(
+    configuration_root: TranscriptRoot,
+    dealings: &BTreeMap<ParticipantIndex, &DealerMessage<G>>,
+) -> TranscriptRoot
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    let mut transcript = TranscriptBuilder::new(b"completion");
+    transcript.bytes(b"configuration", &configuration_root);
+    transcript.bytes(b"proof-backend", B::PROOF_ID);
+    transcript.usize(b"dealers-len", dealings.len());
+    for message in dealings.values() {
+        transcript.bytes(b"dealer-message-root", &message.root());
+    }
+    transcript.root()
+}
+
+fn effective_evrf_message(
+    configuration_root: TranscriptRoot,
+    dealer: ParticipantIndex,
+    position: usize,
+    nonce: DealerMessageNonce,
+) -> EvrfMessage {
+    let mut transcript = TranscriptBuilder::new(b"effective-evrf-message");
+    transcript.bytes(b"configuration", &configuration_root);
+    transcript.participant(b"dealer", dealer);
+    transcript.usize(b"position", position);
+    transcript.bytes(b"nonce", &nonce.0);
+    EvrfMessage(transcript.root())
 }
 
 fn public_share_receivers<G: GoldenGroup>(
@@ -841,17 +1047,21 @@ fn public_share_receivers<G: GoldenGroup>(
         .filter(move |receiver| *receiver != dealer)
 }
 
-fn ensure_public_share_keys<G>(message: &DealerMessage<G>, config: &DkgConfig<G>) -> Result<()>
+fn ensure_public_share_keys<G>(
+    body: &DealingBody<G>,
+    dealer: ParticipantIndex,
+    config: &DkgConfig<G>,
+) -> Result<()>
 where
     G: GoldenGroup,
 {
-    for receiver in message.encrypted_shares.keys() {
-        if *receiver == message.dealer || config.registry.public_key(*receiver).is_err() {
+    for receiver in body.encrypted_shares.keys() {
+        if *receiver == dealer || config.registry.public_key(*receiver).is_err() {
             return Err(Error::UnexpectedShare(receiver.get()));
         }
     }
-    for receiver in public_share_receivers(config, message.dealer) {
-        if !message.encrypted_shares.contains_key(&receiver) {
+    for receiver in public_share_receivers(config, dealer) {
+        if !body.encrypted_shares.contains_key(&receiver) {
             return Err(Error::MissingShare(receiver.get()));
         }
     }
@@ -861,189 +1071,74 @@ where
 fn decrypt_share_for_receiver<G, B>(
     receiver: ParticipantIndex,
     receiver_identity_secret: &G::Scalar,
-    message: &DealerMessage<G>,
+    dealer_message: &DealerMessage<G>,
+    body: &DealingBody<G>,
+    position: usize,
     config: &DkgConfig<G>,
 ) -> Result<Share<G::Scalar>>
 where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
 {
-    let encrypted_share = message
+    let encrypted_share = body
         .encrypted_shares
         .get(&receiver)
         .ok_or(Error::MissingShare(receiver.get()))?;
-    let pad = derive_receiver_pad::<G, B>(
-        config,
-        message.dealer,
-        receiver,
-        receiver_identity_secret,
-        message.msg_i,
-    )?;
-    let share = Share {
-        participant: receiver,
-        value: encrypted_share.encrypted_share.sub(&pad),
-    };
-
-    if !message.commitment.verify_share(&share)? {
-        return Err(Error::CommitmentVerificationFailed);
-    }
-
-    Ok(share)
-}
-
-fn completion_root<G: GoldenGroup>(
-    dealings: &BTreeMap<ParticipantIndex, &DealerMessage<G>>,
-) -> TranscriptRoot {
-    let mut transcript = TranscriptBuilder::new(b"completion");
-    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
-    transcript.usize(b"dealings-len", dealings.len());
-    for (dealer, message) in dealings {
-        transcript.participant(b"dealer", *dealer);
-        transcript.bytes(b"dealing-root", &message.transcript_root);
-    }
-    transcript.root()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn statement_for_receiver<G: GoldenGroup>(
-    config: &DkgConfig<G>,
-    dealer: ParticipantIndex,
-    receiver: ParticipantIndex,
-    msg_i: DealerMessageNonce,
-    share_commitment: G::Element,
-    commitment_coefficients: Vec<G::Element>,
-    encrypted_share: EncryptedShare<G>,
-    transcript_root: TranscriptRoot,
-) -> Result<EvrfStatement<G>> {
-    Ok(EvrfStatement {
-        protocol_version: PROTOCOL_VERSION,
-        backend_id: G::BACKEND_ID,
-        session_id: config.session_id,
-        registry_root: config.registry.root(),
-        threshold: config.threshold,
-        dealer,
-        receiver,
-        msg_i,
-        beta: config.beta.clone(),
-        dealer_public_key: config.registry.public_key(dealer)?.clone(),
-        receiver_public_key: config.registry.public_key(receiver)?.clone(),
-        commitment_coefficients,
-        share_commitment,
-        pad_commitment: encrypted_share.pad_commitment,
-        encrypted_share: encrypted_share.encrypted_share,
-        transcript_root,
-    })
-}
-
-fn statement_root<G: GoldenGroup>(statement: &EvrfStatement<G>) -> TranscriptRoot {
-    let mut transcript = TranscriptBuilder::new(b"evrf-statement");
-    transcript.u32(b"version", statement.protocol_version);
-    transcript.bytes(b"backend", statement.backend_id.as_bytes());
-    transcript.bytes(b"session", &statement.session_id.0);
-    transcript.bytes(b"registry", &statement.registry_root);
-    transcript.usize(b"threshold", statement.threshold);
-    transcript.participant(b"dealer", statement.dealer);
-    transcript.participant(b"receiver", statement.receiver);
-    transcript.bytes(b"msg-i", &statement.msg_i.0);
-    transcript.scalar::<G>(b"beta", &statement.beta);
-    transcript.element::<G>(b"dealer-pk", &statement.dealer_public_key);
-    transcript.element::<G>(b"receiver-pk", &statement.receiver_public_key);
-    transcript.usize(b"commitment-len", statement.commitment_coefficients.len());
-    for coefficient in &statement.commitment_coefficients {
-        transcript.element::<G>(b"commitment", coefficient);
-    }
-    transcript.element::<G>(b"share-commitment", &statement.share_commitment);
-    transcript.element::<G>(b"pad-commitment", &statement.pad_commitment);
-    transcript.scalar::<G>(b"encrypted-share", &statement.encrypted_share);
-    transcript.bytes(b"dealing-root", &statement.transcript_root);
-    transcript.root()
-}
-
-fn derive_receiver_pad<G, B>(
-    config: &DkgConfig<G>,
-    dealer: ParticipantIndex,
-    receiver: ParticipantIndex,
-    receiver_identity_secret: &G::Scalar,
-    msg_i: DealerMessageNonce,
-) -> Result<G::Scalar>
-where
-    G: GoldenGroup,
-    B: EvrfProofBackend<G>,
-{
-    let dealer_public_key = config.registry.public_key(dealer)?;
+    let dealer_public_key = config.registry.public_key(dealer_message.dealer)?;
     let receiver_public_key = config.registry.public_key(receiver)?;
-    B::derive_pad(
-        msg_i,
+    let message = effective_evrf_message(config.root, dealer_message.dealer, position, body.nonce);
+    let pad = B::derive_pad(
+        message,
         &config.beta,
         receiver_identity_secret,
         dealer_public_key,
         receiver_public_key,
-    )
+    )?;
+    Ok(Share {
+        participant: receiver,
+        value: encrypted_share.encrypted_share.sub(&pad),
+    })
 }
 
 fn derive_default_pad<G: GoldenGroup>(
-    msg_i: DealerMessageNonce,
+    message: EvrfMessage,
     receiver_public_key: &G::Element,
     shared_secret: &G::Element,
 ) -> Result<G::Scalar> {
     let mut transcript = TranscriptBuilder::new(b"pad");
-    transcript.bytes(b"msg-i", &msg_i.0);
+    transcript.bytes(b"message", &message.0);
     transcript.element::<G>(b"receiver-pk", receiver_public_key);
     transcript.element::<G>(b"shared-secret", shared_secret);
-    G::Scalar::hash_to_scalar(b"golden-dkg-pad-v1", &transcript.root())
+    G::Scalar::hash_to_scalar(b"golden-dkg-pad-v2", &transcript.root())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use rand_chacha::{
-        rand_core::{RngCore, SeedableRng},
-        ChaCha20Rng,
-    };
 
     use super::*;
     use crate::test_support::{TinyGroup, TinyScalar};
-    use crate::GoldenScalar;
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
-    const FAKE_PROOF_ID: &[u8] = b"golden-core/fake-evrf-proof/v1";
+    enum FakeBackend {}
 
-    #[derive(Clone, Debug)]
-    enum FakeEvrfBackend {}
-
-    impl EvrfProofBackend<TinyGroup> for FakeEvrfBackend {
-        const PROOF_ID: &'static [u8] = FAKE_PROOF_ID;
+    impl EvrfProofBackend<TinyGroup> for FakeBackend {
+        const PROOF_ID: &'static [u8] = b"golden-core/batch-fake/v1";
 
         fn prove_batch(
-            statements: &[EvrfStatement<TinyGroup>],
-            witnesses: &[EvrfWitness<TinyGroup>],
+            statement: &EvrfStatement<TinyGroup>,
+            witness: &EvrfWitness<TinyGroup>,
             _rng: &mut impl CryptoRngCore,
         ) -> Result<Vec<u8>> {
-            if statements.len() != witnesses.len() {
+            witness.validate_shape(statement)?;
+            if TinyGroup::mul_generator(&witness.identity_secret) != statement.dealer_public_key {
                 return Err(Error::ProofVerificationFailed);
             }
-            let mut last_receiver = None;
-            for (statement, witness) in statements.iter().zip(witnesses.iter()) {
-                if last_receiver.is_some_and(|receiver| receiver >= statement.receiver) {
-                    return Err(Error::ProofVerificationFailed);
-                }
-                last_receiver = Some(statement.receiver);
-                ensure_fake_public_relations(statement)?;
-                if TinyGroup::mul_generator(&witness.identity_secret) != statement.dealer_public_key
-                {
-                    return Err(Error::ProofVerificationFailed);
-                }
-            }
-            fake_proof_bytes(statements)
+            Ok(statement.root().to_vec())
         }
 
-        fn verify_batch(statements: &[EvrfStatement<TinyGroup>], proof: &[u8]) -> Result<()> {
-            let expected = fake_proof_bytes(statements)?;
-            for statement in statements {
-                ensure_fake_public_relations(statement)?;
-            }
-            if proof == expected {
+        fn verify_batch(statement: &EvrfStatement<TinyGroup>, proof: &[u8]) -> Result<()> {
+            if proof == statement.root() {
                 Ok(())
             } else {
                 Err(Error::ProofVerificationFailed)
@@ -1051,171 +1146,109 @@ mod tests {
         }
     }
 
-    static OPTIMIZED_SINGLE_VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static OPTIMIZED_BATCH_VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    enum AlternateFakeBackend {}
 
-    #[derive(Clone, Debug)]
-    enum CountingBatchBackend {}
-
-    impl EvrfProofBackend<TinyGroup> for CountingBatchBackend {
-        const PROOF_ID: &'static [u8] = FAKE_PROOF_ID;
+    impl EvrfProofBackend<TinyGroup> for AlternateFakeBackend {
+        const PROOF_ID: &'static [u8] = b"golden-core/batch-fake-alternate/v1";
 
         fn prove_batch(
-            statements: &[EvrfStatement<TinyGroup>],
-            witnesses: &[EvrfWitness<TinyGroup>],
+            statement: &EvrfStatement<TinyGroup>,
+            witness: &EvrfWitness<TinyGroup>,
             rng: &mut impl CryptoRngCore,
         ) -> Result<Vec<u8>> {
-            FakeEvrfBackend::prove_batch(statements, witnesses, rng)
+            FakeBackend::prove_batch(statement, witness, rng)
         }
 
-        fn verify_batch(statements: &[EvrfStatement<TinyGroup>], proof: &[u8]) -> Result<()> {
-            OPTIMIZED_SINGLE_VERIFY_CALLS.fetch_add(1, Ordering::SeqCst);
-            FakeEvrfBackend::verify_batch(statements, proof)
+        fn verify_batch(statement: &EvrfStatement<TinyGroup>, proof: &[u8]) -> Result<()> {
+            FakeBackend::verify_batch(statement, proof)
+        }
+    }
+
+    enum OversizedProofBackend {}
+
+    impl EvrfProofBackend<TinyGroup> for OversizedProofBackend {
+        const PROOF_ID: &'static [u8] = b"golden-core/oversized-proof/v1";
+
+        fn prove_batch(
+            _statement: &EvrfStatement<TinyGroup>,
+            _witness: &EvrfWitness<TinyGroup>,
+            _rng: &mut impl CryptoRngCore,
+        ) -> Result<Vec<u8>> {
+            Ok(vec![0; MAX_DEALER_PROOF_BYTES + 1])
         }
 
-        fn verify_proof_batch(batches: &[(&[EvrfStatement<TinyGroup>], &[u8])]) -> Result<()> {
-            OPTIMIZED_BATCH_VERIFY_CALLS.fetch_add(1, Ordering::SeqCst);
-            for (statements, proof) in batches {
-                FakeEvrfBackend::verify_batch(statements, proof)?;
+        fn verify_batch(_statement: &EvrfStatement<TinyGroup>, _proof: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    static BATCH_VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SINGLE_VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    enum CountingBackend {}
+
+    impl EvrfProofBackend<TinyGroup> for CountingBackend {
+        const PROOF_ID: &'static [u8] = <FakeBackend as EvrfProofBackend<TinyGroup>>::PROOF_ID;
+
+        fn prove_batch(
+            statement: &EvrfStatement<TinyGroup>,
+            witness: &EvrfWitness<TinyGroup>,
+            rng: &mut impl CryptoRngCore,
+        ) -> Result<Vec<u8>> {
+            FakeBackend::prove_batch(statement, witness, rng)
+        }
+
+        fn verify_batch(statement: &EvrfStatement<TinyGroup>, proof: &[u8]) -> Result<()> {
+            SINGLE_VERIFY_CALLS.fetch_add(1, Ordering::SeqCst);
+            FakeBackend::verify_batch(statement, proof)
+        }
+
+        fn verify_proof_batch(batches: &[(&EvrfStatement<TinyGroup>, &[u8])]) -> Result<()> {
+            BATCH_VERIFY_CALLS.fetch_add(1, Ordering::SeqCst);
+            for (statement, proof) in batches {
+                FakeBackend::verify_batch(statement, proof)?;
             }
             Ok(())
         }
     }
 
-    static FALLBACK_SINGLE_VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    enum UnreachableBackend {}
 
-    #[derive(Clone, Debug)]
-    enum CountingFallbackBackend {}
-
-    impl EvrfProofBackend<TinyGroup> for CountingFallbackBackend {
-        const PROOF_ID: &'static [u8] = FAKE_PROOF_ID;
+    impl EvrfProofBackend<TinyGroup> for UnreachableBackend {
+        const PROOF_ID: &'static [u8] = b"golden-core/unreachable/v1";
 
         fn prove_batch(
-            statements: &[EvrfStatement<TinyGroup>],
-            witnesses: &[EvrfWitness<TinyGroup>],
-            rng: &mut impl CryptoRngCore,
+            _statement: &EvrfStatement<TinyGroup>,
+            _witness: &EvrfWitness<TinyGroup>,
+            _rng: &mut impl CryptoRngCore,
         ) -> Result<Vec<u8>> {
-            FakeEvrfBackend::prove_batch(statements, witnesses, rng)
+            Err(Error::ProofVerificationFailed)
         }
 
-        fn verify_batch(statements: &[EvrfStatement<TinyGroup>], proof: &[u8]) -> Result<()> {
-            FALLBACK_SINGLE_VERIFY_CALLS.fetch_add(1, Ordering::SeqCst);
-            FakeEvrfBackend::verify_batch(statements, proof)
+        fn verify_batch(_statement: &EvrfStatement<TinyGroup>, _proof: &[u8]) -> Result<()> {
+            Err(Error::ProofVerificationFailed)
         }
     }
 
-    #[derive(Clone, Debug)]
     enum BatchRejectingBackend {}
 
     impl EvrfProofBackend<TinyGroup> for BatchRejectingBackend {
-        const PROOF_ID: &'static [u8] = FAKE_PROOF_ID;
+        const PROOF_ID: &'static [u8] = <FakeBackend as EvrfProofBackend<TinyGroup>>::PROOF_ID;
 
         fn prove_batch(
-            statements: &[EvrfStatement<TinyGroup>],
-            witnesses: &[EvrfWitness<TinyGroup>],
+            statement: &EvrfStatement<TinyGroup>,
+            witness: &EvrfWitness<TinyGroup>,
             rng: &mut impl CryptoRngCore,
         ) -> Result<Vec<u8>> {
-            FakeEvrfBackend::prove_batch(statements, witnesses, rng)
+            FakeBackend::prove_batch(statement, witness, rng)
         }
 
-        fn verify_batch(statements: &[EvrfStatement<TinyGroup>], proof: &[u8]) -> Result<()> {
-            FakeEvrfBackend::verify_batch(statements, proof)
+        fn verify_batch(statement: &EvrfStatement<TinyGroup>, proof: &[u8]) -> Result<()> {
+            FakeBackend::verify_batch(statement, proof)
         }
 
-        fn verify_proof_batch(_batches: &[(&[EvrfStatement<TinyGroup>], &[u8])]) -> Result<()> {
-            Err(Error::ProofVerificationFailed)
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    enum UnreachableEvrfBackend {}
-
-    impl EvrfProofBackend<TinyGroup> for UnreachableEvrfBackend {
-        const PROOF_ID: &'static [u8] = FAKE_PROOF_ID;
-
-        fn prove_batch(
-            _statements: &[EvrfStatement<TinyGroup>],
-            _witnesses: &[EvrfWitness<TinyGroup>],
-            _rng: &mut impl CryptoRngCore,
-        ) -> Result<Vec<u8>> {
-            Err(Error::ProofVerificationFailed)
-        }
-
-        fn verify_batch(_statements: &[EvrfStatement<TinyGroup>], _proof: &[u8]) -> Result<()> {
-            Err(Error::ProofVerificationFailed)
-        }
-    }
-
-    fn fake_proof_bytes(statements: &[EvrfStatement<TinyGroup>]) -> Result<Vec<u8>> {
-        let id_len =
-            u32::try_from(FAKE_PROOF_ID.len()).map_err(|_| Error::ProofVerificationFailed)?;
-        let mut proof = id_len.to_be_bytes().to_vec();
-        proof.extend_from_slice(FAKE_PROOF_ID);
-        for statement in statements {
-            proof.extend_from_slice(&statement.root());
-        }
-        Ok(proof)
-    }
-
-    fn ensure_fake_public_relations(statement: &EvrfStatement<TinyGroup>) -> Result<()> {
-        if statement.commitment_coefficients.is_empty()
-            || statement.commitment_coefficients.len() != statement.threshold
-        {
-            return Err(Error::ProofVerificationFailed);
-        }
-
-        let x = statement.receiver.to_scalar::<TinyScalar>()?;
-        let mut x_pow = TinyScalar::one();
-        let mut expected_share_commitment = TinyGroup::identity();
-        for coefficient in &statement.commitment_coefficients {
-            expected_share_commitment = TinyGroup::add(
-                &expected_share_commitment,
-                &TinyGroup::mul(coefficient, &x_pow),
-            );
-            x_pow = x_pow.mul(&x);
-        }
-        if expected_share_commitment != statement.share_commitment {
-            return Err(Error::ProofVerificationFailed);
-        }
-
-        let encrypted_share_commitment = TinyGroup::mul_generator(&statement.encrypted_share);
-        let expected_encrypted_share_commitment =
-            TinyGroup::add(&statement.share_commitment, &statement.pad_commitment);
-        if encrypted_share_commitment != expected_encrypted_share_commitment {
-            return Err(Error::ProofVerificationFailed);
-        }
-
-        Ok(())
-    }
-
-    #[derive(Clone, Debug)]
-    enum OffsetPadBackend {}
-
-    impl EvrfProofBackend<TinyGroup> for OffsetPadBackend {
-        const PROOF_ID: &'static [u8] = FAKE_PROOF_ID;
-
-        fn derive_pad(
-            msg_i: DealerMessageNonce,
-            beta: &TinyScalar,
-            identity_secret: &TinyScalar,
-            peer_public_key: &<TinyGroup as GoldenGroup>::Element,
-            receiver_public_key: &<TinyGroup as GoldenGroup>::Element,
-        ) -> Result<TinyScalar> {
-            let shared_secret = TinyGroup::mul(peer_public_key, identity_secret);
-            derive_default_pad::<TinyGroup>(msg_i, receiver_public_key, &shared_secret)
-                .map(|pad| pad.add(beta))
-        }
-
-        fn prove_batch(
-            statements: &[EvrfStatement<TinyGroup>],
-            witnesses: &[EvrfWitness<TinyGroup>],
-            _rng: &mut impl CryptoRngCore,
-        ) -> Result<Vec<u8>> {
-            FakeEvrfBackend::prove_batch(statements, witnesses, _rng)
-        }
-
-        fn verify_batch(statements: &[EvrfStatement<TinyGroup>], proof: &[u8]) -> Result<()> {
-            FakeEvrfBackend::verify_batch(statements, proof)
+        fn verify_proof_batch(_batches: &[(&EvrfStatement<TinyGroup>, &[u8])]) -> Result<()> {
+            Err(Error::InvalidEncoding)
         }
     }
 
@@ -1223,1156 +1256,669 @@ mod tests {
         ParticipantIndex::new(value).unwrap()
     }
 
-    fn identity_secret(participant: ParticipantIndex) -> TinyScalar {
-        TinyScalar::from_u64(u64::from(participant.get()) * 10).unwrap()
+    fn secret(participant: ParticipantIndex) -> TinyScalar {
+        TinyScalar::from_u64(u64::from(participant.get())).unwrap()
     }
 
-    fn config() -> DkgConfig<TinyGroup> {
-        config_for(3, 2, 42)
-    }
-
-    fn config_for(n: usize, threshold: usize, session_byte: u8) -> DkgConfig<TinyGroup> {
-        let entries = (1..=n as u32)
-            .map(|value| {
-                let participant = idx(value);
-                (
-                    participant,
-                    TinyGroup::mul_generator(&identity_secret(participant)),
-                )
-            })
-            .collect();
-        let registry = ParticipantRegistry::new(entries).unwrap();
-        DkgConfig::new(
-            threshold,
-            SessionId([session_byte; 32]),
-            TinyScalar::from_u64(99).unwrap(),
-            registry,
+    fn registry() -> ParticipantRegistry<TinyGroup> {
+        ParticipantRegistry::new(
+            [idx(1), idx(2), idx(3)]
+                .into_iter()
+                .map(|participant| (participant, TinyGroup::mul_generator(&secret(participant))))
+                .collect(),
         )
         .unwrap()
     }
 
-    fn all_dealings(
+    fn mixed_config() -> DkgConfig<TinyGroup> {
+        DkgConfig::batch(
+            2,
+            SessionId([7; 32]),
+            TinyScalar::from_u64(11).unwrap(),
+            registry(),
+            vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
+        )
+        .unwrap()
+    }
+
+    fn single_participant_config() -> DkgConfig<TinyGroup> {
+        let participant = idx(1);
+        let registry = ParticipantRegistry::new(vec![(
+            participant,
+            TinyGroup::mul_generator(&secret(participant)),
+        )])
+        .unwrap();
+        DkgConfig::batch(
+            1,
+            SessionId([8; 32]),
+            TinyScalar::from_u64(11).unwrap(),
+            registry,
+            vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
+        )
+        .unwrap()
+    }
+
+    fn dealer_dealings<B: EvrfProofBackend<TinyGroup>>(
         config: &DkgConfig<TinyGroup>,
+        seed: u8,
     ) -> BTreeMap<ParticipantIndex, DkgDealing<TinyGroup>> {
-        let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
+        let mut rng = ChaCha20Rng::from_seed([seed; 32]);
         config
-            .registry
+            .registry()
             .indexes()
             .map(|dealer| {
-                (
-                    dealer,
-                    create_dealing::<TinyGroup, FakeEvrfBackend>(
-                        dealer,
-                        &identity_secret(dealer),
-                        config,
-                        &mut rng,
-                    )
-                    .unwrap(),
-                )
+                let dealing =
+                    create_dealing::<TinyGroup, B>(dealer, &secret(dealer), config, &mut rng)
+                        .unwrap();
+                (dealer, dealing)
             })
             .collect()
     }
 
-    #[test]
-    fn create_dealing_with_secret_sets_dealer_constant() {
-        let config = config();
-        let dealer = idx(1);
-        let secret = TinyScalar::from_u64(37).unwrap();
-        let mut rng = ChaCha20Rng::from_seed([21u8; 32]);
-
-        let dealing = create_dealing_with_secret::<TinyGroup, FakeEvrfBackend>(
-            dealer,
-            &identity_secret(dealer),
-            secret,
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-
-        assert_eq!(
-            dealing.message.commitment.public_key(),
-            TinyGroup::mul_generator(&secret)
-        );
-        assert!(dealing
-            .message
-            .commitment
-            .verify_share(&dealing.private_share)
-            .unwrap());
-        verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap();
+    fn dealer_messages<B: EvrfProofBackend<TinyGroup>>(
+        config: &DkgConfig<TinyGroup>,
+        seed: u8,
+    ) -> BTreeMap<ParticipantIndex, DealerMessage<TinyGroup>> {
+        dealer_dealings::<B>(config, seed)
+            .into_iter()
+            .map(|(dealer, dealing)| (dealer, dealing.message().clone()))
+            .collect()
     }
 
-    #[test]
-    fn zero_secret_dealing_has_identity_public_key_commitment() {
-        let config = config();
-        let dealer = idx(2);
-        let mut rng = ChaCha20Rng::from_seed([22u8; 32]);
-
-        let dealing = create_dealing_with_secret::<TinyGroup, FakeEvrfBackend>(
-            dealer,
-            &identity_secret(dealer),
-            TinyScalar::zero(),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-
-        assert_eq!(
-            dealing.message.commitment.public_key(),
-            TinyGroup::identity()
-        );
-        verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap();
-    }
-
-    #[test]
-    fn all_honest_participants_compute_same_public_key_and_consistent_shares() {
-        let config = config();
-        let dealings = all_dealings(&config);
-        let mut outputs = BTreeMap::new();
-
-        for receiver in config.registry.indexes() {
-            let own_dealing = dealings.get(&receiver).unwrap();
-            let peer_dealings = dealings
-                .iter()
-                .filter_map(|(dealer, dealing)| {
-                    if *dealer == receiver {
-                        None
-                    } else {
-                        Some((*dealer, dealing.message.clone()))
-                    }
-                })
-                .collect();
-            let output = complete::<TinyGroup, FakeEvrfBackend>(
-                receiver,
-                &identity_secret(receiver),
-                own_dealing,
-                &peer_dealings,
-                &config,
-            )
-            .unwrap();
-            outputs.insert(receiver, output);
-        }
-
-        let first_public_key = outputs.values().next().unwrap().public_key;
-        let first_public_key_shares = outputs.values().next().unwrap().public_key_shares.clone();
-        for output in outputs.values() {
-            assert_eq!(output.public_key, first_public_key);
-            assert_eq!(output.public_key_shares, first_public_key_shares);
-            assert_eq!(
-                TinyGroup::mul_generator(&output.secret_share.value),
-                first_public_key_shares[&output.secret_share.participant]
-            );
-        }
-    }
-
-    #[test]
-    fn complete_uses_one_cross_proof_backend_call() {
-        OPTIMIZED_SINGLE_VERIFY_CALLS.store(0, Ordering::SeqCst);
-        OPTIMIZED_BATCH_VERIFY_CALLS.store(0, Ordering::SeqCst);
-        let config = config();
-        let dealings = all_dealings(&config);
-        let receiver = idx(1);
-        let own_dealing = dealings.get(&receiver).unwrap();
-        let peer_dealings = dealings
+    fn complete_receiver(
+        receiver: ParticipantIndex,
+        dealings: &BTreeMap<ParticipantIndex, DkgDealing<TinyGroup>>,
+        config: &DkgConfig<TinyGroup>,
+    ) -> Result<DkgOutput<TinyGroup>> {
+        let peers = dealings
             .iter()
             .filter(|(dealer, _)| **dealer != receiver)
-            .map(|(dealer, dealing)| (*dealer, dealing.message.clone()))
+            .map(|(dealer, dealing)| (*dealer, dealing.message().clone()))
             .collect();
-
-        complete::<TinyGroup, CountingBatchBackend>(
+        complete::<TinyGroup, FakeBackend>(
             receiver,
-            &identity_secret(receiver),
-            own_dealing,
-            &peer_dealings,
-            &config,
+            &secret(receiver),
+            &dealings[&receiver],
+            &peers,
+            config,
         )
-        .unwrap();
-
-        assert_eq!(OPTIMIZED_BATCH_VERIFY_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(OPTIMIZED_SINGLE_VERIFY_CALLS.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn cross_proof_default_calls_each_single_verifier() {
-        FALLBACK_SINGLE_VERIFY_CALLS.store(0, Ordering::SeqCst);
-        let config = config();
-        let dealings = all_dealings(&config);
-        let messages: Vec<_> = dealings.values().map(|dealing| &dealing.message).collect();
+    fn config_constructors_validate_shape_and_bind_order() {
+        for (config, expected) in [
+            (
+                DkgConfig::random(
+                    2,
+                    SessionId([7; 32]),
+                    TinyScalar::from_u64(11).unwrap(),
+                    registry(),
+                )
+                .unwrap(),
+                DkgInstanceKind::Random,
+            ),
+            (
+                DkgConfig::zero(
+                    2,
+                    SessionId([7; 32]),
+                    TinyScalar::from_u64(11).unwrap(),
+                    registry(),
+                )
+                .unwrap(),
+                DkgInstanceKind::Zero,
+            ),
+        ] {
+            assert_eq!(config.instances(), [expected]);
+        }
 
-        verify_dealings::<TinyGroup, CountingFallbackBackend>(&messages, &config).unwrap();
+        for threshold in [0, 4] {
+            assert_eq!(
+                DkgConfig::random(
+                    threshold,
+                    SessionId([7; 32]),
+                    TinyScalar::from_u64(11).unwrap(),
+                    registry(),
+                )
+                .unwrap_err(),
+                Error::InvalidThreshold {
+                    threshold,
+                    participants: 3,
+                }
+            );
+        }
 
         assert_eq!(
-            FALLBACK_SINGLE_VERIFY_CALLS.load(Ordering::SeqCst),
-            messages.len()
+            DkgConfig::batch(
+                2,
+                SessionId([7; 32]),
+                TinyScalar::from_u64(11).unwrap(),
+                registry(),
+                Vec::new(),
+            )
+            .unwrap_err(),
+            Error::EmptyDkgBatch
         );
+        let config = mixed_config();
+        let reversed = DkgConfig::batch(
+            config.threshold(),
+            config.session_id(),
+            *config.beta(),
+            config.registry().clone(),
+            vec![DkgInstanceKind::Zero, DkgInstanceKind::Random],
+        )
+        .unwrap();
+        assert_ne!(config.root(), reversed.root());
     }
 
     #[test]
-    fn verify_dealings_rejects_an_invalid_proof_in_any_position() {
-        let config = config();
-        let dealings = all_dealings(&config);
-        let honest: Vec<_> = dealings
-            .values()
-            .map(|dealing| dealing.message.clone())
-            .collect();
-
-        for invalid_index in 0..honest.len() {
-            let mut messages = honest.clone();
-            messages[invalid_index].proof[0] ^= 1;
-            let references: Vec<_> = messages.iter().collect();
-            assert_eq!(
-                verify_dealings::<TinyGroup, FakeEvrfBackend>(&references, &config).unwrap_err(),
-                Error::DealerProofVerificationFailed(messages[invalid_index].dealer.get()),
-                "invalid proof at position {invalid_index} must fail"
-            );
+    fn effective_message_binds_configuration_dealer_position_and_nonce() {
+        let configuration = mixed_config().root();
+        let dealer = idx(1);
+        let position = 0;
+        let nonce = DealerMessageNonce([3; DEALER_MESSAGE_NONCE_BYTES]);
+        let message = effective_evrf_message(configuration, dealer, position, nonce);
+        let variants = [
+            effective_evrf_message([9; 32], dealer, position, nonce),
+            effective_evrf_message(configuration, idx(2), position, nonce),
+            effective_evrf_message(configuration, dealer, 1, nonce),
+            effective_evrf_message(
+                configuration,
+                dealer,
+                position,
+                DealerMessageNonce([4; DEALER_MESSAGE_NONCE_BYTES]),
+            ),
+        ];
+        for changed in variants {
+            assert_ne!(message, changed);
         }
     }
 
     #[test]
-    fn verify_dealings_preserves_batch_error_when_individual_proofs_pass() {
-        let config = config();
-        let dealings = all_dealings(&config);
-        let messages: Vec<_> = dealings.values().map(|dealing| &dealing.message).collect();
-
-        assert_eq!(
-            verify_dealings::<TinyGroup, BatchRejectingBackend>(&messages, &config).unwrap_err(),
-            Error::ProofVerificationFailed
-        );
+    fn config_root_binds_every_configuration_dimension() {
+        let base = mixed_config();
+        let changed_registry = ParticipantRegistry::new(vec![
+            (
+                idx(1),
+                TinyGroup::mul_generator(&TinyScalar::from_u64(4).unwrap()),
+            ),
+            (
+                idx(2),
+                TinyGroup::mul_generator(&TinyScalar::from_u64(5).unwrap()),
+            ),
+            (
+                idx(3),
+                TinyGroup::mul_generator(&TinyScalar::from_u64(6).unwrap()),
+            ),
+        ])
+        .unwrap();
+        let variants = [
+            DkgConfig::batch(
+                2,
+                SessionId([8; 32]),
+                *base.beta(),
+                base.registry().clone(),
+                base.instances().to_vec(),
+            )
+            .unwrap(),
+            DkgConfig::batch(
+                2,
+                base.session_id(),
+                TinyScalar::from_u64(12).unwrap(),
+                base.registry().clone(),
+                base.instances().to_vec(),
+            )
+            .unwrap(),
+            DkgConfig::batch(
+                3,
+                base.session_id(),
+                *base.beta(),
+                base.registry().clone(),
+                base.instances().to_vec(),
+            )
+            .unwrap(),
+            DkgConfig::batch(
+                2,
+                base.session_id(),
+                *base.beta(),
+                changed_registry,
+                base.instances().to_vec(),
+            )
+            .unwrap(),
+        ];
+        for changed in variants {
+            assert_ne!(base.root(), changed.root());
+        }
     }
 
     #[test]
-    fn verify_dealings_rejects_an_empty_batch() {
-        let config = config();
-        assert_eq!(
-            verify_dealings::<TinyGroup, FakeEvrfBackend>(&[], &config).unwrap_err(),
-            Error::ProofVerificationFailed
-        );
-    }
-
-    #[test]
-    fn single_participant_dealing_skips_the_proof_backend() {
-        let config = config_for(1, 1, 77);
+    fn single_participant_batch_skips_the_proof_backend() {
+        let config = single_participant_config();
         let dealer = idx(1);
-        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
+        let mut rng = ChaCha20Rng::from_seed([9; 32]);
 
-        let dealing = create_dealing::<TinyGroup, UnreachableEvrfBackend>(
+        let dealing = create_dealing::<TinyGroup, UnreachableBackend>(
             dealer,
-            &identity_secret(dealer),
+            &secret(dealer),
             &config,
             &mut rng,
         )
         .unwrap();
-        assert!(dealing.message.proof.is_empty());
+        assert!(dealing.message().proof.is_empty());
+        assert!(dealing
+            .message()
+            .dealings
+            .iter()
+            .all(|body| body.encrypted_shares.is_empty()));
 
-        verify_dealing::<TinyGroup, UnreachableEvrfBackend>(&dealing.message, &config).unwrap();
-        verify_dealings::<TinyGroup, UnreachableEvrfBackend>(&[&dealing.message], &config).unwrap();
+        verify_dealing::<TinyGroup, UnreachableBackend>(dealing.message(), &config).unwrap();
+        verify_dealings::<TinyGroup, UnreachableBackend>(&[dealing.message()], &config).unwrap();
 
-        let output = complete::<TinyGroup, UnreachableEvrfBackend>(
+        let output = complete::<TinyGroup, UnreachableBackend>(
             dealer,
-            &identity_secret(dealer),
+            &secret(dealer),
             &dealing,
             &BTreeMap::new(),
             &config,
         )
         .unwrap();
-        assert_eq!(
-            TinyGroup::mul_generator(&output.secret_share.value),
-            output.public_key
-        );
+        assert_eq!(output.instances().len(), 2);
+        for instance in output.instances() {
+            assert_eq!(
+                instance.public_key(),
+                &TinyGroup::mul_generator(&instance.secret_share().value)
+            );
+        }
+        assert_eq!(output.instances()[1].public_key(), &TinyGroup::identity());
     }
 
     #[test]
-    fn single_participant_dealing_rejects_a_forged_proof() {
-        let config = config_for(1, 1, 78);
+    fn single_participant_batch_rejects_a_forged_proof() {
+        let config = single_participant_config();
         let dealer = idx(1);
-        let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
+        let mut rng = ChaCha20Rng::from_seed([10; 32]);
 
-        let mut dealing = create_dealing::<TinyGroup, UnreachableEvrfBackend>(
+        let mut dealing = create_dealing::<TinyGroup, UnreachableBackend>(
             dealer,
-            &identity_secret(dealer),
+            &secret(dealer),
             &config,
             &mut rng,
         )
         .unwrap();
-        dealing.message.proof = vec![1];
+        dealing.message.proof.push(1);
 
         assert_eq!(
-            verify_dealing::<TinyGroup, UnreachableEvrfBackend>(&dealing.message, &config)
+            verify_dealing::<TinyGroup, UnreachableBackend>(dealing.message(), &config)
                 .unwrap_err(),
             Error::ProofVerificationFailed
         );
         assert_eq!(
-            verify_dealings::<TinyGroup, UnreachableEvrfBackend>(&[&dealing.message], &config)
+            verify_dealings::<TinyGroup, UnreachableBackend>(&[dealing.message()], &config)
                 .unwrap_err(),
             Error::DealerProofVerificationFailed(dealer.get())
         );
     }
 
     #[test]
-    fn randomized_committee_sizes_complete_consistently() {
-        let mut chooser = ChaCha20Rng::from_seed([21u8; 32]);
-        let mut dealing_rng = ChaCha20Rng::from_seed([22u8; 32]);
-
-        for case in 0..32 {
-            let n = 1 + (chooser.next_u32() as usize % 8);
-            let threshold = 1 + (chooser.next_u32() as usize % n);
-            let config = config_for(n, threshold, case as u8);
-            let dealings = config
-                .registry
-                .indexes()
-                .map(|dealer| {
-                    (
+    fn mixed_batch_completes_atomically_for_all_participants() {
+        let config = mixed_config();
+        let mut rng = ChaCha20Rng::from_seed([13; 32]);
+        let dealings = config
+            .registry()
+            .indexes()
+            .map(|dealer| {
+                (
+                    dealer,
+                    create_dealing::<TinyGroup, FakeBackend>(
                         dealer,
-                        create_dealing::<TinyGroup, FakeEvrfBackend>(
-                            dealer,
-                            &identity_secret(dealer),
-                            &config,
-                            &mut dealing_rng,
-                        )
-                        .unwrap(),
+                        &secret(dealer),
+                        &config,
+                        &mut rng,
                     )
-                })
-                .collect::<BTreeMap<_, _>>();
-            let mut outputs = BTreeMap::new();
+                    .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
 
-            for receiver in config.registry.indexes() {
-                let own_dealing = dealings.get(&receiver).unwrap();
-                let peer_dealings = dealings
-                    .iter()
-                    .filter_map(|(dealer, dealing)| {
-                        if *dealer == receiver {
-                            None
-                        } else {
-                            Some((*dealer, dealing.message.clone()))
-                        }
-                    })
-                    .collect();
-                let output = complete::<TinyGroup, FakeEvrfBackend>(
+        for dealing in dealings.values() {
+            assert_eq!(dealing.message().dealings.len(), 2);
+            assert_ne!(
+                dealing.message().dealings[0].nonce,
+                dealing.message().dealings[1].nonce
+            );
+            assert_ne!(
+                dealing.message().dealings[0].commitment.coefficients(),
+                dealing.message().dealings[1].commitment.coefficients()
+            );
+            let debug = format!("{dealing:?}");
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains("private_shares: ["));
+            verify_dealing::<TinyGroup, FakeBackend>(dealing.message(), &config).unwrap();
+        }
+
+        let mut outputs = Vec::new();
+        for receiver in config.registry().indexes() {
+            let peers = dealings
+                .iter()
+                .filter(|(dealer, _)| **dealer != receiver)
+                .map(|(dealer, dealing)| (*dealer, dealing.message().clone()))
+                .collect();
+            outputs.push(
+                complete::<TinyGroup, FakeBackend>(
                     receiver,
-                    &identity_secret(receiver),
-                    own_dealing,
-                    &peer_dealings,
+                    &secret(receiver),
+                    &dealings[&receiver],
+                    &peers,
                     &config,
                 )
-                .unwrap();
-                outputs.insert(receiver, output);
+                .unwrap(),
+            );
+        }
+
+        for output in &outputs {
+            assert!(format!("{output:?}").contains("<redacted>"));
+            assert_eq!(output.configuration_root(), config.root());
+            assert_eq!(output.instances().len(), 2);
+            assert_eq!(output.instances()[1].public_key(), &TinyGroup::identity());
+            assert_eq!(output.completion_root(), outputs[0].completion_root());
+            for position in 0..2 {
+                assert_eq!(
+                    output.instances()[position].public_key(),
+                    outputs[0].instances()[position].public_key()
+                );
+                assert_eq!(
+                    output.instances()[position].public_key_shares(),
+                    outputs[0].instances()[position].public_key_shares()
+                );
             }
-
-            assert_consistent_outputs(&outputs, case, n, threshold);
-        }
-    }
-
-    fn assert_consistent_outputs(
-        outputs: &BTreeMap<ParticipantIndex, DkgOutput<TinyGroup>>,
-        case: usize,
-        n: usize,
-        threshold: usize,
-    ) {
-        let first = outputs.values().next().unwrap();
-        for output in outputs.values() {
-            assert_eq!(
-                output.public_key, first.public_key,
-                "case {case}: n={n}, threshold={threshold}"
-            );
-            assert_eq!(
-                output.public_key_shares, first.public_key_shares,
-                "case {case}: n={n}, threshold={threshold}"
-            );
-            assert_eq!(
-                TinyGroup::mul_generator(&output.secret_share.value),
-                first.public_key_shares[&output.secret_share.participant],
-                "case {case}: n={n}, threshold={threshold}"
-            );
         }
     }
 
     #[test]
-    fn session_id_is_bound_into_dealing_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([4u8; 32]);
-        let dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let mut wrong_config = config.clone();
-        wrong_config.session_id = SessionId([99u8; 32]);
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &wrong_config)
-                .unwrap_err(),
-            Error::SessionMismatch
-        );
-    }
-
-    #[test]
-    fn setup_beta_is_bound_into_dealing_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([77u8; 32]);
-        let dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let mut wrong_config = config.clone();
-        wrong_config.beta = wrong_config.beta.add(&TinyScalar::one());
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &wrong_config)
-                .unwrap_err(),
-            Error::ProofVerificationFailed
-        );
-    }
-
-    #[test]
-    fn dealer_message_contains_paper_msg_i() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([26u8; 32]);
-        let dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-
-        assert_eq!(dealing.message.msg_i.0.len(), DEALER_MESSAGE_NONCE_BYTES);
-    }
-
-    #[test]
-    fn recompute_transcript_root_matches_create_dealing() {
-        // Pin the contract that `DealerMessage::recompute_transcript_root`
-        // returns the same bytes `create_dealing` embedded. Tests that mutate
-        // the message rely on this; a divergence would let them silently
-        // forge a fresh root for a mutated message and bypass verification.
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([31u8; 32]);
-        let dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-
-        assert_eq!(
-            dealing.message.recompute_transcript_root(),
-            dealing.message.transcript_root,
-        );
-    }
-
-    #[test]
-    fn tampered_transcript_root_fails_dealing_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([32u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        dealing.message.transcript_root[0] ^= 1;
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::ProofVerificationFailed
-        );
-    }
-
-    #[test]
-    fn proof_backend_receives_dealer_identity_secret() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([28u8; 32]);
-        let dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-
-        verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap();
-    }
-
-    #[test]
-    fn proof_backend_owns_pad_derivation_for_creation_and_decryption() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([29u8; 32]);
+    fn generic_backend_cannot_bypass_dealer_proof_limit() {
+        let config = mixed_config();
         let dealer = idx(1);
-        let receiver = idx(2);
-        let dealing = create_dealing::<TinyGroup, OffsetPadBackend>(
-            dealer,
-            &identity_secret(dealer),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-
-        verify_dealing_for_receiver::<TinyGroup, OffsetPadBackend>(
-            receiver,
-            &identity_secret(receiver),
-            &dealing.message,
-            &config,
-        )
-        .unwrap();
-
-        let encrypted_share = dealing.message.encrypted_shares.get(&receiver).unwrap();
-        let default_pad = derive_receiver_pad::<TinyGroup, FakeEvrfBackend>(
-            &config,
-            dealing.message.dealer,
-            receiver,
-            &identity_secret(receiver),
-            dealing.message.msg_i,
-        )
-        .unwrap();
-        let offset_pad = derive_receiver_pad::<TinyGroup, OffsetPadBackend>(
-            &config,
-            dealing.message.dealer,
-            receiver,
-            &identity_secret(receiver),
-            dealing.message.msg_i,
-        )
-        .unwrap();
-        assert_eq!(offset_pad, default_pad.add(&config.beta));
-
-        let decrypted_share = Share {
-            participant: receiver,
-            value: encrypted_share.encrypted_share.sub(&offset_pad),
-        };
-        dealing
-            .message
-            .commitment
-            .verify_share(&decrypted_share)
-            .unwrap();
-
-        let wrongly_decrypted_share = Share {
-            participant: receiver,
-            value: encrypted_share.encrypted_share.sub(&default_pad),
-        };
-        assert!(!dealing
-            .message
-            .commitment
-            .verify_share(&wrongly_decrypted_share)
-            .unwrap());
-    }
-
-    #[test]
-    fn msg_i_is_bound_into_dealing_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([27u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        dealing.message.msg_i.0[0] ^= 1;
-        dealing.message.transcript_root = dealing_root::<TinyGroup>(
-            dealing.message.session_id,
-            dealing.message.registry_root,
-            dealing.message.dealer,
-            dealing.message.msg_i,
-            &dealing.message.commitment,
-            &dealing.message.encrypted_shares,
-        );
+        let mut rng = ChaCha20Rng::from_seed([15; 32]);
 
         assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::ProofVerificationFailed
-        );
-    }
-
-    #[test]
-    fn registry_order_is_bound_into_dealing_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([5u8; 32]);
-        let dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let registry = ParticipantRegistry::new(vec![
-            (
-                idx(1),
-                TinyGroup::mul_generator(&TinyScalar::from_u64(10).unwrap()),
-            ),
-            (
-                idx(2),
-                TinyGroup::mul_generator(&TinyScalar::from_u64(21).unwrap()),
-            ),
-            (
-                idx(3),
-                TinyGroup::mul_generator(&TinyScalar::from_u64(30).unwrap()),
-            ),
-        ])
-        .unwrap();
-        let wrong_config = DkgConfig::new(2, config.session_id, config.beta, registry).unwrap();
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &wrong_config)
-                .unwrap_err(),
-            Error::RegistryMismatch
-        );
-    }
-
-    #[test]
-    fn duplicate_registry_public_keys_are_rejected() {
-        let public_key = TinyGroup::mul_generator(&identity_secret(idx(1)));
-        assert_eq!(
-            ParticipantRegistry::<TinyGroup>::new(vec![(idx(1), public_key), (idx(2), public_key)])
-                .unwrap_err(),
-            Error::DuplicateParticipantPublicKey {
-                first: 1,
-                second: 2,
-            }
-        );
-    }
-
-    #[test]
-    fn dealer_message_excludes_self_encrypted_share() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
-        let dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-
-        assert!(!dealing.message.encrypted_shares.contains_key(&idx(1)));
-        assert_eq!(
-            dealing.message.encrypted_shares.len(),
-            config.registry.len() - 1
-        );
-        assert_eq!(dealing.private_share.participant, idx(1));
-        assert!(dealing
-            .message
-            .commitment
-            .verify_share(&dealing.private_share)
-            .unwrap());
-    }
-
-    #[test]
-    fn self_encrypted_share_is_rejected() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([24u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let encrypted_share = dealing.message.encrypted_shares[&idx(2)].clone();
-        dealing
-            .message
-            .encrypted_shares
-            .insert(idx(1), encrypted_share);
-        dealing.message.transcript_root = dealing_root::<TinyGroup>(
-            dealing.message.session_id,
-            dealing.message.registry_root,
-            dealing.message.dealer,
-            dealing.message.msg_i,
-            &dealing.message.commitment,
-            &dealing.message.encrypted_shares,
-        );
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::UnexpectedShare(1)
-        );
-    }
-
-    #[test]
-    fn missing_dealing_fails_completion() {
-        let config = config();
-        let dealings = all_dealings(&config);
-        let own_dealing = dealings.get(&idx(1)).unwrap();
-        let peer_dealings = BTreeMap::from([(idx(2), dealings[&idx(2)].message.clone())]);
-
-        assert_eq!(
-            complete::<TinyGroup, FakeEvrfBackend>(
-                idx(1),
-                &identity_secret(idx(1)),
-                own_dealing,
-                &peer_dealings,
-                &config
+            create_dealing::<TinyGroup, OversizedProofBackend>(
+                dealer,
+                &secret(dealer),
+                &config,
+                &mut rng,
             )
             .unwrap_err(),
-            Error::MissingDealing(3)
-        );
-    }
-
-    #[test]
-    fn duplicate_dealer_message_fails_completion() {
-        let config = config();
-        let dealings = all_dealings(&config);
-        let own_dealing = dealings.get(&idx(1)).unwrap();
-        let peer_dealings = BTreeMap::from([
-            (idx(1), dealings[&idx(1)].message.clone()),
-            (idx(2), dealings[&idx(2)].message.clone()),
-            (idx(3), dealings[&idx(3)].message.clone()),
-        ]);
-
-        assert_eq!(
-            complete::<TinyGroup, FakeEvrfBackend>(
-                idx(1),
-                &identity_secret(idx(1)),
-                own_dealing,
-                &peer_dealings,
-                &config
-            )
-            .unwrap_err(),
-            Error::DuplicateParticipantIndex(1)
-        );
-    }
-
-    #[test]
-    fn peer_dealing_key_mismatch_fails_completion() {
-        let config = config();
-        let dealings = all_dealings(&config);
-        let own_dealing = dealings.get(&idx(1)).unwrap();
-        let peer_dealings = BTreeMap::from([
-            (idx(2), dealings[&idx(3)].message.clone()),
-            (idx(3), dealings[&idx(2)].message.clone()),
-        ]);
-
-        assert_eq!(
-            complete::<TinyGroup, FakeEvrfBackend>(
-                idx(1),
-                &identity_secret(idx(1)),
-                own_dealing,
-                &peer_dealings,
-                &config
-            )
-            .unwrap_err(),
-            Error::DealerKeyMismatch {
-                map_key: 2,
-                message_dealer: 3,
-            }
-        );
-    }
-
-    #[test]
-    fn own_dealing_dealer_mismatch_fails_completion() {
-        let config = config();
-        let dealings = all_dealings(&config);
-        let own_dealing = dealings.get(&idx(2)).unwrap();
-        let peer_dealings = BTreeMap::from([(idx(3), dealings[&idx(3)].message.clone())]);
-
-        assert_eq!(
-            complete::<TinyGroup, FakeEvrfBackend>(
-                idx(1),
-                &identity_secret(idx(1)),
-                own_dealing,
-                &peer_dealings,
-                &config
-            )
-            .unwrap_err(),
-            Error::DealerKeyMismatch {
-                map_key: 1,
-                message_dealer: 2,
-            }
-        );
-    }
-
-    #[test]
-    fn own_private_share_participant_mismatch_fails_completion() {
-        let config = config();
-        let dealings = all_dealings(&config);
-        let mut own_dealing = dealings[&idx(1)].clone();
-        own_dealing.private_share.participant = idx(2);
-        let peer_dealings = dealings
-            .iter()
-            .filter_map(|(dealer, dealing)| {
-                if *dealer == idx(1) {
-                    None
-                } else {
-                    Some((*dealer, dealing.message.clone()))
-                }
-            })
-            .collect();
-
-        assert_eq!(
-            complete::<TinyGroup, FakeEvrfBackend>(
-                idx(1),
-                &identity_secret(idx(1)),
-                &own_dealing,
-                &peer_dealings,
-                &config
-            )
-            .unwrap_err(),
-            Error::PrivateShareParticipantMismatch {
-                expected: 1,
-                actual: 2,
-            }
-        );
-    }
-
-    #[test]
-    fn wrong_receiver_proof_binding_fails() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([6u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let header_len = 4 + FAKE_PROOF_ID.len();
-        let proof_for_2 = dealing.message.proof[header_len..header_len + 32].to_vec();
-        dealing.message.proof[header_len + 32..header_len + 64].copy_from_slice(&proof_for_2);
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::ProofVerificationFailed
-        );
-    }
-
-    #[test]
-    fn unknown_dealer_fails_public_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        dealing.message.dealer = idx(9);
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::UnknownParticipant(9)
-        );
-    }
-
-    #[test]
-    fn missing_receiver_encrypted_share_fails_public_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        dealing.message.encrypted_shares.remove(&idx(2));
-        dealing.message.transcript_root = dealing_root::<TinyGroup>(
-            dealing.message.session_id,
-            dealing.message.registry_root,
-            dealing.message.dealer,
-            dealing.message.msg_i,
-            &dealing.message.commitment,
-            &dealing.message.encrypted_shares,
+            Error::InvalidEncoding
         );
 
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::MissingShare(2)
-        );
-    }
-
-    #[test]
-    fn missing_receiver_proof_fails_public_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        dealing
-            .message
-            .proof
-            .truncate(dealing.message.proof.len() - 32);
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::ProofVerificationFailed
-        );
-    }
-
-    #[test]
-    fn altered_commitment_fails_public_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let mut coefficients = dealing.message.commitment.coefficients().to_vec();
-        coefficients[0] = TinyGroup::add(&coefficients[0], &TinyGroup::generator());
-        dealing.message.commitment =
-            FeldmanCommitment::<TinyGroup>::from_coefficients(coefficients).unwrap();
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::ProofVerificationFailed
-        );
-    }
-
-    #[test]
-    fn wrong_commitment_degree_fails_public_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([15u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let mut coefficients = dealing.message.commitment.coefficients().to_vec();
-        coefficients.push(TinyGroup::identity());
-        dealing.message.commitment =
-            FeldmanCommitment::<TinyGroup>::from_coefficients(coefficients).unwrap();
-        dealing.message.transcript_root = dealing_root::<TinyGroup>(
-            dealing.message.session_id,
-            dealing.message.registry_root,
-            dealing.message.dealer,
-            dealing.message.msg_i,
-            &dealing.message.commitment,
-            &dealing.message.encrypted_shares,
-        );
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::InvalidCommitmentDegree {
-                expected: 2,
-                actual: 3,
-            }
-        );
-    }
-
-    #[test]
-    fn receiver_local_verification_rejects_publicly_valid_wrong_pad() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([16u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let receiver = idx(2);
-        let share_commitment = dealing
-            .message
-            .commitment
-            .public_key_share(receiver)
-            .unwrap();
-        let real_pad = derive_receiver_pad::<TinyGroup, FakeEvrfBackend>(
-            &config,
-            dealing.message.dealer,
-            receiver,
-            &identity_secret(receiver),
-            dealing.message.msg_i,
-        )
-        .unwrap();
-        let bad_pad = (1u64..97)
-            .map(|value| TinyScalar::from_u64(value).unwrap())
-            .find(|pad| *pad != real_pad)
-            .unwrap();
-        dealing.message.encrypted_shares.insert(
-            receiver,
-            EncryptedShare {
-                pad_commitment: TinyGroup::mul_generator(&bad_pad),
-                encrypted_share: share_commitment.add(&bad_pad),
-            },
-        );
-        dealing.message.transcript_root = dealing_root::<TinyGroup>(
-            dealing.message.session_id,
-            dealing.message.registry_root,
-            dealing.message.dealer,
-            dealing.message.msg_i,
-            &dealing.message.commitment,
-            &dealing.message.encrypted_shares,
-        );
-        let statements = public_share_receivers(&config, dealing.message.dealer)
-            .map(|proof_receiver| {
-                let encrypted_share = dealing.message.encrypted_shares[&proof_receiver].clone();
-                statement_for_receiver::<TinyGroup>(
-                    &config,
-                    dealing.message.dealer,
-                    proof_receiver,
-                    dealing.message.msg_i,
-                    dealing
-                        .message
-                        .commitment
-                        .public_key_share(proof_receiver)
-                        .unwrap(),
-                    dealing.message.commitment.coefficients().to_vec(),
-                    encrypted_share,
-                    dealing.message.transcript_root,
-                )
+        let mut message =
+            create_dealing::<TinyGroup, FakeBackend>(dealer, &secret(dealer), &config, &mut rng)
                 .unwrap()
-            })
-            .collect::<Vec<_>>();
-        dealing.message.proof = fake_proof_bytes(&statements).unwrap();
-
-        verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config)
-            .expect("public verification");
+                .message()
+                .clone();
+        message.proof.resize(MAX_DEALER_PROOF_BYTES + 1, 0);
         assert_eq!(
-            verify_dealing_for_receiver::<TinyGroup, FakeEvrfBackend>(
-                receiver,
-                &identity_secret(receiver),
-                &dealing.message,
-                &config
-            )
-            .unwrap_err(),
-            Error::CommitmentVerificationFailed
-        );
-    }
-
-    #[test]
-    fn invalid_encrypted_share_relation_fails_public_verification() {
-        let config = config();
-        let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
-        let mut dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
-            idx(1),
-            &identity_secret(idx(1)),
-            &config,
-            &mut rng,
-        )
-        .unwrap();
-        let encrypted_share = dealing.message.encrypted_shares.get_mut(&idx(2)).unwrap();
-        encrypted_share.encrypted_share = encrypted_share.encrypted_share.add(&TinyScalar::one());
-        dealing.message.transcript_root = dealing_root::<TinyGroup>(
-            dealing.message.session_id,
-            dealing.message.registry_root,
-            dealing.message.dealer,
-            dealing.message.msg_i,
-            &dealing.message.commitment,
-            &dealing.message.encrypted_shares,
-        );
-
-        assert_eq!(
-            verify_dealing::<TinyGroup, FakeEvrfBackend>(&dealing.message, &config).unwrap_err(),
-            Error::CommitmentVerificationFailed
-        );
-    }
-
-    #[test]
-    fn wrong_receiver_identity_secret_fails_completion() {
-        let config = config();
-        let dealings = all_dealings(&config);
-        let own_dealing = dealings.get(&idx(1)).unwrap();
-        let peer_dealings = dealings
-            .iter()
-            .filter_map(|(dealer, dealing)| {
-                if *dealer == idx(1) {
-                    None
-                } else {
-                    Some((*dealer, dealing.message.clone()))
-                }
-            })
-            .collect();
-
-        assert_eq!(
-            complete::<TinyGroup, FakeEvrfBackend>(
-                idx(1),
-                &identity_secret(idx(2)),
-                own_dealing,
-                &peer_dealings,
-                &config
-            )
-            .unwrap_err(),
-            Error::IdentityKeyMismatch
-        );
-    }
-
-    #[test]
-    fn registry_rejects_identity_public_key() {
-        // A dealer registering the group identity as their public key would
-        // collapse every other participant's secret-share multiplication to
-        // the identity; the registry must reject this at construction time
-        // rather than let a degenerate DKG silently complete.
-        let entries = vec![(idx(1), TinyGroup::identity())];
-        assert_eq!(
-            ParticipantRegistry::<TinyGroup>::new(entries).unwrap_err(),
+            verify_dealing::<TinyGroup, OversizedProofBackend>(&message, &config).unwrap_err(),
             Error::InvalidEncoding
         );
     }
 
     #[test]
-    fn dkg_config_rejects_zero_threshold() {
-        // threshold = 0 produces an empty polynomial, which has no constant
-        // term to act as the secret. The constructor catches this rather
-        // than letting the prover proceed with a degenerate commitment.
-        let registry = ParticipantRegistry::<TinyGroup>::new(
-            (1..=3)
-                .map(|value| {
-                    let participant = idx(value);
-                    (
-                        participant,
-                        TinyGroup::mul_generator(&identity_secret(participant)),
-                    )
-                })
-                .collect(),
+    fn completion_rejects_unregistered_peer_before_aggregation() {
+        let config = mixed_config();
+        let receiver = idx(1);
+        let mut rng = ChaCha20Rng::from_seed([15; 32]);
+        let own_dealing = create_dealing::<TinyGroup, FakeBackend>(
+            receiver,
+            &secret(receiver),
+            &config,
+            &mut rng,
         )
         .unwrap();
+        let messages = dealer_messages::<FakeBackend>(&config, 16);
+        let base_peers = messages
+            .into_iter()
+            .filter(|(dealer, _)| *dealer != receiver)
+            .collect::<BTreeMap<_, _>>();
+        let unknown = idx(4);
+
+        let mut well_shaped = base_peers[&idx(2)].clone();
+        well_shaped.dealer = unknown;
+        let mut short = well_shaped.clone();
+        short.dealings.clear();
+
+        for extra in [short, well_shaped] {
+            let mut peers = base_peers.clone();
+            peers.insert(unknown, extra);
+            assert_eq!(
+                complete::<TinyGroup, FakeBackend>(
+                    receiver,
+                    &secret(receiver),
+                    &own_dealing,
+                    &peers,
+                    &config,
+                )
+                .unwrap_err(),
+                Error::UnknownParticipant(unknown.get())
+            );
+        }
+    }
+
+    #[test]
+    fn completion_rejects_missing_or_malformed_dealers_atomically() {
+        let config = mixed_config();
+        let receiver = idx(1);
+        let dealings = dealer_dealings::<FakeBackend>(&config, 17);
+        let valid_peers = dealings
+            .iter()
+            .filter(|(dealer, _)| **dealer != receiver)
+            .map(|(dealer, dealing)| (*dealer, dealing.message().clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut missing = valid_peers.clone();
+        missing.remove(&idx(3));
+        let mut malformed = valid_peers;
+        malformed.get_mut(&idx(2)).unwrap().dealings.pop();
+
+        for (peers, expected) in [
+            (missing, Error::MissingDealing(3)),
+            (
+                malformed,
+                Error::InvalidDealingCount {
+                    expected: 2,
+                    actual: 1,
+                },
+            ),
+        ] {
+            assert_eq!(
+                complete::<TinyGroup, FakeBackend>(
+                    receiver,
+                    &secret(receiver),
+                    &dealings[&receiver],
+                    &peers,
+                    &config,
+                )
+                .unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn completion_root_changes_with_an_independent_accepted_batch() {
+        let config = mixed_config();
+        let first = dealer_dealings::<FakeBackend>(&config, 18);
+        let second = dealer_dealings::<FakeBackend>(&config, 19);
+        let first_output = complete_receiver(idx(1), &first, &config).unwrap();
+        let second_output = complete_receiver(idx(1), &second, &config).unwrap();
+        let first_messages = first
+            .iter()
+            .map(|(dealer, dealing)| (*dealer, dealing.message()))
+            .collect::<BTreeMap<_, _>>();
+
         assert_eq!(
-            DkgConfig::new(
-                0,
-                SessionId([8u8; 32]),
-                TinyScalar::from_u64(77).unwrap(),
-                registry,
-            )
-            .unwrap_err(),
-            Error::InvalidThreshold {
-                threshold: 0,
-                participants: 3,
-            }
+            first_output.configuration_root(),
+            second_output.configuration_root()
+        );
+        assert_ne!(
+            first_output.completion_root(),
+            second_output.completion_root()
+        );
+        assert_ne!(
+            first_output.completion_root(),
+            completion_root::<TinyGroup, FakeBackend>([9; 32], &first_messages)
         );
     }
 
     #[test]
-    fn dkg_config_rejects_threshold_above_participant_count() {
-        // threshold > n asks for k-of-n reconstruction with k > n, which is
-        // information-theoretically impossible. The constructor must reject
-        // this so the dealer does not silently run a protocol that can never
-        // produce a valid completion.
-        let registry = ParticipantRegistry::<TinyGroup>::new(
-            (1..=3)
-                .map(|value| {
-                    let participant = idx(value);
-                    (
-                        participant,
-                        TinyGroup::mul_generator(&identity_secret(participant)),
-                    )
-                })
-                .collect(),
+    fn completion_root_binds_the_accepting_proof_backend() {
+        let config = mixed_config();
+        let dealings = dealer_dealings::<FakeBackend>(&config, 20);
+        let receiver = idx(1);
+        let peers = dealings
+            .iter()
+            .filter(|(dealer, _)| **dealer != receiver)
+            .map(|(dealer, dealing)| (*dealer, dealing.message().clone()))
+            .collect();
+
+        let default_output = complete::<TinyGroup, FakeBackend>(
+            receiver,
+            &secret(receiver),
+            &dealings[&receiver],
+            &peers,
+            &config,
+        )
+        .unwrap();
+        let alternate_output = complete::<TinyGroup, AlternateFakeBackend>(
+            receiver,
+            &secret(receiver),
+            &dealings[&receiver],
+            &peers,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(
+            default_output.configuration_root(),
+            alternate_output.configuration_root()
+        );
+        assert_eq!(default_output.instances(), alternate_output.instances());
+        assert_ne!(
+            default_output.completion_root(),
+            alternate_output.completion_root()
+        );
+    }
+
+    #[test]
+    fn commitment_constant_shape_matches_the_configured_instance_kind() {
+        let config = mixed_config();
+        let mut rng = ChaCha20Rng::from_seed([17; 32]);
+        let message =
+            create_dealing::<TinyGroup, FakeBackend>(idx(1), &secret(idx(1)), &config, &mut rng)
+                .unwrap()
+                .message()
+                .clone();
+
+        assert!(message.dealings[0].commitment.constant().is_some());
+        assert!(message.dealings[1].commitment.constant().is_none());
+
+        let mut explicit_zero = message.clone();
+        explicit_zero.dealings[1].commitment = FeldmanCommitment::from_coefficients(
+            explicit_zero.dealings[1].commitment.coefficients(),
         )
         .unwrap();
         assert_eq!(
-            DkgConfig::new(
-                4,
-                SessionId([8u8; 32]),
-                TinyScalar::from_u64(77).unwrap(),
-                registry,
-            )
-            .unwrap_err(),
-            Error::InvalidThreshold {
-                threshold: 4,
-                participants: 3,
-            }
+            verify_dealing::<TinyGroup, FakeBackend>(&explicit_zero, &config).unwrap_err(),
+            Error::CommitmentKindMismatch(1)
+        );
+
+        let mut missing_random = message;
+        let tail = missing_random.dealings[0].commitment.coefficients()[1..].to_vec();
+        missing_random.dealings[0].commitment = FeldmanCommitment::from_zero_tail(tail);
+        assert_eq!(
+            verify_dealing::<TinyGroup, FakeBackend>(&missing_random, &config).unwrap_err(),
+            Error::CommitmentKindMismatch(0)
+        );
+    }
+
+    #[test]
+    fn dealing_root_excludes_proof_but_binds_body_order() {
+        let config = mixed_config();
+        let mut rng = ChaCha20Rng::from_seed([19; 32]);
+        let mut message =
+            create_dealing::<TinyGroup, FakeBackend>(idx(1), &secret(idx(1)), &config, &mut rng)
+                .unwrap()
+                .message()
+                .clone();
+        let root = message.root();
+        message.proof.push(0xff);
+        assert_eq!(message.root(), root);
+        message.dealings.swap(0, 1);
+        assert_ne!(message.root(), root);
+    }
+
+    #[test]
+    fn dealer_message_root_binds_all_proof_independent_fields() {
+        let config = mixed_config();
+        let original = dealer_messages::<FakeBackend>(&config, 23)[&idx(1)].clone();
+        let root = original.root();
+
+        let mut changed = original.clone();
+        changed.configuration_root[0] ^= 1;
+        assert_ne!(changed.root(), root);
+
+        let mut changed = original.clone();
+        changed.dealer = idx(2);
+        assert_ne!(changed.root(), root);
+
+        let mut changed = original.clone();
+        changed.dealings[0].nonce.0[0] ^= 1;
+        assert_ne!(changed.root(), root);
+
+        let mut changed = original.clone();
+        let mut coefficients = changed.dealings[0].commitment.coefficients();
+        coefficients[0] = TinyGroup::add(&coefficients[0], &TinyGroup::generator());
+        changed.dealings[0].commitment =
+            FeldmanCommitment::from_coefficients(coefficients).unwrap();
+        assert_ne!(changed.root(), root);
+
+        let mut changed = original;
+        let encrypted = changed.dealings[0].encrypted_shares[&idx(2)].encrypted_share;
+        changed.dealings[0]
+            .encrypted_shares
+            .get_mut(&idx(2))
+            .unwrap()
+            .encrypted_share = TinyGroup::add(&encrypted, &TinyScalar::one());
+        assert_ne!(changed.root(), root);
+    }
+
+    #[test]
+    fn cross_dealer_verification_uses_batch_path_and_attributes_bad_proof() {
+        BATCH_VERIFY_CALLS.store(0, Ordering::SeqCst);
+        SINGLE_VERIFY_CALLS.store(0, Ordering::SeqCst);
+        let config = mixed_config();
+        let messages = dealer_messages::<CountingBackend>(&config, 29);
+        let refs = messages.values().collect::<Vec<_>>();
+        verify_dealings::<TinyGroup, CountingBackend>(&refs, &config).unwrap();
+        assert_eq!(BATCH_VERIFY_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(SINGLE_VERIFY_CALLS.load(Ordering::SeqCst), 0);
+
+        let mut messages = dealer_messages::<FakeBackend>(&config, 31);
+        messages.get_mut(&idx(2)).unwrap().proof[0] ^= 1;
+        let refs = messages.values().collect::<Vec<_>>();
+        assert_eq!(
+            verify_dealings::<TinyGroup, FakeBackend>(&refs, &config).unwrap_err(),
+            Error::DealerProofVerificationFailed(2)
+        );
+    }
+
+    #[test]
+    fn cross_dealer_fallback_preserves_original_batch_error() {
+        let config = mixed_config();
+        let messages = dealer_messages::<BatchRejectingBackend>(&config, 37);
+        let refs = messages.values().collect::<Vec<_>>();
+        assert_eq!(
+            verify_dealings::<TinyGroup, BatchRejectingBackend>(&refs, &config).unwrap_err(),
+            Error::InvalidEncoding
         );
     }
 }

@@ -84,9 +84,8 @@ impl<G: GoldenGroup> PublicKeySet<G> {
 /// Golden setup context bound into `Hdgd` and `Hdcd`.
 ///
 /// This is the crate's addition to paper Section 3: Golden DKG transcript
-/// roots, registry root, session ids, and epoch are bound through
-/// [`SetupContext::root`]. The zero sharing session id is derived by
-/// [`derive_context_session_id`].
+/// roots, registry root, batch session, and epoch are bound through
+/// [`SetupContext::root`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupContext {
     /// Stable Golden backend id.
@@ -97,14 +96,12 @@ pub struct SetupContext {
     pub registry_root: TranscriptRoot,
     /// Participants in canonical order.
     pub participants: Vec<ParticipantIndex>,
-    /// Session id for the `x` sharing.
-    pub decryption_session_id: SessionId,
-    /// Session id for the zero sharing run.
-    pub context_session_id: SessionId,
-    /// Completion transcript root from the `x` sharing.
-    pub decryption_transcript_root: TranscriptRoot,
-    /// Completion transcript root from the zero sharing run.
-    pub context_transcript_root: TranscriptRoot,
+    /// Session id for the atomic `[Random, Zero]` DKG batch.
+    pub session_id: SessionId,
+    /// Canonical DKG configuration identity.
+    pub configuration_root: TranscriptRoot,
+    /// Atomic completion identity for the entire DKG batch.
+    pub completion_root: TranscriptRoot,
     /// Caller provided epoch or setup label.
     pub epoch: [u8; 32],
 }
@@ -120,24 +117,12 @@ impl SetupContext {
         for participant in &self.participants {
             transcript.participant(b"participant", *participant);
         }
-        transcript.bytes(b"decryption-session", &self.decryption_session_id.0);
-        transcript.bytes(b"context-session", &self.context_session_id.0);
-        transcript.bytes(
-            b"decryption-transcript-root",
-            &self.decryption_transcript_root,
-        );
-        transcript.bytes(b"context-transcript-root", &self.context_transcript_root);
+        transcript.bytes(b"session", &self.session_id.0);
+        transcript.bytes(b"configuration-root", &self.configuration_root);
+        transcript.bytes(b"completion-root", &self.completion_root);
         transcript.bytes(b"epoch", &self.epoch);
         transcript.root()
     }
-}
-
-/// Golden setup derivation for the zero sharing session id, not in the paper.
-pub fn derive_context_session_id(decryption_session_id: SessionId) -> SessionId {
-    let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"context-session");
-    transcript.bytes(b"label", b"zero-sharing");
-    transcript.bytes(b"decryption-session", &decryption_session_id.0);
-    SessionId(transcript.root())
 }
 
 /// Errors returned by the EHTDH1 core.

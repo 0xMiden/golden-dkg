@@ -3,10 +3,10 @@
 Context bound threshold encryption for Golden distributed key generation.
 
 This crate implements EHTDH1 from
-[ePrint 2025/279](https://eprint.iacr.org/2025/279). It converts two completed
-Golden DKG runs into a public sealing key, public verification shares, and one
-secret share for each participant. The first DKG run shares the decryption
-secret. The second shares zero so that each decryption share is bound to one
+[ePrint 2025/279](https://eprint.iacr.org/2025/279). It converts one completed
+Golden `[Random, Zero]` DKG batch into a public sealing key, public verification
+shares, and one secret share for each participant. The random sharing provides
+the decryption secret. The zero sharing binds each decryption share to one
 decryption context.
 
 The crate provides:

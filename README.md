@@ -16,12 +16,18 @@ The two protocol implementations follow these papers.
   Shoup, “[Context-Dependent Threshold Decryption and its Applications](https://eprint.iacr.org/2025/279),”
   Cryptology ePrint Archive, Paper 2025/279, 2025.
 
+The DKG API is batch native. A configuration may request one random sharing,
+one zero sharing, or an arbitrary nonempty ordered mixture of both. Each dealer
+broadcasts one message containing every configured dealing and one joint eVRF
+proof. Completion verifies and aggregates the whole batch atomically, returning
+outputs in configuration order only when every dealing succeeds.
+
 The workspace has six crates. All crates are published together and require
 Rust 1.93 or later.
 
-* `golden-core`: Shamir secret sharing, Feldman commitments, DKG messages,
-  transcript binding, and the curve-agnostic `EvrfProofBackend` trait that
-  connects the DKG to a concrete proof system.
+* `golden-core`: batch-native Shamir secret sharing, Feldman commitments, DKG
+  messages, transcript binding, and the curve-agnostic `EvrfProofBackend`
+  trait that connects the DKG to a concrete proof system.
 * `golden-evrf`: the eVRF proof backends. Includes a Secp256k1/Secq256k1
   R1CS backend that proves the full Golden eVRF relation end-to-end via
   `bulletproofs-cycle`, plus a share-opening prototype backend used for

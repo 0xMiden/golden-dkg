@@ -360,11 +360,6 @@ fn validate_combiner_setup<G: GoldenHashToGroup>(
     if setup_context.participants != public_participants {
         return Err(Error::InvalidBridge("setup participant mismatch"));
     }
-    if setup_context.context_session_id
-        != crate::context::derive_context_session_id(setup_context.decryption_session_id)
-    {
-        return Err(Error::InvalidBridge("setup context session mismatch"));
-    }
     Ok(())
 }
 

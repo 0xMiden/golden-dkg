@@ -2,7 +2,7 @@
 //!
 //! This example follows the node Phase 2 flow.
 //!
-//! 1. Three participants run the two Golden DKG sessions needed by EHTDH1.
+//! 1. Three participants run one atomic `[Random, Zero]` Golden DKG batch.
 //!    They agree on one public sealing key with a threshold of two. Each
 //!    participant also receives its own secret share.
 //! 2. A separate writer creates three `(key, value)` pairs. Each key is the
@@ -34,11 +34,11 @@
 //! happen to contain the same bytes in this example, but they remain separate
 //! inputs.
 //!
-//! # Why setup runs DKG twice
+//! # Why setup uses two ordered sharings
 //!
-//! The first DKG shares the joint decryption secret. The second shares zero so
-//! its contributions cancel for one decryption context, but not when contexts
-//! are mixed.
+//! The batch first shares the joint decryption secret and then shares zero. The
+//! zero-sharing contributions cancel for one decryption context, but not when
+//! contexts are mixed.
 //!
 //! # Glossary
 //!
@@ -49,22 +49,24 @@
 //! * The **threshold** is the number of decryption shares needed to open a
 //!   content key. This example uses two out of three.
 //! * **Golden DKG** lets the participants create a joint public key without one
-//!   party choosing the final private key. EHTDH1 setup uses one DKG session
-//!   for the decryption key and one zero sharing session for context binding.
-//! * A **dealing** is one participant's DKG message. It contains encrypted
-//!   shares for the other participants and a proof that they are valid.
+//!   party choosing the final private key. EHTDH1 setup creates its decryption
+//!   and context sharings atomically in one ordered DKG batch.
+//! * A **dealer message** is one participant's DKG broadcast. It contains one
+//!   ordered dealing body per configured sharing and one joint proof. Each body
+//!   contains encrypted shares for the other participants.
 //! * A **DKG output** is one participant's result after all dealings pass. It
-//!   contains public setup data and that participant's local DKG share.
+//!   contains ordered instance outputs, each with public setup data and that
+//!   participant's local share for the corresponding configured sharing.
 //! * A **sealing key** is the joint public key. The writer can use it without
 //!   learning any participant secret.
 //! * A **public key set** has the threshold and joint public key. There is also
 //!   one public share for each participant. The combiner reads this set when it
 //!   checks shares.
 //! * A **setup context** is the identity of the Golden setup. The backend and
-//!   participant list are part of it. Both DKG sessions and their transcript
-//!   roots are also part of it. The epoch names the version of this setup.
+//!   participant list are part of it. The batch session, configuration root,
+//!   and completion root are also part of it. The epoch names this setup.
 //! * A **secret share** is the long lived private EHTDH1 material held by one
-//!   participant. There is one scalar from each DKG session in it. Participants
+//!   participant. There is one scalar from each batch position in it. Participants
 //!   never exchange these secret shares.
 //! * An **unsealing share** wraps one secret share. A participant uses it to
 //!   create a decryption share without exposing the stored secret.
@@ -100,13 +102,13 @@ use std::io;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use golden_core::{
-    complete, create_dealing_with_secret, DealerMessage, DkgConfig, DkgDealing, DkgOutput,
+    complete, create_dealing, DealerMessage, DkgConfig, DkgDealing, DkgInstanceKind, DkgOutput,
     GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
 };
 use golden_ehtdh1::wire::{from_wire_bytes, to_wire_bytes};
 use golden_ehtdh1::{
-    derive_context_session_id, material_from_dkg_outputs, Ciphertext, Combiner, DecryptionShare,
-    Ehtdh1Material, SealingKey, UnsealingShare,
+    material_from_dkg_output, Ciphertext, Combiner, DecryptionShare, Ehtdh1Material, SealingKey,
+    UnsealingShare,
 };
 use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
@@ -312,28 +314,27 @@ fn dkg_config(
         ));
     }
     let registry = ParticipantRegistry::new(entries)?;
-    Ok(DkgConfig::new(2, session_id, scalar(77)?, registry)?)
+    Ok(DkgConfig::batch(
+        2,
+        session_id,
+        scalar(77)?,
+        registry,
+        vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
+    )?)
 }
 
-/// Runs one DKG session and returns one local output for each participant.
+/// Runs one atomic DKG batch and returns one local output for each participant.
 fn run_dkg(
     participants: &[ParticipantIndex; 3],
     config: &DkgConfig<G>,
     rng: &mut ChaCha20Rng,
-    zero_sharing: bool,
 ) -> AppResult<BTreeMap<ParticipantIndex, DkgOutput<G>>> {
     let mut dealings = BTreeMap::<ParticipantIndex, DkgDealing<G>>::new();
     // Every participant acts as a dealer and sends one dealing to its peers.
     for dealer in participants {
-        let secret = if zero_sharing {
-            P256Scalar::zero()
-        } else {
-            scalar(20 + u64::from(dealer.get()))?
-        };
-        let dealing = create_dealing_with_secret::<G, ShareOpeningBackend>(
+        let dealing = create_dealing::<G, ShareOpeningBackend>(
             *dealer,
             &identity_secret(*dealer)?,
-            secret,
             config,
             rng,
         )?;
@@ -347,7 +348,7 @@ fn run_dkg(
         let peer_dealings = dealings
             .iter()
             .filter_map(|(dealer, dealing)| {
-                (*dealer != *receiver).then_some((*dealer, dealing.message.clone()))
+                (*dealer != *receiver).then_some((*dealer, dealing.message().clone()))
             })
             .collect::<BTreeMap<ParticipantIndex, DealerMessage<G>>>();
         let output = complete::<G, ShareOpeningBackend>(
@@ -362,34 +363,21 @@ fn run_dkg(
     Ok(outputs)
 }
 
-/// Runs both DKG sessions and gives each participant its EHTDH1 setup.
+/// Runs one `[Random, Zero]` batch and gives each participant its EHTDH1 setup.
 fn run_golden_setup(
     participants: &[ParticipantIndex; 3],
     rng: &mut ChaCha20Rng,
 ) -> AppResult<BTreeMap<ParticipantIndex, Ehtdh1Material<G>>> {
-    let decryption_config = dkg_config(participants, SessionId([42u8; 32]))?;
-    let context_config = dkg_config(
-        participants,
-        derive_context_session_id(decryption_config.session_id),
-    )?;
-    // The first DKG creates the joint decryption key.
-    let decryption_outputs = run_dkg(participants, &decryption_config, rng, false)?;
-    // The second DKG shares zero so later shares can bind a decryption context.
-    let context_outputs = run_dkg(participants, &context_config, rng, true)?;
+    let config = dkg_config(participants, SessionId([42u8; 32]))?;
+    let outputs = run_dkg(participants, &config, rng)?;
 
     let mut materials = BTreeMap::new();
     for participant in participants {
         materials.insert(
             *participant,
-            material_from_dkg_outputs(
-                &decryption_config,
-                get(
-                    &decryption_outputs,
-                    *participant,
-                    "missing decryption output",
-                )?,
-                &context_config,
-                get(&context_outputs, *participant, "missing context output")?,
+            material_from_dkg_output(
+                &config,
+                get(&outputs, *participant, "missing DKG output")?,
                 [8u8; 32],
             )?,
         );

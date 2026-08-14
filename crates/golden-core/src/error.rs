@@ -32,6 +32,10 @@ pub enum Error {
         participants: usize,
     },
 
+    /// A DKG batch contained no sharing instances.
+    #[error("DKG batch must contain at least one instance")]
+    EmptyDkgBatch,
+
     /// An interpolation denominator was not invertible.
     #[error("non-invertible interpolation denominator")]
     NonInvertibleDenominator,
@@ -53,13 +57,22 @@ pub enum Error {
         actual: usize,
     },
 
-    /// A message belongs to a different session.
-    #[error("session mismatch")]
-    SessionMismatch,
+    /// A message or output belongs to a different DKG configuration.
+    #[error("DKG configuration mismatch")]
+    ConfigurationMismatch,
 
-    /// A message belongs to a different participant registry.
-    #[error("participant registry mismatch")]
-    RegistryMismatch,
+    /// A dealer message had the wrong number of dealing bodies.
+    #[error("invalid dealing count: expected {expected}, got {actual}")]
+    InvalidDealingCount {
+        /// Configured instance count.
+        expected: usize,
+        /// Message dealing count.
+        actual: usize,
+    },
+
+    /// A dealing's constant commitment shape disagreed with its configured kind.
+    #[error("commitment kind mismatch in dealing {0}")]
+    CommitmentKindMismatch(usize),
 
     /// An identity secret key did not match the registered identity public key.
     #[error("identity secret key does not match registered public key")]
@@ -76,15 +89,6 @@ pub enum Error {
         map_key: u32,
         /// Dealer index claimed by the dealer message.
         message_dealer: u32,
-    },
-
-    /// A local private share did not belong to the expected participant.
-    #[error("private share participant mismatch: expected {expected}, got {actual}")]
-    PrivateShareParticipantMismatch {
-        /// Expected participant index.
-        expected: u32,
-        /// Actual private-share participant index.
-        actual: u32,
     },
 
     /// A required dealing was missing.

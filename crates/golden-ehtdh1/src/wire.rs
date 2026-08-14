@@ -22,8 +22,8 @@ use miden_serde_utils::{
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    derive_context_session_id, Ciphertext, DecryptionShare, Error, PublicKeySet, PublicShare,
-    SealingKey, SecretShare, SetupContext,
+    Ciphertext, DecryptionShare, Error, PublicKeySet, PublicShare, SealingKey, SecretShare,
+    SetupContext,
 };
 
 pub use golden_core::wire::{WireDecode, WireEncode, WireMessage};
@@ -72,10 +72,9 @@ impl WireEncode for SetupContext {
         for participant in &self.participants {
             participant.write_wire(out);
         }
-        self.decryption_session_id.write_wire(out);
-        self.context_session_id.write_wire(out);
-        self.decryption_transcript_root.write_wire(out);
-        self.context_transcript_root.write_wire(out);
+        self.session_id.write_wire(out);
+        self.configuration_root.write_wire(out);
+        self.completion_root.write_wire(out);
         out.extend_from_slice(&self.epoch);
     }
 }
@@ -100,20 +99,14 @@ impl WireDecode for SetupContext {
         if threshold == 0 || threshold > participants.len() {
             return Err(CoreError::InvalidEncoding);
         }
-        let decryption_session_id = SessionId::read_wire(reader)?;
-        let context_session_id = SessionId::read_wire(reader)?;
-        if context_session_id != derive_context_session_id(decryption_session_id) {
-            return Err(CoreError::InvalidEncoding);
-        }
         Ok(Self {
             backend_id,
             threshold,
             registry_root,
             participants,
-            decryption_session_id,
-            context_session_id,
-            decryption_transcript_root: TranscriptRoot::read_wire(reader)?,
-            context_transcript_root: TranscriptRoot::read_wire(reader)?,
+            session_id: SessionId::read_wire(reader)?,
+            configuration_root: TranscriptRoot::read_wire(reader)?,
+            completion_root: TranscriptRoot::read_wire(reader)?,
             epoch: reader.read_array()?,
         })
     }
@@ -121,7 +114,7 @@ impl WireDecode for SetupContext {
 
 impl WireMessage for SetupContext {
     const TAG: u8 = TAG_SETUP_CONTEXT;
-    const CODEC_ID: &'static str = "ehtdh1-setup-context-v1";
+    const CODEC_ID: &'static str = "ehtdh1-setup-context-v2";
 }
 
 impl<G: GoldenGroup> WireEncode for PublicShare<G> {
@@ -610,7 +603,7 @@ impl<'de, T: WireMessage> de::Visitor<'de> for WireBytesVisitor<T> {
         self,
         mut sequence: A,
     ) -> core::result::Result<Self::Value, A::Error> {
-        let mut bytes = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        let mut bytes = Vec::new();
         while let Some(byte) = sequence.next_element()? {
             bytes.push(byte);
         }
@@ -625,7 +618,7 @@ mod tests {
     use golden_rustcrypto::{P256Backend, P256Scalar};
     use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
-    use crate::{derive_context_session_id, UnsealingShare};
+    use crate::UnsealingShare;
 
     type G = P256Backend;
 
@@ -677,16 +670,14 @@ mod tests {
         let joint_public_key = G::mul_generator(&decryption_secret);
         let public_key_set = PublicKeySet::new(2, joint_public_key, public_shares).unwrap();
         let sealing_key = SealingKey::new(joint_public_key).unwrap();
-        let decryption_session_id = SessionId([2u8; 32]);
         let setup_context = SetupContext {
             backend_id: G::BACKEND_ID.to_owned(),
             threshold: 2,
             registry_root: [1u8; 32],
             participants: participants.to_vec(),
-            decryption_session_id,
-            context_session_id: derive_context_session_id(decryption_session_id),
-            decryption_transcript_root: [3u8; 32],
-            context_transcript_root: [4u8; 32],
+            session_id: SessionId([2u8; 32]),
+            configuration_root: [3u8; 32],
+            completion_root: [4u8; 32],
             epoch: [5u8; 32],
         };
         let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
@@ -843,12 +834,13 @@ mod tests {
     }
 
     #[test]
-    fn setup_context_rejects_inconsistent_session_ids() {
+    fn setup_context_v1_codec_is_rejected() {
         let setup_context = fixtures().setup_context;
         let mut bytes = to_wire_bytes(&setup_context);
-        let context_session_offset =
-            setup_participants_offset(&setup_context) + 4 * setup_context.participants.len() + 32;
-        bytes[context_session_offset] ^= 1;
+        let codec_id = SetupContext::CODEC_ID.as_bytes();
+        let codec_start = MAGIC.len() + 1 + 8;
+        let codec_end = codec_start + codec_id.len();
+        bytes[codec_start..codec_end].copy_from_slice(b"ehtdh1-setup-context-v1");
 
         assert!(from_wire_bytes::<SetupContext>(&bytes).is_err());
     }
@@ -898,5 +890,57 @@ mod tests {
         let bytes: &'static [u8] = Box::leak(to_wire_bytes(&setup_context).into_boxed_slice());
 
         assert_tokens(&setup_context, &[Token::Bytes(bytes)]);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_sequence_ignores_untrusted_size_hint() {
+        use serde::de::Visitor as _;
+
+        struct HugeHintSequence<'de> {
+            bytes: core::slice::Iter<'de, u8>,
+        }
+
+        impl<'de> de::SeqAccess<'de> for HugeHintSequence<'de> {
+            type Error = de::value::Error;
+
+            fn next_element_seed<T>(
+                &mut self,
+                seed: T,
+            ) -> core::result::Result<Option<T::Value>, Self::Error>
+            where
+                T: de::DeserializeSeed<'de>,
+            {
+                let Some(byte) = self.bytes.next() else {
+                    return Ok(None);
+                };
+                seed.deserialize(de::value::U8Deserializer::new(*byte))
+                    .map(Some)
+            }
+
+            fn size_hint(&self) -> Option<usize> {
+                Some(usize::MAX)
+            }
+        }
+
+        let expected = fixtures().setup_context;
+        let canonical = to_wire_bytes(&expected);
+
+        assert_eq!(
+            WireBytesVisitor::<SetupContext>(PhantomData)
+                .visit_seq(HugeHintSequence {
+                    bytes: canonical.iter(),
+                })
+                .unwrap(),
+            expected
+        );
+        assert!(WireBytesVisitor::<SetupContext>(PhantomData)
+            .visit_seq(HugeHintSequence { bytes: [].iter() })
+            .is_err());
+        assert!(WireBytesVisitor::<SetupContext>(PhantomData)
+            .visit_seq(HugeHintSequence {
+                bytes: canonical[..1].iter(),
+            })
+            .is_err());
     }
 }

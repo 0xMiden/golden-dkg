@@ -1,14 +1,16 @@
 //! End-to-end tests for the batched-dealer paper eVRF relation.
 //!
 //! These exercise the public `evrf_batched_prove` / `evrf_batched_verify`
-//! surface for an arbitrary number of receivers. Tests that build full proofs
+//! surface for arbitrary ordered dealings and receivers. Tests that build full proofs
 //! are marked `#[ignore]` because building the Bulletproofs generators
 //! dominates runtime; run them via `cargo nextest --run-ignored only`.
 
 #![allow(clippy::unwrap_used)]
 
 use ff::Field;
+use golden_core::FeldmanCommitment;
 use golden_evrf::paper::secp_secq::{self as paper, Gin, GinScalar, R1csField};
+use golden_halo2curves::golden_group::Secp256k1Element;
 use group::Group;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
@@ -27,8 +29,12 @@ fn make_pkjs(rng: &mut ChaCha20Rng, n: usize) -> Vec<Gin> {
 fn public_params(
     statement: &paper::BatchedEvrfStatement,
 ) -> std::sync::Arc<paper::BatchedEvrfPublicParams> {
-    paper::BatchedEvrfPublicParams::shared(statement.threshold, statement.receivers.len())
-        .expect("public parameter setup")
+    paper::BatchedEvrfPublicParams::shared(
+        statement.threshold,
+        statement.dealings.len(),
+        statement.dealings[0].receivers.len(),
+    )
+    .expect("public parameter setup")
 }
 
 #[test]
@@ -68,9 +74,16 @@ fn batched_proof_wire_len_matches_v7_vector() {
     let msg = make_msg(0xABCD);
     let (statement, _witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
 
+    let explicit_constant_count = statement
+        .dealings
+        .iter()
+        .filter(|dealing| dealing.commitment.constant().is_some())
+        .count();
     let predicted = paper::BatchedEvrfPublicParams::batched_proof_wire_len(
         statement.threshold,
-        statement.receivers.len(),
+        statement.dealings.len(),
+        statement.dealings[0].receivers.len(),
+        explicit_constant_count,
     )
     .expect("valid shape");
 
@@ -104,20 +117,98 @@ fn evrf_batched_dealer_honest_proof_verifies() {
 }
 
 #[test]
-fn evrf_batched_dealer_rejects_identity_share_commitment() {
+fn ordered_dealings_use_independent_effective_messages() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0003);
+    let sk1 = GinScalar::random(&mut rng);
+    let pkjs = make_pkjs(&mut rng, 2);
+    let beta = R1csField::from(7u64);
+    let messages = [make_msg(0x1000), make_msg(0x2000)];
+    let (statement, _) = paper::testing::build_batched_dealings(&messages, sk1, &pkjs, beta);
+
+    assert_eq!(statement.dealings.len(), 2);
+    assert_eq!(statement.dealings[0].msg, messages[0]);
+    assert_eq!(statement.dealings[1].msg, messages[1]);
+    assert_eq!(statement.dealings[0].receivers.len(), 2);
+    assert_eq!(statement.dealings[1].receivers.len(), 2);
+    assert_ne!(
+        statement.dealings[0].receivers[0].pad_commitment,
+        statement.dealings[1].receivers[0].pad_commitment,
+        "distinct effective messages must derive independent pads"
+    );
+}
+
+#[test]
+#[ignore = "slow: proves two ordered dealings and two receivers in one R1CS proof"]
+fn evrf_multiple_dealings_and_receivers_verify_and_bind_order() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0004);
+    let sk1 = GinScalar::random(&mut rng);
+    let pkjs = make_pkjs(&mut rng, 2);
+    let beta = R1csField::from(7u64);
+    let messages = [make_msg(0x3000), make_msg(0x4000)];
+    let (statement, witness) = paper::testing::build_batched_dealings(&messages, sk1, &pkjs, beta);
+    let params = public_params(&statement);
+    let proof = paper::evrf_batched_prove(&params, &statement, &witness, &mut rng).expect("prove");
+
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    paper::evrf_batched_verify(&params, &statement, &proof, &mut verify_rng).expect("verify");
+
+    let mut reordered = statement.clone();
+    reordered.dealings.reverse();
+    assert!(paper::evrf_batched_verify(&params, &reordered, &proof, &mut verify_rng).is_err());
+
+    let mut tampered_message = statement.clone();
+    tampered_message.dealings[1].msg[0] ^= 0x01;
+    assert!(
+        paper::evrf_batched_verify(&params, &tampered_message, &proof, &mut verify_rng).is_err()
+    );
+
+    let mut tampered_commitment = statement.clone();
+    let mut coefficients = tampered_commitment.dealings[1].commitment.coefficients();
+    coefficients[0].0 += Gin::generator();
+    tampered_commitment.dealings[1].commitment =
+        FeldmanCommitment::from_coefficients(coefficients).unwrap();
+    assert!(
+        paper::evrf_batched_verify(&params, &tampered_commitment, &proof, &mut verify_rng).is_err()
+    );
+
+    let mut tampered_second_receiver = statement.clone();
+    tampered_second_receiver.dealings[1].receivers[1].pad_commitment += Gin::generator();
+    tampered_second_receiver.dealings[1].receivers[1].encrypted_share += GinScalar::from(1u64);
+    assert!(paper::evrf_batched_verify(
+        &params,
+        &tampered_second_receiver,
+        &proof,
+        &mut verify_rng,
+    )
+    .is_err());
+}
+
+#[test]
+#[ignore = "slow: proves a valid identity share commitment"]
+fn evrf_batched_dealer_accepts_valid_identity_share_commitment() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C10);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 1);
     let beta = R1csField::from(7u64);
     let msg = make_msg(0xABCE);
     let (mut statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
-    statement.receivers[0].share_commitment = Gin::identity();
+    let dealing = &mut statement.dealings[0];
+    // f(x) = 1 - x evaluates to zero at receiver 1. The fixture's original
+    // share there was 11, so removing it from the ciphertext leaves the pad.
+    dealing.commitment = FeldmanCommitment::from_coefficients(vec![
+        Secp256k1Element(Gin::generator()),
+        Secp256k1Element(-Gin::generator()),
+    ])
+    .unwrap();
+    dealing.receivers[0].share_commitment = Gin::identity();
+    dealing.receivers[0].encrypted_share -= GinScalar::from(11u64);
 
-    assert!(
-        paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)
-            .is_err(),
-        "batched proof should reject identity share commitments before circuit construction"
-    );
+    let params = public_params(&statement);
+    let proof = paper::evrf_batched_prove(&params, &statement, &witness, &mut rng)
+        .expect("prove identity share commitment");
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    paper::evrf_batched_verify(&params, &statement, &proof, &mut verify_rng)
+        .expect("verify identity share commitment");
 }
 
 #[test]
@@ -130,9 +221,12 @@ fn evrf_batched_dealer_accepts_identity_coefficient_commitment() {
     let msg = make_msg(0xABCF);
     let (mut statement, mut witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
 
-    statement.commitment_coefficients =
-        vec![Gin::identity(), Gin::generator() * GinScalar::from(11u64)];
-    witness.polynomial_constant = GinScalar::ZERO;
+    statement.dealings[0].commitment = FeldmanCommitment::from_coefficients(vec![
+        Secp256k1Element(Gin::identity()),
+        Secp256k1Element(Gin::generator() * GinScalar::from(11u64)),
+    ])
+    .unwrap();
+    witness.polynomial_constants[0] = Some(GinScalar::ZERO);
 
     let proof =
         paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)
@@ -162,7 +256,7 @@ fn evrf_batched_dealer_rejects_wrong_receiver_pk() {
             .expect("prove");
 
     let mut bad = statement.clone();
-    bad.receivers[0].pkj = Gin::generator() * GinScalar::random(&mut rng);
+    bad.dealings[0].receivers[0].pkj = Gin::generator() * GinScalar::random(&mut rng);
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&public_params(&statement), &bad, &proof, &mut verify_rng)
@@ -186,8 +280,7 @@ fn evrf_batched_dealer_rejects_reordered_receivers() {
             .expect("prove");
 
     let mut bad = statement.clone();
-    bad.receivers.reverse();
-    bad.statement_roots.reverse();
+    bad.dealings[0].receivers.reverse();
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&public_params(&statement), &bad, &proof, &mut verify_rng)
@@ -211,8 +304,7 @@ fn evrf_batched_dealer_rejects_missing_receiver() {
             .expect("prove");
 
     let mut bad = statement.clone();
-    bad.receivers.pop();
-    bad.statement_roots.pop();
+    bad.dealings[0].receivers.pop();
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&public_params(&statement), &bad, &proof, &mut verify_rng)
@@ -260,7 +352,7 @@ fn evrf_batched_dealer_rejects_wrong_pad_commitment() {
             .expect("prove");
 
     let mut bad = statement.clone();
-    bad.receivers[1].pad_commitment = Gin::generator() * GinScalar::random(&mut rng);
+    bad.dealings[0].receivers[1].pad_commitment = Gin::generator() * GinScalar::random(&mut rng);
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&public_params(&statement), &bad, &proof, &mut verify_rng)
@@ -284,7 +376,7 @@ fn evrf_batched_dealer_rejects_wrong_share_commitment() {
             .expect("prove");
 
     let mut bad = statement.clone();
-    bad.receivers[1].share_commitment = Gin::generator() * GinScalar::random(&mut rng);
+    bad.dealings[0].receivers[1].share_commitment = Gin::generator() * GinScalar::random(&mut rng);
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&public_params(&statement), &bad, &proof, &mut verify_rng)
@@ -308,7 +400,7 @@ fn evrf_batched_dealer_rejects_wrong_encrypted_share() {
             .expect("prove");
 
     let mut bad = statement.clone();
-    bad.receivers[1].encrypted_share += GinScalar::from(1u64);
+    bad.dealings[0].receivers[1].encrypted_share += GinScalar::from(1u64);
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&public_params(&statement), &bad, &proof, &mut verify_rng)
@@ -332,7 +424,7 @@ fn evrf_batched_dealer_rejects_wrong_msg() {
             .expect("prove");
 
     let mut bad = statement.clone();
-    bad.msg[0] ^= 0x01;
+    bad.dealings[0].msg[0] ^= 0x01;
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&public_params(&statement), &bad, &proof, &mut verify_rng)
@@ -343,7 +435,7 @@ fn evrf_batched_dealer_rejects_wrong_msg() {
 
 #[test]
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
-fn evrf_batched_dealer_rejects_wrong_statement_root() {
+fn evrf_batched_dealer_rejects_wrong_dealer_message_root() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C70);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 2);
@@ -356,12 +448,12 @@ fn evrf_batched_dealer_rejects_wrong_statement_root() {
             .expect("prove");
 
     let mut bad = statement.clone();
-    bad.statement_roots[0][0] ^= 0x80;
+    bad.dealer_message_root[0] ^= 0x80;
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     assert!(
         paper::evrf_batched_verify(&public_params(&statement), &bad, &proof, &mut verify_rng)
             .is_err(),
-        "verifier must reject a proof replayed under a different statement root"
+        "verifier must reject a proof replayed under a different dealer-message root"
     );
 }
 
