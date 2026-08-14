@@ -643,6 +643,7 @@ dependencies = [
  "group",
  "halo2curves",
  "merlin",
+ "p3-maybe-rayon",
  "postcard",
  "rand_chacha",
  "rand_core 0.6.4",

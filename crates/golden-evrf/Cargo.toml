@@ -20,6 +20,7 @@ ff = { workspace = true, optional = true }
 group = { workspace = true, optional = true }
 halo2curves = { workspace = true, optional = true }
 merlin = { workspace = true }
+p3-maybe-rayon = { workspace = true, optional = true }
 rand_chacha = { workspace = true, optional = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 
@@ -35,7 +36,7 @@ rand_chacha = { workspace = true }
 [features]
 default = []
 miden-serde = ["golden-core/miden-serde"]
-parallel = ["bulletproofs-cycle?/parallel"]
+parallel = ["bulletproofs-cycle?/parallel", "p3-maybe-rayon?/parallel"]
 serde = [
     "dep:serde",
     "bulletproofs-cycle?/serde",
@@ -48,6 +49,7 @@ halo2curves-secp256k1 = [
     "dep:ff",
     "dep:group",
     "dep:halo2curves",
+    "dep:p3-maybe-rayon",
     "dep:rand_chacha",
     "golden-halo2curves/halo2curves-secp256k1",
 ]

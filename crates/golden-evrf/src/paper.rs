@@ -47,6 +47,7 @@ pub mod secp_secq {
     use halo2curves::secq256k1::Secq256k1;
     use halo2curves::{Coordinates, CurveAffine, CurveExt};
     use merlin::Transcript;
+    use p3_maybe_rayon::prelude::*;
     use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
     #[cfg(test)]
@@ -2352,6 +2353,19 @@ pub mod secp_secq {
             .map_err(|_| Error::ProofVerificationFailed)
     }
 
+    /// Derive an independent per-proof RNG seed from the batch seed and the
+    /// proof's index, so each proof's verifier-side randomization no longer
+    /// depends on a single RNG being advanced sequentially through every
+    /// other proof first.
+    fn per_proof_seed(batch_seed: &[u8; 32], index: usize) -> [u8; 32] {
+        let mut transcript = Transcript::new(b"golden-paper-evrf-proof-batch-v1-per-proof");
+        transcript.append_message(b"batch-seed", batch_seed);
+        transcript.append_u64(b"proof-index", index as u64);
+        let mut seed = [0u8; 32];
+        transcript.challenge_bytes(b"proof-rng", &mut seed);
+        seed
+    }
+
     /// Verify several independent Batched Dealer Proofs with one shared MSM.
     pub fn evrf_batched_verify_many(
         params: &BatchedEvrfPublicParams,
@@ -2365,8 +2379,10 @@ pub mod secp_secq {
             validate_batched_public_relations(statement)?;
         }
         // Derive the batching entropy from the complete ordered statements and
-        // proof bytes. The lower layer samples a fresh nonzero coefficient for
-        // each equation from this transcript-derived RNG.
+        // proof bytes. Each proof's own verifier-side randomization is
+        // independently re-derived from this seed (see `per_proof_seed`)
+        // rather than threading one RNG sequentially through every proof, so
+        // preparation below can run in parallel.
         let mut batch_transcript = Transcript::new(b"golden-paper-evrf-proof-batch-v1");
         batch_transcript.append_u64(b"batch-len", instances.len() as u64);
         for (index, (statement, proof)) in instances.iter().enumerate() {
@@ -2377,15 +2393,17 @@ pub mod secp_secq {
         }
         let mut seed = [0u8; 32];
         batch_transcript.challenge_bytes(b"batch-rng", &mut seed);
+
+        let equations = instances
+            .par_iter()
+            .enumerate()
+            .map(|(index, (statement, proof))| {
+                let mut proof_rng = ChaCha20Rng::from_seed(per_proof_seed(&seed, index));
+                prepare_batched_proof(params, statement, proof, &mut proof_rng)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let mut rng = ChaCha20Rng::from_seed(seed);
-
-        let mut equations = Vec::with_capacity(instances.len());
-        for (statement, proof) in instances {
-            // Constant-term Schnorr proofs are deliberately verified one at a
-            // time; only the expensive R1CS equations use the shared MSM.
-            equations.push(prepare_batched_proof(params, statement, proof, &mut rng)?);
-        }
-
         VerificationEquation::verify_batch(equations, &mut rng)
             .map_err(|_| Error::ProofVerificationFailed)
     }
