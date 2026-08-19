@@ -2,12 +2,27 @@
 
 use subtle::ConstantTimeEq;
 
-use crate::{Error, GoldenGroup, GoldenScalar, ParticipantIndex, Polynomial, Result, Share};
+use crate::{Error, GoldenGroup, ParticipantIndex, Polynomial, Result, Share};
 
 /// Feldman commitment to a Shamir polynomial.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeldmanCommitment<G: GoldenGroup> {
     coefficients: Vec<G::Element>,
+}
+
+/// Variable-time double-and-add multiplication by a small public scalar.
+fn mul_by_small_scalar<G: GoldenGroup>(point: &G::Element, scalar: u32) -> G::Element {
+    if scalar == 0 {
+        return G::identity();
+    }
+    let mut acc = G::identity();
+    for bit in (0..u32::BITS - scalar.leading_zeros()).rev() {
+        acc = G::add(&acc, &acc);
+        if (scalar >> bit) & 1 == 1 {
+            acc = G::add(&acc, point);
+        }
+    }
+    acc
 }
 
 impl<G: GoldenGroup> FeldmanCommitment<G> {
@@ -35,15 +50,14 @@ impl<G: GoldenGroup> FeldmanCommitment<G> {
         self.coefficients[0].clone()
     }
 
-    /// Compute the expected public key share for a participant.
+    /// Compute the expected public key share for a participant via Horner's
+    /// method.
     pub fn public_key_share(&self, participant: ParticipantIndex) -> Result<G::Element> {
-        let x = participant.to_scalar::<G::Scalar>()?;
+        let x = participant.get();
         let mut result = G::identity();
-        let mut x_pow = G::Scalar::one();
 
-        for coefficient in &self.coefficients {
-            result = G::add(&result, &G::mul(coefficient, &x_pow));
-            x_pow = x_pow.mul(&x);
+        for coefficient in self.coefficients.iter().rev() {
+            result = G::add(&mul_by_small_scalar::<G>(&result, x), coefficient);
         }
 
         Ok(result)
