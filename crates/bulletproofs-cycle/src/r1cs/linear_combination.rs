@@ -171,3 +171,14 @@ impl<S: Field> Mul<S> for LinearCombination<S> {
         self
     }
 }
+
+/// Multiply `factor` by a constraint coefficient.
+pub(crate) fn scaled_by_coefficient<S: Field>(factor: S, coefficient: &S) -> S {
+    if *coefficient == S::ONE {
+        factor
+    } else if *coefficient == -S::ONE {
+        -factor
+    } else {
+        factor * coefficient
+    }
+}

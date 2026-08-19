@@ -12,7 +12,7 @@ use merlin::Transcript;
 use p3_maybe_rayon::prelude::*;
 use rand_core::CryptoRngCore;
 
-use super::linear_combination::VariableKind;
+use super::linear_combination::{scaled_by_coefficient, VariableKind};
 use super::{
     ConstraintSystem, LinearCombination, Metrics, R1CSProof, RandomizableConstraintSystem,
     RandomizedConstraintSystem, Variable,
@@ -379,12 +379,13 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
         let mut exp_z = *z;
         for lc in self.constraints.iter() {
             for (var, coeff) in &lc.terms {
+                let weighted = scaled_by_coefficient(exp_z, coeff);
                 match var.kind {
-                    VariableKind::MultiplierLeft(i) => wL[i] += exp_z * coeff,
-                    VariableKind::MultiplierRight(i) => wR[i] += exp_z * coeff,
-                    VariableKind::MultiplierOutput(i) => wO[i] += exp_z * coeff,
-                    VariableKind::Committed(i) => wV[i] -= exp_z * coeff,
-                    VariableKind::One => wc -= exp_z * coeff,
+                    VariableKind::MultiplierLeft(i) => wL[i] += weighted,
+                    VariableKind::MultiplierRight(i) => wR[i] += weighted,
+                    VariableKind::MultiplierOutput(i) => wO[i] += weighted,
+                    VariableKind::Committed(i) => wV[i] -= weighted,
+                    VariableKind::One => wc -= weighted,
                 }
             }
             exp_z *= z;
