@@ -363,7 +363,16 @@ fn dkg_accepts_the_deterministic_dealing_and_rejects_malformed_or_replayed_proof
             .try_into()
             .unwrap(),
     ) as usize;
-    assert_eq!(payload_start + payload_len, dealing.message.proof.len());
+    // The nested frame contains only the R1CS proof. Protocol v7 appends a
+    // native constant-term proof, encoded as one point and one scalar. The old
+    // assertion treated the nested frame as the complete stream and stopped
+    // this test before it could exercise the malformed and replayed proofs.
+    let constant_term_proof_len = <Secp256k1GoldenGroup as GoldenGroup>::ELEMENT_REPR_BYTES
+        + <Secp256k1Scalar as GoldenScalar>::REPR_BYTES;
+    assert_eq!(
+        payload_start + payload_len + constant_term_proof_len,
+        dealing.message.proof.len()
+    );
 
     let mut wrong_id = dealing.message.clone();
     wrong_id.proof[PROOF_ID_LEN_BYTES] ^= 0x01;
