@@ -1,9 +1,10 @@
 //! End-to-end tests for the batched-dealer paper eVRF relation.
 //!
 //! These exercise the public `evrf_batched_prove` / `evrf_batched_verify`
-//! surface for an arbitrary number of receivers. Tests that build full proofs
-//! are marked `#[ignore]` because building the Bulletproofs generators
-//! dominates runtime; run them via `cargo nextest --run-ignored only`.
+//! surface for an arbitrary number of receivers. The one-receiver regressions
+//! run in the regular suite. Larger proof shapes remain `#[ignore]` because
+//! building the Bulletproofs generators dominates their runtime; run them via
+//! `cargo nextest --run-ignored only`.
 
 #![allow(clippy::unwrap_used)]
 
@@ -32,7 +33,6 @@ fn public_params(
 }
 
 #[test]
-#[ignore = "slow: pins the complete batched dealer proof stream"]
 fn evrf_batched_dealer_matches_v7_vector() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0002);
     let sk1 = GinScalar::random(&mut rng);
@@ -121,7 +121,6 @@ fn evrf_batched_dealer_rejects_identity_share_commitment() {
 }
 
 #[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn evrf_batched_dealer_accepts_identity_coefficient_commitment() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C11);
     let sk1 = GinScalar::random(&mut rng);
