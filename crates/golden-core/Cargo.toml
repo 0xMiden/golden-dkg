@@ -1,6 +1,6 @@
 [package]
 name = "golden-core"
-version = "0.3.0"
+version = "0.4.0"
 description = "Core traits and protocols for Golden distributed key generation"
 edition.workspace = true
 homepage.workspace = true

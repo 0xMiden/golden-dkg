@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "bulletproofs-cycle"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bulletproofs",
  "criterion",
@@ -596,7 +596,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "golden-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "miden-serde-utils",
  "p3-maybe-rayon",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "golden-evrf"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bulletproofs-cycle",
  "codspeed-criterion-compat",
