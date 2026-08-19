@@ -598,6 +598,7 @@ name = "golden-core"
 version = "0.3.0"
 dependencies = [
  "miden-serde-utils",
+ "p3-maybe-rayon",
  "rand_chacha",
  "rand_core 0.6.4",
  "serde",

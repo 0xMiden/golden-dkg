@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use p3_maybe_rayon::prelude::*;
 use rand_core::CryptoRngCore;
 
 use crate::transcript::{TranscriptBuilder, TranscriptRoot};
@@ -538,32 +539,33 @@ where
     }
     ensure_public_share_keys(message, config)?;
 
-    let mut statements = Vec::new();
-    for receiver in public_share_receivers(config, message.dealer) {
-        let encrypted_share = message
-            .encrypted_shares
-            .get(&receiver)
-            .cloned()
-            .ok_or(Error::MissingShare(receiver.get()))?;
-        // `share_commitment = g^encrypted_share - pad_commitment` rather than
-        // evaluating the Feldman polynomial at `receiver`.
-        let encrypted_share_commitment = G::mul_generator(&encrypted_share.encrypted_share);
-        let share_commitment = G::sub(&encrypted_share_commitment, &encrypted_share.pad_commitment);
+    let receivers: Vec<ParticipantIndex> = public_share_receivers(config, message.dealer).collect();
+    receivers
+        .into_par_iter()
+        .map(|receiver| {
+            let encrypted_share = message
+                .encrypted_shares
+                .get(&receiver)
+                .cloned()
+                .ok_or(Error::MissingShare(receiver.get()))?;
+            // `share_commitment = g^encrypted_share - pad_commitment` rather than
+            // evaluating the Feldman polynomial at `receiver`.
+            let encrypted_share_commitment = G::mul_generator(&encrypted_share.encrypted_share);
+            let share_commitment =
+                G::sub(&encrypted_share_commitment, &encrypted_share.pad_commitment);
 
-        let statement = statement_for_receiver::<G>(
-            config,
-            message.dealer,
-            receiver,
-            message.msg_i,
-            share_commitment,
-            message.commitment.coefficients().to_vec(),
-            encrypted_share,
-            message.transcript_root,
-        )?;
-        statements.push(statement);
-    }
-
-    Ok(statements)
+            statement_for_receiver::<G>(
+                config,
+                message.dealer,
+                receiver,
+                message.msg_i,
+                share_commitment,
+                message.commitment.coefficients().to_vec(),
+                encrypted_share,
+                message.transcript_root,
+            )
+        })
+        .collect()
 }
 
 /// Verify one dealer message.

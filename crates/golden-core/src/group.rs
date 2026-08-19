@@ -18,7 +18,7 @@ pub enum FieldByteOrder {
 }
 
 /// Scalar field operations needed by Shamir sharing and interpolation.
-pub trait GoldenScalar: Clone + Debug + Eq + ConstantTimeEq + Sized {
+pub trait GoldenScalar: Clone + Debug + Eq + ConstantTimeEq + Sized + Send + Sync {
     /// Canonical scalar byte representation.
     type Repr: AsRef<[u8]> + Clone + Debug + Eq + TryFrom<Vec<u8>>;
 
@@ -119,7 +119,7 @@ pub trait GoldenGroup: Clone + Debug + Sized {
     type Scalar: GoldenScalar;
 
     /// Group element type.
-    type Element: Clone + Debug + Eq + ConstantTimeEq;
+    type Element: Clone + Debug + Eq + ConstantTimeEq + Send + Sync;
 
     /// Canonical group element byte representation.
     type ElementRepr: AsRef<[u8]> + Clone + Debug + Eq;

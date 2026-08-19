@@ -36,7 +36,7 @@ rand_chacha = { workspace = true }
 [features]
 default = []
 miden-serde = ["golden-core/miden-serde"]
-parallel = ["bulletproofs-cycle?/parallel", "p3-maybe-rayon?/parallel"]
+parallel = ["bulletproofs-cycle?/parallel", "golden-core/parallel", "p3-maybe-rayon?/parallel"]
 serde = [
     "dep:serde",
     "bulletproofs-cycle?/serde",
