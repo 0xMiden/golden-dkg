@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use ff::Field;
 use group::Group;
 use merlin::Transcript;
+use p3_maybe_rayon::prelude::*;
 use rand_core::CryptoRngCore;
 
 use super::linear_combination::VariableKind;
@@ -181,9 +182,10 @@ impl<C: Cycle> VerificationEquation<C> {
         if scalars.len() > accumulator_scalars.len() {
             accumulator_scalars.resize(scalars.len(), C::Scalar::ZERO);
         }
-        for (accumulator, scalar) in accumulator_scalars.iter_mut().zip(scalars) {
-            *accumulator += coefficient * scalar;
-        }
+        accumulator_scalars
+            .par_iter_mut()
+            .zip(scalars.into_par_iter())
+            .for_each(|(accumulator, scalar)| *accumulator += coefficient * scalar);
         Ok(())
     }
 }

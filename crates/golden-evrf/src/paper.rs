@@ -1855,7 +1855,7 @@ pub mod secp_secq {
         if is_identity(&statement.pk1) {
             return Err(Error::ProofVerificationFailed);
         }
-        for rec in &statement.receivers {
+        statement.receivers.par_iter().try_for_each(|rec| {
             if is_identity(&rec.pkj)
                 || is_identity(&rec.share_commitment)
                 || is_identity(&rec.pad_commitment)
@@ -1870,8 +1870,8 @@ pub mod secp_secq {
             if Gin::generator() * rec.encrypted_share != rec.share_commitment + rec.pad_commitment {
                 return Err(Error::ProofVerificationFailed);
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Variable-time double-and-add multiplication by a small scalar.
