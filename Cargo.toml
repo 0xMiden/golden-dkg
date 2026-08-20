@@ -31,8 +31,8 @@ ff = { version = "0.13", default-features = false }
 group = { version = "0.13", default-features = false }
 golden-core = { path = "crates/golden-core", version = "0.4.0" }
 golden-evrf = { path = "crates/golden-evrf", version = "0.4.0" }
-golden-halo2curves = { path = "crates/golden-halo2curves", version = "0.3.0" }
-golden-rustcrypto = { path = "crates/golden-rustcrypto", version = "0.3.0" }
+golden-halo2curves = { path = "crates/golden-halo2curves", version = "0.4.0" }
+golden-rustcrypto = { path = "crates/golden-rustcrypto", version = "0.4.0" }
 halo2curves = { version = "0.10", default-features = false }
 hex = "0.4"
 hkdf = "0.12"
