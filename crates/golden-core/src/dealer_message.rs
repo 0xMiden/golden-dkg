@@ -1,9 +1,9 @@
 //! Private canonical encoding for opaque dealer broadcasts.
 
 use crate::{
-    main_golden::effective_message, DkgConfig, DkgInstanceKind, Error, EvrfMessage, FieldByteOrder,
-    GoldenGroup, GoldenScalar, ParticipantIndex, Result, TranscriptBuilder, TranscriptRoot,
-    PROTOCOL_VERSION,
+    main_golden::effective_message, DealerMessageError, DealerProofStatement, DkgConfig,
+    DkgInstanceKind, Error, EvrfMessage, FeldmanCommitment, FieldByteOrder, GoldenGroup,
+    GoldenScalar, ParticipantIndex, Result, TranscriptBuilder, TranscriptRoot, PROTOCOL_VERSION,
 };
 
 const DEALER_MESSAGE_MAGIC: &[u8; 17] = b"golden-dkg-dealer";
@@ -33,6 +33,13 @@ pub(crate) struct DealerMessageReceiver<G: GoldenGroup> {
     pub(crate) share_commitment: G::Element,
     pub(crate) pad_commitment: G::Element,
     pub(crate) encrypted_share: G::Scalar,
+}
+
+/// One privately parsed opaque dealer message and its flat proof input.
+pub(crate) struct ParsedDealerMessage<G: GoldenGroup> {
+    pub(crate) message: DealerMessageData<G>,
+    pub(crate) statement: DealerProofStatement<G>,
+    pub(crate) proof: Vec<u8>,
 }
 
 pub(crate) fn encoded_prefix_len<G: GoldenGroup>(config: &DkgConfig<G>) -> Result<usize> {
@@ -181,6 +188,189 @@ pub(crate) fn encode_dealer_message<G: GoldenGroup>(
     Ok(encoded)
 }
 
+/// Parse and publicly preflight one exact configuration-shaped message.
+///
+/// This does not interpret the remaining proof suffix. Callers can therefore
+/// validate every public relation in a candidate set before invoking any proof
+/// parser through [`crate::DealerProofSystem`].
+pub(crate) fn parse_dealer_message<G>(
+    config: &DkgConfig<G>,
+    expected_dealer: ParticipantIndex,
+    encoded: &[u8],
+) -> core::result::Result<ParsedDealerMessage<G>, DealerMessageError>
+where
+    G: GoldenGroup,
+{
+    if encoded.len() > MAX_DEALER_MESSAGE_BYTES {
+        return Err(DealerMessageError::TooLarge {
+            actual: encoded.len(),
+            maximum: MAX_DEALER_MESSAGE_BYTES,
+        });
+    }
+
+    let required_prefix =
+        encoded_prefix_len::<G>(config).map_err(|_| DealerMessageError::TooLarge {
+            actual: encoded.len(),
+            maximum: MAX_DEALER_MESSAGE_BYTES,
+        })?;
+    if required_prefix > MAX_DEALER_MESSAGE_BYTES {
+        return Err(DealerMessageError::TooLarge {
+            actual: required_prefix,
+            maximum: MAX_DEALER_MESSAGE_BYTES,
+        });
+    }
+
+    let mut reader = DealerMessageReader::new(encoded);
+    if reader.read_exact(DEALER_MESSAGE_MAGIC.len())? != DEALER_MESSAGE_MAGIC.as_slice()
+        || reader.read_u32()? != DEALER_MESSAGE_CODEC_VERSION
+        || reader.read_u32()? != PROTOCOL_VERSION
+    {
+        return Err(DealerMessageError::Malformed);
+    }
+    let curve_id_len = reader.read_u64_as_usize()?;
+    if curve_id_len != G::CURVE_ID.len()
+        || reader.read_exact(curve_id_len)? != G::CURVE_ID.as_bytes()
+    {
+        return Err(DealerMessageError::Malformed);
+    }
+    let configuration_root = config.root();
+    if reader.read_exact(32)? != configuration_root.as_slice() {
+        return Err(DealerMessageError::ConfigurationMismatch);
+    }
+    let encoded_dealer =
+        ParticipantIndex::new(reader.read_u32()?).map_err(|_| DealerMessageError::Malformed)?;
+    if encoded_dealer != expected_dealer {
+        return Err(DealerMessageError::DealerMismatch {
+            encoded: encoded_dealer,
+        });
+    }
+    config
+        .identity_public_key(encoded_dealer)
+        .ok_or(DealerMessageError::InvalidPublicRelations)?;
+    if encoded.len() < required_prefix {
+        return Err(DealerMessageError::Malformed);
+    }
+
+    let receivers_per_instance = config
+        .registry()
+        .len()
+        .checked_sub(1)
+        .ok_or(DealerMessageError::InvalidPublicRelations)?;
+    let mut instances = Vec::new();
+    instances
+        .try_reserve_exact(config.instances().len())
+        .map_err(|_| DealerMessageError::Malformed)?;
+
+    for (position, kind) in config.instances().iter().copied().enumerate() {
+        let mut nonce_bytes = [0u8; crate::DEALER_MESSAGE_NONCE_BYTES];
+        nonce_bytes.copy_from_slice(reader.read_exact(crate::DEALER_MESSAGE_NONCE_BYTES)?);
+        let nonce = crate::DealerMessageNonce(nonce_bytes);
+        let effective_message =
+            effective_message(config.root(), encoded_dealer, position, kind, nonce);
+
+        let physical_coefficient_count = match kind {
+            DkgInstanceKind::Random => config.threshold(),
+            DkgInstanceKind::Zero => config
+                .threshold()
+                .checked_sub(1)
+                .ok_or(DealerMessageError::InvalidPublicRelations)?,
+        };
+        let mut logical_coefficients = Vec::new();
+        logical_coefficients
+            .try_reserve_exact(config.threshold())
+            .map_err(|_| DealerMessageError::Malformed)?;
+        if matches!(kind, DkgInstanceKind::Zero) {
+            logical_coefficients.push(G::identity());
+        }
+        for _ in 0..physical_coefficient_count {
+            logical_coefficients.push(decode_protocol_element::<G>(
+                reader.read_exact(G::ELEMENT_REPR_BYTES)?,
+            )?);
+        }
+        if logical_coefficients.len() != config.threshold() {
+            return Err(DealerMessageError::InvalidPublicRelations);
+        }
+        let commitment = match kind {
+            DkgInstanceKind::Random => FeldmanCommitment::<G>::from_coefficients(
+                clone_elements_fallibly(&logical_coefficients)?,
+            )
+            .map_err(|_| DealerMessageError::InvalidPublicRelations)?,
+            DkgInstanceKind::Zero => FeldmanCommitment::<G>::from_zero_tail(
+                clone_elements_fallibly(&logical_coefficients[1..])?,
+            ),
+        };
+
+        let mut receivers = Vec::new();
+        receivers
+            .try_reserve_exact(receivers_per_instance)
+            .map_err(|_| DealerMessageError::Malformed)?;
+        for (participant, public_key) in config
+            .registry()
+            .entries()
+            .filter(|(participant, _)| *participant != encoded_dealer)
+        {
+            let pad_commitment =
+                decode_protocol_element::<G>(reader.read_exact(G::ELEMENT_REPR_BYTES)?)?;
+            if bool::from(G::is_identity(&pad_commitment)) {
+                return Err(DealerMessageError::InvalidPublicRelations);
+            }
+            let encrypted_share =
+                decode_protocol_scalar::<G::Scalar>(reader.read_exact(G::Scalar::REPR_BYTES)?)?;
+            let share_commitment = commitment
+                .public_key_share(participant)
+                .map_err(|_| DealerMessageError::InvalidPublicRelations)?;
+            let encrypted_commitment = G::mul_generator(&encrypted_share);
+            let expected_encrypted_commitment = G::add(&share_commitment, &pad_commitment);
+            if encrypted_commitment != expected_encrypted_commitment {
+                return Err(DealerMessageError::InvalidPublicRelations);
+            }
+            receivers.push(DealerMessageReceiver {
+                participant,
+                public_key: public_key.clone(),
+                share_commitment,
+                pad_commitment,
+                encrypted_share,
+            });
+        }
+        if receivers.len() != receivers_per_instance {
+            return Err(DealerMessageError::InvalidPublicRelations);
+        }
+        instances.push(DealerMessageInstance {
+            nonce,
+            effective_message,
+            commitment_coefficients: logical_coefficients,
+            receivers,
+        });
+    }
+
+    if reader.position != required_prefix {
+        return Err(DealerMessageError::Malformed);
+    }
+    let proof_suffix = reader.remaining();
+    if config.registry().len() == 1 && !proof_suffix.is_empty() {
+        return Err(DealerMessageError::Malformed);
+    }
+    let mut proof = Vec::new();
+    proof
+        .try_reserve_exact(proof_suffix.len())
+        .map_err(|_| DealerMessageError::Malformed)?;
+    proof.extend_from_slice(proof_suffix);
+    let message = DealerMessageData {
+        dealer: encoded_dealer,
+        instances,
+    };
+    let message_root = dealer_message_root(config, &message)
+        .map_err(|_| DealerMessageError::InvalidPublicRelations)?;
+    let statement = statement_from_message(config, &message, message_root)
+        .map_err(|_| DealerMessageError::InvalidPublicRelations)?;
+
+    Ok(ParsedDealerMessage {
+        message,
+        statement,
+        proof,
+    })
+}
+
 /// Encode a scalar in the fixed big-endian dealer-message protocol order.
 fn encode_protocol_scalar<S: GoldenScalar>(scalar: &S) -> Result<Vec<u8>> {
     let mut encoded = scalar.to_repr().as_ref().to_vec();
@@ -200,6 +390,171 @@ fn transcript_protocol_scalar<G: GoldenGroup>(
 ) -> Result<()> {
     transcript.bytes(label, &encode_protocol_scalar(scalar)?);
     Ok(())
+}
+
+fn decode_protocol_scalar<S: GoldenScalar>(
+    encoded: &[u8],
+) -> core::result::Result<S, DealerMessageError> {
+    if encoded.len() != S::REPR_BYTES {
+        return Err(DealerMessageError::Malformed);
+    }
+    let mut native = clone_bytes_fallibly(encoded)?;
+    if S::repr_byte_order() == FieldByteOrder::LittleEndian {
+        native.reverse();
+    }
+    let repr = S::Repr::try_from(native).map_err(|_| DealerMessageError::Malformed)?;
+    let scalar = S::from_repr(&repr).map_err(|_| DealerMessageError::Malformed)?;
+    if encode_protocol_scalar(&scalar)
+        .map_err(|_| DealerMessageError::Malformed)?
+        .as_slice()
+        != encoded
+    {
+        return Err(DealerMessageError::Malformed);
+    }
+    Ok(scalar)
+}
+
+fn decode_protocol_element<G>(
+    encoded: &[u8],
+) -> core::result::Result<G::Element, DealerMessageError>
+where
+    G: GoldenGroup,
+{
+    if encoded.len() != G::ELEMENT_REPR_BYTES {
+        return Err(DealerMessageError::Malformed);
+    }
+    let repr = G::ElementRepr::try_from(clone_bytes_fallibly(encoded)?)
+        .map_err(|_| DealerMessageError::Malformed)?;
+    let element = G::decode_element(&repr).map_err(|_| DealerMessageError::Malformed)?;
+    if G::encode_element(&element).as_ref() != encoded {
+        return Err(DealerMessageError::Malformed);
+    }
+    Ok(element)
+}
+
+fn clone_elements_fallibly<E: Clone>(
+    elements: &[E],
+) -> core::result::Result<Vec<E>, DealerMessageError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(elements.len())
+        .map_err(|_| DealerMessageError::Malformed)?;
+    cloned.extend(elements.iter().cloned());
+    Ok(cloned)
+}
+
+fn clone_bytes_fallibly(bytes: &[u8]) -> core::result::Result<Vec<u8>, DealerMessageError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| DealerMessageError::Malformed)?;
+    cloned.extend_from_slice(bytes);
+    Ok(cloned)
+}
+
+fn statement_from_message<G: GoldenGroup>(
+    config: &DkgConfig<G>,
+    message: &DealerMessageData<G>,
+    message_root: TranscriptRoot,
+) -> Result<DealerProofStatement<G>> {
+    let instance_count = message.instances.len();
+    let receivers_per_instance = config
+        .registry()
+        .len()
+        .checked_sub(1)
+        .ok_or(Error::ProofVerificationFailed)?;
+    let coefficient_count = instance_count
+        .checked_mul(config.threshold())
+        .ok_or(Error::ProofVerificationFailed)?;
+    let receiver_count = instance_count
+        .checked_mul(receivers_per_instance)
+        .ok_or(Error::ProofVerificationFailed)?;
+    let mut effective_messages = Vec::new();
+    let mut commitment_coefficients = Vec::new();
+    let mut share_commitments = Vec::new();
+    let mut pad_commitments = Vec::new();
+    let mut encrypted_shares = Vec::new();
+    effective_messages
+        .try_reserve_exact(instance_count)
+        .map_err(|_| Error::ProofVerificationFailed)?;
+    commitment_coefficients
+        .try_reserve_exact(coefficient_count)
+        .map_err(|_| Error::ProofVerificationFailed)?;
+    share_commitments
+        .try_reserve_exact(receiver_count)
+        .map_err(|_| Error::ProofVerificationFailed)?;
+    pad_commitments
+        .try_reserve_exact(receiver_count)
+        .map_err(|_| Error::ProofVerificationFailed)?;
+    encrypted_shares
+        .try_reserve_exact(receiver_count)
+        .map_err(|_| Error::ProofVerificationFailed)?;
+    for instance in &message.instances {
+        effective_messages.push(instance.effective_message);
+        commitment_coefficients.extend(instance.commitment_coefficients.iter().cloned());
+        for receiver in &instance.receivers {
+            share_commitments.push(receiver.share_commitment.clone());
+            pad_commitments.push(receiver.pad_commitment.clone());
+            encrypted_shares.push(receiver.encrypted_share.clone());
+        }
+    }
+    DealerProofStatement::from_public_parts(
+        config,
+        message.dealer,
+        message_root,
+        effective_messages,
+        commitment_coefficients,
+        share_commitments,
+        pad_commitments,
+        encrypted_shares,
+    )
+}
+
+struct DealerMessageReader<'a> {
+    encoded: &'a [u8],
+    position: usize,
+}
+
+impl<'a> DealerMessageReader<'a> {
+    fn new(encoded: &'a [u8]) -> Self {
+        Self {
+            encoded,
+            position: 0,
+        }
+    }
+
+    fn read_exact(&mut self, len: usize) -> core::result::Result<&'a [u8], DealerMessageError> {
+        let end = self
+            .position
+            .checked_add(len)
+            .ok_or(DealerMessageError::Malformed)?;
+        let bytes = self
+            .encoded
+            .get(self.position..end)
+            .ok_or(DealerMessageError::Malformed)?;
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn read_u32(&mut self) -> core::result::Result<u32, DealerMessageError> {
+        let bytes: [u8; 4] = self
+            .read_exact(4)?
+            .try_into()
+            .map_err(|_| DealerMessageError::Malformed)?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
+    fn read_u64_as_usize(&mut self) -> core::result::Result<usize, DealerMessageError> {
+        let bytes: [u8; 8] = self
+            .read_exact(8)?
+            .try_into()
+            .map_err(|_| DealerMessageError::Malformed)?;
+        usize::try_from(u64::from_be_bytes(bytes)).map_err(|_| DealerMessageError::Malformed)
+    }
+
+    fn remaining(&self) -> &'a [u8] {
+        &self.encoded[self.position..]
+    }
 }
 
 fn validate_shape<G: GoldenGroup>(

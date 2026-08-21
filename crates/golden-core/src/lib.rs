@@ -23,20 +23,20 @@ pub mod wire;
 #[cfg(test)]
 mod test_support;
 
-pub use deal::{deal, max_dealer_message_bytes, OwnDealing};
+pub use deal::{complete, deal, max_dealer_message_bytes, OwnDealing};
 pub use dealer_proof::{
     DealerProofInstanceView, DealerProofReceiverView, DealerProofRef, DealerProofStatement,
     DealerProofSystem, DealerProofWitness, DealerProofWitnessInstanceView,
     DealerProofWitnessReceiverView,
 };
 pub use dkg::{
-    complete, create_dealing, verify_dealing, verify_dealings, DealerMessage, DealerMessageNonce,
-    DealingBody, DkgConfig, DkgDealing, DkgInstanceKind, DkgInstanceOutput, DkgOutput,
-    EncryptedShare, EvrfDealingStatement, EvrfDealingWitness, EvrfMessage, EvrfProofBackend,
-    EvrfReceiverStatement, EvrfReceiverWitness, EvrfStatement, EvrfWitness, ParticipantRegistry,
-    SessionId, DEALER_MESSAGE_NONCE_BYTES, PROTOCOL_VERSION,
+    complete_legacy, create_dealing, verify_dealing, verify_dealings, DealerMessage,
+    DealerMessageNonce, DealingBody, DkgConfig, DkgDealing, DkgInstanceKind, DkgInstanceOutput,
+    DkgOutput, EncryptedShare, EvrfDealingStatement, EvrfDealingWitness, EvrfMessage,
+    EvrfProofBackend, EvrfReceiverStatement, EvrfReceiverWitness, EvrfStatement, EvrfWitness,
+    ParticipantRegistry, SessionId, DEALER_MESSAGE_NONCE_BYTES, PROTOCOL_VERSION,
 };
-pub use error::{Error, Result};
+pub use error::{DealerMessageError, Error, Result};
 pub use feldman::FeldmanCommitment;
 pub use group::{FieldByteOrder, GoldenCurve, GoldenGroup, GoldenHashToGroup, GoldenScalar};
 pub use participant::ParticipantIndex;

@@ -123,7 +123,7 @@ pub trait GoldenGroup: Clone + Debug + Sized {
     type Element: Clone + Debug + Eq + ConstantTimeEq;
 
     /// Canonical group element byte representation.
-    type ElementRepr: AsRef<[u8]> + Clone + Debug + Eq;
+    type ElementRepr: AsRef<[u8]> + Clone + Debug + Eq + TryFrom<Vec<u8>>;
 
     /// Length in bytes of [`Self::ElementRepr`].
     const ELEMENT_REPR_BYTES: usize;

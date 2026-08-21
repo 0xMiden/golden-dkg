@@ -1,7 +1,44 @@
 //! Error types for Golden core operations.
 
+use crate::participant::ParticipantIndex;
+
 /// Result type used by `golden-core`.
 pub type Result<T> = core::result::Result<T, Error>;
+
+/// Coarse reason why one attributed opaque dealer message was rejected.
+///
+/// These reasons intentionally omit byte offsets, instance and receiver
+/// positions, parsed values, and proof-system details.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum DealerMessageError {
+    /// The complete opaque message exceeded the protocol limit.
+    #[error("dealer message is too large: actual={actual}, maximum={maximum}")]
+    TooLarge {
+        /// Supplied byte length (or the minimum length required by the config).
+        actual: usize,
+        /// Maximum accepted whole-message length.
+        maximum: usize,
+    },
+
+    /// The envelope or configuration-selected body grammar was malformed.
+    #[error("malformed dealer message")]
+    Malformed,
+
+    /// The message was bound to another DKG configuration.
+    #[error("dealer message configuration mismatch")]
+    ConfigurationMismatch,
+
+    /// The encoded dealer disagreed with the caller's routing metadata.
+    #[error("encoded dealer mismatch: {encoded:?}")]
+    DealerMismatch {
+        /// Canonically decoded dealer carried by the message.
+        encoded: ParticipantIndex,
+    },
+
+    /// A public algebraic relation in the message was invalid.
+    #[error("invalid dealer message public relations")]
+    InvalidPublicRelations,
+}
 
 /// Errors returned by Golden core operations.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -126,6 +163,58 @@ pub enum Error {
     /// Local eVRF evaluation produced a zero pad and must be retried afresh.
     #[error("degenerate local eVRF output; retry the complete deal operation")]
     DegenerateEvrfOutput,
+
+    /// Dealer-local state does not belong to this participant/configuration.
+    #[error("own dealing does not match the completion request")]
+    OwnDealingMismatch,
+
+    /// No candidate was supplied for one configured peer dealer.
+    #[error("missing dealer candidate {dealer:?}")]
+    MissingDealer {
+        /// Missing configured dealer.
+        dealer: ParticipantIndex,
+    },
+
+    /// More than one candidate was supplied for a configured dealer.
+    #[error("duplicate dealer candidate {dealer:?}")]
+    DuplicateDealer {
+        /// Duplicated dealer.
+        dealer: ParticipantIndex,
+    },
+
+    /// A candidate named a participant outside the expected peer set.
+    #[error("unexpected dealer candidate {dealer:?}")]
+    UnexpectedDealer {
+        /// Unexpected dealer.
+        dealer: ParticipantIndex,
+    },
+
+    /// One attributed opaque candidate failed coarse message validation.
+    #[error("invalid dealer message from {dealer:?}: {reason}")]
+    InvalidDealerMessage {
+        /// Expected dealer supplied as routing metadata.
+        dealer: ParticipantIndex,
+        /// Coarse public reason for rejection.
+        reason: DealerMessageError,
+    },
+
+    /// Individual fallback identified every invalid dealer proof.
+    #[error("invalid dealer proofs: {dealers:?}")]
+    InvalidDealerProofs {
+        /// Invalid dealers in canonical participant order.
+        dealers: Vec<ParticipantIndex>,
+    },
+
+    /// Batch verification failed although every individual proof passed.
+    #[error("dealer proof batch verification failed")]
+    BatchVerificationFailed,
+
+    /// A verified dealer message could not be decrypted for this participant.
+    #[error("share decryption failed for dealer {dealer:?}")]
+    ShareDecryptionFailed {
+        /// Dealer whose receiver share could not be recovered.
+        dealer: ParticipantIndex,
+    },
 
     /// A dealer proof failed individual verification after a batch failure.
     #[error("proof verification failed for dealer {0}")]

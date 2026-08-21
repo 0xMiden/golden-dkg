@@ -102,8 +102,9 @@ use std::io;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use golden_core::{
-    complete, create_dealing, DealerMessage, DkgConfig, DkgDealing, DkgInstanceKind, DkgOutput,
-    GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
+    complete_legacy as complete, create_dealing, DealerMessage, DkgConfig, DkgDealing,
+    DkgInstanceKind, DkgOutput, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry,
+    SessionId,
 };
 use golden_ehtdh1::wire::{from_wire_bytes, to_wire_bytes};
 use golden_ehtdh1::{

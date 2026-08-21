@@ -97,6 +97,33 @@ impl<G: GoldenGroup> DealerProofStatement<G> {
         .map_err(|_| Error::ProofGenerationFailed)
     }
 
+    /// Reconstruct the core-owned public statement from a canonically parsed
+    /// dealer message. All failures stay on the verification side of the
+    /// public error boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_public_parts(
+        config: &DkgConfig<G>,
+        dealer: ParticipantIndex,
+        dealer_message_root: TranscriptRoot,
+        effective_messages: Vec<EvrfMessage>,
+        commitment_coefficients: Vec<G::Element>,
+        share_commitments: Vec<G::Element>,
+        pad_commitments: Vec<G::Element>,
+        encrypted_shares: Vec<G::Scalar>,
+    ) -> Result<Self> {
+        Self::build(
+            config,
+            dealer,
+            dealer_message_root,
+            effective_messages,
+            commitment_coefficients,
+            share_commitments,
+            pad_commitments,
+            encrypted_shares,
+        )
+        .map_err(|_| Error::ProofVerificationFailed)
+    }
+
     #[allow(dead_code, clippy::too_many_arguments)]
     fn build(
         config: &DkgConfig<G>,

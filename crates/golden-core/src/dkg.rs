@@ -441,18 +441,30 @@ impl<G: GoldenGroup> core::fmt::Debug for DkgDealing<G> {
 #[derive(Clone, Eq, PartialEq)]
 pub struct DkgInstanceOutput<G: GoldenGroup> {
     public_key: G::Element,
-    secret_share: Share<G::Scalar>,
+    secret_share: G::Scalar,
     public_key_shares: BTreeMap<ParticipantIndex, G::Element>,
 }
 
 impl<G: GoldenGroup> DkgInstanceOutput<G> {
+    pub(crate) fn new(
+        public_key: G::Element,
+        secret_share: G::Scalar,
+        public_key_shares: BTreeMap<ParticipantIndex, G::Element>,
+    ) -> Self {
+        Self {
+            public_key,
+            secret_share,
+            public_key_shares,
+        }
+    }
+
     /// Return the shared public key.
     pub fn public_key(&self) -> &G::Element {
         &self.public_key
     }
 
     /// Return this participant's secret share.
-    pub fn secret_share(&self) -> &Share<G::Scalar> {
+    pub fn secret_share(&self) -> &G::Scalar {
         &self.secret_share
     }
 
@@ -475,12 +487,29 @@ impl<G: GoldenGroup> core::fmt::Debug for DkgInstanceOutput<G> {
 /// Immutable atomic output for the complete ordered DKG batch.
 #[derive(Clone, Eq, PartialEq)]
 pub struct DkgOutput<G: GoldenGroup> {
+    participant: ParticipantIndex,
     configuration_root: TranscriptRoot,
     instances: Vec<DkgInstanceOutput<G>>,
-    completion_root: TranscriptRoot,
 }
 
 impl<G: GoldenGroup> DkgOutput<G> {
+    pub(crate) fn new(
+        participant: ParticipantIndex,
+        configuration_root: TranscriptRoot,
+        instances: Vec<DkgInstanceOutput<G>>,
+    ) -> Self {
+        Self {
+            participant,
+            configuration_root,
+            instances,
+        }
+    }
+
+    /// Return the participant whose local secret shares this output contains.
+    pub fn participant(&self) -> ParticipantIndex {
+        self.participant
+    }
+
     /// Return the proof-policy-independent configuration root accepted during
     /// completion.
     pub fn configuration_root(&self) -> TranscriptRoot {
@@ -492,18 +521,24 @@ impl<G: GoldenGroup> DkgOutput<G> {
         &self.instances
     }
 
-    /// Return the atomic completion identity, including the proof policy used.
+    /// Return one completed instance by configuration position.
+    pub fn instance(&self, position: usize) -> Option<&DkgInstanceOutput<G>> {
+        self.instances.get(position)
+    }
+
+    /// Derive the identity of the common public DKG result.
     pub fn completion_root(&self) -> TranscriptRoot {
-        self.completion_root
+        completion_root_from_public::<G>(self.configuration_root, &self.instances)
     }
 }
 
 impl<G: GoldenGroup> core::fmt::Debug for DkgOutput<G> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DkgOutput")
+            .field("participant", &self.participant)
             .field("configuration_root", &self.configuration_root)
             .field("instances", &self.instances)
-            .field("completion_root", &self.completion_root)
+            .field("completion_root", &self.completion_root())
             .finish()
     }
 }
@@ -816,7 +851,7 @@ where
 ///
 /// `legacy_beta` must be the same caller-selected scalar used by every dealer.
 /// It is unrelated to the protocol-wide Main Golden base-field coefficient.
-pub fn complete<G, B>(
+pub fn complete_legacy<G, B>(
     receiver: ParticipantIndex,
     receiver_identity_secret: &G::Scalar,
     own_dealing: &DkgDealing<G>,
@@ -916,21 +951,14 @@ where
                 aggregate_commitment.public_key_share(participant)?,
             );
         }
-        outputs.push(DkgInstanceOutput {
-            public_key: aggregate_commitment.public_key(),
-            secret_share: Share {
-                participant: receiver,
-                value: secret_share_value,
-            },
+        outputs.push(DkgInstanceOutput::new(
+            aggregate_commitment.public_key(),
+            secret_share_value,
             public_key_shares,
-        });
+        ));
     }
 
-    Ok(DkgOutput {
-        configuration_root: config.root,
-        instances: outputs,
-        completion_root: completion_root::<G, B>(config.root, &all_dealings),
-    })
+    Ok(DkgOutput::new(receiver, config.root, outputs))
 }
 
 fn config_root<G: GoldenGroup>(
@@ -1026,20 +1054,23 @@ fn statement_root<G: GoldenGroup>(statement: &EvrfStatement<G>) -> TranscriptRoo
     transcript.root()
 }
 
-fn completion_root<G, B>(
+fn completion_root_from_public<G: GoldenGroup>(
     configuration_root: TranscriptRoot,
-    dealings: &BTreeMap<ParticipantIndex, &DealerMessage<G>>,
-) -> TranscriptRoot
-where
-    G: GoldenGroup,
-    B: EvrfProofBackend<G>,
-{
-    let mut transcript = TranscriptBuilder::new(b"completion");
-    transcript.bytes(b"configuration", &configuration_root);
-    transcript.bytes(b"proof-backend", B::PROOF_ID);
-    transcript.usize(b"dealers-len", dealings.len());
-    for message in dealings.values() {
-        transcript.bytes(b"dealer-message-root", &message.root());
+    instances: &[DkgInstanceOutput<G>],
+) -> TranscriptRoot {
+    let mut transcript =
+        TranscriptBuilder::with_prefix(b"golden-dkg/completion-root/v1", b"common-public-output");
+    transcript.u32(b"protocol-version", PROTOCOL_VERSION);
+    transcript.bytes(b"configuration-root", &configuration_root);
+    transcript.usize(b"instance-count", instances.len());
+    for (position, instance) in instances.iter().enumerate() {
+        transcript.usize(b"instance-position", position);
+        transcript.element::<G>(b"public-key", &instance.public_key);
+        transcript.usize(b"public-key-share-count", instance.public_key_shares.len());
+        for (participant, public_key_share) in &instance.public_key_shares {
+            transcript.participant(b"participant", *participant);
+            transcript.element::<G>(b"public-key-share", public_key_share);
+        }
     }
     transcript.root()
 }
@@ -1407,7 +1438,7 @@ mod tests {
             .filter(|(dealer, _)| **dealer != receiver)
             .map(|(dealer, dealing)| (*dealer, dealing.message().clone()))
             .collect();
-        complete::<TinyGroup, ExplicitLegacyBetaBackend>(
+        complete_legacy::<TinyGroup, ExplicitLegacyBetaBackend>(
             receiver,
             &secret(receiver),
             &dealings[&receiver],
@@ -1729,7 +1760,7 @@ mod tests {
             .filter(|(dealer, _)| **dealer != receiver)
             .map(|(dealer, dealing)| (*dealer, dealing.message().clone()))
             .collect();
-        complete::<TinyGroup, FakeBackend>(
+        complete_legacy::<TinyGroup, FakeBackend>(
             receiver,
             &secret(receiver),
             &dealings[&receiver],
@@ -1894,7 +1925,7 @@ mod tests {
         )
         .unwrap();
 
-        let output = complete::<TinyGroup, UnreachableBackend>(
+        let output = complete_legacy::<TinyGroup, UnreachableBackend>(
             dealer,
             &secret(dealer),
             &dealing,
@@ -1907,7 +1938,7 @@ mod tests {
         for instance in output.instances() {
             assert_eq!(
                 instance.public_key(),
-                &TinyGroup::mul_generator(&instance.secret_share().value)
+                &TinyGroup::mul_generator(instance.secret_share())
             );
         }
         assert_eq!(output.instances()[1].public_key(), &TinyGroup::identity());
@@ -1996,7 +2027,7 @@ mod tests {
                 .map(|(dealer, dealing)| (*dealer, dealing.message().clone()))
                 .collect();
             outputs.push(
-                complete::<TinyGroup, FakeBackend>(
+                complete_legacy::<TinyGroup, FakeBackend>(
                     receiver,
                     &secret(receiver),
                     &dealings[&receiver],
@@ -2092,7 +2123,7 @@ mod tests {
             let mut peers = base_peers.clone();
             peers.insert(unknown, extra);
             assert_eq!(
-                complete::<TinyGroup, FakeBackend>(
+                complete_legacy::<TinyGroup, FakeBackend>(
                     receiver,
                     &secret(receiver),
                     &own_dealing,
@@ -2133,7 +2164,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                complete::<TinyGroup, FakeBackend>(
+                complete_legacy::<TinyGroup, FakeBackend>(
                     receiver,
                     &secret(receiver),
                     &dealings[&receiver],
@@ -2154,11 +2185,6 @@ mod tests {
         let second = dealer_dealings::<FakeBackend>(&config, 19);
         let first_output = complete_receiver(idx(1), &first, &config).unwrap();
         let second_output = complete_receiver(idx(1), &second, &config).unwrap();
-        let first_messages = first
-            .iter()
-            .map(|(dealer, dealing)| (*dealer, dealing.message()))
-            .collect::<BTreeMap<_, _>>();
-
         assert_eq!(
             first_output.configuration_root(),
             second_output.configuration_root()
@@ -2169,12 +2195,12 @@ mod tests {
         );
         assert_ne!(
             first_output.completion_root(),
-            completion_root::<TinyGroup, FakeBackend>([9; 32], &first_messages)
+            completion_root_from_public::<TinyGroup>([9; 32], first_output.instances())
         );
     }
 
     #[test]
-    fn completion_root_binds_the_accepting_proof_backend() {
+    fn completion_root_excludes_the_accepting_proof_backend() {
         let config = mixed_config();
         let dealings = dealer_dealings::<FakeBackend>(&config, 20);
         let receiver = idx(1);
@@ -2184,7 +2210,7 @@ mod tests {
             .map(|(dealer, dealing)| (*dealer, dealing.message().clone()))
             .collect();
 
-        let default_output = complete::<TinyGroup, FakeBackend>(
+        let default_output = complete_legacy::<TinyGroup, FakeBackend>(
             receiver,
             &secret(receiver),
             &dealings[&receiver],
@@ -2193,7 +2219,7 @@ mod tests {
             &legacy_beta(),
         )
         .unwrap();
-        let alternate_output = complete::<TinyGroup, AlternateFakeBackend>(
+        let alternate_output = complete_legacy::<TinyGroup, AlternateFakeBackend>(
             receiver,
             &secret(receiver),
             &dealings[&receiver],
@@ -2208,7 +2234,7 @@ mod tests {
             alternate_output.configuration_root()
         );
         assert_eq!(default_output.instances(), alternate_output.instances());
-        assert_ne!(
+        assert_eq!(
             default_output.completion_root(),
             alternate_output.completion_root()
         );

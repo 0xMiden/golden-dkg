@@ -6,8 +6,9 @@
 use std::collections::BTreeMap;
 
 use golden_core::{
-    complete, create_dealing, DealerMessage, DkgConfig, DkgDealing, DkgInstanceKind, DkgOutput,
-    GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
+    complete_legacy as complete, create_dealing, DealerMessage, DkgConfig, DkgDealing,
+    DkgInstanceKind, DkgOutput, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry,
+    SessionId,
 };
 use golden_ehtdh1::{material_from_dkg_output, Combiner, Error, SetupContext, UnsealingShare};
 use golden_evrf::prototype::ShareOpeningBackend;
@@ -140,9 +141,12 @@ fn golden_batch_outputs_open_ehtdh1_payload_and_preserve_share_meaning() {
             assert_eq!(material.secret_share.participant, *participant);
             assert_eq!(
                 material.secret_share.decryption,
-                decryption.secret_share().value
+                decryption.secret_share().clone()
             );
-            assert_eq!(material.secret_share.context, context.secret_share().value);
+            assert_eq!(
+                material.secret_share.context,
+                context.secret_share().clone()
+            );
             assert_eq!(material.setup_context.session_id, config.session_id());
             assert_eq!(material.setup_context.configuration_root, config.root());
             assert_eq!(

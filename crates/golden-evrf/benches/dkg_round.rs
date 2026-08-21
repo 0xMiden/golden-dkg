@@ -41,7 +41,7 @@ mod support;
 
 use codspeed_criterion_compat as criterion;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode};
-use golden_core::{complete, create_dealing};
+use golden_core::{complete_legacy as complete, create_dealing};
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};

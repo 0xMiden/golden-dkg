@@ -74,9 +74,9 @@ pub fn material_from_dkg_output<G: GoldenHashToGroup>(
         public_shares,
     )?;
     let secret_share = SecretShare {
-        participant: decryption_output.secret_share().participant,
-        decryption: decryption_output.secret_share().value.clone(),
-        context: context_output.secret_share().value.clone(),
+        participant: output.participant(),
+        decryption: decryption_output.secret_share().clone(),
+        context: context_output.secret_share().clone(),
     };
     let setup_context = SetupContext {
         backend_id: G::BACKEND_ID.to_owned(),

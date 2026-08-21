@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use golden_core::{
-    complete, create_dealing, verify_dealing,
+    complete_legacy as complete, create_dealing, verify_dealing,
     wire::{from_wire_bytes, to_wire_bytes},
     DealerMessage, DkgConfig, DkgDealing, DkgInstanceKind, EvrfDealingStatement,
     EvrfDealingWitness, EvrfMessage, EvrfProofBackend, EvrfReceiverStatement, EvrfReceiverWitness,
@@ -296,7 +296,7 @@ fn create_wire_roundtrip_verify_and_complete_uses_opaque_proof_bytes() {
     for instance in output.instances() {
         assert_eq!(
             instance.public_key_shares()[&receiver],
-            P256Backend::mul_generator(&instance.secret_share().value)
+            P256Backend::mul_generator(instance.secret_share())
         );
         assert_eq!(instance.public_key_shares().len(), participants().len());
     }

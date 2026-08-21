@@ -274,7 +274,6 @@ impl<G: GoldenGroup> WireEncode for EncryptedShare<G> {
 impl<G> WireDecode for EncryptedShare<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         Ok(Self {
@@ -287,7 +286,6 @@ where
 impl<G> WireMessage for EncryptedShare<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_ENCRYPTED_SHARE;
     const CODEC_ID: &'static str = "encrypted-share-v2";
@@ -345,7 +343,6 @@ impl<G: GoldenGroup> WireEncode for DealingBody<G> {
 impl<G> WireDecode for DealingBody<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let nonce = DealerMessageNonce::read_wire(reader)?;
@@ -385,7 +382,6 @@ impl<G: GoldenGroup> WireEncode for FeldmanCommitment<G> {
 impl<G> WireDecode for FeldmanCommitment<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let has_constant = match reader.read_u8()? {
@@ -417,7 +413,6 @@ where
 impl<G> WireMessage for FeldmanCommitment<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_FELDMAN_COMMITMENT;
     const CODEC_ID: &'static str = "feldman-commitment-v1";
@@ -446,7 +441,6 @@ impl<G: GoldenGroup> WireEncode for ParticipantRegistry<G> {
 impl<G> WireDecode for ParticipantRegistry<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let len = reader.read_len()?;
@@ -466,7 +460,6 @@ where
 impl<G> WireMessage for ParticipantRegistry<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_PARTICIPANT_REGISTRY;
     const CODEC_ID: &'static str = "participant-registry-v1";
@@ -497,7 +490,6 @@ impl<G: GoldenGroup> WireEncode for DkgConfig<G> {
 impl<G> WireDecode for DkgConfig<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let threshold = reader.read_len()?;
@@ -516,7 +508,6 @@ where
 impl<G> WireMessage for DkgConfig<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_DKG_CONFIG;
     const CODEC_ID: &'static str = "dkg-config-v3";
@@ -560,7 +551,6 @@ impl<G: GoldenGroup> WireEncode for DealerMessage<G> {
 impl<G> WireDecode for DealerMessage<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let configuration_root = TranscriptRoot::read_wire(reader)?;
@@ -592,7 +582,6 @@ where
 impl<G> WireMessage for DealerMessage<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_DEALER_MESSAGE;
     const CODEC_ID: &'static str = "dealer-message-v4";
@@ -652,7 +641,6 @@ impl Deserializable for DealerMessageNonce {
 impl<G> Serializable for EncryptedShare<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         write_miden_wire(self, target);
@@ -667,7 +655,6 @@ where
 impl<G> Deserializable for EncryptedShare<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_from<R: ByteReader>(
         source: &mut R,
@@ -680,7 +667,6 @@ where
 impl<G> Serializable for FeldmanCommitment<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         write_miden_wire(self, target);
@@ -695,7 +681,6 @@ where
 impl<G> Deserializable for FeldmanCommitment<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_from<R: ByteReader>(
         source: &mut R,
@@ -708,7 +693,6 @@ where
 impl<G> Serializable for ParticipantRegistry<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         write_miden_wire(self, target);
@@ -723,7 +707,6 @@ where
 impl<G> Deserializable for ParticipantRegistry<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_from<R: ByteReader>(
         source: &mut R,
@@ -736,7 +719,6 @@ where
 impl<G> Serializable for DkgConfig<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         write_miden_wire(self, target);
@@ -751,7 +733,6 @@ where
 impl<G> Deserializable for DkgConfig<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_from<R: ByteReader>(
         source: &mut R,
@@ -764,7 +745,6 @@ where
 impl<G> Serializable for DealerMessage<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
         write_miden_wire(self, target);
@@ -779,7 +759,6 @@ where
 impl<G> Deserializable for DealerMessage<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn read_from<R: ByteReader>(
         source: &mut R,
@@ -866,7 +845,6 @@ impl<'de> Deserialize<'de> for DealerMessageNonce {
 impl<G> Serialize for EncryptedShare<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
         serialize_wire(self, serializer)
@@ -877,7 +855,6 @@ where
 impl<'de, G> Deserialize<'de> for EncryptedShare<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
         deserialize_wire(deserializer)
@@ -888,7 +865,6 @@ where
 impl<G> Serialize for FeldmanCommitment<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
         serialize_wire(self, serializer)
@@ -899,7 +875,6 @@ where
 impl<'de, G> Deserialize<'de> for FeldmanCommitment<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
         deserialize_wire(deserializer)
@@ -910,7 +885,6 @@ where
 impl<G> Serialize for ParticipantRegistry<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
         serialize_wire(self, serializer)
@@ -921,7 +895,6 @@ where
 impl<'de, G> Deserialize<'de> for ParticipantRegistry<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
         deserialize_wire(deserializer)
@@ -932,7 +905,6 @@ where
 impl<G> Serialize for DkgConfig<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
         serialize_wire(self, serializer)
@@ -943,7 +915,6 @@ where
 impl<'de, G> Deserialize<'de> for DkgConfig<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
         deserialize_wire(deserializer)
@@ -954,7 +925,6 @@ where
 impl<G> Serialize for DealerMessage<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
         serialize_wire(self, serializer)
@@ -965,7 +935,6 @@ where
 impl<'de, G> Deserialize<'de> for DealerMessage<G>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
         deserialize_wire(deserializer)
@@ -1073,7 +1042,6 @@ pub fn write_element<G: GoldenGroup>(out: &mut Vec<u8>, element: &G::Element) {
 pub fn read_element<G>(reader: &mut WireReader<'_>) -> Result<G::Element>
 where
     G: GoldenGroup,
-    G::ElementRepr: TryFrom<Vec<u8>>,
 {
     let repr = G::ElementRepr::try_from(reader.read_exact(G::ELEMENT_REPR_BYTES)?.to_vec())
         .map_err(|_| Error::InvalidEncoding)?;

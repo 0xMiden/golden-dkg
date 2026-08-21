@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use golden_core::{
-    complete, create_dealing, verify_dealing,
+    complete_legacy as complete, create_dealing, verify_dealing,
     wire::{from_wire_bytes, to_wire_bytes},
     DealerMessage, DkgConfig, DkgDealing, DkgInstanceKind, GoldenGroup, GoldenScalar,
     ParticipantIndex, ParticipantRegistry, SessionId,
@@ -152,7 +152,7 @@ fn assert_dkg_completes(config: DkgConfig<Group>, decode_messages: bool) {
     for (kind, instance) in config.instances().iter().zip(output.instances()) {
         assert_eq!(
             instance.public_key_shares()[&receiver],
-            Group::mul_generator(&instance.secret_share().value)
+            Group::mul_generator(instance.secret_share())
         );
         assert_eq!(instance.public_key_shares().len(), config.registry().len());
         if *kind == DkgInstanceKind::Zero {
@@ -197,7 +197,7 @@ fn single_participant_dkg_completes_without_proving() {
     for instance in output.instances() {
         assert_eq!(
             instance.public_key(),
-            &Group::mul_generator(&instance.secret_share().value)
+            &Group::mul_generator(instance.secret_share())
         );
     }
     assert!(bool::from(Group::is_identity(
