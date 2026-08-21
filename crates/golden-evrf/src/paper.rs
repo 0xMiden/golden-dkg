@@ -16,7 +16,9 @@
 #![allow(non_snake_case)]
 
 #[cfg(feature = "halo2curves-secp256k1")]
-use golden_core::{Error, FeldmanCommitment, ParticipantIndex, Result, TranscriptRoot};
+use golden_core::{
+    Error, FeldmanCommitment, ParticipantIndex, Result, TranscriptRoot, PROTOCOL_VERSION,
+};
 #[cfg(feature = "halo2curves-secp256k1")]
 use rand_core::CryptoRngCore;
 
@@ -111,6 +113,14 @@ pub mod secp_secq {
     const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v3";
     /// Proof protocol identifier for the batched dealer relation and v7 stream grammar.
     const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v7";
+    /// Private proof-stream grammar for the fixed Main Golden dealer relation.
+    const MAIN_GOLDEN_PROOF_ID: &[u8] = b"golden-dkg/secp-secq-bulletproofs/v1";
+    /// Version explicitly absorbed by Main Golden proof and batch transcripts.
+    const MAIN_GOLDEN_PROOF_VERSION: u32 = 1;
+    /// Dedicated transcript domain for cross-dealer verification coefficients.
+    const MAIN_GOLDEN_BATCH_ID: &[u8] = b"golden-dkg/secp-secq-proof-batch/v1";
+    /// Version explicitly absorbed by the cross-dealer batch transcript.
+    const MAIN_GOLDEN_BATCH_VERSION: u32 = 1;
 
     /// Largest supported padded generator table for the batched dealer relation.
     const MAX_BATCHED_GENERATOR_CAPACITY: usize = 1 << 20;
@@ -183,6 +193,10 @@ pub mod secp_secq {
         pub receiver: ParticipantIndex,
         /// Receiver identity public key `PK_j` in `G_in`.
         pub pkj: Gin,
+        /// First hash-to-group base for this dealer/receiver relation.
+        pub h1: Gin,
+        /// Second hash-to-group base for this dealer/receiver relation.
+        pub h2: Gin,
         /// Public commitment `g_in^share_j` to the receiver share.
         pub share_commitment: Gin,
         /// Published pad commitment `g_in^pad_j` in the dealer broadcast.
@@ -198,6 +212,11 @@ pub mod secp_secq {
         pub msg: [u8; MESSAGE_BYTES],
         /// Feldman commitment to this dealing's polynomial.
         pub commitment: FeldmanCommitment<Secp256k1GoldenGroup>,
+        /// Whether the constant coefficient has a private opening.
+        ///
+        /// Fixed-zero dealings carry the identity as their first logical
+        /// commitment coefficient but deliberately omit a Schnorr record.
+        pub constant_is_explicit: bool,
         /// Per-receiver statements, in the canonical ordered receiver list.
         pub receivers: Vec<BatchedReceiverStatement>,
     }
@@ -1876,7 +1895,7 @@ pub mod secp_secq {
     // Batched statement validation and transcript binding.
     // ------------------------------------------------------------------
 
-    fn validate_batched_public_relations(statement: &BatchedEvrfStatement) -> Result<()> {
+    fn validate_batched_public_relations_common(statement: &BatchedEvrfStatement) -> Result<()> {
         if statement.threshold == 0 || statement.dealings.is_empty() || is_identity(&statement.pk1)
         {
             return Err(Error::ProofVerificationFailed);
@@ -1892,6 +1911,8 @@ pub mod secp_secq {
         for dealing in &statement.dealings {
             if dealing.commitment.threshold() != statement.threshold
                 || dealing.receivers.len() != canonical_receivers.len()
+                || (!dealing.constant_is_explicit
+                    && !is_identity(&dealing.commitment.public_key().0))
             {
                 return Err(Error::ProofVerificationFailed);
             }
@@ -1904,6 +1925,8 @@ pub mod secp_secq {
                     || canonical_receivers[receiver_position].receiver != rec.receiver
                     || canonical_receivers[receiver_position].pkj != rec.pkj
                     || is_identity(&rec.pkj)
+                    || is_identity(&rec.h1)
+                    || is_identity(&rec.h2)
                     || is_identity(&rec.pad_commitment)
                 {
                     return Err(Error::ProofVerificationFailed);
@@ -1921,6 +1944,26 @@ pub mod secp_secq {
             }
         }
         Ok(())
+    }
+
+    fn validate_batched_public_relations(statement: &BatchedEvrfStatement) -> Result<()> {
+        validate_batched_public_relations_common(statement)?;
+        for dealing in &statement.dealings {
+            let h1 = h_gin_1(&dealing.msg);
+            let h2 = h_gin_2(&dealing.msg);
+            if dealing
+                .receivers
+                .iter()
+                .any(|receiver| receiver.h1 != h1 || receiver.h2 != h2)
+            {
+                return Err(Error::ProofVerificationFailed);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_main_golden_public_relations(statement: &BatchedEvrfStatement) -> Result<()> {
+        validate_batched_public_relations_common(statement)
     }
 
     /// Observe the complete batched dealer statement in canonical nested order.
@@ -1941,7 +1984,7 @@ pub mod secp_secq {
             stream.observe_bytes(b"msg", &dealing.msg);
             stream.observe_bytes(
                 b"constant-present",
-                &[u8::from(dealing.commitment.constant().is_some())],
+                &[u8::from(dealing.constant_is_explicit)],
             );
             stream.observe_bytes(
                 b"commitment-len",
@@ -1978,6 +2021,82 @@ pub mod secp_secq {
                 )?;
                 stream
                     .observe_scalar::<GinStreamCurve>(b"encrypted-share", &rec.encrypted_share)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    struct MainGoldenProofContext {
+        configuration_root: TranscriptRoot,
+        dealer: ParticipantIndex,
+    }
+
+    #[derive(Clone, Copy)]
+    enum BatchedProofGrammar {
+        Legacy,
+        MainGolden(MainGoldenProofContext),
+    }
+
+    impl BatchedProofGrammar {
+        fn proof_id(self) -> &'static [u8] {
+            match self {
+                Self::Legacy => BATCHED_PROOF_ID,
+                Self::MainGolden(_) => MAIN_GOLDEN_PROOF_ID,
+            }
+        }
+
+        fn validate(self, statement: &BatchedEvrfStatement) -> Result<()> {
+            match self {
+                Self::Legacy => validate_batched_public_relations(statement),
+                Self::MainGolden(_) => validate_main_golden_public_relations(statement),
+            }
+        }
+
+        fn observe(
+            self,
+            stream: &mut impl Observe,
+            statement: &BatchedEvrfStatement,
+        ) -> Result<()> {
+            match self {
+                Self::Legacy => observe_batched_statement(stream, statement),
+                Self::MainGolden(context) => {
+                    observe_main_golden_statement(stream, context, statement)
+                }
+            }
+        }
+    }
+
+    /// Observe the complete core-owned Main Golden public input before any
+    /// nested proof data or challenge is emitted.
+    fn observe_main_golden_statement(
+        stream: &mut impl Observe,
+        context: MainGoldenProofContext,
+        statement: &BatchedEvrfStatement,
+    ) -> Result<()> {
+        stream.observe_bytes(b"protocol-version", &PROTOCOL_VERSION.to_be_bytes());
+        stream.observe_bytes(b"proof-version", &MAIN_GOLDEN_PROOF_VERSION.to_be_bytes());
+        stream.observe_bytes(b"configuration-root", &context.configuration_root);
+        stream.observe_bytes(b"dealer", &context.dealer.get().to_be_bytes());
+        observe_batched_statement(stream, statement)?;
+        for (instance_position, dealing) in statement.dealings.iter().enumerate() {
+            let instance_position =
+                u64::try_from(instance_position).map_err(|_| Error::ProofVerificationFailed)?;
+            stream.observe_bytes(b"hash-instance", &instance_position.to_be_bytes());
+            for (receiver_position, receiver) in dealing.receivers.iter().enumerate() {
+                let receiver_position =
+                    u64::try_from(receiver_position).map_err(|_| Error::ProofVerificationFailed)?;
+                stream.observe_bytes(b"hash-receiver", &receiver_position.to_be_bytes());
+                stream.observe_point::<GinStreamCurve>(
+                    b"H1",
+                    &receiver.h1,
+                    IdentityPolicy::Reject,
+                )?;
+                stream.observe_point::<GinStreamCurve>(
+                    b"H2",
+                    &receiver.h2,
+                    IdentityPolicy::Reject,
+                )?;
             }
         }
         Ok(())
@@ -2140,8 +2259,6 @@ pub mod secp_secq {
         sk1: &Fq,
         rec: &BatchedReceiverStatement,
         beta: &Fp,
-        h1: &Gin,
-        h2: &Gin,
     ) -> Result<HiddenReceiverWitness> {
         let g_in = Gin::generator();
         let sj = rec.pkj * *sk1;
@@ -2152,8 +2269,8 @@ pub mod secp_secq {
         // chord_compute_witness's L_λ coordinates ARE T_1/T_2's affine
         // coordinates, so compute the witness once and reuse it below
         // instead of separately re-deriving T_1/T_2 via chord_evaluate_point.
-        let t1_witness = chord_compute_witness(&k_bool_bits, h1, K_BITS)?;
-        let t2_witness = chord_compute_witness(&k_bool_bits, h2, K_BITS)?;
+        let t1_witness = chord_compute_witness(&k_bool_bits, &rec.h1, K_BITS)?;
+        let t2_witness = chord_compute_witness(&k_bool_bits, &rec.h2, K_BITS)?;
         // The final window is always a checkpoint (see
         // chord_is_checkpoint_window), so the last entry is L_λ.
         let (t1_x, _) = *t1_witness
@@ -2242,16 +2359,13 @@ pub mod secp_secq {
         .map_err(|_| Error::ProofVerificationFailed)?;
 
         for dealing in &statement.dealings {
-            let h1 = h_gin_1(&dealing.msg);
-            let h2 = h_gin_2(&dealing.msg);
-            let precomp_h1 =
-                precompute_chord(&h1, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
-            let precomp_h2 =
-                precompute_chord(&h2, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
-
             for rec in &dealing.receivers {
+                let precomp_h1 = precompute_chord(&rec.h1, K_BITS)
+                    .map_err(|_| Error::ProofVerificationFailed)?;
+                let precomp_h2 = precompute_chord(&rec.h2, K_BITS)
+                    .map_err(|_| Error::ProofVerificationFailed)?;
                 let rec_witness =
-                    compute_hidden_receiver_witness(&witness.sk1, rec, &statement.beta, &h1, &h2)?;
+                    compute_hidden_receiver_witness(&witness.sk1, rec, &statement.beta)?;
                 build_hidden_receiver_slot(
                     &mut prover,
                     rec,
@@ -2273,18 +2387,17 @@ pub mod secp_secq {
         Ok(r1cs_proof.to_bytes())
     }
 
-    /// Generate a Batched Dealer Proof containing a nested R1CS proof followed
-    /// by one constant-term Schnorr proof per explicit constant.
-    pub fn evrf_batched_prove(
+    fn prove_batched_with_grammar(
         params: &BatchedEvrfPublicParams,
         statement: &BatchedEvrfStatement,
         witness: &BatchedEvrfWitness,
         rng: &mut impl CryptoRngCore,
+        grammar: BatchedProofGrammar,
     ) -> Result<Vec<u8>> {
         params.validate_statement(statement)?;
-        validate_batched_public_relations(statement)?;
-        let mut stream = ProverProofStream::new(BATCHED_PROOF_ID)?;
-        observe_batched_statement(&mut stream, statement)?;
+        grammar.validate(statement)?;
+        let mut stream = ProverProofStream::new(grammar.proof_id())?;
+        grammar.observe(&mut stream, statement)?;
         stream.send_nested(|transcript| {
             prove_batched_r1cs(params, statement, witness, rng, transcript)
         })?;
@@ -2296,15 +2409,45 @@ pub mod secp_secq {
             .iter()
             .zip(witness.polynomial_constants.iter())
         {
-            match (dealing.commitment.constant(), polynomial_constant) {
-                (Some(constant), Some(polynomial_constant)) => {
-                    constant_term_prove(&mut stream, &constant.0, polynomial_constant, rng)?
-                }
-                (None, None) => {}
+            match (dealing.constant_is_explicit, polynomial_constant) {
+                (true, Some(polynomial_constant)) => constant_term_prove(
+                    &mut stream,
+                    &dealing.commitment.public_key().0,
+                    polynomial_constant,
+                    rng,
+                )?,
+                (false, None) => {}
                 _ => return Err(Error::ProofVerificationFailed),
             }
         }
         stream.finish_checked()
+    }
+
+    /// Generate a Batched Dealer Proof containing a nested R1CS proof followed
+    /// by one constant-term Schnorr proof per explicit constant.
+    pub fn evrf_batched_prove(
+        params: &BatchedEvrfPublicParams,
+        statement: &BatchedEvrfStatement,
+        witness: &BatchedEvrfWitness,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<Vec<u8>> {
+        prove_batched_with_grammar(params, statement, witness, rng, BatchedProofGrammar::Legacy)
+    }
+
+    fn main_golden_batched_prove(
+        params: &BatchedEvrfPublicParams,
+        context: MainGoldenProofContext,
+        statement: &BatchedEvrfStatement,
+        witness: &BatchedEvrfWitness,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<Vec<u8>> {
+        prove_batched_with_grammar(
+            params,
+            statement,
+            witness,
+            rng,
+            BatchedProofGrammar::MainGolden(context),
+        )
     }
 
     fn build_batched_verifier<T>(
@@ -2337,14 +2480,11 @@ pub mod secp_secq {
         .map_err(|_| Error::ProofVerificationFailed)?;
 
         for dealing in &statement.dealings {
-            let h1 = h_gin_1(&dealing.msg);
-            let h2 = h_gin_2(&dealing.msg);
-            let precomp_h1 =
-                precompute_chord(&h1, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
-            let precomp_h2 =
-                precompute_chord(&h2, K_BITS).map_err(|_| Error::ProofVerificationFailed)?;
-
             for rec in &dealing.receivers {
+                let precomp_h1 = precompute_chord(&rec.h1, K_BITS)
+                    .map_err(|_| Error::ProofVerificationFailed)?;
+                let precomp_h2 = precompute_chord(&rec.h2, K_BITS)
+                    .map_err(|_| Error::ProofVerificationFailed)?;
                 build_hidden_receiver_slot(
                     &mut verifier,
                     rec,
@@ -2375,15 +2515,16 @@ pub mod secp_secq {
             .map_err(|_| Error::ProofVerificationFailed)
     }
 
-    pub(super) fn parse_batched_proof_stream(
+    fn parse_batched_proof_stream_with_grammar(
         statement: &BatchedEvrfStatement,
         proof: &[u8],
+        grammar: BatchedProofGrammar,
     ) -> Result<()> {
-        let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
-        observe_batched_statement(&mut stream, statement)?;
+        let mut stream = VerifierProofStream::new(grammar.proof_id(), proof)?;
+        grammar.observe(&mut stream, statement)?;
         stream.receive_nested(|_, payload| parse_canonical_r1cs_proof(payload).map(|_| ()))?;
         for dealing in &statement.dealings {
-            if dealing.commitment.constant().is_some() {
+            if dealing.constant_is_explicit {
                 stream
                     .receive_point::<GinStreamCurve>(b"constant-term.a", IdentityPolicy::Reject)?;
                 stream.receive_scalar::<GinStreamCurve>(b"constant-term.t")?;
@@ -2392,25 +2533,60 @@ pub mod secp_secq {
         stream.finish()
     }
 
+    pub(super) fn parse_batched_proof_stream(
+        statement: &BatchedEvrfStatement,
+        proof: &[u8],
+    ) -> Result<()> {
+        parse_batched_proof_stream_with_grammar(statement, proof, BatchedProofGrammar::Legacy)
+    }
+
+    fn parse_main_golden_proof_stream(
+        context: MainGoldenProofContext,
+        statement: &BatchedEvrfStatement,
+        proof: &[u8],
+    ) -> Result<()> {
+        parse_batched_proof_stream_with_grammar(
+            statement,
+            proof,
+            BatchedProofGrammar::MainGolden(context),
+        )
+    }
+
+    fn prepare_batched_proof_with_grammar(
+        params: &BatchedEvrfPublicParams,
+        statement: &BatchedEvrfStatement,
+        proof: &[u8],
+        rng: &mut impl CryptoRngCore,
+        grammar: BatchedProofGrammar,
+    ) -> Result<VerificationEquation<R1csCycle>> {
+        let mut stream = VerifierProofStream::new(grammar.proof_id(), proof)?;
+        grammar.observe(&mut stream, statement)?;
+        let equation = stream.receive_nested(|transcript, payload| {
+            let r1cs_proof = parse_canonical_r1cs_proof(payload)?;
+            prepare_batched_r1cs(params, statement, &r1cs_proof, rng, transcript)
+        })?;
+        for dealing in &statement.dealings {
+            if dealing.constant_is_explicit {
+                constant_term_verify(&mut stream, &dealing.commitment.public_key().0)?;
+            }
+        }
+        stream.finish()?;
+        Ok(equation)
+    }
+
     fn prepare_batched_proof(
         params: &BatchedEvrfPublicParams,
         statement: &BatchedEvrfStatement,
         proof: &[u8],
         rng: &mut impl CryptoRngCore,
     ) -> Result<VerificationEquation<R1csCycle>> {
-        let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
-        observe_batched_statement(&mut stream, statement)?;
-        let equation = stream.receive_nested(|transcript, payload| {
-            let r1cs_proof = parse_canonical_r1cs_proof(payload)?;
-            prepare_batched_r1cs(params, statement, &r1cs_proof, rng, transcript)
-        })?;
-        for dealing in &statement.dealings {
-            if let Some(constant) = dealing.commitment.constant() {
-                constant_term_verify(&mut stream, &constant.0)?;
-            }
-        }
-        stream.finish()?;
-        Ok(equation)
+        prepare_batched_proof_with_grammar(
+            params,
+            statement,
+            proof,
+            rng,
+            BatchedProofGrammar::Legacy,
+        )
     }
 
     /// Verify a Batched Dealer Proof represented as a nested R1CS proof and
@@ -2465,6 +2641,92 @@ pub mod secp_secq {
 
         VerificationEquation::verify_batch(equations, &mut rng)
             .map_err(|_| Error::ProofVerificationFailed)
+    }
+
+    fn main_golden_batch_rng(
+        configuration_root: TranscriptRoot,
+        instances: &[(MainGoldenProofContext, &BatchedEvrfStatement, &[u8])],
+    ) -> Result<ChaCha20Rng> {
+        let mut batch_transcript = Transcript::new(MAIN_GOLDEN_BATCH_ID);
+        batch_transcript.append_message(b"protocol-version", &PROTOCOL_VERSION.to_be_bytes());
+        batch_transcript.append_message(b"proof-version", &MAIN_GOLDEN_PROOF_VERSION.to_be_bytes());
+        batch_transcript.append_message(b"batch-version", &MAIN_GOLDEN_BATCH_VERSION.to_be_bytes());
+        batch_transcript.append_message(b"configuration-root", &configuration_root);
+        let batch_len =
+            u64::try_from(instances.len()).map_err(|_| Error::ProofVerificationFailed)?;
+        batch_transcript.append_message(b"batch-len", &batch_len.to_be_bytes());
+
+        let mut previous_dealer = None;
+        for (proof_index, (context, statement, proof)) in instances.iter().enumerate() {
+            if context.configuration_root != configuration_root
+                || previous_dealer.is_some_and(|previous| previous >= context.dealer)
+            {
+                return Err(Error::ProofVerificationFailed);
+            }
+            previous_dealer = Some(context.dealer);
+            let proof_index =
+                u64::try_from(proof_index).map_err(|_| Error::ProofVerificationFailed)?;
+            batch_transcript.append_message(b"proof-index", &proof_index.to_be_bytes());
+            observe_main_golden_statement(&mut batch_transcript, *context, statement)?;
+            let proof_len =
+                u64::try_from(proof.len()).map_err(|_| Error::ProofVerificationFailed)?;
+            batch_transcript.append_message(b"proof-len", &proof_len.to_be_bytes());
+            batch_transcript.append_message(b"proof", proof);
+        }
+
+        let mut seed = [0u8; 32];
+        batch_transcript.challenge_bytes(b"batch-rng", &mut seed);
+        Ok(ChaCha20Rng::from_seed(seed))
+    }
+
+    fn main_golden_batched_verify(
+        params: &BatchedEvrfPublicParams,
+        context: MainGoldenProofContext,
+        statement: &BatchedEvrfStatement,
+        proof: &[u8],
+    ) -> Result<()> {
+        params.validate_statement(statement)?;
+        validate_main_golden_public_relations(statement)?;
+        let instances = [(context, statement, proof)];
+        let mut rng = main_golden_batch_rng(context.configuration_root, &instances)?;
+        let equation = prepare_batched_proof_with_grammar(
+            params,
+            statement,
+            proof,
+            &mut rng,
+            BatchedProofGrammar::MainGolden(context),
+        )?;
+        equation
+            .verify()
+            .map_err(|_| Error::ProofVerificationFailed)
+    }
+
+    fn main_golden_batched_verify_many(
+        params: &BatchedEvrfPublicParams,
+        configuration_root: TranscriptRoot,
+        instances: &[(MainGoldenProofContext, &BatchedEvrfStatement, &[u8])],
+    ) -> Result<()> {
+        if instances.is_empty() {
+            return Ok(());
+        }
+        for (_, statement, _) in instances {
+            params.validate_statement(statement)?;
+            validate_main_golden_public_relations(statement)?;
+        }
+        let mut rng = main_golden_batch_rng(configuration_root, instances)?;
+        let mut equations = Vec::with_capacity(instances.len());
+        for (context, statement, proof) in instances {
+            equations.push(prepare_batched_proof_with_grammar(
+                params,
+                statement,
+                proof,
+                &mut rng,
+                BatchedProofGrammar::MainGolden(*context),
+            )?);
+        }
+
+        VerificationEquation::verify_batch(equations, &mut rng)
+            .map_err(|_| Error::BatchVerificationFailed)
     }
 
     // ------------------------------------------------------------------
@@ -2533,7 +2795,7 @@ pub mod secp_secq {
 
     mod dkg_backend;
 
-    pub use dkg_backend::SecpSecqBackend;
+    pub use dkg_backend::{SecpSecqBackend, SecpSecqBulletproofs};
 
     /// Test-only helpers exposed so integration tests under `tests/` can
     /// build honest statements without re-implementing the protocol's
@@ -2646,6 +2908,8 @@ pub mod secp_secq {
                             BatchedReceiverStatement {
                                 receiver,
                                 pkj,
+                                h1,
+                                h2,
                                 share_commitment: g_in * share,
                                 pad_commitment: g_in * pad,
                                 encrypted_share: share + pad,
@@ -2655,6 +2919,7 @@ pub mod secp_secq {
                     BatchedDealingStatement {
                         msg: *msg,
                         commitment,
+                        constant_is_explicit: true,
                         receivers,
                     }
                 })
@@ -3647,6 +3912,9 @@ pub mod secp_secq {
             let pkj = g_in * GinScalar::from(5u64);
             let share = GinScalar::from(13u64);
             let pad = GinScalar::from(7u64);
+            let msg = [9u8; MESSAGE_BYTES];
+            let h1 = h_gin_1(&msg);
+            let h2 = h_gin_2(&msg);
 
             BatchedEvrfStatement {
                 pk1,
@@ -3654,14 +3922,17 @@ pub mod secp_secq {
                 threshold: 1,
                 dealer_message_root: [1u8; 32],
                 dealings: vec![BatchedDealingStatement {
-                    msg: [9u8; MESSAGE_BYTES],
+                    msg,
                     commitment: FeldmanCommitment::from_coefficients(vec![Secp256k1Element(
                         g_in * share,
                     )])
                     .expect("nonempty commitment"),
+                    constant_is_explicit: true,
                     receivers: vec![BatchedReceiverStatement {
                         receiver: ParticipantIndex::new(1).unwrap(),
                         pkj,
+                        h1,
+                        h2,
                         share_commitment: g_in * share,
                         pad_commitment: g_in * pad,
                         encrypted_share: share + pad,
