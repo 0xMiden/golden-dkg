@@ -597,6 +597,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 name = "golden-core"
 version = "0.3.0"
 dependencies = [
+ "ff",
  "miden-serde-utils",
  "rand_chacha",
  "rand_core 0.6.4",
@@ -657,6 +658,7 @@ dependencies = [
  "bulletproofs-cycle",
  "ff",
  "golden-core",
+ "golden-rustcrypto",
  "group",
  "halo2curves",
  "merlin",

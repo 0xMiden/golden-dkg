@@ -2,6 +2,7 @@
 
 use core::fmt::Debug;
 
+use ff::PrimeField;
 use rand_core::CryptoRngCore;
 use sha2::{Digest, Sha256};
 use subtle::{Choice, ConstantTimeEq};
@@ -162,33 +163,41 @@ pub trait GoldenGroup: Clone + Debug + Sized {
 
 /// Random-oracle-to-group operation for prime-order output groups.
 ///
-/// This is smaller than [`GoldenEvrfCurve`]: paper output groups and
+/// This is smaller than [`GoldenCurve`]: protocol output groups and
 /// Bulletproofs generator groups need independent hash-to-group points, but do
 /// not necessarily need affine coordinates for the input-curve exponentiation
 /// gadgets.
 pub trait GoldenHashToGroup: GoldenGroup {
     /// Hash a domain-separated message to a non-identity group element.
+    ///
+    /// `domain` is the application-specific prefix. Curve adapters append the
+    /// ciphersuite's fixed RFC 9380 domain suffix before hashing.
     fn hash_to_group(domain: &[u8], message: &[u8]) -> Result<Self::Element>;
 }
 
-/// Extra curve operations needed by the paper eVRF relation.
+/// Curve operations needed to evaluate the fixed Main Golden relation.
 ///
 /// This is deliberately separate from [`GoldenGroup`]: Shamir sharing and
-/// Feldman commitments only need prime-order group arithmetic, while the paper
-/// eVRF circuit also needs random-oracle-to-group points and public affine
-/// coordinates for circuit inputs.
-pub trait GoldenEvrfCurve: GoldenHashToGroup {
-    /// Canonical base-field byte representation for one affine coordinate.
-    type BaseFieldRepr: AsRef<[u8]> + Clone + Debug + Eq + TryFrom<Vec<u8>>;
+/// Feldman commitments only need prime-order group arithmetic, while Main
+/// Golden also needs full base-field arithmetic and affine x-coordinates.
+pub trait GoldenCurve: GoldenHashToGroup {
+    /// Base field containing affine coordinates and the setup coefficient.
+    type BaseField: PrimeField;
 
-    /// Return affine `(x, y)` coordinates for a non-identity group element.
-    fn affine_coordinates(
-        point: &Self::Element,
-    ) -> Result<(Self::BaseFieldRepr, Self::BaseFieldRepr)>;
-
-    /// Return the base-field modulus in the same byte order as [`Self::BaseFieldRepr`].
-    fn base_field_modulus() -> Self::BaseFieldRepr;
-
-    /// Return the byte order used by [`Self::BaseFieldRepr`].
+    /// Return the byte order used by [`PrimeField::Repr`] for the base field.
     fn base_field_byte_order() -> FieldByteOrder;
+
+    /// Return the affine x-coordinate of a non-identity group element.
+    ///
+    /// Implementations must fail closed for the identity and for any point
+    /// whose affine representation is unavailable. They must not substitute
+    /// zero for a missing coordinate.
+    fn affine_x(point: &Self::Element) -> Result<Self::BaseField>;
+
+    /// Interpret a base-field element as its canonical integer and reduce that
+    /// integer modulo the group scalar order.
+    ///
+    /// This conversion is exact and infallible for every canonical base-field
+    /// element; it is not a fallible cross-field decoding operation.
+    fn reduce_base_field(value: &Self::BaseField) -> Self::Scalar;
 }

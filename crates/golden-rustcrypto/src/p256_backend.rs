@@ -2,13 +2,20 @@
 
 use core::fmt;
 
-use golden_core::{Error, FieldByteOrder, GoldenGroup, GoldenHashToGroup, GoldenScalar, Result};
+use golden_core::{
+    Error, FieldByteOrder, GoldenCurve, GoldenGroup, GoldenHashToGroup, GoldenScalar, Result,
+};
+use p256::elliptic_curve::bigint::U256;
 use p256::elliptic_curve::ff::Field;
 use p256::elliptic_curve::hash2curve::{ExpandMsgXmd, GroupDigest};
+use p256::elliptic_curve::ops::Reduce;
+use p256::elliptic_curve::point::AffineCoordinates;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::elliptic_curve::Group;
 use p256::elliptic_curve::PrimeField;
-use p256::{AffinePoint, EncodedPoint, FieldBytes, NistP256, ProjectivePoint, Scalar};
+use p256::{
+    AffinePoint, EncodedPoint, FieldBytes, FieldElement, NistP256, ProjectivePoint, Scalar,
+};
 use rand_core::CryptoRngCore;
 use sha2::Sha256;
 use subtle::{Choice, ConstantTimeEq};
@@ -18,6 +25,8 @@ const P256_SCALAR_FIELD_MODULUS: [u8; 32] = [
     0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
 ];
+
+const HASH_TO_CURVE_SUITE_DOMAIN: &[u8] = b"P256_XMD:SHA-256_SSWU_RO_";
 
 /// P-256 scalar wrapper.
 ///
@@ -244,13 +253,37 @@ impl GoldenGroup for P256Backend {
 
 impl GoldenHashToGroup for P256Backend {
     fn hash_to_group(domain: &[u8], message: &[u8]) -> Result<Self::Element> {
-        let point = NistP256::hash_from_bytes::<ExpandMsgXmd<Sha256>>(&[message], &[domain])
-            .map_err(|_| Error::InvalidEncoding)?;
+        let point = NistP256::hash_from_bytes::<ExpandMsgXmd<Sha256>>(
+            &[message],
+            &[domain, HASH_TO_CURVE_SUITE_DOMAIN],
+        )
+        .map_err(|_| Error::InvalidEncoding)?;
         let element = P256Element(point);
         if bool::from(Self::is_identity(&element)) {
             return Err(Error::InvalidEncoding);
         }
         Ok(element)
+    }
+}
+
+impl GoldenCurve for P256Backend {
+    type BaseField = FieldElement;
+
+    fn base_field_byte_order() -> FieldByteOrder {
+        FieldByteOrder::BigEndian
+    }
+
+    fn affine_x(point: &Self::Element) -> Result<Self::BaseField> {
+        if bool::from(Self::is_identity(point)) {
+            return Err(Error::InvalidEncoding);
+        }
+
+        let x = AffinePoint::from(point.0).x();
+        Option::<FieldElement>::from(FieldElement::from_repr(x)).ok_or(Error::InvalidEncoding)
+    }
+
+    fn reduce_base_field(value: &Self::BaseField) -> Self::Scalar {
+        P256Scalar(<Scalar as Reduce<U256>>::reduce_bytes(&value.to_repr()))
     }
 }
 
@@ -312,6 +345,42 @@ mod tests {
         assert_eq!(
             P256Backend::decode_element(&repr).unwrap(),
             P256Backend::identity()
+        );
+    }
+
+    #[test]
+    fn p256_affine_x_returns_the_generator_coordinate_and_rejects_identity() {
+        let x = P256Backend::affine_x(&P256Backend::generator())
+            .expect("generator has affine coordinates");
+
+        assert_eq!(
+            x.to_repr(),
+            FieldBytes::from([
+                0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
+                0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45,
+                0xd8, 0x98, 0xc2, 0x96,
+            ])
+        );
+        assert!(P256Backend::affine_x(&P256Backend::identity()).is_err());
+    }
+
+    #[test]
+    fn p256_reduces_the_full_base_field_integer() {
+        let p_minus_one =
+            Option::<FieldElement>::from(FieldElement::from_repr(FieldBytes::from([
+                0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xfe,
+            ])))
+            .expect("p - 1 is canonical");
+
+        assert_eq!(
+            P256Backend::reduce_base_field(&p_minus_one).to_repr(),
+            [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x43, 0x19, 0x05, 0x53, 0x58, 0xe8, 0x61, 0x7b, 0x0c, 0x46, 0x35, 0x3d,
+                0x03, 0x9c, 0xda, 0xad,
+            ]
         );
     }
 

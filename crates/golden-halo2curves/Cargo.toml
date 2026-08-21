@@ -24,6 +24,7 @@ subtle = { workspace = true }
 halo2curves = { workspace = true, features = ["asm"] }
 
 [dev-dependencies]
+golden-rustcrypto = { workspace = true, features = ["k256"] }
 merlin = { workspace = true }
 rand_chacha = { workspace = true }
 

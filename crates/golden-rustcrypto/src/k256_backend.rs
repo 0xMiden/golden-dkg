@@ -2,13 +2,20 @@
 
 use core::fmt;
 
-use golden_core::{Error, FieldByteOrder, GoldenGroup, GoldenHashToGroup, GoldenScalar, Result};
+use golden_core::{
+    Error, FieldByteOrder, GoldenCurve, GoldenGroup, GoldenHashToGroup, GoldenScalar, Result,
+};
+use k256::elliptic_curve::bigint::U256;
 use k256::elliptic_curve::ff::Field;
 use k256::elliptic_curve::hash2curve::{ExpandMsgXmd, GroupDigest};
+use k256::elliptic_curve::ops::Reduce;
+use k256::elliptic_curve::point::AffineCoordinates;
 use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use k256::elliptic_curve::Group;
 use k256::elliptic_curve::PrimeField;
-use k256::{AffinePoint, EncodedPoint, FieldBytes, ProjectivePoint, Scalar, Secp256k1};
+use k256::{
+    AffinePoint, EncodedPoint, FieldBytes, FieldElement, ProjectivePoint, Scalar, Secp256k1,
+};
 use rand_core::CryptoRngCore;
 use sha2::Sha256;
 use subtle::{Choice, ConstantTimeEq};
@@ -18,6 +25,8 @@ const K256_SCALAR_FIELD_MODULUS: [u8; 32] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
     0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 ];
+
+const HASH_TO_CURVE_SUITE_DOMAIN: &[u8] = b"secp256k1_XMD:SHA-256_SSWU_RO_";
 
 /// secp256k1 scalar wrapper.
 ///
@@ -235,13 +244,37 @@ impl GoldenGroup for K256Backend {
 
 impl GoldenHashToGroup for K256Backend {
     fn hash_to_group(domain: &[u8], message: &[u8]) -> Result<Self::Element> {
-        let point = Secp256k1::hash_from_bytes::<ExpandMsgXmd<Sha256>>(&[message], &[domain])
-            .map_err(|_| Error::InvalidEncoding)?;
+        let point = Secp256k1::hash_from_bytes::<ExpandMsgXmd<Sha256>>(
+            &[message],
+            &[domain, HASH_TO_CURVE_SUITE_DOMAIN],
+        )
+        .map_err(|_| Error::InvalidEncoding)?;
         let element = K256Element(point);
         if bool::from(Self::is_identity(&element)) {
             return Err(Error::InvalidEncoding);
         }
         Ok(element)
+    }
+}
+
+impl GoldenCurve for K256Backend {
+    type BaseField = FieldElement;
+
+    fn base_field_byte_order() -> FieldByteOrder {
+        FieldByteOrder::BigEndian
+    }
+
+    fn affine_x(point: &Self::Element) -> Result<Self::BaseField> {
+        if bool::from(Self::is_identity(point)) {
+            return Err(Error::InvalidEncoding);
+        }
+
+        let x = AffinePoint::from(point.0).x();
+        Option::<FieldElement>::from(FieldElement::from_repr(x)).ok_or(Error::InvalidEncoding)
+    }
+
+    fn reduce_base_field(value: &Self::BaseField) -> Self::Scalar {
+        K256Scalar(<Scalar as Reduce<U256>>::reduce_bytes(&value.to_repr()))
     }
 }
 
@@ -343,6 +376,42 @@ mod tests {
         assert_eq!(
             K256Backend::decode_element(&repr).unwrap(),
             K256Backend::identity()
+        );
+    }
+
+    #[test]
+    fn k256_affine_x_returns_the_generator_coordinate_and_rejects_identity() {
+        let x = K256Backend::affine_x(&K256Backend::generator())
+            .expect("generator has affine coordinates");
+
+        assert_eq!(
+            x.to_repr(),
+            FieldBytes::from([
+                0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+                0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
+                0x16, 0xf8, 0x17, 0x98,
+            ])
+        );
+        assert!(K256Backend::affine_x(&K256Backend::identity()).is_err());
+    }
+
+    #[test]
+    fn k256_reduces_the_full_base_field_integer() {
+        let p_minus_one =
+            Option::<FieldElement>::from(FieldElement::from_repr(FieldBytes::from([
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+                0xff, 0xff, 0xfc, 0x2e,
+            ])))
+            .expect("p - 1 is canonical");
+
+        assert_eq!(
+            K256Backend::reduce_base_field(&p_minus_one).to_repr(),
+            [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01, 0x45, 0x51, 0x23, 0x19, 0x50, 0xb7, 0x5f, 0xc4, 0x40, 0x2d, 0xa1, 0x72,
+                0x2f, 0xc9, 0xba, 0xed,
+            ]
         );
     }
 

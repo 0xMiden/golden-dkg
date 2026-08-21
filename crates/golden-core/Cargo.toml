@@ -11,6 +11,7 @@ rust-version.workspace = true
 publish = ["crates-io"]
 
 [dependencies]
+ff = { workspace = true }
 miden-serde-utils = { workspace = true, optional = true }
 rand_core = { workspace = true }
 serde = { workspace = true, optional = true }

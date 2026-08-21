@@ -12,8 +12,12 @@ publish = ["crates-io"]
 
 [dependencies]
 golden-core = { workspace = true }
-k256 = { workspace = true, default-features = false, features = ["arithmetic", "hash2curve"], optional = true }
-p256 = { version = "0.13", default-features = false, features = ["arithmetic", "hash2curve"], optional = true }
+k256 = { workspace = true, default-features = false, optional = true, features = [
+    "arithmetic", "expose-field", "hash2curve",
+] }
+p256 = { version = "0.13", default-features = false, optional = true, features = [
+    "arithmetic", "expose-field", "hash2curve",
+] }
 rand_core = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }

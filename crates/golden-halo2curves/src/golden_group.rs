@@ -8,9 +8,9 @@
 
 use core::fmt;
 
-use ff::{Field, PrimeField};
+use ff::{Field, FromUniformBytes, PrimeField};
 use golden_core::{
-    Error, FieldByteOrder, GoldenEvrfCurve, GoldenGroup, GoldenHashToGroup, GoldenScalar, Result,
+    Error, FieldByteOrder, GoldenCurve, GoldenGroup, GoldenHashToGroup, GoldenScalar, Result,
 };
 use group::{Curve, Group, GroupEncoding};
 use halo2curves::secp256k1::{Fp, Fq, Secp256k1, Secp256k1Affine};
@@ -21,6 +21,7 @@ use subtle::{Choice, ConstantTimeEq};
 
 /// Secp256k1 base-field modulus, little-endian canonical bytes.
 /// `p = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f`.
+#[cfg(test)]
 const SECP256K1_FP_MODULUS_LE: [u8; 32] = [
     0x2f, 0xfc, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -191,9 +192,16 @@ impl GoldenGroup for Secp256k1GoldenGroup {
         if bool::from(Self::is_identity(point)) {
             return [0u8; 33];
         }
+
+        let halo_encoding = GroupEncoding::to_bytes(&point.0);
         let mut out = [0u8; 33];
-        let bytes = GroupEncoding::to_bytes(&point.0);
-        out.copy_from_slice(bytes.as_ref());
+        out[0] = 2 | ((halo_encoding.as_ref()[0] >> 7) & 1);
+        for (output, input) in out[1..]
+            .iter_mut()
+            .zip(halo_encoding.as_ref()[1..].iter().rev())
+        {
+            *output = *input;
+        }
         out
     }
 
@@ -201,9 +209,18 @@ impl GoldenGroup for Secp256k1GoldenGroup {
         if repr == &[0u8; 33] {
             return Ok(Self::identity());
         }
-        let compressed = Repr::<33>::from(*repr);
-        let ct: subtle::CtOption<Secp256k1> = GroupEncoding::from_bytes(&compressed);
-        Option::<Secp256k1>::from(ct)
+        if !matches!(repr[0], 2 | 3) {
+            return Err(Error::InvalidEncoding);
+        }
+
+        let mut halo_encoding = [0u8; 33];
+        halo_encoding[0] = (repr[0] & 1) << 7;
+        for (output, input) in halo_encoding[1..].iter_mut().zip(repr[1..].iter().rev()) {
+            *output = *input;
+        }
+        let compressed = Repr::<33>::from(halo_encoding);
+        let point = GroupEncoding::from_bytes(&compressed);
+        Option::<Secp256k1>::from(point)
             .map(Secp256k1Element)
             .ok_or(Error::InvalidEncoding)
     }
@@ -238,12 +255,14 @@ impl GoldenHashToGroup for Secp256k1GoldenGroup {
     }
 }
 
-impl GoldenEvrfCurve for Secp256k1GoldenGroup {
-    type BaseFieldRepr = [u8; 32];
+impl GoldenCurve for Secp256k1GoldenGroup {
+    type BaseField = Fp;
 
-    fn affine_coordinates(
-        point: &Self::Element,
-    ) -> Result<(Self::BaseFieldRepr, Self::BaseFieldRepr)> {
+    fn base_field_byte_order() -> FieldByteOrder {
+        FieldByteOrder::LittleEndian
+    }
+
+    fn affine_x(point: &Self::Element) -> Result<Self::BaseField> {
         if bool::from(Self::is_identity(point)) {
             return Err(Error::InvalidEncoding);
         }
@@ -251,19 +270,13 @@ impl GoldenEvrfCurve for Secp256k1GoldenGroup {
         let coords = aff.coordinates();
         let opt: Option<Coordinates<Secp256k1Affine>> = Option::from(coords);
         let c = opt.ok_or(Error::InvalidEncoding)?;
-        let mut x = [0u8; 32];
-        let mut y = [0u8; 32];
-        x.copy_from_slice(c.x().to_repr().as_ref());
-        y.copy_from_slice(c.y().to_repr().as_ref());
-        Ok((x, y))
+        Ok(*c.x())
     }
 
-    fn base_field_modulus() -> Self::BaseFieldRepr {
-        SECP256K1_FP_MODULUS_LE
-    }
-
-    fn base_field_byte_order() -> FieldByteOrder {
-        FieldByteOrder::LittleEndian
+    fn reduce_base_field(value: &Self::BaseField) -> Self::Scalar {
+        let mut wide = [0u8; 64];
+        wide[..32].copy_from_slice(value.to_repr().as_ref());
+        Secp256k1Scalar(Fq::from_uniform_bytes(&wide))
     }
 }
 
@@ -362,9 +375,19 @@ mod tests {
     }
 
     #[test]
-    fn base_field_modulus_matches_secp256k1_p() {
-        let expected = hex_modulus_to_le(<Fp as PrimeField>::MODULUS);
-        assert_eq!(Secp256k1GoldenGroup::base_field_modulus(), expected);
+    fn affine_x_returns_the_generator_coordinate_and_rejects_identity() {
+        let x = Secp256k1GoldenGroup::affine_x(&Secp256k1GoldenGroup::generator())
+            .expect("generator has affine coordinates");
+
+        assert_eq!(
+            x.to_repr().inner(),
+            &[
+                0x98, 0x17, 0xf8, 0x16, 0x5b, 0x81, 0xf2, 0x59, 0xd9, 0x28, 0xce, 0x2d, 0xdb, 0xfc,
+                0x9b, 0x02, 0x07, 0x0b, 0x87, 0xce, 0x95, 0x62, 0xa0, 0x55, 0xac, 0xbb, 0xdc, 0xf9,
+                0x7e, 0x66, 0xbe, 0x79,
+            ]
+        );
+        assert!(Secp256k1GoldenGroup::affine_x(&Secp256k1GoldenGroup::identity()).is_err());
     }
 
     #[test]

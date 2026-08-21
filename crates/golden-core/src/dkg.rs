@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rand_core::CryptoRngCore;
 
+use crate::main_golden::effective_message;
 use crate::transcript::{TranscriptBuilder, TranscriptRoot};
 use crate::wire::MAX_DEALER_PROOF_BYTES;
 use crate::{
@@ -548,7 +549,7 @@ where
             }
         };
         let nonce = DealerMessageNonce::random(rng);
-        let message = effective_evrf_message(config.root, dealer, position, nonce);
+        let message = effective_message(config.root, dealer, position, kind, nonce);
 
         let mut shares = BTreeMap::new();
         for receiver in config.registry.indexes() {
@@ -706,7 +707,7 @@ where
             });
         }
         dealings.push(EvrfDealingStatement {
-            message: effective_evrf_message(config.root, message.dealer, position, body.nonce),
+            message: effective_message(config.root, message.dealer, position, kind, body.nonce),
             commitment: body.commitment.clone(),
             receivers,
         });
@@ -862,6 +863,7 @@ where
                     message,
                     body,
                     position,
+                    kind,
                     config,
                 )?
             };
@@ -1023,20 +1025,6 @@ where
     transcript.root()
 }
 
-fn effective_evrf_message(
-    configuration_root: TranscriptRoot,
-    dealer: ParticipantIndex,
-    position: usize,
-    nonce: DealerMessageNonce,
-) -> EvrfMessage {
-    let mut transcript = TranscriptBuilder::new(b"effective-evrf-message");
-    transcript.bytes(b"configuration", &configuration_root);
-    transcript.participant(b"dealer", dealer);
-    transcript.usize(b"position", position);
-    transcript.bytes(b"nonce", &nonce.0);
-    EvrfMessage(transcript.root())
-}
-
 fn public_share_receivers<G: GoldenGroup>(
     config: &DkgConfig<G>,
     dealer: ParticipantIndex,
@@ -1074,6 +1062,7 @@ fn decrypt_share_for_receiver<G, B>(
     dealer_message: &DealerMessage<G>,
     body: &DealingBody<G>,
     position: usize,
+    kind: DkgInstanceKind,
     config: &DkgConfig<G>,
 ) -> Result<Share<G::Scalar>>
 where
@@ -1086,7 +1075,13 @@ where
         .ok_or(Error::MissingShare(receiver.get()))?;
     let dealer_public_key = config.registry.public_key(dealer_message.dealer)?;
     let receiver_public_key = config.registry.public_key(receiver)?;
-    let message = effective_evrf_message(config.root, dealer_message.dealer, position, body.nonce);
+    let message = effective_message(
+        config.root,
+        dealer_message.dealer,
+        position,
+        kind,
+        body.nonce,
+    );
     let pad = B::derive_pad(
         message,
         &config.beta,
@@ -1411,20 +1406,29 @@ mod tests {
     }
 
     #[test]
-    fn effective_message_binds_configuration_dealer_position_and_nonce() {
+    fn effective_message_binds_configuration_dealer_position_kind_and_nonce() {
         let configuration = mixed_config().root();
         let dealer = idx(1);
         let position = 0;
+        let kind = DkgInstanceKind::Random;
         let nonce = DealerMessageNonce([3; DEALER_MESSAGE_NONCE_BYTES]);
-        let message = effective_evrf_message(configuration, dealer, position, nonce);
+        let message = effective_message(configuration, dealer, position, kind, nonce);
         let variants = [
-            effective_evrf_message([9; 32], dealer, position, nonce),
-            effective_evrf_message(configuration, idx(2), position, nonce),
-            effective_evrf_message(configuration, dealer, 1, nonce),
-            effective_evrf_message(
+            effective_message([9; 32], dealer, position, kind, nonce),
+            effective_message(configuration, idx(2), position, kind, nonce),
+            effective_message(configuration, dealer, 1, kind, nonce),
+            effective_message(
                 configuration,
                 dealer,
                 position,
+                DkgInstanceKind::Zero,
+                nonce,
+            ),
+            effective_message(
+                configuration,
+                dealer,
+                position,
+                kind,
                 DealerMessageNonce([4; DEALER_MESSAGE_NONCE_BYTES]),
             ),
         ];
