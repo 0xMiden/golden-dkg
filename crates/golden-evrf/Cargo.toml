@@ -20,6 +20,7 @@ ff = { workspace = true, optional = true }
 group = { workspace = true, optional = true }
 halo2curves = { workspace = true, optional = true }
 merlin = { workspace = true }
+postcard = { workspace = true, optional = true }
 rand_chacha = { workspace = true, optional = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 
@@ -29,7 +30,6 @@ codspeed-criterion-compat = "5.0.1"
 criterion = "0.5"
 ff = { workspace = true }
 golden-rustcrypto = { workspace = true, features = ["p256"] }
-postcard = { workspace = true }
 rand_chacha = { workspace = true }
 
 [features]
@@ -38,6 +38,7 @@ insecure-revealed-witness = []
 miden-serde = ["golden-core/miden-serde"]
 parallel = ["bulletproofs-cycle?/parallel"]
 serde = [
+    "dep:postcard",
     "dep:serde",
     "bulletproofs-cycle?/serde",
     "golden-core/serde",

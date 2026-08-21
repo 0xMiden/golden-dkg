@@ -217,6 +217,11 @@ fn generator_cache() -> &'static Mutex<GeneratorCache> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static DERIVE_REQUESTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 /// Test/benchmark-only: clears the cache so the next derivation is cold.
 /// Production code should let it grow monotonically.
 #[doc(hidden)]
@@ -229,6 +234,9 @@ pub fn clear_generator_cache() {
 
 impl<C: Cycle> BulletproofGens<C> {
     fn derive(label: &[u8], capacity: usize) -> Arc<Vec<C::Affine>> {
+        #[cfg(test)]
+        DERIVE_REQUESTS.with(|requests| requests.set(requests.get() + 1));
+
         let key = (TypeId::of::<C>(), label.to_vec());
 
         loop {
@@ -246,7 +254,10 @@ impl<C: Cycle> BulletproofGens<C> {
                 }
             };
             if have.len() >= capacity {
-                return have;
+                if have.len() == capacity {
+                    return have;
+                }
+                return Arc::new(have[..capacity].to_vec());
             }
 
             let uniforms: Vec<[u8; 64]> = GeneratorsChain::new(label)
@@ -284,6 +295,33 @@ impl<C: Cycle> BulletproofGens<C> {
         };
         gens.increase_capacity(gens_capacity);
         gens
+    }
+
+    /// Restore one exact, already-validated generator prefix without deriving it.
+    ///
+    /// This constructor is intended for bounded persistence decoders. It
+    /// rejects mismatched dimensions and identity points, and it never reads
+    /// from or enlarges the process-wide deterministic generator cache.
+    #[doc(hidden)]
+    pub fn from_single_party_exact(
+        g_prefix: Vec<C::Affine>,
+        h_prefix: Vec<C::Affine>,
+    ) -> Option<Self> {
+        if g_prefix.len() != h_prefix.len()
+            || g_prefix
+                .iter()
+                .chain(&h_prefix)
+                .any(|point| C::compressed_is_identity(&C::affine_compress(point)))
+        {
+            return None;
+        }
+
+        Some(Self {
+            gens_capacity: g_prefix.len(),
+            party_capacity: 1,
+            G_vec: vec![Arc::new(g_prefix)],
+            H_vec: vec![Arc::new(h_prefix)],
+        })
     }
 
     /// The `j`-th party's share of the generators.
@@ -386,6 +424,47 @@ mod tests {
         assert_eq!(actual_g, expected_g);
     }
 
+    #[test]
+    fn smaller_instance_keeps_an_exact_prefix_after_the_cache_grows() {
+        type C = RistrettoCycle;
+
+        clear_generator_cache();
+        let large = BulletproofGens::<C>::new(96, 1);
+        let small = BulletproofGens::<C>::new(8, 1);
+
+        assert_eq!(small.G_vec[0].len(), 8);
+        assert_eq!(small.H_vec[0].len(), 8);
+        assert_eq!(
+            small.share(0).G(8).collect::<Vec<_>>(),
+            large.share(0).G(8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            small.share(0).H(8).collect::<Vec<_>>(),
+            large.share(0).H(8).collect::<Vec<_>>()
+        );
+
+        let g_prefix = small.share(0).G(8).copied().collect();
+        let h_prefix = small.share(0).H(8).copied().collect();
+        let requests_before = DERIVE_REQUESTS.with(core::cell::Cell::get);
+        let restored = BulletproofGens::<C>::from_single_party_exact(g_prefix, h_prefix)
+            .expect("valid exact generator prefix");
+        assert_eq!(restored.gens_capacity, 8);
+        assert_eq!(restored.party_capacity, 1);
+        assert_eq!(
+            restored.share(0).G(8).collect::<Vec<_>>(),
+            small.share(0).G(8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            restored.share(0).H(8).collect::<Vec<_>>(),
+            small.share(0).H(8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            DERIVE_REQUESTS.with(core::cell::Cell::get),
+            requests_before,
+            "restoration must not request deterministic generator derivation"
+        );
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn generator_serialization_roundtrip() {
@@ -430,5 +509,15 @@ mod tests {
         })
         .expect("serialize identity generators");
         assert!(postcard::from_bytes::<BulletproofGens<C>>(&encoded_identity).is_err());
+
+        let derive_requests_before = DERIVE_REQUESTS.with(core::cell::Cell::get);
+        let restored: BulletproofGens<C> =
+            postcard::from_bytes(&encoded).expect("restore without derivation");
+        assert_eq!(restored.gens_capacity, gens.gens_capacity);
+        assert_eq!(
+            DERIVE_REQUESTS.with(core::cell::Cell::get),
+            derive_requests_before,
+            "restoration must not request deterministic generator derivation"
+        );
     }
 }

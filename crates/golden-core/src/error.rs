@@ -209,6 +209,19 @@ pub enum Error {
     #[error("dealer proof batch verification failed")]
     BatchVerificationFailed,
 
+    /// Prepared proof-system state cannot serve the requested configuration.
+    #[error("insufficient proof capacity: required={required}, available={available}")]
+    InsufficientProofCapacity {
+        /// Minimum padded generator capacity required by the configuration.
+        required: usize,
+        /// Declared padded generator capacity available to the proof system.
+        available: usize,
+    },
+
+    /// A prepared proof-generator persistence artifact was malformed.
+    #[error("malformed prepared proof generators")]
+    MalformedPreparedGenerators,
+
     /// A verified dealer message could not be decrypted for this participant.
     #[error("share decryption failed for dealer {dealer:?}")]
     ShareDecryptionFailed {

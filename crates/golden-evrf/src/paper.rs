@@ -2795,7 +2795,7 @@ pub mod secp_secq {
 
     mod dkg_backend;
 
-    pub use dkg_backend::{SecpSecqBackend, SecpSecqBulletproofs};
+    pub use dkg_backend::{SecpSecqBackend, SecpSecqBulletproofs, SecpSecqPreparedGenerators};
 
     /// Test-only helpers exposed so integration tests under `tests/` can
     /// build honest statements without re-implementing the protocol's
