@@ -3,10 +3,11 @@
 use ff::PrimeField;
 use sha2::{Digest, Sha256};
 
-use crate::dkg::{DealerMessageNonce, DkgInstanceKind, EvrfMessage};
-use crate::group::{FieldByteOrder, GoldenCurve};
+use crate::dealer_proof::{DealerProofStatement, DealerProofWitness};
+use crate::dkg::{DealerMessageNonce, DkgConfig, DkgInstanceKind, EvrfMessage};
+use crate::group::{FieldByteOrder, GoldenCurve, GoldenGroup};
 use crate::transcript::{TranscriptBuilder, TranscriptRoot};
-use crate::{Error, ParticipantIndex, Result};
+use crate::{Error, GoldenScalar, ParticipantIndex, Result};
 
 const BETA_PROTOCOL_STRING: &[u8] = b"golden-dkg/main-golden-beta/v1";
 const BASE_FIELD_CANDIDATE_DOMAIN: &[u8] = b"golden-dkg/base-field-candidate/v1";
@@ -140,6 +141,125 @@ pub fn receiver_pad<G: GoldenCurve>(
     let output = beta::<G>()? * t1_x + t2_x;
 
     Ok(G::reduce_base_field(&output))
+}
+
+/// Reconstruct an immutable revealed dealer witness after canonical decoding.
+///
+/// This exists only for proof implementations whose private grammar reveals
+/// the witness. Ordinary applications cannot use it to construct statements.
+#[doc(hidden)]
+pub fn reconstruct_revealed_witness<G: GoldenGroup>(
+    config: &DkgConfig<G>,
+    statement: &DealerProofStatement<G>,
+    identity_secret: G::Scalar,
+    polynomial_constants: Vec<Option<G::Scalar>>,
+    receiver_openings: Vec<(G::Scalar, G::Scalar)>,
+) -> Result<DealerProofWitness<G>> {
+    DealerProofWitness::from_revealed_parts(
+        config,
+        statement,
+        identity_secret,
+        polynomial_constants,
+        receiver_openings,
+    )
+}
+
+/// Check the exact native Main Golden dealer relation.
+///
+/// All relation and shape failures are deliberately collapsed into the stable
+/// proof-verification error boundary.
+#[doc(hidden)]
+pub fn check_dealer_relation<G: GoldenCurve>(
+    config: &DkgConfig<G>,
+    statement: &DealerProofStatement<G>,
+    witness: &DealerProofWitness<G>,
+) -> Result<()> {
+    check_dealer_relation_with_pad(config, statement, witness, |message, secret, peer_key| {
+        receiver_pad::<G>(message, secret, peer_key)
+    })
+    .map_err(|_| Error::ProofVerificationFailed)
+}
+
+pub(crate) fn check_dealer_relation_with_pad<G: GoldenGroup>(
+    config: &DkgConfig<G>,
+    statement: &DealerProofStatement<G>,
+    witness: &DealerProofWitness<G>,
+    mut evaluate_pad: impl FnMut(EvrfMessage, &G::Scalar, &G::Element) -> Result<G::Scalar>,
+) -> Result<()> {
+    statement.validate_against(config)?;
+    witness.validate_shape(config, statement)?;
+
+    let registered_dealer_key = config.registry().public_key(statement.dealer())?;
+    if registered_dealer_key != statement.dealer_public_key()
+        || G::mul_generator(witness.identity_secret()) != *statement.dealer_public_key()
+    {
+        return Err(Error::ProofVerificationFailed);
+    }
+
+    for position in 0..statement.instance_count() {
+        let kind = config
+            .instances()
+            .get(position)
+            .ok_or(Error::ProofVerificationFailed)?;
+        let instance = statement
+            .instance(position)
+            .ok_or(Error::ProofVerificationFailed)?;
+        let private_instance = witness
+            .instance(position)
+            .ok_or(Error::ProofVerificationFailed)?;
+        let constant_commitment = instance
+            .commitment_coefficients()
+            .first()
+            .ok_or(Error::ProofVerificationFailed)?;
+
+        match (kind, private_instance.polynomial_constant()) {
+            (DkgInstanceKind::Random, Some(constant))
+                if G::mul_generator(constant) == *constant_commitment => {}
+            (DkgInstanceKind::Zero, None) if bool::from(G::is_identity(constant_commitment)) => {}
+            _ => return Err(Error::ProofVerificationFailed),
+        }
+
+        for receiver_position in 0..instance.receiver_count() {
+            let receiver = instance
+                .receiver(receiver_position)
+                .ok_or(Error::ProofVerificationFailed)?;
+            let opening = private_instance
+                .receiver(receiver_position)
+                .ok_or(Error::ProofVerificationFailed)?;
+
+            if G::mul_generator(opening.share()) != *receiver.share_commitment()
+                || evaluate_feldman::<G>(
+                    instance.commitment_coefficients(),
+                    receiver.participant(),
+                )? != *receiver.share_commitment()
+                || bool::from(opening.pad().is_zero())
+                || bool::from(G::is_identity(receiver.pad_commitment()))
+                || G::mul_generator(opening.pad()) != *receiver.pad_commitment()
+                || opening.share().add(opening.pad()) != *receiver.encrypted_share()
+                || evaluate_pad(
+                    instance.effective_message(),
+                    witness.identity_secret(),
+                    receiver.public_key(),
+                )? != *opening.pad()
+            {
+                return Err(Error::ProofVerificationFailed);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn evaluate_feldman<G: GoldenGroup>(
+    coefficients: &[G::Element],
+    participant: ParticipantIndex,
+) -> Result<G::Element> {
+    let x = participant.to_scalar::<G::Scalar>()?;
+    let mut value = G::identity();
+    for coefficient in coefficients.iter().rev() {
+        value = G::add(&G::mul(&value, &x), coefficient);
+    }
+    Ok(value)
 }
 
 fn hash_input<G: GoldenCurve>(

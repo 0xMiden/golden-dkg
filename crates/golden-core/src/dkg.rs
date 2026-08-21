@@ -1113,6 +1113,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::{TinyGroup, TinyScalar};
+    use crate::DealerProofStatement;
     use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
     enum FakeBackend {}
@@ -1274,6 +1275,256 @@ mod tests {
             vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
         )
         .unwrap()
+    }
+
+    fn flat_statement(config: &DkgConfig<TinyGroup>) -> DealerProofStatement<TinyGroup> {
+        DealerProofStatement::new(
+            config,
+            idx(1),
+            [13; 32],
+            vec![EvrfMessage([21; 32]), EvrfMessage([22; 32])],
+            vec![
+                TinyScalar::from_u64(5).unwrap(),
+                TinyScalar::from_u64(7).unwrap(),
+                TinyScalar::zero(),
+                TinyScalar::from_u64(9).unwrap(),
+            ],
+            vec![
+                TinyScalar::from_u64(19).unwrap(),
+                TinyScalar::from_u64(26).unwrap(),
+                TinyScalar::from_u64(18).unwrap(),
+                TinyScalar::from_u64(27).unwrap(),
+            ],
+            vec![
+                TinyScalar::from_u64(31).unwrap(),
+                TinyScalar::from_u64(32).unwrap(),
+                TinyScalar::from_u64(33).unwrap(),
+                TinyScalar::from_u64(34).unwrap(),
+            ],
+            vec![
+                TinyScalar::from_u64(50).unwrap(),
+                TinyScalar::from_u64(58).unwrap(),
+                TinyScalar::from_u64(51).unwrap(),
+                TinyScalar::from_u64(61).unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn revealed_openings() -> Vec<(TinyScalar, TinyScalar)> {
+        [(19, 31), (26, 32), (18, 33), (27, 34)]
+            .into_iter()
+            .map(|(share, pad)| {
+                (
+                    TinyScalar::from_u64(share).unwrap(),
+                    TinyScalar::from_u64(pad).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flat_dealer_proof_views_preserve_instance_and_receiver_order() {
+        let config = mixed_config();
+        let statement = flat_statement(&config);
+        let witness = crate::main_golden::reconstruct_revealed_witness(
+            &config,
+            &statement,
+            secret(idx(1)),
+            vec![Some(TinyScalar::from_u64(5).unwrap()), None],
+            revealed_openings(),
+        )
+        .unwrap();
+
+        assert_eq!(statement.dealer(), idx(1));
+        assert_eq!(statement.dealer_public_key(), &secret(idx(1)));
+        assert_eq!(statement.dealer_message_root(), [13; 32]);
+        assert_eq!(statement.instance_count(), 2);
+
+        let random = statement.instance(0).unwrap();
+        assert_eq!(random.effective_message(), EvrfMessage([21; 32]));
+        assert_eq!(
+            random.commitment_coefficients(),
+            &[
+                TinyScalar::from_u64(5).unwrap(),
+                TinyScalar::from_u64(7).unwrap(),
+            ]
+        );
+        assert_eq!(random.receiver_count(), 2);
+        let first_receiver = random.receiver(0).unwrap();
+        assert_eq!(first_receiver.participant(), idx(2));
+        assert_eq!(first_receiver.public_key(), &secret(idx(2)));
+        assert_eq!(
+            first_receiver.share_commitment(),
+            &TinyScalar::from_u64(19).unwrap()
+        );
+        assert_eq!(
+            first_receiver.pad_commitment(),
+            &TinyScalar::from_u64(31).unwrap()
+        );
+        assert_eq!(
+            first_receiver.encrypted_share(),
+            &TinyScalar::from_u64(50).unwrap()
+        );
+        assert_eq!(random.receiver(1).unwrap().participant(), idx(3));
+        assert!(random.receiver(2).is_none());
+        assert!(statement.instance(2).is_none());
+
+        assert_eq!(witness.identity_secret(), &secret(idx(1)));
+        assert_eq!(witness.instance_count(), 2);
+        let random_witness = witness.instance(0).unwrap();
+        assert_eq!(
+            random_witness.polynomial_constant(),
+            Some(&TinyScalar::from_u64(5).unwrap())
+        );
+        assert_eq!(random_witness.receiver_count(), 2);
+        let first_opening = random_witness.receiver(0).unwrap();
+        assert_eq!(first_opening.share(), &TinyScalar::from_u64(19).unwrap());
+        assert_eq!(first_opening.pad(), &TinyScalar::from_u64(31).unwrap());
+        assert!(random_witness.receiver(2).is_none());
+        assert_eq!(witness.instance(1).unwrap().polynomial_constant(), None);
+        assert!(witness.instance(2).is_none());
+        assert_eq!(
+            format!("{witness:?}"),
+            "DealerProofWitness { identity_secret: \"<redacted>\", polynomial_constants: \"<redacted>\", receiver_openings: \"<redacted>\" }"
+        );
+    }
+
+    #[test]
+    fn flat_statement_construction_rejects_inexact_dimensions() {
+        let config = mixed_config();
+        let result = DealerProofStatement::new(
+            &config,
+            idx(1),
+            [13; 32],
+            vec![EvrfMessage([21; 32]), EvrfMessage([22; 32])],
+            vec![TinyScalar::zero(); 3],
+            vec![TinyScalar::one(); 4],
+            vec![TinyScalar::one(); 4],
+            vec![TinyScalar::one(); 4],
+        );
+
+        assert_eq!(result.unwrap_err(), Error::ProofGenerationFailed);
+    }
+
+    #[test]
+    fn revealed_witness_reconstruction_checks_dimensions_and_kind_grammar() {
+        let config = mixed_config();
+        let statement = flat_statement(&config);
+        let identity_secret = secret(idx(1));
+        let random = TinyScalar::from_u64(5).unwrap();
+
+        let cases = [
+            (vec![Some(random)], revealed_openings()),
+            (vec![None, None], revealed_openings()),
+            (
+                vec![Some(random), Some(TinyScalar::zero())],
+                revealed_openings(),
+            ),
+            (
+                vec![Some(random), None],
+                revealed_openings().into_iter().take(3).collect(),
+            ),
+        ];
+
+        for (polynomial_constants, receiver_openings) in cases {
+            assert_eq!(
+                crate::main_golden::reconstruct_revealed_witness(
+                    &config,
+                    &statement,
+                    identity_secret,
+                    polynomial_constants,
+                    receiver_openings,
+                )
+                .unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+    }
+
+    fn check_flat_relation(
+        config: &DkgConfig<TinyGroup>,
+        statement: &DealerProofStatement<TinyGroup>,
+        witness: &crate::DealerProofWitness<TinyGroup>,
+        alter_pad: bool,
+    ) -> Result<()> {
+        crate::main_golden::check_dealer_relation_with_pad(
+            config,
+            statement,
+            witness,
+            |message, _, peer_key| {
+                let pad = match (message.0, *peer_key) {
+                    (value, key) if value == [21; 32] && key == secret(idx(2)) => 31,
+                    (value, key) if value == [21; 32] && key == secret(idx(3)) => 32,
+                    (value, key) if value == [22; 32] && key == secret(idx(2)) => 33,
+                    (value, key) if value == [22; 32] && key == secret(idx(3)) => 34,
+                    _ => return Err(Error::ProofVerificationFailed),
+                };
+                TinyScalar::from_u64(pad + u64::from(alter_pad))
+            },
+        )
+    }
+
+    #[test]
+    fn native_relation_checks_the_complete_flat_witness() {
+        let config = mixed_config();
+        let statement = flat_statement(&config);
+        let witness = crate::main_golden::reconstruct_revealed_witness(
+            &config,
+            &statement,
+            secret(idx(1)),
+            vec![Some(TinyScalar::from_u64(5).unwrap()), None],
+            revealed_openings(),
+        )
+        .unwrap();
+
+        check_flat_relation(&config, &statement, &witness, false).unwrap();
+        assert_eq!(
+            check_flat_relation(&config, &statement, &witness, true).unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+    }
+
+    #[test]
+    fn native_relation_rejects_altered_secret_constant_and_share() {
+        let config = mixed_config();
+        let statement = flat_statement(&config);
+        let cases = [
+            (
+                secret(idx(2)),
+                vec![Some(TinyScalar::from_u64(5).unwrap()), None],
+                revealed_openings(),
+            ),
+            (
+                secret(idx(1)),
+                vec![Some(TinyScalar::from_u64(6).unwrap()), None],
+                revealed_openings(),
+            ),
+            (
+                secret(idx(1)),
+                vec![Some(TinyScalar::from_u64(5).unwrap()), None],
+                {
+                    let mut openings = revealed_openings();
+                    openings[0].0 = TinyScalar::from_u64(20).unwrap();
+                    openings
+                },
+            ),
+        ];
+
+        for (identity_secret, polynomial_constants, receiver_openings) in cases {
+            let witness = crate::main_golden::reconstruct_revealed_witness(
+                &config,
+                &statement,
+                identity_secret,
+                polynomial_constants,
+                receiver_openings,
+            )
+            .unwrap();
+            assert_eq!(
+                check_flat_relation(&config, &statement, &witness, false).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
     }
 
     fn single_participant_config() -> DkgConfig<TinyGroup> {

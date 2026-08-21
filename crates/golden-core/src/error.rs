@@ -107,6 +107,10 @@ pub enum Error {
     #[error("proof verification failed")]
     ProofVerificationFailed,
 
+    /// A proof system could not produce a proof for a valid request.
+    #[error("proof generation failed")]
+    ProofGenerationFailed,
+
     /// A dealer proof failed individual verification after a batch failure.
     #[error("proof verification failed for dealer {0}")]
     DealerProofVerificationFailed(u32),

@@ -14,7 +14,12 @@ use rand_core::CryptoRngCore;
 
 pub mod paper;
 
+#[cfg(feature = "insecure-revealed-witness")]
+mod insecure_revealed_witness;
 mod proof_stream;
+
+#[cfg(feature = "insecure-revealed-witness")]
+pub use insecure_revealed_witness::InsecureRevealedWitnessProof;
 
 /// Curve-agnostic Schnorr backend for DKG share and pad openings.
 /// Not the Golden eVRF proof; see [`paper`] for that.
