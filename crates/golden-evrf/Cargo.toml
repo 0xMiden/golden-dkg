@@ -14,11 +14,14 @@ publish = ["crates-io"]
 golden-core = { workspace = true }
 rand_core = { workspace = true }
 sha2 = { workspace = true }
+bls12_381 = { workspace = true, optional = true }
 bulletproofs-cycle = { workspace = true, optional = true }
+golden-bls-jubjub = { workspace = true, optional = true }
 golden-halo2curves = { workspace = true, optional = true }
 ff = { workspace = true, optional = true }
 group = { workspace = true, optional = true }
 halo2curves = { workspace = true, optional = true }
+jubjub = { workspace = true, optional = true }
 merlin = { workspace = true }
 p3-maybe-rayon = { workspace = true, optional = true }
 rand_chacha = { workspace = true, optional = true }
@@ -53,6 +56,16 @@ halo2curves-secp256k1 = [
     "dep:rand_chacha",
     "golden-halo2curves/halo2curves-secp256k1",
 ]
+bls12-381-jubjub = [
+    "dep:bls12_381",
+    "dep:bulletproofs-cycle",
+    "dep:golden-bls-jubjub",
+    "dep:ff",
+    "dep:group",
+    "dep:jubjub",
+    "dep:p3-maybe-rayon",
+    "dep:rand_chacha",
+]
 
 [[test]]
 name = "one_receiver"
@@ -73,6 +86,14 @@ required-features = ["halo2curves-secp256k1"]
 [[test]]
 name = "public_params_serde"
 required-features = ["halo2curves-secp256k1", "serde"]
+
+[[test]]
+name = "bls_dkg_integration"
+required-features = ["bls12-381-jubjub"]
+
+[[test]]
+name = "bls_paper_public_api"
+required-features = ["bls12-381-jubjub"]
 
 [[bench]]
 name = "evrf_prove"
@@ -104,6 +125,36 @@ name = "batched_setup"
 harness = false
 required-features = ["halo2curves-secp256k1", "parallel"]
 
+[[bench]]
+name = "bls_evrf_prove"
+harness = false
+required-features = ["bls12-381-jubjub", "parallel"]
+
+[[bench]]
+name = "bls_evrf_verify"
+harness = false
+required-features = ["bls12-381-jubjub", "parallel"]
+
+[[bench]]
+name = "bls_evrf_proof_size"
+harness = false
+required-features = ["bls12-381-jubjub"]
+
+[[bench]]
+name = "bls_dkg_round"
+harness = false
+required-features = ["bls12-381-jubjub", "parallel"]
+
+[[bench]]
+name = "bls_dkg_communication"
+harness = false
+required-features = ["bls12-381-jubjub"]
+
+[[bench]]
+name = "bls_batched_setup"
+harness = false
+required-features = ["bls12-381-jubjub", "parallel"]
+
 [[example]]
 name = "warm_bench_fixtures"
 required-features = ["halo2curves-secp256k1", "parallel"]
@@ -111,6 +162,14 @@ required-features = ["halo2curves-secp256k1", "parallel"]
 [[example]]
 name = "check_bench_fixtures"
 required-features = ["halo2curves-secp256k1", "parallel"]
+
+[[example]]
+name = "warm_bench_fixtures_bls"
+required-features = ["bls12-381-jubjub", "parallel"]
+
+[[example]]
+name = "check_bench_fixtures_bls"
+required-features = ["bls12-381-jubjub", "parallel"]
 
 [lints]
 workspace = true

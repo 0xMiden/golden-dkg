@@ -1,6 +1,8 @@
 [workspace]
 members = [
+    "crates/bls12_381",
     "crates/bulletproofs-cycle",
+    "crates/golden-bls-jubjub",
     "crates/golden-core",
     "crates/golden-ehtdh1",
     "crates/golden-evrf",
@@ -22,6 +24,8 @@ repository = "https://github.com/0xMiden/golden-dkg"
 rust-version = "1.93"
 
 [workspace.dependencies]
+bls12_381 = { version = "0.8", default-features = false, features = ["groups", "bits", "alloc"] }
+blstrs = { version = "0.7", default-features = false }
 bulletproofs = { version = "5.0.0", default-features = false }
 bulletproofs-cycle = { path = "crates/bulletproofs-cycle", version = "0.4.0" }
 chacha20 = "0.9"
@@ -29,6 +33,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 curve25519-dalek = { version = "4.1.3", default-features = false }
 ff = { version = "0.13", default-features = false }
 group = { version = "0.13", default-features = false }
+golden-bls-jubjub = { path = "crates/golden-bls-jubjub", version = "0.4.0" }
 golden-core = { path = "crates/golden-core", version = "0.4.0" }
 golden-evrf = { path = "crates/golden-evrf", version = "0.4.0" }
 golden-halo2curves = { path = "crates/golden-halo2curves", version = "0.4.0" }
@@ -36,6 +41,7 @@ golden-rustcrypto = { path = "crates/golden-rustcrypto", version = "0.4.0" }
 halo2curves = { version = "0.10", default-features = false }
 hex = "0.4"
 hkdf = "0.12"
+jubjub = { version = "0.10", default-features = false, features = ["bits", "alloc"] }
 k256 = { version = "0.13", default-features = false }
 merlin = { version = "3", default-features = false }
 miden-serde-utils = { version = "0.28", default-features = false }
@@ -51,6 +57,14 @@ smallvec = "1"
 subtle = "2.6"
 thiserror = "2"
 zeroize = "1.8"
+
+# `crates/bls12_381` adds `G1Affine::x()`/`y()`/`from_raw_unchecked()` so a
+# `Cycle` implementation can drive true batch-affine MSM bucket accumulation
+# (see `golden-bls-jubjub`'s MSM module) without private-field access.
+# `jubjub`'s own `bls12_381` dependency is patched too, so `jubjub::Fq`
+# stays the exact same type as this workspace's `bls12_381::Scalar`.
+[patch.crates-io]
+bls12_381 = { path = "crates/bls12_381" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -190,10 +190,14 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Check checked-in dealer-message fixtures still verify
+      - name: Check checked-in dealer-message fixtures still verify (Secp/Secq)
         run: |
           cargo run --profile optimized --example check_bench_fixtures \
             --features golden-evrf/halo2curves-secp256k1,golden-evrf/parallel
+      - name: Check checked-in dealer-message fixtures still verify (BLS12-381/Jubjub)
+        run: |
+          cargo run --profile optimized --example check_bench_fixtures_bls \
+            --features golden-evrf/bls12-381-jubjub,golden-evrf/parallel
 
   doc:
     name: Docs

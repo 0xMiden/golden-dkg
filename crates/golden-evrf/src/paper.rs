@@ -15,13 +15,18 @@
 
 #![allow(non_snake_case)]
 
-#[cfg(feature = "halo2curves-secp256k1")]
+#[cfg(any(feature = "halo2curves-secp256k1", feature = "bls12-381-jubjub"))]
 use golden_core::{Error, ParticipantIndex, Result, TranscriptRoot};
-#[cfg(feature = "halo2curves-secp256k1")]
+#[cfg(any(feature = "halo2curves-secp256k1", feature = "bls12-381-jubjub"))]
 use rand_core::CryptoRngCore;
 
 /// Byte length of the paper `msg_i` nonce (256-bit security parameter).
 pub const MESSAGE_BYTES: usize = 256 / 8;
+
+/// Concrete BLS12-381/Jubjub paper eVRF backend, feature-gated behind
+/// `bls12-381-jubjub`.
+#[cfg(feature = "bls12-381-jubjub")]
+pub mod bls_jubjub;
 
 /// Concrete Secp/Secq paper eVRF backend, feature-gated behind
 /// `halo2curves-secp256k1`.
