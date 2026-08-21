@@ -128,8 +128,14 @@ pub trait GoldenGroup: Clone + Debug + Sized {
     /// Length in bytes of [`Self::ElementRepr`].
     const ELEMENT_REPR_BYTES: usize;
 
-    /// Stable backend identifier for transcript binding.
+    /// Stable adapter identifier for implementation-specific contexts.
     const BACKEND_ID: &'static str;
+
+    /// Stable concrete-curve identifier for protocol roots and wire envelopes.
+    ///
+    /// Unlike [`Self::BACKEND_ID`], this value must be identical for every
+    /// adapter implementing the same curve with the same canonical encoding.
+    const CURVE_ID: &'static str;
 
     /// Return the group generator.
     fn generator() -> Self::Element;

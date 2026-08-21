@@ -70,9 +70,9 @@ pub struct DealerProofStatement<G: GoldenGroup> {
 }
 
 impl<G: GoldenGroup> DealerProofStatement<G> {
-    // The free `deal` workflow is introduced in the next migration slice. Keep
-    // construction crate-private while the flat proof seam lands first.
-    #[allow(dead_code)]
+    // Only core constructs proof inputs from validated dealer data. Keeping
+    // this crate-private prevents proof systems from defining a second
+    // statement-construction seam.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &DkgConfig<G>,
@@ -351,6 +351,23 @@ pub struct DealerProofWitness<G: GoldenGroup> {
 }
 
 impl<G: GoldenGroup> DealerProofWitness<G> {
+    pub(crate) fn new(
+        config: &DkgConfig<G>,
+        statement: &DealerProofStatement<G>,
+        identity_secret: G::Scalar,
+        polynomial_constants: Vec<Option<G::Scalar>>,
+        receiver_openings: Vec<(G::Scalar, G::Scalar)>,
+    ) -> Result<Self> {
+        Self::from_revealed_parts(
+            config,
+            statement,
+            identity_secret,
+            polynomial_constants,
+            receiver_openings,
+        )
+        .map_err(|_| Error::ProofGenerationFailed)
+    }
+
     pub(crate) fn from_revealed_parts(
         config: &DkgConfig<G>,
         statement: &DealerProofStatement<G>,

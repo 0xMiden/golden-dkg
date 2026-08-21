@@ -163,6 +163,7 @@ impl GoldenGroup for Secp256k1GoldenGroup {
     const ELEMENT_REPR_BYTES: usize = 33;
 
     const BACKEND_ID: &'static str = "halo2curves-secp256k1-v1";
+    const CURVE_ID: &'static str = "secp256k1-v1";
 
     fn generator() -> Self::Element {
         Secp256k1Element(Secp256k1::generator())
@@ -313,7 +314,54 @@ pub fn scalar_to_r1cs_field(scalar: &Secp256k1Scalar) -> Option<Fp> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use golden_core::{
+        deal, DealerProofStatement, DealerProofSystem, DealerProofWitness, DkgConfig,
+        ParticipantIndex, ParticipantRegistry, SessionId,
+    };
+    use golden_rustcrypto::{K256Backend, K256Scalar};
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+
+    const FIXED_TEST_PROOF: &[u8] = &[0x5a, 0xa5];
+
+    #[derive(Default)]
+    struct CapturingProofSystem {
+        dealer_message_root: Mutex<Option<[u8; 32]>>,
+    }
+
+    impl CapturingProofSystem {
+        fn dealer_message_root(&self) -> [u8; 32] {
+            self.dealer_message_root.lock().unwrap().unwrap()
+        }
+    }
+
+    impl<G: GoldenCurve> DealerProofSystem<G> for CapturingProofSystem {
+        fn prove(
+            &self,
+            _config: &DkgConfig<G>,
+            statement: &DealerProofStatement<G>,
+            _witness: &DealerProofWitness<G>,
+            _rng: &mut impl CryptoRngCore,
+        ) -> Result<Vec<u8>> {
+            *self.dealer_message_root.lock().unwrap() = Some(statement.dealer_message_root());
+            Ok(FIXED_TEST_PROOF.to_vec())
+        }
+
+        fn verify(
+            &self,
+            _config: &DkgConfig<G>,
+            _statement: &DealerProofStatement<G>,
+            proof: &[u8],
+        ) -> Result<()> {
+            if proof == FIXED_TEST_PROOF {
+                Ok(())
+            } else {
+                Err(Error::ProofVerificationFailed)
+            }
+        }
+    }
 
     #[test]
     fn scalar_encoding_round_trips() {
@@ -333,6 +381,84 @@ mod tests {
     fn identity_encoding_is_fixed_width() {
         let repr = Secp256k1GoldenGroup::encode_element(&Secp256k1GoldenGroup::identity());
         assert_eq!(repr, [0u8; 33]);
+    }
+
+    #[test]
+    fn secp256k1_protocol_identity_is_adapter_independent() {
+        let dealer = ParticipantIndex::new(1).unwrap();
+        let receiver = ParticipantIndex::new(2).unwrap();
+        let halo_dealer_secret = Secp256k1Scalar::from_u64(7).unwrap();
+        let halo_receiver_secret = Secp256k1Scalar::from_u64(11).unwrap();
+        let rustcrypto_dealer_secret = K256Scalar::from_u64(7).unwrap();
+        let rustcrypto_receiver_secret = K256Scalar::from_u64(11).unwrap();
+        let halo_registry: ParticipantRegistry<Secp256k1GoldenGroup> =
+            ParticipantRegistry::new(vec![
+                (
+                    dealer,
+                    Secp256k1GoldenGroup::mul_generator(&halo_dealer_secret),
+                ),
+                (
+                    receiver,
+                    Secp256k1GoldenGroup::mul_generator(&halo_receiver_secret),
+                ),
+            ])
+            .unwrap();
+        let rustcrypto_registry: ParticipantRegistry<K256Backend> = ParticipantRegistry::new(vec![
+            (
+                dealer,
+                K256Backend::mul_generator(&rustcrypto_dealer_secret),
+            ),
+            (
+                receiver,
+                K256Backend::mul_generator(&rustcrypto_receiver_secret),
+            ),
+        ])
+        .unwrap();
+        let halo_config = DkgConfig::new_zero(1, SessionId([0x42; 32]), halo_registry).unwrap();
+        let rustcrypto_config =
+            DkgConfig::new_zero(1, SessionId([0x42; 32]), rustcrypto_registry).unwrap();
+
+        assert_ne!(Secp256k1GoldenGroup::BACKEND_ID, K256Backend::BACKEND_ID);
+        assert_eq!(Secp256k1GoldenGroup::CURVE_ID, K256Backend::CURVE_ID);
+        assert_ne!(
+            halo_dealer_secret.to_repr(),
+            rustcrypto_dealer_secret.to_repr()
+        );
+        assert_eq!(halo_config.root(), rustcrypto_config.root());
+
+        let mut halo_rng = ChaCha20Rng::from_seed([0x24; 32]);
+        let mut rustcrypto_rng = ChaCha20Rng::from_seed([0x24; 32]);
+        let halo_proof_system = CapturingProofSystem::default();
+        let rustcrypto_proof_system = CapturingProofSystem::default();
+        let halo_dealing = deal(
+            &halo_proof_system,
+            &halo_config,
+            dealer,
+            &halo_dealer_secret,
+            &mut halo_rng,
+        )
+        .unwrap();
+        let rustcrypto_dealing = deal(
+            &rustcrypto_proof_system,
+            &rustcrypto_config,
+            dealer,
+            &rustcrypto_dealer_secret,
+            &mut rustcrypto_rng,
+        )
+        .unwrap();
+
+        assert_eq!(
+            halo_proof_system.dealer_message_root(),
+            rustcrypto_proof_system.dealer_message_root()
+        );
+        assert_eq!(halo_dealing.dealer_message_bytes().len(), 180);
+        assert!(halo_dealing
+            .dealer_message_bytes()
+            .ends_with(FIXED_TEST_PROOF));
+        assert_eq!(
+            halo_dealing.dealer_message_bytes(),
+            rustcrypto_dealing.dealer_message_bytes()
+        );
     }
 
     #[test]

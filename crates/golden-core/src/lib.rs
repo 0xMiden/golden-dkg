@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+mod deal;
+mod dealer_message;
 mod dealer_proof;
 pub mod dkg;
 pub mod error;
@@ -21,6 +23,7 @@ pub mod wire;
 #[cfg(test)]
 mod test_support;
 
+pub use deal::{deal, max_dealer_message_bytes, OwnDealing};
 pub use dealer_proof::{
     DealerProofInstanceView, DealerProofReceiverView, DealerProofRef, DealerProofStatement,
     DealerProofSystem, DealerProofWitness, DealerProofWitnessInstanceView,

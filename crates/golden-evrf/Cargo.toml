@@ -70,6 +70,10 @@ name = "paper_public_api"
 required-features = ["halo2curves-secp256k1"]
 
 [[test]]
+name = "dkg_opaque"
+required-features = ["insecure-revealed-witness"]
+
+[[test]]
 name = "public_params_serde"
 required-features = ["halo2curves-secp256k1", "serde"]
 

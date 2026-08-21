@@ -32,6 +32,10 @@ fn identity_secret(participant: ParticipantIndex) -> P256Scalar {
     scalar(100 + u64::from(participant.get()))
 }
 
+fn legacy_beta() -> P256Scalar {
+    scalar(77)
+}
+
 fn config(session_id: SessionId, instances: Vec<DkgInstanceKind>) -> DkgConfig<G> {
     let registry = ParticipantRegistry::new(
         participants()
@@ -45,7 +49,7 @@ fn config(session_id: SessionId, instances: Vec<DkgInstanceKind>) -> DkgConfig<G
             .collect(),
     )
     .unwrap();
-    DkgConfig::batch(2, session_id, scalar(77), registry, instances).unwrap()
+    DkgConfig::new(2, session_id, registry, instances).unwrap()
 }
 
 fn ehtdh1_config(session_id: SessionId) -> DkgConfig<G> {
@@ -67,6 +71,7 @@ fn dealings(
                 dealer,
                 &identity_secret(dealer),
                 config,
+                &legacy_beta(),
                 rng,
             )
             .unwrap();
@@ -102,6 +107,7 @@ fn outputs(
                 dealings.get(&receiver).unwrap(),
                 &peer_dealings(receiver, &dealings),
                 config,
+                &legacy_beta(),
             )
             .unwrap();
             (receiver, output)
@@ -273,6 +279,10 @@ mod secp_secq {
         scalar(100 + u64::from(participant.get()))
     }
 
+    fn legacy_beta() -> Secp256k1Scalar {
+        scalar(77)
+    }
+
     fn config() -> DkgConfig<PaperGroup> {
         let registry = ParticipantRegistry::new(
             participants()
@@ -286,10 +296,9 @@ mod secp_secq {
                 .collect(),
         )
         .unwrap();
-        DkgConfig::batch(
+        DkgConfig::new(
             2,
             SessionId([55u8; 32]),
-            scalar(77),
             registry,
             vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
         )
@@ -308,6 +317,7 @@ mod secp_secq {
                     dealer,
                     &identity_secret(dealer),
                     config,
+                    &legacy_beta(),
                     rng,
                 )
                 .unwrap();
@@ -331,6 +341,7 @@ mod secp_secq {
                     dealings.get(&receiver).unwrap(),
                     &peers,
                     config,
+                    &legacy_beta(),
                 )
                 .unwrap();
                 (receiver, output)

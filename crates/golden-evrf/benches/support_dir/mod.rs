@@ -85,6 +85,11 @@ pub fn identity_secret(p: ParticipantIndex) -> Secp256k1Scalar {
     Secp256k1Scalar::from_u64(100 + u64::from(p.get())).unwrap()
 }
 
+/// Caller-selected scalar coefficient retained only by the legacy DKG seam.
+pub fn legacy_beta() -> Secp256k1Scalar {
+    Secp256k1Scalar::from_u64(77).unwrap()
+}
+
 /// Build a deterministic receiver public key for a synthetic receiver with
 /// index `j` (1-indexed), used to drive the eVRF prover in isolation without
 /// paying the cost of a full DKG `create_dealing`.
@@ -110,13 +115,7 @@ pub fn build_config(n: usize, t: usize) -> DkgConfig<Secp256k1GoldenGroup> {
             .collect(),
     )
     .unwrap();
-    DkgConfig::random(
-        t,
-        SessionId([42u8; 32]),
-        Secp256k1Scalar::from_u64(77).unwrap(),
-        registry,
-    )
-    .unwrap()
+    DkgConfig::new_random(t, SessionId([42u8; 32]), registry).unwrap()
 }
 
 /// Build a batched eVRF statement/witness pair covering exactly `n_e`

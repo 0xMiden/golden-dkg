@@ -486,7 +486,6 @@ impl<G: GoldenGroup> WireEncode for DkgConfig<G> {
     fn write_wire(&self, out: &mut Vec<u8>) {
         write_len(out, self.threshold());
         self.session_id().write_wire(out);
-        write_scalar::<G>(out, self.beta());
         self.registry().write_wire(out);
         write_len(out, self.instances().len());
         for kind in self.instances() {
@@ -503,7 +502,6 @@ where
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let threshold = reader.read_len()?;
         let session_id = SessionId::read_wire(reader)?;
-        let beta = read_scalar::<G>(reader)?;
         let registry = ParticipantRegistry::read_wire(reader)?;
         let instance_count = reader.read_len()?;
         reader.ensure_remaining_items(instance_count, 1)?;
@@ -511,7 +509,7 @@ where
         for _ in 0..instance_count {
             instances.push(DkgInstanceKind::read_wire(reader)?);
         }
-        Self::batch(threshold, session_id, beta, registry, instances)
+        Self::new(threshold, session_id, registry, instances)
     }
 }
 
@@ -521,7 +519,7 @@ where
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_DKG_CONFIG;
-    const CODEC_ID: &'static str = "dkg-config-v2";
+    const CODEC_ID: &'static str = "dkg-config-v3";
 
     fn write_wire_context(out: &mut Vec<u8>) {
         write_context_field(out, Self::CODEC_ID.as_bytes());
@@ -1144,7 +1142,7 @@ mod batch_tests {
     }
 
     fn config(kinds: Vec<DkgInstanceKind>) -> DkgConfig<TinyGroup> {
-        DkgConfig::batch(2, SessionId([7; 32]), scalar(9), registry(), kinds).unwrap()
+        DkgConfig::new(2, SessionId([7; 32]), registry(), kinds).unwrap()
     }
 
     fn encrypted_share(pad: u64, encrypted: u64) -> EncryptedShare<TinyGroup> {
@@ -1312,7 +1310,7 @@ mod batch_tests {
         assert_eq!(MAGIC, b"golden-dkg-wire-v4");
         assert_eq!(
             <DkgConfig<TinyGroup> as WireMessage>::CODEC_ID,
-            "dkg-config-v2"
+            "dkg-config-v3"
         );
         assert_eq!(
             <DealerMessage<TinyGroup> as WireMessage>::CODEC_ID,
@@ -1332,6 +1330,26 @@ mod batch_tests {
             assert_eq!(decoded.instances(), kinds);
             assert_eq!(decoded.root(), expected.root());
         }
+    }
+
+    #[test]
+    fn config_wire_grammar_contains_only_final_configuration_fields() {
+        let expected = config(vec![DkgInstanceKind::Random, DkgInstanceKind::Zero]);
+        let encoded = to_wire_bytes(&expected);
+        let mut expected_nested = Vec::new();
+        write_len(&mut expected_nested, expected.threshold());
+        expected.session_id().write_wire(&mut expected_nested);
+        expected.registry().write_wire(&mut expected_nested);
+        write_len(&mut expected_nested, expected.instances().len());
+        for kind in expected.instances() {
+            kind.write_wire(&mut expected_nested);
+        }
+
+        assert_eq!(encoded, wrap::<DkgConfig<TinyGroup>>(&expected_nested));
+        assert_eq!(
+            from_wire_bytes::<DkgConfig<TinyGroup>>(&encoded).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -1438,19 +1456,11 @@ mod batch_tests {
     }
 
     #[test]
-    fn noncanonical_config_scalar_and_registry_element_are_rejected() {
+    fn noncanonical_config_registry_element_is_rejected() {
         let expected = config(vec![DkgInstanceKind::Random]);
-        let mut bytes = to_wire_bytes(&expected);
         let payload = standalone_prefix::<DkgConfig<TinyGroup>>().len();
-        let beta_offset = payload + 8 + 32;
-        bytes[beta_offset] = 97;
-        assert_eq!(
-            from_wire_bytes::<DkgConfig<TinyGroup>>(&bytes).unwrap_err(),
-            Error::InvalidEncoding
-        );
-
         let mut bytes = to_wire_bytes(&expected);
-        let first_registry_element = payload + 8 + 32 + TinyScalar::REPR_BYTES + 8 + 4;
+        let first_registry_element = payload + 8 + 32 + 8 + 4;
         bytes[first_registry_element] = 97;
         assert_eq!(
             from_wire_bytes::<DkgConfig<TinyGroup>>(&bytes).unwrap_err(),
@@ -1468,6 +1478,14 @@ mod batch_tests {
             from_wire_bytes::<DkgConfig<TinyGroup>>(&zero_threshold),
             Err(Error::InvalidThreshold { .. })
         ));
+
+        let mut empty_registry = to_wire_bytes(&expected);
+        let registry_len = payload + 8 + 32;
+        empty_registry[registry_len..registry_len + 8].copy_from_slice(&0u64.to_be_bytes());
+        assert_eq!(
+            from_wire_bytes::<DkgConfig<TinyGroup>>(&empty_registry).unwrap_err(),
+            Error::EmptyParticipantRegistry
+        );
 
         let mut hostile = to_wire_bytes(&expected);
         let kind_count_offset = hostile.len() - expected.instances().len() - 8;

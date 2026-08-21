@@ -6,6 +6,10 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// Errors returned by Golden core operations.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum Error {
+    /// A participant registry contained no entries.
+    #[error("participant registry must not be empty")]
+    EmptyParticipantRegistry,
+
     /// A participant index was zero.
     #[error("participant indexes must be nonzero")]
     ZeroParticipantIndex,
@@ -110,6 +114,18 @@ pub enum Error {
     /// A proof system could not produce a proof for a valid request.
     #[error("proof generation failed")]
     ProofGenerationFailed,
+
+    /// A complete opaque dealer message exceeded the protocol size bound.
+    #[error("dealer message exceeds the protocol size limit")]
+    DealerMessageTooLarge,
+
+    /// The native Main Golden relation could not be evaluated.
+    #[error("Main Golden relation evaluation failed")]
+    RelationEvaluationFailed,
+
+    /// Local eVRF evaluation produced a zero pad and must be retried afresh.
+    #[error("degenerate local eVRF output; retry the complete deal operation")]
+    DegenerateEvrfOutput,
 
     /// A dealer proof failed individual verification after a batch failure.
     #[error("proof verification failed for dealer {0}")]

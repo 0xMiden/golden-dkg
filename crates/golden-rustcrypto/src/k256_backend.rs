@@ -171,8 +171,8 @@ impl ConstantTimeEq for K256Element {
 ///
 /// Like the other backend types in this crate this is an empty enum used as
 /// the concrete `Self` for `impl GoldenGroup for K256Backend`. There is never
-/// a value of this type; it exists to carry the associated types and
-/// `BACKEND_ID` constant that scope a backend's wire format.
+/// a value of this type; it exists to carry the associated types, the
+/// implementation-specific `BACKEND_ID`, and the protocol `CURVE_ID`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum K256Backend {}
 
@@ -184,6 +184,7 @@ impl GoldenGroup for K256Backend {
     const ELEMENT_REPR_BYTES: usize = 33;
 
     const BACKEND_ID: &'static str = "rustcrypto-k256-v1";
+    const CURVE_ID: &'static str = "secp256k1-v1";
 
     fn generator() -> Self::Element {
         K256Element(ProjectivePoint::GENERATOR)

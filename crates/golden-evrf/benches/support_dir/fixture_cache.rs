@@ -38,7 +38,7 @@ use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use sha2::{Digest, Sha256};
 
-use super::{identity_secret, BENCH_SEED};
+use super::{identity_secret, legacy_beta, BENCH_SEED};
 
 /// The command printed in panic/log messages so a stale or missing fixture
 /// tells the reader exactly how to fix it.
@@ -93,6 +93,7 @@ fn build_dealer_messages(
                 dealer,
                 &identity_secret(dealer),
                 config,
+                &legacy_beta(),
                 &mut rng,
             )
             .unwrap()
@@ -173,7 +174,8 @@ fn load_valid(
 
     if !already_verified {
         let refs: Vec<_> = messages.iter().collect();
-        verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(&refs, config).ok()?;
+        verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(&refs, config, &legacy_beta())
+            .ok()?;
         write_stamp(threshold, n, &digest);
     }
 
@@ -267,6 +269,7 @@ pub fn cached_round1_setup(
         receiver,
         &identity_secret(receiver),
         config,
+        &legacy_beta(),
         &mut rng,
     )
     .unwrap();

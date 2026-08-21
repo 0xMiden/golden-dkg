@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// Protocol version used in transcript binding.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Byte length of a raw dealer nonce and an effective eVRF message.
 pub const DEALER_MESSAGE_NONCE_BYTES: usize = 32;
@@ -58,6 +58,10 @@ pub struct ParticipantRegistry<G: GoldenGroup> {
 impl<G: GoldenGroup> ParticipantRegistry<G> {
     /// Build a registry from participant identity public keys.
     pub fn new(entries: Vec<(ParticipantIndex, G::Element)>) -> Result<Self> {
+        if entries.is_empty() {
+            return Err(Error::EmptyParticipantRegistry);
+        }
+
         let mut participants = BTreeMap::new();
         let mut public_keys = Vec::<(Vec<u8>, ParticipantIndex)>::new();
         for (participant, public_key) in entries {
@@ -134,18 +138,16 @@ pub enum DkgInstanceKind {
 pub struct DkgConfig<G: GoldenGroup> {
     threshold: usize,
     session_id: SessionId,
-    beta: G::Scalar,
     registry: ParticipantRegistry<G>,
     instances: Vec<DkgInstanceKind>,
     root: TranscriptRoot,
 }
 
 impl<G: GoldenGroup> DkgConfig<G> {
-    /// Construct an arbitrary ordered, nonempty batch.
-    pub fn batch(
+    /// Construct an arbitrary ordered, nonempty set of sharing instances.
+    pub fn new(
         threshold: usize,
         session_id: SessionId,
-        beta: G::Scalar,
         registry: ParticipantRegistry<G>,
         instances: Vec<DkgInstanceKind>,
     ) -> Result<Self> {
@@ -158,11 +160,10 @@ impl<G: GoldenGroup> DkgConfig<G> {
         if instances.is_empty() {
             return Err(Error::EmptyDkgBatch);
         }
-        let root = config_root::<G>(threshold, session_id, &beta, &registry, &instances);
+        let root = config_root::<G>(threshold, session_id, &registry, &instances);
         Ok(Self {
             threshold,
             session_id,
-            beta,
             registry,
             instances,
             root,
@@ -170,35 +171,26 @@ impl<G: GoldenGroup> DkgConfig<G> {
     }
 
     /// Construct one random sharing.
-    pub fn random(
+    pub fn new_random(
         threshold: usize,
         session_id: SessionId,
-        beta: G::Scalar,
         registry: ParticipantRegistry<G>,
     ) -> Result<Self> {
-        Self::batch(
+        Self::new(
             threshold,
             session_id,
-            beta,
             registry,
             vec![DkgInstanceKind::Random],
         )
     }
 
     /// Construct one zero sharing.
-    pub fn zero(
+    pub fn new_zero(
         threshold: usize,
         session_id: SessionId,
-        beta: G::Scalar,
         registry: ParticipantRegistry<G>,
     ) -> Result<Self> {
-        Self::batch(
-            threshold,
-            session_id,
-            beta,
-            registry,
-            vec![DkgInstanceKind::Zero],
-        )
+        Self::new(threshold, session_id, registry, vec![DkgInstanceKind::Zero])
     }
 
     /// Return the threshold.
@@ -211,19 +203,24 @@ impl<G: GoldenGroup> DkgConfig<G> {
         self.session_id
     }
 
-    /// Return the public eVRF coefficient.
-    pub fn beta(&self) -> &G::Scalar {
-        &self.beta
-    }
-
     /// Return the participant registry.
     pub fn registry(&self) -> &ParticipantRegistry<G> {
         &self.registry
     }
 
+    /// Return one registered participant identity public key.
+    pub fn identity_public_key(&self, participant: ParticipantIndex) -> Option<&G::Element> {
+        self.registry.participants.get(&participant)
+    }
+
     /// Return configured instance kinds in protocol order.
     pub fn instances(&self) -> &[DkgInstanceKind] {
         &self.instances
+    }
+
+    /// Return one configured instance kind by protocol position.
+    pub fn instance(&self, position: usize) -> Option<DkgInstanceKind> {
+        self.instances.get(position).copied()
     }
 
     /// Return the canonical configuration root.
@@ -512,10 +509,15 @@ impl<G: GoldenGroup> core::fmt::Debug for DkgOutput<G> {
 }
 
 /// Create one dealer message for the complete configured batch.
+///
+/// `legacy_beta` is the caller-selected scalar coefficient used by this legacy
+/// static proof seam. It is unrelated to the protocol-wide Main Golden
+/// base-field coefficient.
 pub fn create_dealing<G, B>(
     dealer: ParticipantIndex,
     dealer_identity_secret: &G::Scalar,
     config: &DkgConfig<G>,
+    legacy_beta: &G::Scalar,
     rng: &mut impl CryptoRngCore,
 ) -> Result<DkgDealing<G>>
 where
@@ -567,7 +569,7 @@ where
                 .ok_or(Error::MissingShare(receiver.get()))?;
             let pad = B::derive_pad(
                 message,
-                &config.beta,
+                legacy_beta,
                 dealer_identity_secret,
                 receiver_public_key,
                 receiver_public_key,
@@ -617,7 +619,7 @@ where
     };
     let statement = EvrfStatement {
         dealer_public_key: dealer_public_key.clone(),
-        beta: config.beta.clone(),
+        beta: (*legacy_beta).clone(),
         dealer_message_root: message.root(),
         dealings: proof_dealings,
     };
@@ -650,6 +652,7 @@ where
 fn dealing_statement<G>(
     message: &DealerMessage<G>,
     config: &DkgConfig<G>,
+    legacy_beta: &G::Scalar,
 ) -> Result<EvrfStatement<G>>
 where
     G: GoldenGroup,
@@ -715,19 +718,26 @@ where
 
     Ok(EvrfStatement {
         dealer_public_key: dealer_public_key.clone(),
-        beta: config.beta.clone(),
+        beta: (*legacy_beta).clone(),
         dealer_message_root: message.root(),
         dealings,
     })
 }
 
 /// Verify one complete dealer message.
-pub fn verify_dealing<G, B>(message: &DealerMessage<G>, config: &DkgConfig<G>) -> Result<()>
+///
+/// `legacy_beta` must be the same caller-selected scalar used to create the
+/// message. It is not the Main Golden base-field coefficient.
+pub fn verify_dealing<G, B>(
+    message: &DealerMessage<G>,
+    config: &DkgConfig<G>,
+    legacy_beta: &G::Scalar,
+) -> Result<()>
 where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
 {
-    let statement = dealing_statement(message, config)?;
+    let statement = dealing_statement(message, config, legacy_beta)?;
     if statement
         .dealings
         .iter()
@@ -745,7 +755,14 @@ where
 }
 
 /// Verify several independent dealer messages in one backend call.
-pub fn verify_dealings<G, B>(messages: &[&DealerMessage<G>], config: &DkgConfig<G>) -> Result<()>
+///
+/// `legacy_beta` must be the same caller-selected scalar used to create every
+/// message. It is not the Main Golden base-field coefficient.
+pub fn verify_dealings<G, B>(
+    messages: &[&DealerMessage<G>],
+    config: &DkgConfig<G>,
+    legacy_beta: &G::Scalar,
+) -> Result<()>
 where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
@@ -763,7 +780,7 @@ where
     // Complete structural preflight for every message before combining proofs.
     let statements = messages
         .iter()
-        .map(|message| dealing_statement(message, config))
+        .map(|message| dealing_statement(message, config, legacy_beta))
         .collect::<Result<Vec<_>>>()?;
     if statements.iter().all(|statement| {
         statement
@@ -796,12 +813,16 @@ where
 }
 
 /// Complete every configured sharing atomically for one receiver.
+///
+/// `legacy_beta` must be the same caller-selected scalar used by every dealer.
+/// It is unrelated to the protocol-wide Main Golden base-field coefficient.
 pub fn complete<G, B>(
     receiver: ParticipantIndex,
     receiver_identity_secret: &G::Scalar,
     own_dealing: &DkgDealing<G>,
     peer_dealings: &BTreeMap<ParticipantIndex, DealerMessage<G>>,
     config: &DkgConfig<G>,
+    legacy_beta: &G::Scalar,
 ) -> Result<DkgOutput<G>>
 where
     G: GoldenGroup,
@@ -843,7 +864,7 @@ where
                 .ok_or(Error::MissingDealing(dealer.get()))
         })
         .collect::<Result<Vec<_>>>()?;
-    verify_dealings::<G, B>(&messages, config)?;
+    verify_dealings::<G, B>(&messages, config, legacy_beta)?;
 
     let mut outputs = Vec::with_capacity(config.instances.len());
     for (position, kind) in config.instances.iter().copied().enumerate() {
@@ -863,8 +884,8 @@ where
                     message,
                     body,
                     position,
-                    kind,
                     config,
+                    legacy_beta,
                 )?
             };
             if !body.commitment.verify_share(&share)? {
@@ -915,16 +936,14 @@ where
 fn config_root<G: GoldenGroup>(
     threshold: usize,
     session_id: SessionId,
-    beta: &G::Scalar,
     registry: &ParticipantRegistry<G>,
     instances: &[DkgInstanceKind],
 ) -> TranscriptRoot {
     let mut transcript = TranscriptBuilder::new(b"dkg-config");
     transcript.u32(b"version", PROTOCOL_VERSION);
-    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
+    transcript.bytes(b"curve", G::CURVE_ID.as_bytes());
     transcript.bytes(b"session", &session_id.0);
     transcript.usize(b"threshold", threshold);
-    transcript.scalar::<G>(b"beta", beta);
     transcript.bytes(b"registry", &registry.root());
     transcript.usize(b"instances-len", instances.len());
     for kind in instances {
@@ -943,7 +962,7 @@ fn registry_root<G: GoldenGroup>(
     participants: &BTreeMap<ParticipantIndex, G::Element>,
 ) -> TranscriptRoot {
     let mut transcript = TranscriptBuilder::new(b"registry");
-    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
+    transcript.bytes(b"curve", G::CURVE_ID.as_bytes());
     transcript.usize(b"len", participants.len());
     for (participant, public_key) in participants {
         transcript.participant(b"participant", *participant);
@@ -1062,8 +1081,8 @@ fn decrypt_share_for_receiver<G, B>(
     dealer_message: &DealerMessage<G>,
     body: &DealingBody<G>,
     position: usize,
-    kind: DkgInstanceKind,
     config: &DkgConfig<G>,
+    legacy_beta: &G::Scalar,
 ) -> Result<Share<G::Scalar>>
 where
     G: GoldenGroup,
@@ -1075,6 +1094,7 @@ where
         .ok_or(Error::MissingShare(receiver.get()))?;
     let dealer_public_key = config.registry.public_key(dealer_message.dealer)?;
     let receiver_public_key = config.registry.public_key(receiver)?;
+    let kind = config.instances[position];
     let message = effective_message(
         config.root,
         dealer_message.dealer,
@@ -1084,7 +1104,7 @@ where
     );
     let pad = B::derive_pad(
         message,
-        &config.beta,
+        legacy_beta,
         receiver_identity_secret,
         dealer_public_key,
         receiver_public_key,
@@ -1181,6 +1201,45 @@ mod tests {
     static BATCH_VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SINGLE_VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+    static LEGACY_BETA_PAD_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LEGACY_BETA_PROVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LEGACY_BETA_VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    enum ExplicitLegacyBetaBackend {}
+
+    impl EvrfProofBackend<TinyGroup> for ExplicitLegacyBetaBackend {
+        const PROOF_ID: &'static [u8] = b"golden-core/explicit-legacy-beta/v1";
+
+        fn derive_pad(
+            message: EvrfMessage,
+            legacy_beta: &TinyScalar,
+            identity_secret: &TinyScalar,
+            peer_public_key: &<TinyGroup as GoldenGroup>::Element,
+            receiver_public_key: &<TinyGroup as GoldenGroup>::Element,
+        ) -> Result<TinyScalar> {
+            assert_eq!(legacy_beta, &explicit_legacy_beta());
+            LEGACY_BETA_PAD_CALLS.fetch_add(1, Ordering::SeqCst);
+            let shared_secret = TinyGroup::mul(peer_public_key, identity_secret);
+            derive_default_pad::<TinyGroup>(message, receiver_public_key, &shared_secret)
+        }
+
+        fn prove_batch(
+            statement: &EvrfStatement<TinyGroup>,
+            witness: &EvrfWitness<TinyGroup>,
+            rng: &mut impl CryptoRngCore,
+        ) -> Result<Vec<u8>> {
+            assert_eq!(statement.beta, explicit_legacy_beta());
+            LEGACY_BETA_PROVE_CALLS.fetch_add(1, Ordering::SeqCst);
+            FakeBackend::prove_batch(statement, witness, rng)
+        }
+
+        fn verify_batch(statement: &EvrfStatement<TinyGroup>, proof: &[u8]) -> Result<()> {
+            assert_eq!(statement.beta, explicit_legacy_beta());
+            LEGACY_BETA_VERIFY_CALLS.fetch_add(1, Ordering::SeqCst);
+            FakeBackend::verify_batch(statement, proof)
+        }
+    }
+
     enum CountingBackend {}
 
     impl EvrfProofBackend<TinyGroup> for CountingBackend {
@@ -1256,6 +1315,14 @@ mod tests {
         TinyScalar::from_u64(u64::from(participant.get())).unwrap()
     }
 
+    fn explicit_legacy_beta() -> TinyScalar {
+        TinyScalar::from_u64(42).unwrap()
+    }
+
+    fn legacy_beta() -> TinyScalar {
+        TinyScalar::from_u64(11).unwrap()
+    }
+
     fn registry() -> ParticipantRegistry<TinyGroup> {
         ParticipantRegistry::new(
             [idx(1), idx(2), idx(3)]
@@ -1266,15 +1333,92 @@ mod tests {
         .unwrap()
     }
 
-    fn mixed_config() -> DkgConfig<TinyGroup> {
-        DkgConfig::batch(
+    #[test]
+    fn registry_and_config_expose_the_final_validated_contract() {
+        assert_eq!(
+            ParticipantRegistry::<TinyGroup>::new(Vec::new()).unwrap_err(),
+            Error::EmptyParticipantRegistry
+        );
+
+        let registry = registry();
+        let config = DkgConfig::new(
             2,
             SessionId([7; 32]),
-            TinyScalar::from_u64(11).unwrap(),
+            registry.clone(),
+            vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
+        )
+        .unwrap();
+
+        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(config.threshold(), 2);
+        assert_eq!(config.session_id(), SessionId([7; 32]));
+        assert_eq!(config.registry(), &registry);
+        assert_eq!(
+            config.identity_public_key(idx(2)),
+            Some(registry.public_key(idx(2)).unwrap())
+        );
+        assert_eq!(config.identity_public_key(idx(4)), None);
+        assert_eq!(config.instance(0), Some(DkgInstanceKind::Random));
+        assert_eq!(config.instance(1), Some(DkgInstanceKind::Zero));
+        assert_eq!(config.instance(2), None);
+    }
+
+    fn mixed_config() -> DkgConfig<TinyGroup> {
+        DkgConfig::new(
+            2,
+            SessionId([7; 32]),
             registry(),
             vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn legacy_workflow_threads_the_explicit_scalar_beta_unchanged() {
+        LEGACY_BETA_PAD_CALLS.store(0, Ordering::SeqCst);
+        LEGACY_BETA_PROVE_CALLS.store(0, Ordering::SeqCst);
+        LEGACY_BETA_VERIFY_CALLS.store(0, Ordering::SeqCst);
+
+        let config = mixed_config();
+        let legacy_beta = explicit_legacy_beta();
+        let mut rng = ChaCha20Rng::from_seed([29; 32]);
+        let dealings = config
+            .registry()
+            .indexes()
+            .map(|dealer| {
+                let dealing = create_dealing::<TinyGroup, ExplicitLegacyBetaBackend>(
+                    dealer,
+                    &secret(dealer),
+                    &config,
+                    &legacy_beta,
+                    &mut rng,
+                )
+                .unwrap();
+                (dealer, dealing)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(LEGACY_BETA_PAD_CALLS.load(Ordering::SeqCst), 12);
+        assert_eq!(LEGACY_BETA_PROVE_CALLS.load(Ordering::SeqCst), 3);
+
+        let receiver = idx(1);
+        let peers = dealings
+            .iter()
+            .filter(|(dealer, _)| **dealer != receiver)
+            .map(|(dealer, dealing)| (*dealer, dealing.message().clone()))
+            .collect();
+        complete::<TinyGroup, ExplicitLegacyBetaBackend>(
+            receiver,
+            &secret(receiver),
+            &dealings[&receiver],
+            &peers,
+            &config,
+            &legacy_beta,
+        )
+        .unwrap();
+
+        assert_eq!(LEGACY_BETA_PAD_CALLS.load(Ordering::SeqCst), 16);
+        assert_eq!(LEGACY_BETA_VERIFY_CALLS.load(Ordering::SeqCst), 3);
     }
 
     fn flat_statement(config: &DkgConfig<TinyGroup>) -> DealerProofStatement<TinyGroup> {
@@ -1534,10 +1678,9 @@ mod tests {
             TinyGroup::mul_generator(&secret(participant)),
         )])
         .unwrap();
-        DkgConfig::batch(
+        DkgConfig::new(
             1,
             SessionId([8; 32]),
-            TinyScalar::from_u64(11).unwrap(),
             registry,
             vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
         )
@@ -1553,9 +1696,14 @@ mod tests {
             .registry()
             .indexes()
             .map(|dealer| {
-                let dealing =
-                    create_dealing::<TinyGroup, B>(dealer, &secret(dealer), config, &mut rng)
-                        .unwrap();
+                let dealing = create_dealing::<TinyGroup, B>(
+                    dealer,
+                    &secret(dealer),
+                    config,
+                    &legacy_beta(),
+                    &mut rng,
+                )
+                .unwrap();
                 (dealer, dealing)
             })
             .collect()
@@ -1587,6 +1735,7 @@ mod tests {
             &dealings[&receiver],
             &peers,
             config,
+            &legacy_beta(),
         )
     }
 
@@ -1594,23 +1743,11 @@ mod tests {
     fn config_constructors_validate_shape_and_bind_order() {
         for (config, expected) in [
             (
-                DkgConfig::random(
-                    2,
-                    SessionId([7; 32]),
-                    TinyScalar::from_u64(11).unwrap(),
-                    registry(),
-                )
-                .unwrap(),
+                DkgConfig::new_random(2, SessionId([7; 32]), registry()).unwrap(),
                 DkgInstanceKind::Random,
             ),
             (
-                DkgConfig::zero(
-                    2,
-                    SessionId([7; 32]),
-                    TinyScalar::from_u64(11).unwrap(),
-                    registry(),
-                )
-                .unwrap(),
+                DkgConfig::new_zero(2, SessionId([7; 32]), registry()).unwrap(),
                 DkgInstanceKind::Zero,
             ),
         ] {
@@ -1619,13 +1756,7 @@ mod tests {
 
         for threshold in [0, 4] {
             assert_eq!(
-                DkgConfig::random(
-                    threshold,
-                    SessionId([7; 32]),
-                    TinyScalar::from_u64(11).unwrap(),
-                    registry(),
-                )
-                .unwrap_err(),
+                DkgConfig::new_random(threshold, SessionId([7; 32]), registry(),).unwrap_err(),
                 Error::InvalidThreshold {
                     threshold,
                     participants: 3,
@@ -1634,21 +1765,13 @@ mod tests {
         }
 
         assert_eq!(
-            DkgConfig::batch(
-                2,
-                SessionId([7; 32]),
-                TinyScalar::from_u64(11).unwrap(),
-                registry(),
-                Vec::new(),
-            )
-            .unwrap_err(),
+            DkgConfig::new(2, SessionId([7; 32]), registry(), Vec::new(),).unwrap_err(),
             Error::EmptyDkgBatch
         );
         let config = mixed_config();
-        let reversed = DkgConfig::batch(
+        let reversed = DkgConfig::new(
             config.threshold(),
             config.session_id(),
-            *config.beta(),
             config.registry().clone(),
             vec![DkgInstanceKind::Zero, DkgInstanceKind::Random],
         )
@@ -1707,36 +1830,32 @@ mod tests {
         ])
         .unwrap();
         let variants = [
-            DkgConfig::batch(
+            DkgConfig::new(
                 2,
                 SessionId([8; 32]),
-                *base.beta(),
                 base.registry().clone(),
                 base.instances().to_vec(),
             )
             .unwrap(),
-            DkgConfig::batch(
-                2,
-                base.session_id(),
-                TinyScalar::from_u64(12).unwrap(),
-                base.registry().clone(),
-                base.instances().to_vec(),
-            )
-            .unwrap(),
-            DkgConfig::batch(
+            DkgConfig::new(
                 3,
                 base.session_id(),
-                *base.beta(),
                 base.registry().clone(),
                 base.instances().to_vec(),
             )
             .unwrap(),
-            DkgConfig::batch(
+            DkgConfig::new(
                 2,
                 base.session_id(),
-                *base.beta(),
                 changed_registry,
                 base.instances().to_vec(),
+            )
+            .unwrap(),
+            DkgConfig::new(
+                2,
+                base.session_id(),
+                base.registry().clone(),
+                vec![DkgInstanceKind::Zero, DkgInstanceKind::Random],
             )
             .unwrap(),
         ];
@@ -1755,6 +1874,7 @@ mod tests {
             dealer,
             &secret(dealer),
             &config,
+            &legacy_beta(),
             &mut rng,
         )
         .unwrap();
@@ -1765,8 +1885,14 @@ mod tests {
             .iter()
             .all(|body| body.encrypted_shares.is_empty()));
 
-        verify_dealing::<TinyGroup, UnreachableBackend>(dealing.message(), &config).unwrap();
-        verify_dealings::<TinyGroup, UnreachableBackend>(&[dealing.message()], &config).unwrap();
+        verify_dealing::<TinyGroup, UnreachableBackend>(dealing.message(), &config, &legacy_beta())
+            .unwrap();
+        verify_dealings::<TinyGroup, UnreachableBackend>(
+            &[dealing.message()],
+            &config,
+            &legacy_beta(),
+        )
+        .unwrap();
 
         let output = complete::<TinyGroup, UnreachableBackend>(
             dealer,
@@ -1774,6 +1900,7 @@ mod tests {
             &dealing,
             &BTreeMap::new(),
             &config,
+            &legacy_beta(),
         )
         .unwrap();
         assert_eq!(output.instances().len(), 2);
@@ -1796,19 +1923,28 @@ mod tests {
             dealer,
             &secret(dealer),
             &config,
+            &legacy_beta(),
             &mut rng,
         )
         .unwrap();
         dealing.message.proof.push(1);
 
         assert_eq!(
-            verify_dealing::<TinyGroup, UnreachableBackend>(dealing.message(), &config)
-                .unwrap_err(),
+            verify_dealing::<TinyGroup, UnreachableBackend>(
+                dealing.message(),
+                &config,
+                &legacy_beta(),
+            )
+            .unwrap_err(),
             Error::ProofVerificationFailed
         );
         assert_eq!(
-            verify_dealings::<TinyGroup, UnreachableBackend>(&[dealing.message()], &config)
-                .unwrap_err(),
+            verify_dealings::<TinyGroup, UnreachableBackend>(
+                &[dealing.message()],
+                &config,
+                &legacy_beta(),
+            )
+            .unwrap_err(),
             Error::DealerProofVerificationFailed(dealer.get())
         );
     }
@@ -1827,6 +1963,7 @@ mod tests {
                         dealer,
                         &secret(dealer),
                         &config,
+                        &legacy_beta(),
                         &mut rng,
                     )
                     .unwrap(),
@@ -1847,7 +1984,8 @@ mod tests {
             let debug = format!("{dealing:?}");
             assert!(debug.contains("<redacted>"));
             assert!(!debug.contains("private_shares: ["));
-            verify_dealing::<TinyGroup, FakeBackend>(dealing.message(), &config).unwrap();
+            verify_dealing::<TinyGroup, FakeBackend>(dealing.message(), &config, &legacy_beta())
+                .unwrap();
         }
 
         let mut outputs = Vec::new();
@@ -1864,6 +2002,7 @@ mod tests {
                     &dealings[&receiver],
                     &peers,
                     &config,
+                    &legacy_beta(),
                 )
                 .unwrap(),
             );
@@ -1899,20 +2038,27 @@ mod tests {
                 dealer,
                 &secret(dealer),
                 &config,
+                &legacy_beta(),
                 &mut rng,
             )
             .unwrap_err(),
             Error::InvalidEncoding
         );
 
-        let mut message =
-            create_dealing::<TinyGroup, FakeBackend>(dealer, &secret(dealer), &config, &mut rng)
-                .unwrap()
-                .message()
-                .clone();
+        let mut message = create_dealing::<TinyGroup, FakeBackend>(
+            dealer,
+            &secret(dealer),
+            &config,
+            &legacy_beta(),
+            &mut rng,
+        )
+        .unwrap()
+        .message()
+        .clone();
         message.proof.resize(MAX_DEALER_PROOF_BYTES + 1, 0);
         assert_eq!(
-            verify_dealing::<TinyGroup, OversizedProofBackend>(&message, &config).unwrap_err(),
+            verify_dealing::<TinyGroup, OversizedProofBackend>(&message, &config, &legacy_beta(),)
+                .unwrap_err(),
             Error::InvalidEncoding
         );
     }
@@ -1926,6 +2072,7 @@ mod tests {
             receiver,
             &secret(receiver),
             &config,
+            &legacy_beta(),
             &mut rng,
         )
         .unwrap();
@@ -1951,6 +2098,7 @@ mod tests {
                     &own_dealing,
                     &peers,
                     &config,
+                    &legacy_beta(),
                 )
                 .unwrap_err(),
                 Error::UnknownParticipant(unknown.get())
@@ -1991,6 +2139,7 @@ mod tests {
                     &dealings[&receiver],
                     &peers,
                     &config,
+                    &legacy_beta(),
                 )
                 .unwrap_err(),
                 expected
@@ -2041,6 +2190,7 @@ mod tests {
             &dealings[&receiver],
             &peers,
             &config,
+            &legacy_beta(),
         )
         .unwrap();
         let alternate_output = complete::<TinyGroup, AlternateFakeBackend>(
@@ -2049,6 +2199,7 @@ mod tests {
             &dealings[&receiver],
             &peers,
             &config,
+            &legacy_beta(),
         )
         .unwrap();
 
@@ -2067,11 +2218,16 @@ mod tests {
     fn commitment_constant_shape_matches_the_configured_instance_kind() {
         let config = mixed_config();
         let mut rng = ChaCha20Rng::from_seed([17; 32]);
-        let message =
-            create_dealing::<TinyGroup, FakeBackend>(idx(1), &secret(idx(1)), &config, &mut rng)
-                .unwrap()
-                .message()
-                .clone();
+        let message = create_dealing::<TinyGroup, FakeBackend>(
+            idx(1),
+            &secret(idx(1)),
+            &config,
+            &legacy_beta(),
+            &mut rng,
+        )
+        .unwrap()
+        .message()
+        .clone();
 
         assert!(message.dealings[0].commitment.constant().is_some());
         assert!(message.dealings[1].commitment.constant().is_none());
@@ -2082,7 +2238,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            verify_dealing::<TinyGroup, FakeBackend>(&explicit_zero, &config).unwrap_err(),
+            verify_dealing::<TinyGroup, FakeBackend>(&explicit_zero, &config, &legacy_beta(),)
+                .unwrap_err(),
             Error::CommitmentKindMismatch(1)
         );
 
@@ -2090,7 +2247,8 @@ mod tests {
         let tail = missing_random.dealings[0].commitment.coefficients()[1..].to_vec();
         missing_random.dealings[0].commitment = FeldmanCommitment::from_zero_tail(tail);
         assert_eq!(
-            verify_dealing::<TinyGroup, FakeBackend>(&missing_random, &config).unwrap_err(),
+            verify_dealing::<TinyGroup, FakeBackend>(&missing_random, &config, &legacy_beta(),)
+                .unwrap_err(),
             Error::CommitmentKindMismatch(0)
         );
     }
@@ -2099,11 +2257,16 @@ mod tests {
     fn dealing_root_excludes_proof_but_binds_body_order() {
         let config = mixed_config();
         let mut rng = ChaCha20Rng::from_seed([19; 32]);
-        let mut message =
-            create_dealing::<TinyGroup, FakeBackend>(idx(1), &secret(idx(1)), &config, &mut rng)
-                .unwrap()
-                .message()
-                .clone();
+        let mut message = create_dealing::<TinyGroup, FakeBackend>(
+            idx(1),
+            &secret(idx(1)),
+            &config,
+            &legacy_beta(),
+            &mut rng,
+        )
+        .unwrap()
+        .message()
+        .clone();
         let root = message.root();
         message.proof.push(0xff);
         assert_eq!(message.root(), root);
@@ -2153,7 +2316,7 @@ mod tests {
         let config = mixed_config();
         let messages = dealer_messages::<CountingBackend>(&config, 29);
         let refs = messages.values().collect::<Vec<_>>();
-        verify_dealings::<TinyGroup, CountingBackend>(&refs, &config).unwrap();
+        verify_dealings::<TinyGroup, CountingBackend>(&refs, &config, &legacy_beta()).unwrap();
         assert_eq!(BATCH_VERIFY_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(SINGLE_VERIFY_CALLS.load(Ordering::SeqCst), 0);
 
@@ -2161,7 +2324,7 @@ mod tests {
         messages.get_mut(&idx(2)).unwrap().proof[0] ^= 1;
         let refs = messages.values().collect::<Vec<_>>();
         assert_eq!(
-            verify_dealings::<TinyGroup, FakeBackend>(&refs, &config).unwrap_err(),
+            verify_dealings::<TinyGroup, FakeBackend>(&refs, &config, &legacy_beta()).unwrap_err(),
             Error::DealerProofVerificationFailed(2)
         );
     }
@@ -2172,7 +2335,8 @@ mod tests {
         let messages = dealer_messages::<BatchRejectingBackend>(&config, 37);
         let refs = messages.values().collect::<Vec<_>>();
         assert_eq!(
-            verify_dealings::<TinyGroup, BatchRejectingBackend>(&refs, &config).unwrap_err(),
+            verify_dealings::<TinyGroup, BatchRejectingBackend>(&refs, &config, &legacy_beta(),)
+                .unwrap_err(),
             Error::InvalidEncoding
         );
     }

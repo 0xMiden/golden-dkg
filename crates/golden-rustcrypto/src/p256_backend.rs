@@ -186,6 +186,7 @@ impl GoldenGroup for P256Backend {
     const ELEMENT_REPR_BYTES: usize = 33;
 
     const BACKEND_ID: &'static str = "rustcrypto-p256-v1";
+    const CURVE_ID: &'static str = "nist-p256-v1";
 
     fn generator() -> Self::Element {
         P256Element(ProjectivePoint::GENERATOR)

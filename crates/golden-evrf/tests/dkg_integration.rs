@@ -33,6 +33,10 @@ fn identity_secret(participant: ParticipantIndex) -> Secp256k1Scalar {
     Secp256k1Scalar::from_u64(100 + u64::from(participant.get())).unwrap()
 }
 
+fn legacy_beta() -> Secp256k1Scalar {
+    Secp256k1Scalar::from_u64(77).unwrap()
+}
+
 fn config(
     participants: &[ParticipantIndex],
     threshold: usize,
@@ -50,14 +54,7 @@ fn config(
             .collect(),
     )
     .unwrap();
-    DkgConfig::batch(
-        threshold,
-        SessionId([42u8; 32]),
-        Secp256k1Scalar::from_u64(77).unwrap(),
-        registry,
-        instances,
-    )
-    .unwrap()
+    DkgConfig::new(threshold, SessionId([42u8; 32]), registry, instances).unwrap()
 }
 
 fn random_config() -> DkgConfig<Group> {
@@ -104,6 +101,7 @@ fn all_dealings(
                 dealer,
                 &identity_secret(dealer),
                 config,
+                &legacy_beta(),
                 rng,
             )
             .unwrap();
@@ -131,7 +129,7 @@ fn assert_dkg_completes(config: DkgConfig<Group>, decode_messages: bool) {
         .collect::<BTreeMap<_, _>>();
 
     for message in messages.values() {
-        verify_dealing::<Group, SecpSecqBackend>(message, &config).unwrap();
+        verify_dealing::<Group, SecpSecqBackend>(message, &config, &legacy_beta()).unwrap();
     }
 
     let receiver = idx(2);
@@ -145,6 +143,7 @@ fn assert_dkg_completes(config: DkgConfig<Group>, decode_messages: bool) {
         dealings.get(&receiver).unwrap(),
         &peer_dealings,
         &config,
+        &legacy_beta(),
     )
     .unwrap();
 
@@ -172,6 +171,7 @@ fn single_participant_dkg_completes_without_proving() {
         dealer,
         &identity_secret(dealer),
         &config,
+        &legacy_beta(),
         &mut rng,
     )
     .unwrap();
@@ -182,7 +182,7 @@ fn single_participant_dkg_completes_without_proving() {
         .iter()
         .all(|body| body.encrypted_shares.is_empty()));
 
-    verify_dealing::<Group, SecpSecqBackend>(dealing.message(), &config).unwrap();
+    verify_dealing::<Group, SecpSecqBackend>(dealing.message(), &config, &legacy_beta()).unwrap();
 
     let output = complete::<Group, SecpSecqBackend>(
         dealer,
@@ -190,6 +190,7 @@ fn single_participant_dkg_completes_without_proving() {
         &dealing,
         &BTreeMap::new(),
         &config,
+        &legacy_beta(),
     )
     .unwrap();
     assert_eq!(output.instances().len(), 2);
@@ -226,11 +227,12 @@ fn dkg_rejects_tampered_public_fields() {
         dealer,
         &identity_secret(dealer),
         &config,
+        &legacy_beta(),
         &mut rng,
     )
     .unwrap();
     let message = dealing.message();
-    verify_dealing::<Group, SecpSecqBackend>(message, &config).unwrap();
+    verify_dealing::<Group, SecpSecqBackend>(message, &config, &legacy_beta()).unwrap();
 
     let receiver = idx(2);
     let mut wrong_pad = message.clone();
@@ -312,7 +314,7 @@ fn dkg_rejects_tampered_public_fields() {
         extra_self_receiver,
         wrong_proof_pad,
     ] {
-        let result = verify_dealing::<Group, SecpSecqBackend>(&tampered, &config);
+        let result = verify_dealing::<Group, SecpSecqBackend>(&tampered, &config, &legacy_beta());
         assert!(
             result.is_err(),
             "tampered dealer message must be rejected, got {result:?}"
@@ -330,11 +332,12 @@ fn dkg_rejects_malformed_or_replayed_proofs() {
         dealer,
         &identity_secret(dealer),
         &config,
+        &legacy_beta(),
         &mut rng,
     )
     .unwrap();
     let message = dealing.message();
-    verify_dealing::<Group, SecpSecqBackend>(message, &config).unwrap();
+    verify_dealing::<Group, SecpSecqBackend>(message, &config, &legacy_beta()).unwrap();
 
     let proof_id_len =
         u32::from_be_bytes(message.proof[..PROOF_ID_LEN_BYTES].try_into().unwrap()) as usize;
@@ -373,13 +376,15 @@ fn dkg_rejects_malformed_or_replayed_proofs() {
         corrupted_payload,
         noncanonical_nested,
     ] {
-        assert!(verify_dealing::<Group, SecpSecqBackend>(&invalid, &config).is_err());
+        assert!(
+            verify_dealing::<Group, SecpSecqBackend>(&invalid, &config, &legacy_beta()).is_err()
+        );
     }
 
     let mut replayed = message.clone();
     replayed.dealings[0].nonce.0[0] ^= 0x01;
     assert!(
-        verify_dealing::<Group, SecpSecqBackend>(&replayed, &config).is_err(),
+        verify_dealing::<Group, SecpSecqBackend>(&replayed, &config, &legacy_beta()).is_err(),
         "proof replay under a different dealing nonce must be rejected"
     );
 }

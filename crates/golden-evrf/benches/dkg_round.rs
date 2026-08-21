@@ -45,7 +45,9 @@ use golden_core::{complete, create_dealing};
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-use support::{build_config, identity_secret, idx, table5_n_values, BENCH_SEED, SLOW_SAMPLE_SIZE};
+use support::{
+    build_config, identity_secret, idx, legacy_beta, table5_n_values, BENCH_SEED, SLOW_SAMPLE_SIZE,
+};
 
 /// Per-participant Round 0: one dealer builds its dealing.
 fn dkg_round0(c: &mut Criterion) {
@@ -63,7 +65,11 @@ fn dkg_round0(c: &mut Criterion) {
                 || ChaCha20Rng::from_seed(BENCH_SEED),
                 |mut rng| {
                     create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                        dealer, &secret, &config, &mut rng,
+                        dealer,
+                        &secret,
+                        &config,
+                        &legacy_beta(),
+                        &mut rng,
                     )
                     .unwrap();
                 },
@@ -97,6 +103,7 @@ fn dkg_round1(c: &mut Criterion) {
                 &own_dealing,
                 &peer_dealings,
                 &config,
+                &legacy_beta(),
             )
             .unwrap();
             b.iter_batched(
@@ -108,6 +115,7 @@ fn dkg_round1(c: &mut Criterion) {
                         &own_dealing,
                         &peer_dealings,
                         &config,
+                        &legacy_beta(),
                     )
                     .unwrap();
                 },
@@ -141,6 +149,7 @@ fn dkg_total(c: &mut Criterion) {
                         participant,
                         &secret,
                         &config,
+                        &legacy_beta(),
                         &mut rng,
                     )
                     .unwrap();
@@ -150,6 +159,7 @@ fn dkg_total(c: &mut Criterion) {
                         &own_dealing,
                         &peer_dealings,
                         &config,
+                        &legacy_beta(),
                     )
                     .unwrap();
                 },

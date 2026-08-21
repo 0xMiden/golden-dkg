@@ -28,6 +28,10 @@ fn identity_secret(participant: ParticipantIndex) -> P256Scalar {
     P256Scalar::from_u64(100 + u64::from(participant.get())).unwrap()
 }
 
+fn legacy_beta() -> P256Scalar {
+    P256Scalar::from_u64(77).unwrap()
+}
+
 fn config() -> DkgConfig<P256Backend> {
     let registry = ParticipantRegistry::new(
         participants()
@@ -41,10 +45,9 @@ fn config() -> DkgConfig<P256Backend> {
             .collect(),
     )
     .unwrap();
-    DkgConfig::batch(
+    DkgConfig::new(
         3,
         SessionId([42u8; 32]),
-        P256Scalar::from_u64(77).unwrap(),
         registry,
         vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
     )
@@ -59,6 +62,7 @@ fn create_dealing_fixture(seed: u8) -> (DkgConfig<P256Backend>, DkgDealing<P256B
         dealer,
         &identity_secret(dealer),
         &config,
+        &legacy_beta(),
         &mut rng,
     )
     .unwrap();
@@ -142,11 +146,14 @@ fn proof_record_len() -> usize {
 fn assert_proof_rejected(seed: u8, mutate: impl FnOnce(&mut Vec<u8>)) {
     let (config, dealing) = create_dealing_fixture(seed);
     let mut message = dealing.message().clone();
-    verify_dealing::<P256Backend, ShareOpeningBackend>(&message, &config).unwrap();
+    verify_dealing::<P256Backend, ShareOpeningBackend>(&message, &config, &legacy_beta()).unwrap();
     let root = message.root();
     mutate(&mut message.proof);
     assert_eq!(message.root(), root);
-    assert!(verify_dealing::<P256Backend, ShareOpeningBackend>(&message, &config).is_err());
+    assert!(
+        verify_dealing::<P256Backend, ShareOpeningBackend>(&message, &config, &legacy_beta())
+            .is_err()
+    );
 }
 
 #[test]
@@ -171,7 +178,7 @@ fn prototype_emits_one_joint_proof_for_mixed_batch() {
         message.proof.len(),
         proof_header_len(&message.proof) + 2 * receiver_count * proof_record_len()
     );
-    verify_dealing::<P256Backend, ShareOpeningBackend>(message, &config).unwrap();
+    verify_dealing::<P256Backend, ShareOpeningBackend>(message, &config, &legacy_beta()).unwrap();
 }
 
 #[test]
@@ -253,6 +260,7 @@ fn create_wire_roundtrip_verify_and_complete_uses_opaque_proof_bytes() {
                 dealer,
                 &identity_secret(dealer),
                 &config,
+                &legacy_beta(),
                 &mut rng,
             )
             .unwrap();
@@ -260,7 +268,8 @@ fn create_wire_roundtrip_verify_and_complete_uses_opaque_proof_bytes() {
             let decoded = from_wire_bytes::<DealerMessage<P256Backend>>(&encoded).unwrap();
             assert_eq!(to_wire_bytes(&decoded), encoded);
             assert_eq!(&decoded, dealing.message());
-            verify_dealing::<P256Backend, ShareOpeningBackend>(&decoded, &config).unwrap();
+            verify_dealing::<P256Backend, ShareOpeningBackend>(&decoded, &config, &legacy_beta())
+                .unwrap();
             (dealer, dealing)
         })
         .collect();
@@ -278,6 +287,7 @@ fn create_wire_roundtrip_verify_and_complete_uses_opaque_proof_bytes() {
         own_dealing,
         &peer_dealings,
         &config,
+        &legacy_beta(),
     )
     .unwrap();
 
@@ -375,5 +385,8 @@ fn dealer_message_wire_decode_accepts_malformed_inner_proof_bytes() {
         .expect("generic dealer-message decoding must treat proof bytes as opaque");
 
     assert_eq!(decoded.proof, message.proof);
-    assert!(verify_dealing::<P256Backend, ShareOpeningBackend>(&decoded, &config).is_err());
+    assert!(
+        verify_dealing::<P256Backend, ShareOpeningBackend>(&decoded, &config, &legacy_beta())
+            .is_err()
+    );
 }

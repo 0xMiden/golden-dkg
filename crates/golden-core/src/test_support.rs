@@ -106,6 +106,7 @@ impl GoldenGroup for TinyGroup {
     const ELEMENT_REPR_BYTES: usize = 1;
 
     const BACKEND_ID: &'static str = "golden-test-tiny-v1";
+    const CURVE_ID: &'static str = "golden-test-tiny-v1";
 
     fn generator() -> Self::Element {
         TinyScalar::one()

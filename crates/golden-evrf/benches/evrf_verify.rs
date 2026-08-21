@@ -37,8 +37,8 @@ use golden_evrf::paper::secp_secq::{evrf_batched_verify, SecpSecqBackend};
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use support::{
-    build_config, idx, prove_one_batched, table4_ne_values, BENCH_SEED, SLOW_SAMPLE_SIZE,
-    TABLE4_THRESHOLD,
+    build_config, idx, legacy_beta, prove_one_batched, table4_ne_values, BENCH_SEED,
+    SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD,
 };
 
 /// Time `evrf_batched_verify` on one precomputed proof covering `n_e`
@@ -97,13 +97,22 @@ fn evrf_verify_batch(c: &mut Criterion) {
             let (config, messages) = build_n_independent_messages(n_e);
             let peer_messages: Vec<_> = messages.values().cloned().collect();
             let peer_refs: Vec<_> = peer_messages.iter().collect();
-            verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(&peer_refs, &config).unwrap();
+            verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(
+                &peer_refs,
+                &config,
+                &legacy_beta(),
+            )
+            .unwrap();
             b.iter_batched(
                 || peer_messages.clone(),
                 |msgs| {
                     let refs: Vec<_> = msgs.iter().collect();
-                    verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(&refs, &config)
-                        .unwrap();
+                    verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(
+                        &refs,
+                        &config,
+                        &legacy_beta(),
+                    )
+                    .unwrap();
                 },
                 BatchSize::SmallInput,
             )

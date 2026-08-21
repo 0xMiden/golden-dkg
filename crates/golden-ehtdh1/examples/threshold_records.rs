@@ -314,10 +314,9 @@ fn dkg_config(
         ));
     }
     let registry = ParticipantRegistry::new(entries)?;
-    Ok(DkgConfig::batch(
+    Ok(DkgConfig::new(
         2,
         session_id,
-        scalar(77)?,
         registry,
         vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
     )?)
@@ -329,6 +328,7 @@ fn run_dkg(
     config: &DkgConfig<G>,
     rng: &mut ChaCha20Rng,
 ) -> AppResult<BTreeMap<ParticipantIndex, DkgOutput<G>>> {
+    let legacy_beta = scalar(77)?;
     let mut dealings = BTreeMap::<ParticipantIndex, DkgDealing<G>>::new();
     // Every participant acts as a dealer and sends one dealing to its peers.
     for dealer in participants {
@@ -336,6 +336,7 @@ fn run_dkg(
             *dealer,
             &identity_secret(*dealer)?,
             config,
+            &legacy_beta,
             rng,
         )?;
         dealings.insert(*dealer, dealing);
@@ -357,6 +358,7 @@ fn run_dkg(
             own_dealing,
             &peer_dealings,
             config,
+            &legacy_beta,
         )?;
         outputs.insert(*receiver, output);
     }
