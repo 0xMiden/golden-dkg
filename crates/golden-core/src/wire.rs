@@ -17,13 +17,19 @@ use miden_serde_utils::{
     ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
 };
 #[cfg(feature = "serde")]
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de,
+    ser::{SerializeSeq, SerializeTuple},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 
 use crate::{
     DealerMessage, DealerMessageNonce, DealingBody, DkgConfig, DkgInstanceKind, EncryptedShare,
     Error, FeldmanCommitment, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry,
     Result, SessionId, TranscriptRoot,
 };
+#[cfg(any(feature = "serde", feature = "miden-serde"))]
+use crate::{DkgInstanceOutput, DkgOutput, OwnDealing};
 
 /// Magic prefix for every standalone DKG wire value.
 pub const MAGIC: &[u8; 18] = b"golden-dkg-wire-v4";
@@ -45,6 +51,10 @@ pub const TAG_DEALER_MESSAGE: u8 = 0x07;
 
 /// Maximum accepted byte length of a dealer's proof.
 pub const MAX_DEALER_PROOF_BYTES: usize = 16 * 1024 * 1024;
+
+/// Coarse allocation ceiling for one trusted-persistence collection.
+#[cfg(any(feature = "serde", feature = "miden-serde"))]
+const MAX_PERSISTED_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
 
 /// Encode a value into its nested canonical wire representation.
 pub trait WireEncode {
@@ -600,11 +610,11 @@ where
 #[cfg(feature = "miden-serde")]
 impl Serializable for SessionId {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
-        write_miden_wire(self, target);
+        target.write_bytes(&self.0);
     }
 
     fn get_size_hint(&self) -> usize {
-        miden_wire_size_hint(self)
+        32
     }
 }
 
@@ -613,7 +623,68 @@ impl Deserializable for SessionId {
     fn read_from<R: ByteReader>(
         source: &mut R,
     ) -> core::result::Result<Self, DeserializationError> {
-        read_miden_wire(source)
+        Ok(Self(source.read_array()?))
+    }
+
+    fn min_serialized_size() -> usize {
+        32
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl Serializable for ParticipantIndex {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        target.write_u32(self.get());
+    }
+
+    fn get_size_hint(&self) -> usize {
+        4
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl Deserializable for ParticipantIndex {
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        Self::new(source.read_u32()?).map_err(miden_persistence_error)
+    }
+
+    fn min_serialized_size() -> usize {
+        4
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl Serializable for DkgInstanceKind {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        target.write_u8(match self {
+            Self::Random => 0,
+            Self::Zero => 1,
+        });
+    }
+
+    fn get_size_hint(&self) -> usize {
+        1
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl Deserializable for DkgInstanceKind {
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        match source.read_u8()? {
+            0 => Ok(Self::Random),
+            1 => Ok(Self::Zero),
+            value => Err(DeserializationError::InvalidValue(format!(
+                "invalid DKG instance kind {value}"
+            ))),
+        }
+    }
+
+    fn min_serialized_size() -> usize {
+        1
     }
 }
 
@@ -695,11 +766,15 @@ where
     G: GoldenGroup,
 {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
-        write_miden_wire(self, target);
+        target.write_usize(self.len());
+        for (participant, public_key) in self.entries() {
+            participant.write_into(target);
+            write_miden_element::<G, _>(public_key, target);
+        }
     }
 
     fn get_size_hint(&self) -> usize {
-        miden_wire_size_hint(self)
+        miden_usize_size(self.len()) + self.len() * (4 + G::ELEMENT_REPR_BYTES)
     }
 }
 
@@ -711,7 +786,19 @@ where
     fn read_from<R: ByteReader>(
         source: &mut R,
     ) -> core::result::Result<Self, DeserializationError> {
-        read_miden_wire(source)
+        let len = read_miden_persisted_len(source, 4 + G::ELEMENT_REPR_BYTES)?;
+        let mut entries = Vec::with_capacity(len);
+        for _ in 0..len {
+            entries.push((
+                ParticipantIndex::read_from(source)?,
+                read_miden_element::<G, _>(source)?,
+            ));
+        }
+        ParticipantRegistry::new(entries).map_err(miden_persistence_error)
+    }
+
+    fn min_serialized_size() -> usize {
+        1 + 4 + G::ELEMENT_REPR_BYTES
     }
 }
 
@@ -721,11 +808,21 @@ where
     G: GoldenGroup,
 {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
-        write_miden_wire(self, target);
+        target.write_usize(self.threshold());
+        self.session_id().write_into(target);
+        self.registry().write_into(target);
+        target.write_usize(self.instances().len());
+        for kind in self.instances() {
+            kind.write_into(target);
+        }
     }
 
     fn get_size_hint(&self) -> usize {
-        miden_wire_size_hint(self)
+        miden_usize_size(self.threshold())
+            + self.session_id().get_size_hint()
+            + self.registry().get_size_hint()
+            + miden_usize_size(self.instances().len())
+            + self.instances().len()
     }
 }
 
@@ -737,7 +834,184 @@ where
     fn read_from<R: ByteReader>(
         source: &mut R,
     ) -> core::result::Result<Self, DeserializationError> {
-        read_miden_wire(source)
+        let threshold = source.read_usize()?;
+        let session_id = SessionId::read_from(source)?;
+        let registry = ParticipantRegistry::<G>::read_from(source)?;
+        let instance_count = read_miden_persisted_len(source, 1)?;
+        let mut instances = Vec::with_capacity(instance_count);
+        for _ in 0..instance_count {
+            instances.push(DkgInstanceKind::read_from(source)?);
+        }
+        DkgConfig::new(threshold, session_id, registry, instances).map_err(miden_persistence_error)
+    }
+
+    fn min_serialized_size() -> usize {
+        1 + 32 + <ParticipantRegistry<G> as Deserializable>::min_serialized_size() + 1 + 1
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Serializable for OwnDealing<G>
+where
+    G: GoldenGroup,
+{
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        target.write_u32(self.participant().get());
+        target.write_bytes(&self.configuration_root());
+        target.write_usize(self.dealer_message_bytes().len());
+        target.write_bytes(self.dealer_message_bytes());
+        target.write_usize(self.private_shares().len());
+        for share in self.private_shares() {
+            target.write_bytes(share.to_repr().as_ref());
+        }
+    }
+
+    fn get_size_hint(&self) -> usize {
+        4 + 32
+            + miden_usize_size(self.dealer_message_bytes().len())
+            + self.dealer_message_bytes().len()
+            + miden_usize_size(self.private_shares().len())
+            + self.private_shares().len() * G::Scalar::REPR_BYTES
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Deserializable for OwnDealing<G>
+where
+    G: GoldenGroup,
+{
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        let participant =
+            ParticipantIndex::new(source.read_u32()?).map_err(miden_persistence_error)?;
+        let configuration_root = source.read_array()?;
+        let dealer_message_len = read_miden_persisted_len(source, 1)?;
+        let dealer_message_bytes = source.read_vec(dealer_message_len)?;
+        let private_share_count = read_miden_persisted_len(source, G::Scalar::REPR_BYTES)?;
+        let mut private_shares = Vec::with_capacity(private_share_count);
+        for _ in 0..private_share_count {
+            private_shares.push(read_miden_scalar::<G, _>(source)?);
+        }
+        OwnDealing::from_persisted_parts(
+            participant,
+            configuration_root,
+            dealer_message_bytes,
+            private_shares,
+        )
+        .map_err(miden_persistence_error)
+    }
+
+    fn min_serialized_size() -> usize {
+        4 + 32 + 1 + 1 + G::Scalar::REPR_BYTES
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Serializable for DkgInstanceOutput<G>
+where
+    G: GoldenGroup,
+{
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        write_miden_element::<G, _>(self.public_key(), target);
+        target.write_bytes(self.secret_share().to_repr().as_ref());
+        target.write_usize(self.public_key_shares().len());
+        for (participant, public_share) in self.public_key_shares() {
+            participant.write_into(target);
+            write_miden_element::<G, _>(public_share, target);
+        }
+    }
+
+    fn get_size_hint(&self) -> usize {
+        G::ELEMENT_REPR_BYTES
+            + G::Scalar::REPR_BYTES
+            + miden_usize_size(self.public_key_shares().len())
+            + self.public_key_shares().len() * (4 + G::ELEMENT_REPR_BYTES)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Deserializable for DkgInstanceOutput<G>
+where
+    G: GoldenGroup,
+{
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        let public_key = read_miden_element::<G, _>(source)?;
+        let secret_share = read_miden_scalar::<G, _>(source)?;
+        let public_share_count = read_miden_persisted_len(source, 4 + G::ELEMENT_REPR_BYTES)?;
+        let mut public_key_shares = BTreeMap::new();
+        for _ in 0..public_share_count {
+            let participant = ParticipantIndex::read_from(source)?;
+            let public_share = read_miden_element::<G, _>(source)?;
+            if public_key_shares
+                .insert(participant, public_share)
+                .is_some()
+            {
+                return Err(DeserializationError::InvalidValue(
+                    "duplicate participant in public-key-share map".into(),
+                ));
+            }
+        }
+        DkgInstanceOutput::from_persisted_parts(public_key, secret_share, public_key_shares)
+            .map_err(miden_persistence_error)
+    }
+
+    fn min_serialized_size() -> usize {
+        G::ELEMENT_REPR_BYTES + G::Scalar::REPR_BYTES + 1 + 4 + G::ELEMENT_REPR_BYTES
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Serializable for DkgOutput<G>
+where
+    G: GoldenGroup,
+{
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        self.participant().write_into(target);
+        target.write_bytes(&self.configuration_root());
+        target.write_usize(self.instances().len());
+        for instance in self.instances() {
+            instance.write_into(target);
+        }
+    }
+
+    fn get_size_hint(&self) -> usize {
+        4 + 32
+            + miden_usize_size(self.instances().len())
+            + self
+                .instances()
+                .iter()
+                .map(|instance| instance.get_size_hint())
+                .sum::<usize>()
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Deserializable for DkgOutput<G>
+where
+    G: GoldenGroup,
+{
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        let participant = ParticipantIndex::read_from(source)?;
+        let configuration_root = source.read_array()?;
+        let instance_count = read_miden_persisted_len(
+            source,
+            <DkgInstanceOutput<G> as Deserializable>::min_serialized_size(),
+        )?;
+        let mut instances = Vec::with_capacity(instance_count);
+        for _ in 0..instance_count {
+            instances.push(DkgInstanceOutput::<G>::read_from(source)?);
+        }
+        DkgOutput::from_persisted_parts(participant, configuration_root, instances)
+            .map_err(miden_persistence_error)
+    }
+
+    fn min_serialized_size() -> usize {
+        4 + 32 + 1 + <DkgInstanceOutput<G> as Deserializable>::min_serialized_size()
     }
 }
 
@@ -813,17 +1087,765 @@ fn miden_usize_size(value: usize) -> usize {
     9 - core::cmp::min(len, 8)
 }
 
+#[cfg(feature = "miden-serde")]
+fn read_miden_persisted_len<R: ByteReader>(
+    source: &mut R,
+    minimum_item_bytes: usize,
+) -> core::result::Result<usize, DeserializationError> {
+    let minimum_item_bytes = minimum_item_bytes.max(1);
+    let len = source.read_usize()?;
+    let maximum = MAX_PERSISTED_COLLECTION_BYTES / minimum_item_bytes;
+    if len > maximum || len > source.max_alloc(minimum_item_bytes) {
+        return Err(DeserializationError::InvalidValue(format!(
+            "persistence collection length {len} exceeds allocation bound {maximum}"
+        )));
+    }
+    source.check_eor(len.checked_mul(minimum_item_bytes).ok_or_else(|| {
+        DeserializationError::InvalidValue("persistence length overflow".into())
+    })?)?;
+    Ok(len)
+}
+
+#[cfg(feature = "miden-serde")]
+fn read_miden_scalar<G, R>(source: &mut R) -> core::result::Result<G::Scalar, DeserializationError>
+where
+    G: GoldenGroup,
+    R: ByteReader,
+{
+    let bytes = source.read_vec(G::Scalar::REPR_BYTES)?;
+    let repr = <G::Scalar as GoldenScalar>::Repr::try_from(bytes.clone())
+        .map_err(|_| DeserializationError::InvalidValue("invalid scalar width".into()))?;
+    let scalar = G::Scalar::from_repr(&repr).map_err(miden_persistence_error)?;
+    if scalar.to_repr().as_ref() != bytes {
+        return Err(DeserializationError::InvalidValue(
+            "noncanonical scalar encoding".into(),
+        ));
+    }
+    Ok(scalar)
+}
+
+#[cfg(feature = "miden-serde")]
+fn write_miden_element<G, W>(element: &G::Element, target: &mut W)
+where
+    G: GoldenGroup,
+    W: ByteWriter,
+{
+    target.write_bytes(G::encode_element(element).as_ref());
+}
+
+#[cfg(feature = "miden-serde")]
+fn read_miden_element<G, R>(
+    source: &mut R,
+) -> core::result::Result<G::Element, DeserializationError>
+where
+    G: GoldenGroup,
+    R: ByteReader,
+{
+    let bytes = source.read_vec(G::ELEMENT_REPR_BYTES)?;
+    let repr = G::ElementRepr::try_from(bytes.clone())
+        .map_err(|_| DeserializationError::InvalidValue("invalid group element width".into()))?;
+    let element = G::decode_element(&repr).map_err(miden_persistence_error)?;
+    if G::encode_element(&element).as_ref() != bytes {
+        return Err(DeserializationError::InvalidValue(
+            "noncanonical group element encoding".into(),
+        ));
+    }
+    Ok(element)
+}
+
+#[cfg(feature = "miden-serde")]
+fn miden_persistence_error(error: Error) -> DeserializationError {
+    DeserializationError::InvalidValue(error.to_string())
+}
+
+#[cfg(feature = "serde")]
+struct PersistenceBytes<'a>(&'a [u8]);
+
+#[cfg(feature = "serde")]
+impl Serialize for PersistenceBytes<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct DecodedPersistenceBytes(Vec<u8>);
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for DecodedPersistenceBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserializer.deserialize_bytes(PersistenceBytesVisitor)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct PersistenceBytesVisitor;
+
+#[cfg(feature = "serde")]
+impl<'de> de::Visitor<'de> for PersistenceBytesVisitor {
+    type Value = DecodedPersistenceBytes;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a bounded byte string used for trusted application persistence")
+    }
+
+    fn visit_bytes<E: de::Error>(self, value: &[u8]) -> core::result::Result<Self::Value, E> {
+        if value.len() > MAX_PERSISTED_COLLECTION_BYTES {
+            return Err(E::custom(
+                "persistence byte string exceeds allocation bound",
+            ));
+        }
+        Ok(DecodedPersistenceBytes(value.to_vec()))
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> core::result::Result<Self::Value, E> {
+        if value.len() > MAX_PERSISTED_COLLECTION_BYTES {
+            return Err(E::custom(
+                "persistence byte string exceeds allocation bound",
+            ));
+        }
+        Ok(DecodedPersistenceBytes(value))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        if seq
+            .size_hint()
+            .is_some_and(|hint| hint > MAX_PERSISTED_COLLECTION_BYTES)
+        {
+            return Err(de::Error::custom(
+                "persistence byte sequence exceeds allocation bound",
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(byte) = seq.next_element()? {
+            if bytes.len() == MAX_PERSISTED_COLLECTION_BYTES {
+                return Err(de::Error::custom(
+                    "persistence byte sequence exceeds allocation bound",
+                ));
+            }
+            bytes.push(byte);
+        }
+        Ok(DecodedPersistenceBytes(bytes))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ScalarSlice<'a, G: GoldenGroup>(&'a [G::Scalar]);
+
+#[cfg(feature = "serde")]
+impl<G: GoldenGroup> Serialize for ScalarSlice<'_, G> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for scalar in self.0 {
+            let repr = scalar.to_repr();
+            sequence.serialize_element(&PersistenceBytes(repr.as_ref()))?;
+        }
+        sequence.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ScalarVec<G: GoldenGroup>(Vec<G::Scalar>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> Deserialize<'de> for ScalarVec<G> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserializer.deserialize_seq(ScalarVecVisitor::<G>(PhantomData))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ScalarVecVisitor<G: GoldenGroup>(PhantomData<G>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> de::Visitor<'de> for ScalarVecVisitor<G> {
+    type Value = ScalarVec<G>;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a bounded sequence of canonical Golden scalars")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let maximum = MAX_PERSISTED_COLLECTION_BYTES / G::Scalar::REPR_BYTES.max(1);
+        if seq.size_hint().is_some_and(|hint| hint > maximum) {
+            return Err(de::Error::custom(
+                "persistence scalar sequence exceeds allocation bound",
+            ));
+        }
+        let mut scalars = Vec::new();
+        while let Some(DecodedPersistenceBytes(bytes)) = seq.next_element()? {
+            if scalars.len() == maximum || bytes.len() != G::Scalar::REPR_BYTES {
+                return Err(de::Error::custom(
+                    "invalid persistence scalar sequence or scalar width",
+                ));
+            }
+            let repr = <G::Scalar as GoldenScalar>::Repr::try_from(bytes.clone())
+                .map_err(|_| de::Error::custom("invalid scalar width"))?;
+            let scalar = G::Scalar::from_repr(&repr).map_err(de::Error::custom)?;
+            if scalar.to_repr().as_ref() != bytes {
+                return Err(de::Error::custom("noncanonical scalar encoding"));
+            }
+            scalars.push(scalar);
+        }
+        Ok(ScalarVec(scalars))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ScalarRef<'a, G: GoldenGroup>(&'a G::Scalar);
+
+#[cfg(feature = "serde")]
+impl<G: GoldenGroup> Serialize for ScalarRef<'_, G> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        let repr = self.0.to_repr();
+        serializer.serialize_bytes(repr.as_ref())
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ScalarValue<G: GoldenGroup>(G::Scalar);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> Deserialize<'de> for ScalarValue<G> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        let DecodedPersistenceBytes(bytes) = DecodedPersistenceBytes::deserialize(deserializer)?;
+        if bytes.len() != G::Scalar::REPR_BYTES {
+            return Err(de::Error::custom("invalid scalar width"));
+        }
+        let repr = <G::Scalar as GoldenScalar>::Repr::try_from(bytes.clone())
+            .map_err(|_| de::Error::custom("invalid scalar width"))?;
+        let scalar = G::Scalar::from_repr(&repr).map_err(de::Error::custom)?;
+        if scalar.to_repr().as_ref() != bytes.as_slice() {
+            return Err(de::Error::custom("noncanonical scalar encoding"));
+        }
+        Ok(Self(scalar))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<G: GoldenGroup> Serialize for OwnDealing<G> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        let configuration_root = self.configuration_root();
+        let mut tuple = serializer.serialize_tuple(4)?;
+        tuple.serialize_element(&self.participant().get())?;
+        tuple.serialize_element(&PersistenceBytes(&configuration_root))?;
+        tuple.serialize_element(&PersistenceBytes(self.dealer_message_bytes()))?;
+        tuple.serialize_element(&ScalarSlice::<G>(self.private_shares()))?;
+        tuple.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> Deserialize<'de> for OwnDealing<G> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserializer.deserialize_tuple(4, OwnDealingVisitor::<G>(PhantomData))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct OwnDealingVisitor<G: GoldenGroup>(PhantomData<G>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> de::Visitor<'de> for OwnDealingVisitor<G> {
+    type Value = OwnDealing<G>;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a validated Golden own-dealing persistence tuple")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let participant = seq
+            .next_element::<u32>()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))
+            .and_then(|value| ParticipantIndex::new(value).map_err(de::Error::custom))?;
+        let DecodedPersistenceBytes(configuration_root) = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+        let configuration_root: TranscriptRoot = configuration_root
+            .try_into()
+            .map_err(|_| de::Error::custom("configuration root must contain 32 bytes"))?;
+        let DecodedPersistenceBytes(dealer_message_bytes) = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+        let ScalarVec(private_shares): ScalarVec<G> = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(3, &self))?;
+        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(5, &self));
+        }
+        OwnDealing::from_persisted_parts(
+            participant,
+            configuration_root,
+            dealer_message_bytes,
+            private_shares,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ElementRef<'a, G: GoldenGroup>(&'a G::Element);
+
+#[cfg(feature = "serde")]
+impl<G: GoldenGroup> Serialize for ElementRef<'_, G> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        let repr = G::encode_element(self.0);
+        serializer.serialize_bytes(repr.as_ref())
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ElementValue<G: GoldenGroup>(G::Element);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> Deserialize<'de> for ElementValue<G> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        let DecodedPersistenceBytes(bytes) = DecodedPersistenceBytes::deserialize(deserializer)?;
+        if bytes.len() != G::ELEMENT_REPR_BYTES {
+            return Err(de::Error::custom("invalid group element width"));
+        }
+        let repr = G::ElementRepr::try_from(bytes.clone())
+            .map_err(|_| de::Error::custom("invalid group element width"))?;
+        let element = G::decode_element(&repr).map_err(de::Error::custom)?;
+        if G::encode_element(&element).as_ref() != bytes {
+            return Err(de::Error::custom("noncanonical group element encoding"));
+        }
+        Ok(Self(element))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ParticipantElementRef<'a, G: GoldenGroup> {
+    participant: ParticipantIndex,
+    element: &'a G::Element,
+}
+
+#[cfg(feature = "serde")]
+impl<G: GoldenGroup> Serialize for ParticipantElementRef<'_, G> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        let mut tuple = serializer.serialize_tuple(2)?;
+        tuple.serialize_element(&self.participant)?;
+        tuple.serialize_element(&ElementRef::<G>(self.element))?;
+        tuple.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ParticipantElement<G: GoldenGroup> {
+    participant: ParticipantIndex,
+    element: G::Element,
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> Deserialize<'de> for ParticipantElement<G> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserializer.deserialize_tuple(2, ParticipantElementVisitor::<G>(PhantomData))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ParticipantElementVisitor<G: GoldenGroup>(PhantomData<G>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> de::Visitor<'de> for ParticipantElementVisitor<G> {
+    type Value = ParticipantElement<G>;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a participant and canonical Golden group element")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let participant = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        let ElementValue(element): ElementValue<G> = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(3, &self));
+        }
+        Ok(ParticipantElement {
+            participant,
+            element,
+        })
+    }
+}
+
+#[cfg(feature = "serde")]
+struct PublicShareMapRef<'a, G: GoldenGroup>(&'a BTreeMap<ParticipantIndex, G::Element>);
+
+#[cfg(feature = "serde")]
+impl<G: GoldenGroup> Serialize for PublicShareMapRef<'_, G> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for (participant, public_share) in self.0 {
+            sequence.serialize_element(&ParticipantElementRef::<G> {
+                participant: *participant,
+                element: public_share,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+struct PublicShareMap<G: GoldenGroup>(BTreeMap<ParticipantIndex, G::Element>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> Deserialize<'de> for PublicShareMap<G> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserializer.deserialize_seq(PublicShareMapVisitor::<G>(PhantomData))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct PublicShareMapVisitor<G: GoldenGroup>(PhantomData<G>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> de::Visitor<'de> for PublicShareMapVisitor<G> {
+    type Value = PublicShareMap<G>;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a bounded canonical participant/public-key-share sequence")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let minimum_item_bytes = 4usize.saturating_add(G::ELEMENT_REPR_BYTES).max(1);
+        let maximum = MAX_PERSISTED_COLLECTION_BYTES / minimum_item_bytes;
+        if seq.size_hint().is_some_and(|hint| hint > maximum) {
+            return Err(de::Error::custom(
+                "public-key-share map exceeds persistence allocation bound",
+            ));
+        }
+        let mut shares = BTreeMap::new();
+        while let Some(ParticipantElement {
+            participant,
+            element,
+        }) = seq.next_element::<ParticipantElement<G>>()?
+        {
+            if shares.len() == maximum {
+                return Err(de::Error::custom(
+                    "public-key-share map exceeds persistence allocation bound",
+                ));
+            }
+            if shares.insert(participant, element).is_some() {
+                return Err(de::Error::custom(
+                    "duplicate participant in public-key-share map",
+                ));
+            }
+        }
+        Ok(PublicShareMap(shares))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct DkgInstanceOutputVisitor<G: GoldenGroup>(PhantomData<G>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> de::Visitor<'de> for DkgInstanceOutputVisitor<G> {
+    type Value = DkgInstanceOutput<G>;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a validated Golden DKG instance-output persistence tuple")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let ElementValue(public_key): ElementValue<G> = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        let ScalarValue(secret_share): ScalarValue<G> = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+        let PublicShareMap(public_key_shares): PublicShareMap<G> = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(4, &self));
+        }
+        DkgInstanceOutput::from_persisted_parts(public_key, secret_share, public_key_shares)
+            .map_err(de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct InstanceVec<G: GoldenGroup>(Vec<DkgInstanceOutput<G>>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> Deserialize<'de> for InstanceVec<G> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserializer.deserialize_seq(InstanceVecVisitor::<G>(PhantomData))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct InstanceVecVisitor<G: GoldenGroup>(PhantomData<G>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> de::Visitor<'de> for InstanceVecVisitor<G> {
+    type Value = InstanceVec<G>;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a bounded sequence of validated Golden DKG instance outputs")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let minimum_item_bytes = G::ELEMENT_REPR_BYTES
+            .saturating_add(G::Scalar::REPR_BYTES)
+            .saturating_add(1)
+            .max(1);
+        let maximum = MAX_PERSISTED_COLLECTION_BYTES / minimum_item_bytes;
+        if seq.size_hint().is_some_and(|hint| hint > maximum) {
+            return Err(de::Error::custom(
+                "DKG output instance sequence exceeds persistence allocation bound",
+            ));
+        }
+        let mut instances = Vec::new();
+        while let Some(instance) = seq.next_element()? {
+            if instances.len() == maximum {
+                return Err(de::Error::custom(
+                    "DKG output instance sequence exceeds persistence allocation bound",
+                ));
+            }
+            instances.push(instance);
+        }
+        Ok(InstanceVec(instances))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct DkgOutputVisitor<G: GoldenGroup>(PhantomData<G>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> de::Visitor<'de> for DkgOutputVisitor<G> {
+    type Value = DkgOutput<G>;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a validated Golden DKG output persistence tuple")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let participant = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        let DecodedPersistenceBytes(configuration_root) = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+        let configuration_root = configuration_root
+            .try_into()
+            .map_err(|_| de::Error::custom("configuration root must contain 32 bytes"))?;
+        let InstanceVec(instances) = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(4, &self));
+        }
+        DkgOutput::from_persisted_parts(participant, configuration_root, instances)
+            .map_err(de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ParticipantRegistryVisitor<G: GoldenGroup>(PhantomData<G>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> de::Visitor<'de> for ParticipantRegistryVisitor<G> {
+    type Value = ParticipantRegistry<G>;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a bounded participant registry persistence sequence")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let minimum_item_bytes = 4usize.saturating_add(G::ELEMENT_REPR_BYTES).max(1);
+        let maximum = MAX_PERSISTED_COLLECTION_BYTES / minimum_item_bytes;
+        if seq.size_hint().is_some_and(|hint| hint > maximum) {
+            return Err(de::Error::custom(
+                "participant registry exceeds persistence allocation bound",
+            ));
+        }
+        let mut entries = Vec::new();
+        while let Some(ParticipantElement {
+            participant,
+            element,
+        }) = seq.next_element::<ParticipantElement<G>>()?
+        {
+            if entries.len() == maximum {
+                return Err(de::Error::custom(
+                    "participant registry exceeds persistence allocation bound",
+                ));
+            }
+            if entries.iter().any(|(known, _)| *known == participant) {
+                return Err(de::Error::custom("duplicate participant in registry"));
+            }
+            entries.push((participant, element));
+        }
+        ParticipantRegistry::new(entries).map_err(de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct KindVec(Vec<DkgInstanceKind>);
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for KindVec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserializer.deserialize_seq(KindVecVisitor)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct KindVecVisitor;
+
+#[cfg(feature = "serde")]
+impl<'de> de::Visitor<'de> for KindVecVisitor {
+    type Value = KindVec;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a bounded sequence of DKG instance kinds")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        if seq
+            .size_hint()
+            .is_some_and(|hint| hint > MAX_PERSISTED_COLLECTION_BYTES)
+        {
+            return Err(de::Error::custom(
+                "DKG instance sequence exceeds persistence allocation bound",
+            ));
+        }
+        let mut instances = Vec::new();
+        while let Some(kind) = seq.next_element()? {
+            if instances.len() == MAX_PERSISTED_COLLECTION_BYTES {
+                return Err(de::Error::custom(
+                    "DKG instance sequence exceeds persistence allocation bound",
+                ));
+            }
+            instances.push(kind);
+        }
+        Ok(KindVec(instances))
+    }
+}
+
+#[cfg(feature = "serde")]
+struct DkgConfigVisitor<G: GoldenGroup>(PhantomData<G>);
+
+#[cfg(feature = "serde")]
+impl<'de, G: GoldenGroup> de::Visitor<'de> for DkgConfigVisitor<G> {
+    type Value = DkgConfig<G>;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("a validated Golden DKG configuration persistence tuple")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let threshold = seq
+            .next_element::<u64>()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))
+            .and_then(|value| {
+                usize::try_from(value)
+                    .map_err(|_| de::Error::custom("threshold does not fit usize"))
+            })?;
+        let session_id = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+        let registry = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+        let KindVec(instances) = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(3, &self))?;
+        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(5, &self));
+        }
+        DkgConfig::new(threshold, session_id, registry, instances).map_err(de::Error::custom)
+    }
+}
+
 #[cfg(feature = "serde")]
 impl Serialize for SessionId {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
-        serialize_wire(self, serializer)
+        serializer.serialize_bytes(&self.0)
     }
 }
 
 #[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for SessionId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
-        deserialize_wire(deserializer)
+        let DecodedPersistenceBytes(bytes) = DecodedPersistenceBytes::deserialize(deserializer)?;
+        bytes
+            .try_into()
+            .map(Self)
+            .map_err(|_| de::Error::custom("session identifier must contain 32 bytes"))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for ParticipantIndex {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serializer.serialize_u32(self.get())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for ParticipantIndex {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        Self::new(u32::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for DkgInstanceKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serializer.serialize_u8(match self {
+            Self::Random => 0,
+            Self::Zero => 1,
+        })
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for DkgInstanceKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        match u8::deserialize(deserializer)? {
+            0 => Ok(Self::Random),
+            1 => Ok(Self::Zero),
+            value => Err(de::Error::custom(format!(
+                "invalid DKG instance kind {value}"
+            ))),
+        }
     }
 }
 
@@ -887,7 +1909,14 @@ where
     G: GoldenGroup,
 {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
-        serialize_wire(self, serializer)
+        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+        for (participant, public_key) in self.entries() {
+            sequence.serialize_element(&ParticipantElementRef::<G> {
+                participant,
+                element: public_key,
+            })?;
+        }
+        sequence.end()
     }
 }
 
@@ -897,7 +1926,7 @@ where
     G: GoldenGroup,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
-        deserialize_wire(deserializer)
+        deserializer.deserialize_seq(ParticipantRegistryVisitor::<G>(PhantomData))
     }
 }
 
@@ -907,7 +1936,14 @@ where
     G: GoldenGroup,
 {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
-        serialize_wire(self, serializer)
+        let threshold = u64::try_from(self.threshold())
+            .map_err(|_| serde::ser::Error::custom("DKG threshold does not fit u64"))?;
+        let mut tuple = serializer.serialize_tuple(4)?;
+        tuple.serialize_element(&threshold)?;
+        tuple.serialize_element(&self.session_id())?;
+        tuple.serialize_element(self.registry())?;
+        tuple.serialize_element(self.instances())?;
+        tuple.end()
     }
 }
 
@@ -917,7 +1953,56 @@ where
     G: GoldenGroup,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
-        deserialize_wire(deserializer)
+        deserializer.deserialize_tuple(4, DkgConfigVisitor::<G>(PhantomData))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<G> Serialize for DkgInstanceOutput<G>
+where
+    G: GoldenGroup,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        let mut tuple = serializer.serialize_tuple(3)?;
+        tuple.serialize_element(&ElementRef::<G>(self.public_key()))?;
+        tuple.serialize_element(&ScalarRef::<G>(self.secret_share()))?;
+        tuple.serialize_element(&PublicShareMapRef::<G>(self.public_key_shares()))?;
+        tuple.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G> Deserialize<'de> for DkgInstanceOutput<G>
+where
+    G: GoldenGroup,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserializer.deserialize_tuple(3, DkgInstanceOutputVisitor::<G>(PhantomData))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<G> Serialize for DkgOutput<G>
+where
+    G: GoldenGroup,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        let configuration_root = self.configuration_root();
+        let mut tuple = serializer.serialize_tuple(3)?;
+        tuple.serialize_element(&self.participant())?;
+        tuple.serialize_element(&PersistenceBytes(&configuration_root))?;
+        tuple.serialize_element(self.instances())?;
+        tuple.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G> Deserialize<'de> for DkgOutput<G>
+where
+    G: GoldenGroup,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserializer.deserialize_tuple(3, DkgOutputVisitor::<G>(PhantomData))
     }
 }
 
@@ -1111,6 +2196,157 @@ mod batch_tests {
 
     fn config(kinds: Vec<DkgInstanceKind>) -> DkgConfig<TinyGroup> {
         DkgConfig::new(2, SessionId([7; 32]), registry(), kinds).unwrap()
+    }
+
+    #[cfg(any(feature = "serde", feature = "miden-serde"))]
+    fn instance_output(
+        participant: ParticipantIndex,
+        constant: u64,
+        slope: u64,
+    ) -> DkgInstanceOutput<TinyGroup> {
+        let public_key_shares = [idx(1), idx(2), idx(3)]
+            .into_iter()
+            .map(|share_participant| {
+                let x = scalar(u64::from(share_participant.get()));
+                let value = scalar(constant).add(&scalar(slope).mul(&x));
+                (share_participant, TinyGroup::mul_generator(&value))
+            })
+            .collect::<BTreeMap<_, _>>();
+        DkgInstanceOutput::new(
+            element(constant),
+            public_key_shares[&participant],
+            public_key_shares,
+        )
+    }
+
+    #[cfg(any(feature = "serde", feature = "miden-serde"))]
+    fn output() -> DkgOutput<TinyGroup> {
+        let participant = idx(2);
+        DkgOutput::from_persisted_parts(
+            participant,
+            [19; 32],
+            vec![
+                instance_output(participant, 9, 4),
+                instance_output(participant, 0, 7),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_application_values_use_logical_persistence_and_rederive_roots() {
+        let participant = idx(3);
+        let kind = DkgInstanceKind::Zero;
+        let expected = config(vec![DkgInstanceKind::Random, kind]);
+
+        let participant_bytes = postcard::to_allocvec(&participant).unwrap();
+        let kind_bytes = postcard::to_allocvec(&kind).unwrap();
+        let encoded = postcard::to_allocvec(&expected).unwrap();
+        assert!(!encoded.windows(MAGIC.len()).any(|window| window == MAGIC));
+
+        assert_eq!(
+            postcard::from_bytes::<ParticipantIndex>(&participant_bytes).unwrap(),
+            participant
+        );
+        assert_eq!(
+            postcard::from_bytes::<DkgInstanceKind>(&kind_bytes).unwrap(),
+            kind
+        );
+        let decoded = postcard::from_bytes::<DkgConfig<TinyGroup>>(&encoded).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.registry().root(), expected.registry().root());
+        assert_eq!(decoded.root(), expected.root());
+    }
+
+    #[cfg(feature = "miden-serde")]
+    #[test]
+    fn miden_application_values_use_logical_persistence_and_rederive_roots() {
+        use miden_serde_utils::{Deserializable as _, Serializable as _};
+
+        let participant = idx(3);
+        let kind = DkgInstanceKind::Zero;
+        let expected = config(vec![DkgInstanceKind::Random, kind]);
+
+        let participant_bytes = participant.to_bytes();
+        let kind_bytes = kind.to_bytes();
+        let encoded = expected.to_bytes();
+        assert!(!encoded.windows(MAGIC.len()).any(|window| window == MAGIC));
+
+        assert_eq!(
+            ParticipantIndex::read_from_bytes(&participant_bytes).unwrap(),
+            participant
+        );
+        assert_eq!(DkgInstanceKind::read_from_bytes(&kind_bytes).unwrap(), kind);
+        let decoded = DkgConfig::<TinyGroup>::read_from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.registry().root(), expected.registry().root());
+        assert_eq!(decoded.root(), expected.root());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_output_values_are_direct_logical_persistence() {
+        let expected = output();
+        let encoded_instance = postcard::to_allocvec(&expected.instances()[0]).unwrap();
+        let encoded_output = postcard::to_allocvec(&expected).unwrap();
+        assert!(!encoded_output
+            .windows(MAGIC.len())
+            .any(|window| window == MAGIC));
+
+        assert_eq!(
+            postcard::from_bytes::<DkgInstanceOutput<TinyGroup>>(&encoded_instance).unwrap(),
+            expected.instances()[0]
+        );
+        let decoded = postcard::from_bytes::<DkgOutput<TinyGroup>>(&encoded_output).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.completion_root(), expected.completion_root());
+    }
+
+    #[cfg(feature = "miden-serde")]
+    #[test]
+    fn miden_output_restoration_rejects_noncanonical_and_inconsistent_state() {
+        use miden_serde_utils::{Deserializable as _, Serializable as _};
+
+        let expected = output();
+        let mut invalid_point = expected.instances()[0].to_bytes();
+        invalid_point[0] = 97;
+        assert!(DkgInstanceOutput::<TinyGroup>::read_from_bytes(&invalid_point).is_err());
+
+        let mut invalid_scalar = expected.instances()[0].to_bytes();
+        invalid_scalar[1] = 97;
+        assert!(DkgInstanceOutput::<TinyGroup>::read_from_bytes(&invalid_scalar).is_err());
+
+        let mut duplicate_participant = expected.instances()[0].to_bytes();
+        let first_participant = duplicate_participant[3..7].to_vec();
+        duplicate_participant[8..12].copy_from_slice(&first_participant);
+        assert!(DkgInstanceOutput::<TinyGroup>::read_from_bytes(&duplicate_participant).is_err());
+
+        let one_instance = DkgOutput::new(
+            expected.participant(),
+            expected.configuration_root(),
+            vec![expected.instances()[0].clone()],
+        );
+        let mut wrong_local_binding = one_instance.to_bytes();
+        wrong_local_binding[38] = wrong_local_binding[44];
+        assert!(DkgOutput::<TinyGroup>::read_from_bytes(&wrong_local_binding).is_err());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_persistence_rejects_hostile_collection_size_hints_before_allocation() {
+        use serde::de::Visitor as _;
+
+        assert!(PersistenceBytesVisitor
+            .visit_seq(HostileSizeHintSeq {
+                bytes: Vec::new().into_iter(),
+            })
+            .is_err());
+        assert!(KindVecVisitor
+            .visit_seq(HostileSizeHintSeq {
+                bytes: Vec::new().into_iter(),
+            })
+            .is_err());
     }
 
     fn encrypted_share(pad: u64, encrypted: u64) -> EncryptedShare<TinyGroup> {

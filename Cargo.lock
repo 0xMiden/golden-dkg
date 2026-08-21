@@ -599,6 +599,7 @@ version = "0.3.0"
 dependencies = [
  "ff",
  "miden-serde-utils",
+ "postcard",
  "rand_chacha",
  "rand_core 0.6.4",
  "serde",

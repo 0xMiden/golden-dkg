@@ -27,6 +27,27 @@ pub struct OwnDealing<G: GoldenGroup> {
 }
 
 impl<G: GoldenGroup> OwnDealing<G> {
+    #[cfg(any(feature = "serde", feature = "miden-serde"))]
+    pub(crate) fn from_persisted_parts(
+        participant: ParticipantIndex,
+        configuration_root: TranscriptRoot,
+        dealer_message_bytes: Vec<u8>,
+        private_shares: Vec<G::Scalar>,
+    ) -> Result<Self> {
+        if dealer_message_bytes.is_empty()
+            || dealer_message_bytes.len() > MAX_DEALER_MESSAGE_BYTES
+            || private_shares.is_empty()
+        {
+            return Err(Error::InvalidEncoding);
+        }
+        Ok(Self {
+            participant,
+            configuration_root,
+            dealer_message_bytes,
+            private_shares,
+        })
+    }
+
     /// Return the dealer participant.
     pub fn participant(&self) -> ParticipantIndex {
         self.participant
@@ -609,5 +630,52 @@ mod tests {
 
         assert_eq!(proof_calls.get(), 0);
         assert!(!own_dealing.dealer_message_bytes().is_empty());
+    }
+
+    fn single_participant_own_dealing() -> OwnDealing<TinyGroup> {
+        let config = config(1);
+        let mut rng = ChaCha20Rng::from_seed([10; 32]);
+        deal_with(
+            &config,
+            participant(1),
+            &secret(1),
+            &mut rng,
+            |_, _, _| Err(Error::RelationEvaluationFailed),
+            |_, _, _, _| Ok(Vec::new()),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn own_dealing_serde_round_trip_preserves_retryable_local_state() {
+        let expected = single_participant_own_dealing();
+        let encoded = postcard::to_allocvec(&expected).unwrap();
+        let decoded: OwnDealing<TinyGroup> = postcard::from_bytes(&encoded).unwrap();
+
+        assert_eq!(decoded, expected);
+    }
+
+    #[cfg(feature = "miden-serde")]
+    #[test]
+    fn own_dealing_miden_round_trip_preserves_retryable_local_state() {
+        use miden_serde_utils::{Deserializable as _, Serializable as _};
+
+        let expected = single_participant_own_dealing();
+        let encoded = expected.to_bytes();
+        let decoded = OwnDealing::<TinyGroup>::read_from_bytes(&encoded).unwrap();
+
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn own_dealing_debug_redacts_private_shares_and_opaque_message_bytes() {
+        let own_dealing = single_participant_own_dealing();
+        let debug = format!("{own_dealing:?}");
+
+        assert!(debug.contains("private_shares: \"<redacted>\""));
+        assert!(debug.contains("dealer_message_bytes: \"<redacted>\""));
+        assert!(!debug.contains(&format!("{:?}", own_dealing.private_shares)));
+        assert!(!debug.contains(&format!("{:?}", own_dealing.dealer_message_bytes)));
     }
 }

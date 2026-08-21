@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rand_core::CryptoRngCore;
 
+#[cfg(any(feature = "serde", feature = "miden-serde"))]
+use crate::lagrange_coefficients_at_zero;
 use crate::main_golden::effective_message;
 use crate::transcript::{TranscriptBuilder, TranscriptRoot};
 use crate::wire::MAX_DEALER_PROOF_BYTES;
@@ -458,6 +460,53 @@ impl<G: GoldenGroup> DkgInstanceOutput<G> {
         }
     }
 
+    #[cfg(any(feature = "serde", feature = "miden-serde"))]
+    pub(crate) fn from_persisted_parts(
+        public_key: G::Element,
+        secret_share: G::Scalar,
+        public_key_shares: BTreeMap<ParticipantIndex, G::Element>,
+    ) -> Result<Self> {
+        let output = Self::new(public_key, secret_share, public_key_shares);
+        output.validate_persisted()?;
+        Ok(output)
+    }
+
+    #[cfg(any(feature = "serde", feature = "miden-serde"))]
+    fn validate_persisted(&self) -> Result<()> {
+        if self.public_key_shares.is_empty() {
+            return Err(Error::InvalidEncoding);
+        }
+
+        let local_public_share = G::mul_generator(&self.secret_share);
+        if !self
+            .public_key_shares
+            .values()
+            .any(|public_share| public_share == &local_public_share)
+        {
+            return Err(Error::InvalidEncoding);
+        }
+
+        let participant_scalars = self
+            .public_key_shares
+            .keys()
+            .map(|participant| participant.to_scalar::<G::Scalar>())
+            .collect::<Result<Vec<_>>>()
+            .map_err(|_| Error::InvalidEncoding)?;
+        let coefficients = lagrange_coefficients_at_zero(&participant_scalars)
+            .map_err(|_| Error::InvalidEncoding)?;
+        let interpolated_public_key = self
+            .public_key_shares
+            .values()
+            .zip(coefficients.iter())
+            .fold(G::identity(), |accumulator, (public_share, coefficient)| {
+                G::add(&accumulator, &G::mul(public_share, coefficient))
+            });
+        if interpolated_public_key != self.public_key {
+            return Err(Error::InvalidEncoding);
+        }
+        Ok(())
+    }
+
     /// Return the shared public key.
     pub fn public_key(&self) -> &G::Element {
         &self.public_key
@@ -503,6 +552,27 @@ impl<G: GoldenGroup> DkgOutput<G> {
             configuration_root,
             instances,
         }
+    }
+
+    #[cfg(any(feature = "serde", feature = "miden-serde"))]
+    pub(crate) fn from_persisted_parts(
+        participant: ParticipantIndex,
+        configuration_root: TranscriptRoot,
+        instances: Vec<DkgInstanceOutput<G>>,
+    ) -> Result<Self> {
+        let first = instances.first().ok_or(Error::InvalidEncoding)?;
+        for instance in &instances {
+            let local_public_share = G::mul_generator(&instance.secret_share);
+            if instance.public_key_shares.get(&participant) != Some(&local_public_share)
+                || !instance
+                    .public_key_shares
+                    .keys()
+                    .eq(first.public_key_shares.keys())
+            {
+                return Err(Error::InvalidEncoding);
+            }
+        }
+        Ok(Self::new(participant, configuration_root, instances))
     }
 
     /// Return the participant whose local secret shares this output contains.
@@ -1768,6 +1838,198 @@ mod tests {
             config,
             &legacy_beta(),
         )
+    }
+
+    #[cfg(any(feature = "serde", feature = "miden-serde"))]
+    fn completed_outputs(config: &DkgConfig<TinyGroup>, seed: u8) -> Vec<DkgOutput<TinyGroup>> {
+        let dealings = dealer_dealings::<FakeBackend>(config, seed);
+        config
+            .registry()
+            .indexes()
+            .map(|participant| complete_receiver(participant, &dealings, config).unwrap())
+            .collect()
+    }
+
+    fn persisted_instance(
+        participant: ParticipantIndex,
+        constant: u64,
+        slope: u64,
+    ) -> DkgInstanceOutput<TinyGroup> {
+        let public_key_shares = [idx(1), idx(2), idx(3)]
+            .into_iter()
+            .map(|share_participant| {
+                let x = TinyScalar::from_u64(u64::from(share_participant.get())).unwrap();
+                let value = TinyScalar::from_u64(constant)
+                    .unwrap()
+                    .add(&TinyScalar::from_u64(slope).unwrap().mul(&x));
+                (share_participant, TinyGroup::mul_generator(&value))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let secret_share = public_key_shares[&participant];
+        DkgInstanceOutput::new(
+            TinyGroup::mul_generator(&TinyScalar::from_u64(constant).unwrap()),
+            secret_share,
+            public_key_shares,
+        )
+    }
+
+    #[cfg(any(feature = "serde", feature = "miden-serde"))]
+    #[test]
+    fn persisted_instance_reconstruction_validates_its_algebra() {
+        let participant = idx(2);
+        let random = persisted_instance(participant, 9, 4);
+        let expected = DkgInstanceOutput::<TinyGroup>::from_persisted_parts(
+            *random.public_key(),
+            *random.secret_share(),
+            random.public_key_shares().clone(),
+        )
+        .unwrap();
+        assert_eq!(expected, random);
+
+        let cases = [
+            (
+                *random.public_key(),
+                *random.secret_share(),
+                BTreeMap::new(),
+            ),
+            (
+                *random.public_key(),
+                TinyScalar::from_u64(96).unwrap(),
+                random.public_key_shares().clone(),
+            ),
+            (
+                TinyGroup::identity(),
+                *random.secret_share(),
+                random.public_key_shares().clone(),
+            ),
+        ];
+        for (public_key, secret_share, public_key_shares) in cases {
+            assert_eq!(
+                DkgInstanceOutput::<TinyGroup>::from_persisted_parts(
+                    public_key,
+                    secret_share,
+                    public_key_shares,
+                )
+                .unwrap_err(),
+                Error::InvalidEncoding
+            );
+        }
+    }
+
+    #[cfg(any(feature = "serde", feature = "miden-serde"))]
+    #[test]
+    fn persisted_output_reconstruction_validates_only_batch_composition() {
+        let participant = idx(2);
+        let random = persisted_instance(participant, 9, 4);
+        let random = DkgInstanceOutput::<TinyGroup>::from_persisted_parts(
+            *random.public_key(),
+            *random.secret_share(),
+            random.public_key_shares().clone(),
+        )
+        .unwrap();
+        let zero = persisted_instance(participant, 0, 7);
+        let zero = DkgInstanceOutput::<TinyGroup>::from_persisted_parts(
+            *zero.public_key(),
+            *zero.secret_share(),
+            zero.public_key_shares().clone(),
+        )
+        .unwrap();
+        let expected = DkgOutput::from_persisted_parts(
+            participant,
+            mixed_config().root(),
+            vec![random.clone(), zero.clone()],
+        )
+        .unwrap();
+        assert_eq!(expected.instances(), [random.clone(), zero.clone()]);
+        assert_eq!(expected.instances()[1].public_key(), &TinyGroup::identity());
+
+        let mut missing_local_shares = random.public_key_shares().clone();
+        missing_local_shares.remove(&participant);
+        let missing_local = DkgInstanceOutput::<TinyGroup>::from_persisted_parts(
+            *random.public_key(),
+            missing_local_shares[&idx(1)],
+            missing_local_shares,
+        )
+        .unwrap();
+        let wrong_local = DkgInstanceOutput::<TinyGroup>::from_persisted_parts(
+            *random.public_key(),
+            random.public_key_shares()[&idx(1)],
+            random.public_key_shares().clone(),
+        )
+        .unwrap();
+        let mut different_participant_shares = zero.public_key_shares().clone();
+        different_participant_shares.remove(&idx(3));
+        let different_participants = DkgInstanceOutput::<TinyGroup>::from_persisted_parts(
+            *zero.public_key(),
+            *zero.secret_share(),
+            different_participant_shares,
+        )
+        .unwrap();
+
+        for instances in [
+            Vec::new(),
+            vec![missing_local],
+            vec![wrong_local],
+            vec![random, different_participants],
+        ] {
+            assert_eq!(
+                DkgOutput::from_persisted_parts(participant, mixed_config().root(), instances,)
+                    .unwrap_err(),
+                Error::InvalidEncoding
+            );
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_output_persistence_round_trips_every_participant_and_batch_shape() {
+        let one = DkgConfig::new_random(2, SessionId([21; 32]), registry()).unwrap();
+        let mut cases = completed_outputs(&one, 21);
+        cases.extend(completed_outputs(&mixed_config(), 22));
+        cases.extend(completed_outputs(&single_participant_config(), 23));
+
+        for expected in cases {
+            let completion_root = expected.completion_root();
+            let encoded = postcard::to_allocvec(&expected).unwrap();
+            let restored = postcard::from_bytes::<DkgOutput<TinyGroup>>(&encoded).unwrap();
+            assert_eq!(restored, expected);
+            assert_eq!(restored.configuration_root(), expected.configuration_root());
+            assert_eq!(restored.completion_root(), completion_root);
+        }
+    }
+
+    #[cfg(feature = "miden-serde")]
+    #[test]
+    fn miden_output_persistence_round_trips_every_participant_and_batch_shape() {
+        use miden_serde_utils::{Deserializable as _, Serializable as _};
+
+        let one = DkgConfig::new_random(2, SessionId([24; 32]), registry()).unwrap();
+        let mut cases = completed_outputs(&one, 24);
+        cases.extend(completed_outputs(&mixed_config(), 25));
+        cases.extend(completed_outputs(&single_participant_config(), 26));
+
+        for expected in cases {
+            let completion_root = expected.completion_root();
+            let restored = DkgOutput::<TinyGroup>::read_from_bytes(&expected.to_bytes()).unwrap();
+            assert_eq!(restored, expected);
+            assert_eq!(restored.configuration_root(), expected.configuration_root());
+            assert_eq!(restored.completion_root(), completion_root);
+        }
+    }
+
+    #[test]
+    fn output_debug_redacts_the_actual_local_secret_share() {
+        let participant = idx(2);
+        let valid = persisted_instance(participant, 9, 4);
+        let instance: DkgInstanceOutput<TinyGroup> = DkgInstanceOutput::new(
+            *valid.public_key(),
+            TinyScalar::from_u64(96).unwrap(),
+            valid.public_key_shares().clone(),
+        );
+        let secret_debug = format!("{:?}", instance.secret_share());
+        let debug = format!("{instance:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&secret_debug));
     }
 
     #[test]
