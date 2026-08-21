@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "bulletproofs-cycle"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bulletproofs",
  "criterion",
@@ -112,6 +112,7 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "sha3",
+ "smallvec",
  "subtle",
  "thiserror",
 ]
@@ -595,9 +596,10 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "golden-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "miden-serde-utils",
+ "p3-maybe-rayon",
  "rand_chacha",
  "rand_core 0.6.4",
  "serde",
@@ -610,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "golden-ehtdh1"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chacha20",
  "chacha20poly1305",
@@ -631,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "golden-evrf"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bulletproofs-cycle",
  "codspeed-criterion-compat",
@@ -653,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "golden-halo2curves"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bulletproofs-cycle",
  "ff",
@@ -668,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "golden-rustcrypto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "golden-core",
  "hex",
@@ -1496,6 +1498,12 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "smallvec"
+version = "1.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "spin"

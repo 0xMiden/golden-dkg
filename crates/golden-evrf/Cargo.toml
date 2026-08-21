@@ -1,6 +1,6 @@
 [package]
 name = "golden-evrf"
-version = "0.3.0"
+version = "0.4.0"
 description = "Verifiable random function proof backends for Golden distributed key generation"
 edition.workspace = true
 homepage.workspace = true
@@ -36,7 +36,7 @@ rand_chacha = { workspace = true }
 [features]
 default = []
 miden-serde = ["golden-core/miden-serde"]
-parallel = ["bulletproofs-cycle?/parallel", "p3-maybe-rayon?/parallel"]
+parallel = ["bulletproofs-cycle?/parallel", "golden-core/parallel", "p3-maybe-rayon?/parallel"]
 serde = [
     "dep:serde",
     "bulletproofs-cycle?/serde",

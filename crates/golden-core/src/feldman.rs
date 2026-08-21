@@ -2,12 +2,27 @@
 
 use subtle::ConstantTimeEq;
 
-use crate::{Error, GoldenGroup, GoldenScalar, ParticipantIndex, Polynomial, Result, Share};
+use crate::{Error, GoldenGroup, ParticipantIndex, Polynomial, Result, Share};
 
 /// Feldman commitment to a Shamir polynomial.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeldmanCommitment<G: GoldenGroup> {
     coefficients: Vec<G::Element>,
+}
+
+/// Variable-time double-and-add multiplication by a small public scalar.
+fn mul_by_small_scalar<G: GoldenGroup>(point: &G::Element, scalar: u32) -> G::Element {
+    if scalar == 0 {
+        return G::identity();
+    }
+    let mut acc = G::identity();
+    for bit in (0..u32::BITS - scalar.leading_zeros()).rev() {
+        acc = G::add(&acc, &acc);
+        if (scalar >> bit) & 1 == 1 {
+            acc = G::add(&acc, point);
+        }
+    }
+    acc
 }
 
 impl<G: GoldenGroup> FeldmanCommitment<G> {
@@ -35,15 +50,15 @@ impl<G: GoldenGroup> FeldmanCommitment<G> {
         self.coefficients[0].clone()
     }
 
-    /// Compute the expected public key share for a participant.
+    /// Compute the expected public key share for a participant via Horner's
+    /// method.
     pub fn public_key_share(&self, participant: ParticipantIndex) -> Result<G::Element> {
-        let x = participant.to_scalar::<G::Scalar>()?;
+        participant.to_scalar::<G::Scalar>()?;
+        let x = participant.get();
         let mut result = G::identity();
-        let mut x_pow = G::Scalar::one();
 
-        for coefficient in &self.coefficients {
-            result = G::add(&result, &G::mul(coefficient, &x_pow));
-            x_pow = x_pow.mul(&x);
+        for coefficient in self.coefficients.iter().rev() {
+            result = G::add(&mul_by_small_scalar::<G>(&result, x), coefficient);
         }
 
         Ok(result)
@@ -134,6 +149,160 @@ mod tests {
         let repr = TinyGroup::encode_element(&point);
         assert_eq!(TinyGroup::decode_element(&repr).unwrap(), point);
         assert!(TinyGroup::decode_element(&[97]).is_err());
+    }
+
+    #[test]
+    fn public_key_share_rejects_index_outside_scalar_range() {
+        use rejecting::RejectingGroup;
+
+        let poly =
+            Polynomial::from_coefficients(vec![<RejectingGroup as GoldenGroup>::Scalar::from_u64(
+                1,
+            )
+            .unwrap()])
+            .unwrap();
+        let commitment = FeldmanCommitment::<RejectingGroup>::commit(&poly).unwrap();
+        let out_of_range = ParticipantIndex::new(5).unwrap();
+
+        assert!(commitment.public_key_share(out_of_range).is_err());
+    }
+
+    /// Backend whose `from_u64` rejects values that fall outside its
+    /// canonical scalar range, exercising the fast-path validation in
+    /// [`FeldmanCommitment::public_key_share`].
+    mod rejecting {
+        use rand_core::CryptoRngCore;
+        use subtle::{Choice, ConstantTimeEq};
+
+        use crate::{Error, FieldByteOrder, GoldenGroup, GoldenScalar, Result};
+
+        const MODULUS: u8 = 5;
+
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        pub struct RejectingScalar(u8);
+
+        impl ConstantTimeEq for RejectingScalar {
+            fn ct_eq(&self, other: &Self) -> Choice {
+                self.0.ct_eq(&other.0)
+            }
+        }
+
+        impl zeroize::Zeroize for RejectingScalar {
+            fn zeroize(&mut self) {
+                self.0 = 0;
+            }
+        }
+
+        impl GoldenScalar for RejectingScalar {
+            type Repr = [u8; 1];
+
+            const REPR_BYTES: usize = 1;
+
+            fn zero() -> Self {
+                Self(0)
+            }
+
+            fn one() -> Self {
+                Self(1)
+            }
+
+            fn random(rng: &mut impl CryptoRngCore) -> Self {
+                Self((rng.next_u32() % u32::from(MODULUS)) as u8)
+            }
+
+            fn from_u64(value: u64) -> Result<Self> {
+                if value >= u64::from(MODULUS) {
+                    return Err(Error::InvalidEncoding);
+                }
+                Ok(Self(value as u8))
+            }
+
+            fn add(&self, rhs: &Self) -> Self {
+                Self((self.0 + rhs.0) % MODULUS)
+            }
+
+            fn sub(&self, rhs: &Self) -> Self {
+                Self((MODULUS + self.0 - rhs.0) % MODULUS)
+            }
+
+            fn mul(&self, rhs: &Self) -> Self {
+                Self(((u16::from(self.0) * u16::from(rhs.0)) % u16::from(MODULUS)) as u8)
+            }
+
+            fn invert(&self) -> Option<Self> {
+                if self.0 == 0 {
+                    return None;
+                }
+                (1..MODULUS)
+                    .map(Self)
+                    .find(|candidate| self.mul(candidate) == Self::one())
+            }
+
+            fn to_repr(&self) -> Self::Repr {
+                [self.0]
+            }
+
+            fn from_repr(repr: &Self::Repr) -> Result<Self> {
+                if repr[0] < MODULUS {
+                    Ok(Self(repr[0]))
+                } else {
+                    Err(Error::InvalidEncoding)
+                }
+            }
+
+            fn modulus() -> Self::Repr {
+                [MODULUS]
+            }
+
+            fn repr_byte_order() -> FieldByteOrder {
+                FieldByteOrder::BigEndian
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum RejectingGroup {}
+
+        impl GoldenGroup for RejectingGroup {
+            type Scalar = RejectingScalar;
+            type Element = RejectingScalar;
+            type ElementRepr = [u8; 1];
+
+            const ELEMENT_REPR_BYTES: usize = 1;
+
+            const BACKEND_ID: &'static str = "golden-test-rejecting-v1";
+
+            fn generator() -> Self::Element {
+                RejectingScalar::one()
+            }
+
+            fn identity() -> Self::Element {
+                RejectingScalar::zero()
+            }
+
+            fn add(a: &Self::Element, b: &Self::Element) -> Self::Element {
+                a.add(b)
+            }
+
+            fn sub(a: &Self::Element, b: &Self::Element) -> Self::Element {
+                a.sub(b)
+            }
+
+            fn mul(point: &Self::Element, scalar: &Self::Scalar) -> Self::Element {
+                point.mul(scalar)
+            }
+
+            fn is_identity(point: &Self::Element) -> Choice {
+                point.is_zero()
+            }
+
+            fn encode_element(point: &Self::Element) -> Self::ElementRepr {
+                point.to_repr()
+            }
+
+            fn decode_element(repr: &Self::ElementRepr) -> Result<Self::Element> {
+                RejectingScalar::from_repr(repr)
+            }
+        }
     }
 
     #[test]

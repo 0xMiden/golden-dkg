@@ -9,9 +9,10 @@ use alloc::sync::Arc;
 use ff::Field;
 use group::Group;
 use merlin::Transcript;
+use p3_maybe_rayon::prelude::*;
 use rand_core::CryptoRngCore;
 
-use super::linear_combination::VariableKind;
+use super::linear_combination::{scaled_by_coefficient, VariableKind};
 use super::{
     ConstraintSystem, LinearCombination, Metrics, R1CSProof, RandomizableConstraintSystem,
     RandomizedConstraintSystem, Variable,
@@ -181,9 +182,10 @@ impl<C: Cycle> VerificationEquation<C> {
         if scalars.len() > accumulator_scalars.len() {
             accumulator_scalars.resize(scalars.len(), C::Scalar::ZERO);
         }
-        for (accumulator, scalar) in accumulator_scalars.iter_mut().zip(scalars) {
-            *accumulator += coefficient * scalar;
-        }
+        accumulator_scalars
+            .par_iter_mut()
+            .zip(scalars.into_par_iter())
+            .for_each(|(accumulator, scalar)| *accumulator += coefficient * scalar);
         Ok(())
     }
 }
@@ -377,12 +379,13 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
         let mut exp_z = *z;
         for lc in self.constraints.iter() {
             for (var, coeff) in &lc.terms {
+                let weighted = scaled_by_coefficient(exp_z, coeff);
                 match var.kind {
-                    VariableKind::MultiplierLeft(i) => wL[i] += exp_z * coeff,
-                    VariableKind::MultiplierRight(i) => wR[i] += exp_z * coeff,
-                    VariableKind::MultiplierOutput(i) => wO[i] += exp_z * coeff,
-                    VariableKind::Committed(i) => wV[i] -= exp_z * coeff,
-                    VariableKind::One => wc -= exp_z * coeff,
+                    VariableKind::MultiplierLeft(i) => wL[i] += weighted,
+                    VariableKind::MultiplierRight(i) => wR[i] += weighted,
+                    VariableKind::MultiplierOutput(i) => wO[i] += weighted,
+                    VariableKind::Committed(i) => wV[i] -= weighted,
+                    VariableKind::One => wc -= weighted,
                 }
             }
             exp_z *= z;

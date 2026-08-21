@@ -8,6 +8,7 @@ use core::marker::PhantomData;
 use core::ops::{Add, Mul, Neg, Sub};
 
 use ff::Field;
+use smallvec::{smallvec, SmallVec};
 
 /// Kind of a [`Variable`]: where its value comes from in the constraint system.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -68,13 +69,13 @@ impl<S: Field> Variable<S> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinearCombination<S: Field> {
     /// `(variable, coefficient)` terms.
-    pub terms: Vec<(Variable<S>, S)>,
+    pub terms: SmallVec<[(Variable<S>, S); 4]>,
 }
 
 impl<S: Field> From<Variable<S>> for LinearCombination<S> {
     fn from(v: Variable<S>) -> Self {
         LinearCombination {
-            terms: vec![(v, S::ONE)],
+            terms: smallvec![(v, S::ONE)],
         }
     }
 }
@@ -82,14 +83,16 @@ impl<S: Field> From<Variable<S>> for LinearCombination<S> {
 impl<S: Field> From<S> for LinearCombination<S> {
     fn from(s: S) -> Self {
         LinearCombination {
-            terms: vec![(Variable::one(), s)],
+            terms: smallvec![(Variable::one(), s)],
         }
     }
 }
 
 impl<S: Field> Default for LinearCombination<S> {
     fn default() -> Self {
-        LinearCombination { terms: Vec::new() }
+        LinearCombination {
+            terms: SmallVec::new(),
+        }
     }
 }
 
@@ -122,7 +125,7 @@ impl<S: Field> Mul<S> for Variable<S> {
 
     fn mul(self, other: S) -> Self::Output {
         LinearCombination {
-            terms: vec![(self, other)],
+            terms: smallvec![(self, other)],
         }
     }
 }
@@ -166,5 +169,16 @@ impl<S: Field> Mul<S> for LinearCombination<S> {
             *s *= other;
         }
         self
+    }
+}
+
+/// Multiply `factor` by a constraint coefficient.
+pub(crate) fn scaled_by_coefficient<S: Field>(factor: S, coefficient: &S) -> S {
+    if *coefficient == S::ONE {
+        factor
+    } else if *coefficient == -S::ONE {
+        -factor
+    } else {
+        factor * coefficient
     }
 }
