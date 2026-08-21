@@ -4,7 +4,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use golden_core::{DkgConfig, DkgInstanceKind, DkgOutput, GoldenHashToGroup};
+use golden_core::{DkgConfig, DkgInstanceKind, DkgOutput, GoldenGroup, GoldenHashToGroup};
 
 use crate::context::{Error, PublicKeySet, PublicShare, SecretShare, SetupContext};
 use crate::encrypt::SealingKey;
@@ -34,13 +34,27 @@ impl<G: GoldenHashToGroup> fmt::Debug for Ehtdh1Material<G> {
     }
 }
 
+fn validate_aggregate_keys<G: GoldenGroup>(
+    decryption_key: &G::Element,
+    context_key: &G::Element,
+) -> Result<(), Error> {
+    if bool::from(G::is_identity(decryption_key)) {
+        return Err(Error::InvalidJointPublicKey);
+    }
+    if !bool::from(G::is_identity(context_key)) {
+        return Err(Error::InvalidPublicKeySet);
+    }
+    Ok(())
+}
+
 /// Convert one Golden `[Random, Zero]` DKG batch into paper `(pk, pkc, sk_1..sk_N)` material.
 ///
 /// The paper treats key generation as centralized. This bridge checks matching
 /// configuration and output identity before interpreting batch position zero as
 /// the decryption sharing and position one as the context sharing.
-/// `PublicKeySet::new` checks that `X_i` interpolates to `X` and `Z_i`
-/// interpolates to identity.
+/// It requires the decryption aggregate key to be nonidentity and the context
+/// aggregate key to be identity. `PublicKeySet::new` additionally checks that
+/// `X_i` interpolates to `X` and `Z_i` interpolates to identity.
 pub fn material_from_dkg_output<G: GoldenHashToGroup>(
     config: &DkgConfig<G>,
     output: &DkgOutput<G>,
@@ -52,8 +66,16 @@ pub fn material_from_dkg_output<G: GoldenHashToGroup>(
     if output.configuration_root() != config.root() {
         return Err(Error::InvalidBridge("configuration root mismatch"));
     }
-    let decryption_output = &output.instances()[0];
-    let context_output = &output.instances()[1];
+    if output.instances().len() != 2 {
+        return Err(Error::InvalidBridge("output instance count mismatch"));
+    }
+    let decryption_output = output
+        .instance(0)
+        .ok_or(Error::InvalidBridge("output instance count mismatch"))?;
+    let context_output = output
+        .instance(1)
+        .ok_or(Error::InvalidBridge("output instance count mismatch"))?;
+    validate_aggregate_keys::<G>(decryption_output.public_key(), context_output.public_key())?;
 
     let participants = config.registry().indexes().collect::<Vec<_>>();
 
@@ -62,8 +84,16 @@ pub fn material_from_dkg_output<G: GoldenHashToGroup>(
         public_shares.insert(
             *participant,
             PublicShare {
-                decryption: decryption_output.public_key_shares()[participant].clone(),
-                context: context_output.public_key_shares()[participant].clone(),
+                decryption: decryption_output
+                    .public_key_shares()
+                    .get(participant)
+                    .ok_or(Error::InvalidBridge("missing decryption public share"))?
+                    .clone(),
+                context: context_output
+                    .public_key_shares()
+                    .get(participant)
+                    .ok_or(Error::InvalidBridge("missing context public share"))?
+                    .clone(),
             },
         );
     }
@@ -96,4 +126,37 @@ pub fn material_from_dkg_output<G: GoldenHashToGroup>(
         secret_share,
         setup_context,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use golden_core::{GoldenGroup, GoldenScalar};
+    use golden_rustcrypto::{P256Backend, P256Scalar};
+
+    use super::*;
+
+    type G = P256Backend;
+
+    fn scalar(value: u64) -> P256Scalar {
+        P256Scalar::from_u64(value).unwrap()
+    }
+
+    #[test]
+    fn aggregate_keys_must_be_nonidentity_then_identity() {
+        let identity = G::identity();
+        let nonidentity = G::mul_generator(&scalar(1));
+
+        assert_eq!(
+            validate_aggregate_keys::<G>(&identity, &identity),
+            Err(Error::InvalidJointPublicKey)
+        );
+        assert_eq!(
+            validate_aggregate_keys::<G>(&nonidentity, &nonidentity),
+            Err(Error::InvalidPublicKeySet)
+        );
+        assert_eq!(
+            validate_aggregate_keys::<G>(&nonidentity, &identity),
+            Ok(())
+        );
+    }
 }

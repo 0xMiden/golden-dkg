@@ -14,9 +14,8 @@
 //! 5. A combiner checks the decryption shares. Any two valid shares recover the
 //!    content key, which then decrypts the value.
 //!
-//! The example uses a fast prototype proof backend so it can run as a normal
-//! example. It uses the same Golden DKG and EHTDH1 public APIs as the full
-//! proof backend.
+//! The example uses the Secp/Secq Main Golden proof system. Proof parameter
+//! preparation and dealing are intentionally explicit setup steps.
 //!
 //! # Context policy
 //!
@@ -102,25 +101,22 @@ use std::io;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use golden_core::{
-    complete_legacy as complete, create_dealing, DealerMessage, DkgConfig, DkgDealing,
-    DkgInstanceKind, DkgOutput, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry,
-    SessionId,
+    complete, deal, DkgConfig, DkgInstanceKind, DkgOutput, GoldenGroup, GoldenScalar, OwnDealing,
+    ParticipantIndex, ParticipantRegistry, SessionId,
 };
 use golden_ehtdh1::wire::{from_wire_bytes, to_wire_bytes};
 use golden_ehtdh1::{
     material_from_dkg_output, Ciphertext, Combiner, DecryptionShare, Ehtdh1Material, SealingKey,
     UnsealingShare,
 };
-use golden_evrf::prototype::ShareOpeningBackend;
-use golden_rustcrypto::{P256Backend, P256Scalar};
-use rand_chacha::{
-    rand_core::{RngCore, SeedableRng},
-    ChaCha20Rng,
-};
+use golden_evrf::paper::secp_secq::SecpSecqBulletproofs;
+use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
-/// Concrete group used by this fast example.
-type G = P256Backend;
+/// Main Golden input group used by the Secp/Secq proof system.
+type G = Secp256k1GoldenGroup;
 
 /// Error type used by the example helpers.
 type AppResult<T> = Result<T, Box<dyn Error>>;
@@ -292,13 +288,13 @@ fn idx(value: u32) -> AppResult<ParticipantIndex> {
     Ok(ParticipantIndex::new(value)?)
 }
 
-/// Builds a small P256 scalar for repeatable example inputs.
-fn scalar(value: u64) -> AppResult<P256Scalar> {
-    Ok(P256Scalar::from_u64(value)?)
+/// Builds a small Secp256k1 scalar for repeatable example inputs.
+fn scalar(value: u64) -> AppResult<Secp256k1Scalar> {
+    Ok(Secp256k1Scalar::from_u64(value)?)
 }
 
 /// Returns the repeatable identity secret for one participant.
-fn identity_secret(participant: ParticipantIndex) -> AppResult<P256Scalar> {
+fn identity_secret(participant: ParticipantIndex) -> AppResult<Secp256k1Scalar> {
     scalar(100 + u64::from(participant.get()))
 }
 
@@ -329,15 +325,15 @@ fn run_dkg(
     config: &DkgConfig<G>,
     rng: &mut ChaCha20Rng,
 ) -> AppResult<BTreeMap<ParticipantIndex, DkgOutput<G>>> {
-    let legacy_beta = scalar(77)?;
-    let mut dealings = BTreeMap::<ParticipantIndex, DkgDealing<G>>::new();
+    let proof_system = SecpSecqBulletproofs::prepare_for(config)?;
+    let mut dealings = BTreeMap::<ParticipantIndex, OwnDealing<G>>::new();
     // Every participant acts as a dealer and sends one dealing to its peers.
     for dealer in participants {
-        let dealing = create_dealing::<G, ShareOpeningBackend>(
+        let dealing = deal(
+            &proof_system,
+            config,
             *dealer,
             &identity_secret(*dealer)?,
-            config,
-            &legacy_beta,
             rng,
         )?;
         dealings.insert(*dealer, dealing);
@@ -350,16 +346,15 @@ fn run_dkg(
         let peer_dealings = dealings
             .iter()
             .filter_map(|(dealer, dealing)| {
-                (*dealer != *receiver).then_some((*dealer, dealing.message().clone()))
+                (*dealer != *receiver).then_some((*dealer, dealing.dealer_message_bytes().to_vec()))
             })
-            .collect::<BTreeMap<ParticipantIndex, DealerMessage<G>>>();
-        let output = complete::<G, ShareOpeningBackend>(
-            *receiver,
+            .collect::<Vec<_>>();
+        let output = complete(
+            &proof_system,
+            config,
             &identity_secret(*receiver)?,
             own_dealing,
             &peer_dealings,
-            config,
-            &legacy_beta,
         )?;
         outputs.insert(*receiver, output);
     }

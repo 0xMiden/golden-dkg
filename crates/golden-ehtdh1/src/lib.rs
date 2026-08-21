@@ -23,9 +23,10 @@
 //! - a random decryption sharing for `x`;
 //! - a zero context sharing for `z`.
 //!
-//! The bridge rejects the wrong instance order or an output from another
-//! configuration. It binds the batch session, configuration root, and atomic
-//! completion root into [`SetupContext`].
+//! The bridge rejects the wrong instance order, an output from another
+//! configuration, an identity decryption aggregate key, or a nonidentity
+//! context aggregate key. It binds the batch session, configuration root, and
+//! atomic completion root into [`SetupContext`].
 //!
 //! [`Combiner::new`] checks that a manually supplied [`PublicKeySet`] and
 //! [`SetupContext`] agree on backend id, threshold, and participant order.
@@ -56,8 +57,11 @@
 //! # Security goals
 //!
 //! A payload stays hidden unless the combiner receives a threshold of valid
-//! EHTDH1 decryption shares. This assumes sound Golden DKG outputs, group
-//! operations, hash to group, and randomness.
+//! EHTDH1 decryption shares. The EHTDH1 claim assumes static corruption of
+//! fewer than the threshold participants, the random-oracle model, the LOMDH
+//! assumption, and a semantically secure symmetric cipher. It does not claim
+//! adaptive-corruption security. Separately, this implementation assumes sound
+//! Golden DKG outputs, group operations, hash to group, and randomness.
 //!
 //! Ciphertext checks reject malformed EHTDH1 encryption proofs. Share checks
 //! reject malformed shares and shares made for the wrong context.
@@ -108,7 +112,7 @@
 //! Run the full three party threshold record example with:
 //!
 //! ```text
-//! cargo run -p golden-ehtdh1 --example threshold_records --features prototype-bridge
+//! cargo run -p golden-ehtdh1 --example threshold_records --features halo2curves-secp256k1
 //! ```
 //!
 //! # Example

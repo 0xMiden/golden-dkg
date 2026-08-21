@@ -78,7 +78,7 @@ jobs:
             --exclude-features default,bulletproofs-compat \
             --all-targets
       - name: Compile EHTDH1 threshold record example
-        run: cargo check -p golden-ehtdh1 --example threshold_records --features prototype-bridge
+        run: cargo check -p golden-ehtdh1 --example threshold_records --features halo2curves-secp256k1
       - name: Check browser recovery crates
         run: |
           cargo check \
@@ -131,8 +131,8 @@ jobs:
         run: cargo nextest run -p golden-rustcrypto --features k256
       - name: Test eVRF proof backend
         run: cargo nextest run -p golden-evrf --features golden-rustcrypto/p256
-      - name: Test EHTDH1 prototype bridge
-        run: cargo nextest run -p golden-ehtdh1 --features prototype-bridge
+      - name: Test EHTDH1 Secp/Secq bridge
+        run: cargo nextest run -p golden-ehtdh1 --features halo2curves-secp256k1
       - name: Test Secp/Secq R1CS cycle
         run: cargo nextest run -p golden-halo2curves --features halo2curves-secp256k1
       - name: Test bulletproofs-compat (upstream domain separation)

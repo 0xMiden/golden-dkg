@@ -85,7 +85,7 @@ We require all commits to be
 ```bash
 cargo fmt --all --check
 cargo clippy --all --benches --tests --examples --all-features --exclude bulletproofs-cycle -- -D warnings
-cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-ehtdh1/prototype-bridge,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1
+cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-ehtdh1/halo2curves-secp256k1,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1
 cargo test --workspace --doc
 ```
 

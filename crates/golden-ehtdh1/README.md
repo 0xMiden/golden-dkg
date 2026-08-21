@@ -7,7 +7,9 @@ This crate implements EHTDH1 from
 Golden `[Random, Zero]` DKG batch into a public sealing key, public verification
 shares, and one secret share for each participant. The random sharing provides
 the decryption secret. The zero sharing binds each decryption share to one
-decryption context.
+decryption context. The bridge rejects an identity decryption aggregate key or
+a nonidentity context aggregate key and binds both the configuration and atomic
+completion roots into the EHTDH1 setup context.
 
 The crate provides:
 
@@ -28,7 +30,7 @@ recovery, and rejection of shares made for different contexts.
 Run it with:
 
 ```console
-cargo run -p golden-ehtdh1 --example threshold_records --features prototype-bridge
+cargo run -p golden-ehtdh1 --example threshold_records --features halo2curves-secp256k1
 ```
 
 ## Features
@@ -37,9 +39,9 @@ The crate has no default features.
 
 * `serde` provides Serde adapters that use the canonical wire encoding.
 * `miden-serde` provides `miden-serde-utils` adapters that use the same bytes.
-* `prototype-bridge` enables the fast Golden DKG bridge example and tests.
-* `halo2curves-secp256k1` enables the ignored integration test for the
-  Secp256k1 and Secq256k1 proof backend.
+* `halo2curves-secp256k1` enables the Secp/Secq Main Golden bridge example and
+  its integration tests. The full proof lifecycle test is ignored by default
+  because it is slow and remains explicitly runnable.
 
 ## Security scope
 
@@ -48,6 +50,11 @@ Callers must:
 * Protect participant secret shares.
 * Authenticate requests for decryption shares.
 * Supply the intended setup, associated data, and decryption context.
+
+The EHTDH1 security claim is for static corruption of fewer than the threshold
+participants in the random-oracle model, under the LOMDH assumption and the
+semantic security of the symmetric cipher. It does not claim adaptive-corruption
+security. Golden DKG setup has its own separate assumptions.
 
 This crate does not encrypt record values. It does not provide authorization,
 networking, replay prevention, secret share refresh, or secret share custody.
