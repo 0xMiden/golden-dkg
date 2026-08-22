@@ -61,16 +61,27 @@ fn candidate_compressed_bytes(seed: &[u8; 64], counter: u64) -> [u8; 48] {
 /// existing `Cycle` impls (`golden-halo2curves` documents the same
 /// restriction) and is fine here: every caller uses this to derive public,
 /// nothing-up-my-sleeve Bulletproofs generators, never secret data.
+///
+/// The x-coordinate recovery (a 381-bit field square root, the dominant
+/// cost of each candidate) runs through `blstrs`' hand-written-assembly
+/// field layer rather than `bls12_381`'s plain-Rust one; both crates decode
+/// the same standard compressed BLS12-381 encoding, so this produces
+/// identical candidate points to decoding directly with `bls12_381` — only
+/// the arithmetic backend for the recovery differs.
 fn hash_to_curve_try_and_increment(seed: &[u8; 64]) -> G1Projective {
     let mut counter: u64 = 0;
     loop {
         let candidate = candidate_compressed_bytes(seed, counter);
-        let affine: CtOption<G1Affine> = G1Affine::from_compressed_unchecked(&candidate);
-        let affine: Option<G1Affine> = Option::from(affine);
-        if let Some(affine) = affine {
-            let point: G1Projective = G1Projective::from(affine).clear_cofactor();
-            if !bool::from(point.is_identity()) {
-                return point;
+        let blst_affine: CtOption<blstrs::G1Affine> =
+            blstrs::G1Affine::from_compressed_unchecked(&candidate);
+        if let Some(blst_affine) = Option::<blstrs::G1Affine>::from(blst_affine) {
+            let uncompressed = blst_affine.to_uncompressed();
+            let affine: CtOption<G1Affine> = G1Affine::from_uncompressed_unchecked(&uncompressed);
+            if let Some(affine) = Option::<G1Affine>::from(affine) {
+                let point: G1Projective = G1Projective::from(affine).clear_cofactor();
+                if !bool::from(point.is_identity()) {
+                    return point;
+                }
             }
         }
         counter += 1;
@@ -225,6 +236,37 @@ mod tests {
         let a = Bls12_381G1Cycle::point_hash_from_uniform(&[1u8; 64]);
         let b = Bls12_381G1Cycle::point_hash_from_uniform(&[2u8; 64]);
         assert_ne!(a, b);
+    }
+
+    /// Decode a candidate's x-coordinate recovery entirely through
+    /// `bls12_381`, independent of [`hash_to_curve_try_and_increment`]'s
+    /// `blstrs` decode path, to confirm the two backends agree on which
+    /// candidates land on the curve and on the resulting point.
+    fn hash_to_curve_try_and_increment_reference(seed: &[u8; 64]) -> G1Projective {
+        let mut counter: u64 = 0;
+        loop {
+            let candidate = candidate_compressed_bytes(seed, counter);
+            let affine: Option<G1Affine> =
+                Option::from(G1Affine::from_compressed_unchecked(&candidate));
+            if let Some(affine) = affine {
+                let point: G1Projective = G1Projective::from(affine).clear_cofactor();
+                if !bool::from(point.is_identity()) {
+                    return point;
+                }
+            }
+            counter += 1;
+        }
+    }
+
+    #[test]
+    fn point_hash_from_uniform_matches_pure_bls12_381_reference_decode() {
+        for i in 0u8..32 {
+            let seed = [i; 64];
+            assert_eq!(
+                Bls12_381G1Cycle::point_hash_from_uniform(&seed),
+                hash_to_curve_try_and_increment_reference(&seed),
+            );
+        }
     }
 
     #[test]
