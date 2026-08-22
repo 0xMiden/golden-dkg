@@ -25,6 +25,7 @@ rust-version = "1.93"
 
 [workspace.dependencies]
 bls12_381 = { version = "0.8", default-features = false, features = ["groups", "bits", "alloc"] }
+blst = { version = "0.3", default-features = false }
 blstrs = { version = "0.7", default-features = false }
 bulletproofs = { version = "5.0.0", default-features = false }
 bulletproofs-cycle = { path = "crates/bulletproofs-cycle", version = "0.4.0" }

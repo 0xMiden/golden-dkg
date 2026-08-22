@@ -663,6 +663,7 @@ name = "golden-bls-jubjub"
 version = "0.4.0"
 dependencies = [
  "bls12_381",
+ "blst",
  "blstrs",
  "bulletproofs-cycle",
  "ff",
