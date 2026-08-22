@@ -618,9 +618,12 @@ fn constrain_bits_lt_bound_when<CS: ConstraintSystem<R1csCycle>>(
 /// (unified) law
 /// `u3 = (u1*v2 + v1*u2) / (1 + d*u1*u2*v1*v2)`,
 /// `v3 = (v1*v2 - a*u1*u2) / (1 - d*u1*u2*v1*v2)`.
-/// Costs 7 explicit multiplier gates, plus 1 more from `u_out`/`v_out`'s two
+/// The `u3` numerator is folded into one cross multiply,
+/// `(u1+v1)*(u2+v2) - u1*u2 - v1*v2`, rather than the two multiplies
+/// `u1*v2` and `v1*u2` a direct reading of the formula suggests. Costs 6
+/// explicit multiplier gates, plus 1 more from `u_out`/`v_out`'s two
 /// `cs.allocate` calls pairing into one shared multiplier
-/// (`ConstraintSystem::allocate`'s own documented behavior) — 8 total,
+/// (`ConstraintSystem::allocate`'s own documented behavior) — 7 total,
 /// regardless of how many bits `(u_step, v_step)` encodes (a single bit via
 /// [`edwards_conditional_add_r1cs`], or several via
 /// [`edwards_exponentiate_windowed_r1cs`]'s windowed selection).
@@ -641,10 +644,12 @@ fn edwards_add_r1cs<CS: ConstraintSystem<R1csCycle>>(
     let (_, _, m1) = cs.multiply(acc_u.clone(), u_step.clone());
     let (_, _, m2) = cs.multiply(acc_v.clone(), v_step.clone());
     let (_, _, t) = cs.multiply(LinearCombination::from(m1) * d, m2.into());
-    let (_, _, m4) = cs.multiply(acc_u, v_step);
-    let (_, _, m5) = cs.multiply(acc_v, u_step);
+    // u3's numerator u1*v2 + v1*u2 via one cross multiply instead of two:
+    // (u1+v1)*(u2+v2) = u1*u2 + u1*v2 + v1*u2 + v1*v2, so
+    // u1*v2 + v1*u2 = cross - m1 - m2.
+    let (_, _, cross) = cs.multiply(acc_u + acc_v, u_step + v_step);
 
-    let u_out_num = LinearCombination::from(m4) + m5;
+    let u_out_num = LinearCombination::from(cross) - m1 - m2;
     let u_out = cs.allocate(result.map(|(u, _)| u))?;
     let (_, _, u_out_check) =
         cs.multiply(u_out.into(), LinearCombination::from(R1csField::ONE) + t);
@@ -1254,7 +1259,7 @@ fn parse_nested_commitment(
 
 /// Bulletproofs generator capacity for the one-receiver relation. Each
 /// [`edwards_add_r1cs`] call (one per bit-0 base case, one per 2-bit
-/// window) costs 8 multiplier gates — 7 from its explicit `cs.multiply`
+/// window) costs 7 multiplier gates — 6 from its explicit `cs.multiply`
 /// calls, plus 1 because its two `cs.allocate` calls (`u_out`, `v_out`)
 /// pair up into one shared multiplier gate
 /// (`ConstraintSystem::allocate`'s own documented behavior) — regardless of
@@ -1265,7 +1270,7 @@ fn parse_nested_commitment(
 /// single-bit steps. For two exponentiations (`T_1`, `T_2`) sharing one set
 /// of window AND products (`128` more multipliers) over one
 /// `K_BITS + 1`-bit decomposition (`2 * 257 = 514`):
-/// `2 * (8 + 128 * 8) + 128 + 514 = 2706` multipliers, padded to the next
+/// `2 * (7 + 128 * 7) + 128 + 514 = 2448` multipliers, padded to the next
 /// power of two. Checked exactly (not just bounded) in
 /// `one_receiver_prover_uses_exactly_the_expected_multiplier_count`.
 const R1CS_GENS_CAPACITY: usize = 4_096;
@@ -1691,11 +1696,11 @@ fn observe_batched_statement(
 /// failure). Measured and pinned exactly in
 /// `batched_multiplier_count_matches_real_circuit_shape`, which also checks
 /// this formula's prediction covers the real count for several shapes.
-const BATCHED_SHARED_MULTIPLIERS: usize = 1_675;
+const BATCHED_SHARED_MULTIPLIERS: usize = 1_546;
 /// Multipliers added by one receiver relation (S_j exponentiation, k
 /// bit-decompose, T_1/T_2 exponentiations, pad reduction, pad-commitment
 /// exponentiation). Exact, same rationale as [`BATCHED_SHARED_MULTIPLIERS`].
-const BATCHED_RECEIVER_MULTIPLIERS: usize = 6_388;
+const BATCHED_RECEIVER_MULTIPLIERS: usize = 5_872;
 
 /// Count multipliers from the exact public circuit shape.
 fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
@@ -2478,7 +2483,7 @@ mod one_receiver_tests {
         .unwrap();
 
         let multipliers = ConstraintSystem::<R1csCycle>::metrics(&prover).multipliers;
-        assert_eq!(multipliers, 2706);
+        assert_eq!(multipliers, 2448);
         assert!(
             multipliers <= R1CS_GENS_CAPACITY,
             "circuit needs {multipliers} multipliers but R1CS_GENS_CAPACITY is only {R1CS_GENS_CAPACITY}"
@@ -2604,7 +2609,7 @@ mod batched_tests {
         // than left at a loose guessed margin (see their doc comments).
         assert_eq!(
             (shared, per_receiver),
-            (1675, 6388),
+            (1546, 5872),
             "real batched circuit shape changed; update BATCHED_SHARED_MULTIPLIERS / \
              BATCHED_RECEIVER_MULTIPLIERS in lockstep"
         );
