@@ -141,8 +141,16 @@ impl Cycle for JubjubCycle {
     }
 
     fn affine_to_point(point: &Self::Affine) -> Self::Point {
-        let extended: ExtendedPoint = (*point).into();
-        extended.clear_cofactor()
+        // `from_raw_unchecked` is O(1) (a plain reinterpretation of the
+        // coordinates); `clear_cofactor()`/`into_subgroup()` would instead
+        // pay a real scalar multiplication or a torsion-free check. Every
+        // `Self::Affine` this crate produces already comes from a
+        // prime-order-subgroup point (via `point_to_affine`, or via
+        // Bulletproofs generators derived through
+        // `point_hash_from_uniform`/`batch_normalize`, both subgroup-valued),
+        // so no check is needed here — exactly the "hard-coding constants"
+        // contract `SubgroupPoint::from_raw_unchecked` documents.
+        SubgroupPoint::from_raw_unchecked(point.get_u(), point.get_v())
     }
 
     fn batch_normalize(points: &[Self::Point]) -> Vec<Self::Affine> {
@@ -239,6 +247,28 @@ mod tests {
         let point = SubgroupPoint::generator();
         let msm = JubjubCycle::vartime_msm(&[scalar], &[point]);
         assert_eq!(msm, point * scalar);
+    }
+
+    #[test]
+    fn affine_to_point_is_the_inverse_of_point_to_affine() {
+        let mut rng = ChaCha20Rng::seed_from_u64(31);
+        for _ in 0..8 {
+            let p = SubgroupPoint::random(&mut rng);
+            let a = JubjubCycle::point_to_affine(&p);
+            assert_eq!(JubjubCycle::affine_to_point(&a), p);
+        }
+    }
+
+    #[test]
+    fn vartime_msm_affine_matches_vartime_msm() {
+        let mut rng = ChaCha20Rng::seed_from_u64(32);
+        let points: Vec<SubgroupPoint> = (0..4).map(|_| SubgroupPoint::random(&mut rng)).collect();
+        let scalars: Vec<Fr> = (0..4).map(|_| Fr::random(&mut rng)).collect();
+        let affine = JubjubCycle::batch_normalize(&points);
+        assert_eq!(
+            JubjubCycle::vartime_msm_affine(&scalars, &affine),
+            JubjubCycle::vartime_msm(&scalars, &points)
+        );
     }
 
     #[test]
