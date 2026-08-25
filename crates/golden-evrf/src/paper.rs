@@ -609,10 +609,7 @@ pub mod secp_secq {
         // Batch-normalize every point with a single field inversion.
         let affines = batch_affine(&points)?;
         let (base, window_coords) = affines.split_at(2);
-        let windows = window_coords
-            .chunks_exact(4)
-            .map(|q| [q[0], q[1], q[2], q[3]])
-            .collect();
+        let windows = window_coords.as_chunks::<4>().0.to_vec();
         Ok(ChordPrecomp {
             c0: base[0],
             d0: base[1],

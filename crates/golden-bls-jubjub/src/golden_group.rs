@@ -212,6 +212,12 @@ impl GoldenGroup for JubjubGoldenGroup {
         }
         let mut inner = [0u8; 32];
         inner.copy_from_slice(&repr[1..]);
+        // `SubgroupPoint::from_bytes` pays a real scalar multiplication
+        // (`into_subgroup`'s torsion-free check) per call, unlike a
+        // prime-order curve's cheap decode: Jubjub has cofactor 8 and no
+        // fast subgroup check. This is required, not an oversight — do not
+        // switch to `from_bytes_unchecked`, which would silently accept
+        // off-subgroup points.
         let ct: subtle::CtOption<SubgroupPoint> = GroupEncoding::from_bytes(&inner);
         Option::<SubgroupPoint>::from(ct)
             .map(JubjubElement)

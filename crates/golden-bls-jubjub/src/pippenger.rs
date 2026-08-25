@@ -1,20 +1,21 @@
 //! Generic bucket-method (Pippenger) multi-scalar multiplication over any
 //! [`group::Group`].
 //!
-//! `bls12_381` ships no multi-exponentiation helper (unlike `halo2curves`,
-//! which exposes `msm::msm_best`), so this fills that gap for the BLS12-381
-//! G1 [`bulletproofs_cycle::Cycle`] implementation. It only uses generic
-//! projective addition and doubling, so it needs no curve-specific fast
-//! path, at the cost of the affine-batched speedups a curve-specific MSM
-//! could use. Optimizing this is a follow-up perf item, not a correctness
-//! concern for the first working backend.
+//! `jubjub` ships no multi-exponentiation helper, so this fills that gap for
+//! the Jubjub [`bulletproofs_cycle::Cycle`] implementation
+//! ([`crate::jubjub_cycle`]). BLS12-381 G1's `Cycle` implementation instead
+//! delegates to `blst`'s own tuned Pippenger MSM (see [`crate::msm_blst`]),
+//! which has hardware-accelerated field arithmetic this module's generic
+//! `group::Group` addition/doubling cannot use. This module only uses
+//! generic projective addition and doubling, so it needs no curve-specific
+//! fast path, at the cost of the affine-batched speedups a curve-specific
+//! MSM could use. Optimizing this is a follow-up perf item, not a
+//! correctness concern for the first working backend.
 
 use group::Group;
 
 /// Window size in bits. Larger windows trade more bucket memory for fewer
-/// point additions. [`crate::msm_bls12_381`] reuses this same windowing
-/// scheme (via [`window_digit`]) with a curve-specific, larger window size
-/// tuned for its cheaper batch-affine bucket-accumulation step.
+/// point additions.
 pub(crate) const WINDOW_BITS: u32 = 4;
 
 /// Multi-scalar multiplication `sum(scalars[i] * points[i])`.

@@ -8,8 +8,8 @@
 //!
 //! Compare against Table 5 (BLS12-381, zkalc, optimized variant):
 //! n=2 -> 0.4s, n=10 -> 2.4s, n=50 -> 13.5s, n=100 -> 35.8s.
-//! Our absolute numbers will differ: this is a real, unwindowed
-//! additive-ladder gadget, not the paper's asymptotic estimate.
+//! Our absolute numbers will differ: these are real measurements against a
+//! real circuit, not the paper's asymptotic estimate.
 //!
 //! `GOLDEN_BLS_TABLE5_METRIC=total` measures Round 0 and Round 1 together.
 //! `GOLDEN_BLS_TABLE5_N_VALUES` may select a comma-separated row subset.

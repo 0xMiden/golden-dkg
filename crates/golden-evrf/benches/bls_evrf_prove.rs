@@ -7,9 +7,9 @@
 //!
 //! Compare against Table 4 (BLS12-381, zkalc):
 //! n_e=1 -> 0.3s, n_e=9 -> 1.8s, n_e=49 -> 6.8s, n_e=99 -> 13.5s.
-//! Our numbers will differ: this is a real, unwindowed additive-ladder
-//! gadget (see `crates/golden-evrf/src/paper/bls_jubjub.rs`), not the
-//! paper's windowed chord-rule circuit or a zkalc estimate.
+//! Our numbers will differ: these are real measurements against a real
+//! circuit (see `crates/golden-evrf/src/paper/bls_jubjub.rs`), not zkalc's
+//! asymptotic estimate.
 //!
 //! `GOLDEN_BLS_TABLE4_NE_VALUES` may select a comma-separated subset.
 

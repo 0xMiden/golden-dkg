@@ -6,8 +6,11 @@
 //! Wire size depends only on the number and byte width of group
 //! elements/scalars per receiver, not on the exponentiation gadget, so this
 //! column (unlike prove/verify timing) should track the paper's numbers
-//! more closely at the same `n` — BLS12-381 group elements are 48 bytes
-//! compressed (32 for Jubjub's own `Gin` elements) vs. Secp256k1's 33.
+//! more closely at the same `n`. Jubjub's own `Gin` elements are 33 bytes
+//! compressed (`JubjubGoldenGroup::ELEMENT_REPR_BYTES`), the same width as
+//! Secp256k1's `Gin` elements, so per-receiver wire size (the dominant cost
+//! at this column) is expected to be close to Secp256k1/Secq256k1's rather
+//! than smaller.
 
 #![allow(non_snake_case)]
 #![allow(missing_docs)]

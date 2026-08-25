@@ -11,6 +11,14 @@ pub struct FeldmanCommitment<G: GoldenGroup> {
 }
 
 /// Variable-time double-and-add multiplication by a small public scalar.
+///
+/// Requires `G::add` to be a *complete* addition law (`G::add(p, p) == 2p`
+/// for every `p`, including the identity): the doubling step
+/// `acc = G::add(&acc, &acc)` relies on this holding even when `acc` is the
+/// identity, which every current `GoldenGroup` backend in this workspace
+/// satisfies (prime-order groups with complete addition formulas), but a
+/// backend built on an incomplete Weierstrass law would need a real
+/// doubling operation here instead.
 fn mul_by_small_scalar<G: GoldenGroup>(point: &G::Element, scalar: u32) -> G::Element {
     if scalar == 0 {
         return G::identity();
@@ -53,6 +61,10 @@ impl<G: GoldenGroup> FeldmanCommitment<G> {
     /// Compute the expected public key share for a participant via Horner's
     /// method.
     pub fn public_key_share(&self, participant: ParticipantIndex) -> Result<G::Element> {
+        // Range-check `participant` against `G::Scalar` before taking the
+        // fast path below, which evaluates Horner's method directly over
+        // `participant.get()` as a small `u32` rather than through
+        // `G::Scalar` arithmetic.
         participant.to_scalar::<G::Scalar>()?;
         let x = participant.get();
         let mut result = G::identity();
