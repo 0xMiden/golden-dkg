@@ -3,15 +3,7 @@
 //!
 //! Drives the public `golden_core::{create_dealing, verify_dealing, complete}`
 //! surface bound to `BlsJubjubBackend`, mirroring
-//! `crates/golden-evrf/tests/dkg_integration.rs`'s Secp/Secq coverage. Most
-//! tests are `#[ignore]` because the backend proves a full R1CS instance per
-//! dealing (and this backend's unwindowed additive-ladder gadget is slower
-//! per proof than `secp_secq`'s windowed chord gadget — see
-//! `crates/golden-evrf/src/paper/bls_jubjub.rs`'s module doc); run via
-//! `cargo nextest --run-ignored only`.
-//! `single_participant_dkg_completes_without_proving` is the exception: a
-//! single-participant (n=1) dealing has no eVRF statement to prove, so it
-//! runs unignored.
+//! `crates/golden-evrf/tests/dkg_integration.rs`'s Secp/Secq coverage.
 
 #![allow(clippy::unwrap_used)]
 
@@ -151,13 +143,11 @@ fn single_participant_dkg_completes_without_proving() {
 }
 
 #[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn dkg_completes_with_batched_evrf_backend() {
     assert_dkg_completes(config());
 }
 
 #[test]
-#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn dkg_rejects_tampered_encrypted_share() {
     let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
     let config = config();
