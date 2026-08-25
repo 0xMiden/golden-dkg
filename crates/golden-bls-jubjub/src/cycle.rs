@@ -91,7 +91,11 @@ fn hash_to_curve_try_and_increment(seed: &[u8; 64]) -> G1Projective {
 impl Cycle for Bls12_381G1Cycle {
     type Scalar = Scalar;
     type Point = G1Projective;
-    type Affine = G1Affine;
+    // `blst`'s native affine representation, not `bls12_381::G1Affine`: see
+    // `crate::msm_blst`'s module doc for why. Converting to/from it happens
+    // once per stored generator or commitment (here and in
+    // `batch_normalize`/`affine_compress`), not once per MSM call.
+    type Affine = blst::blst_p1_affine;
     type Compressed = <G1Projective as GroupEncoding>::Repr;
     const COMPRESSED_BYTES: usize = 48;
 
@@ -163,21 +167,21 @@ impl Cycle for Bls12_381G1Cycle {
     }
 
     fn point_to_affine(point: &Self::Point) -> Self::Affine {
-        point.to_affine()
+        crate::msm_blst::to_blst_affine(&point.to_affine())
     }
 
     fn affine_to_point(point: &Self::Affine) -> Self::Point {
-        G1Projective::from(point)
+        G1Projective::from(crate::msm_blst::from_blst_affine(point))
     }
 
     fn batch_normalize(points: &[Self::Point]) -> Vec<Self::Affine> {
-        let mut affine = vec![Self::Affine::default(); points.len()];
+        let mut affine = vec![G1Affine::default(); points.len()];
         G1Projective::batch_normalize(points, &mut affine);
-        affine
+        affine.iter().map(crate::msm_blst::to_blst_affine).collect()
     }
 
     fn affine_compress(point: &Self::Affine) -> Self::Compressed {
-        GroupEncoding::to_bytes(point)
+        GroupEncoding::to_bytes(&crate::msm_blst::from_blst_affine(point))
     }
 
     fn vartime_msm(scalars: &[Self::Scalar], points: &[Self::Point]) -> Self::Point {
@@ -322,5 +326,43 @@ mod tests {
         let point = G1Projective::generator();
         let msm = Bls12_381G1Cycle::vartime_msm(&[scalar], &[point]);
         assert_eq!(msm, point * scalar);
+    }
+
+    #[test]
+    fn point_to_affine_and_back_round_trips_the_identity() {
+        let identity = G1Projective::identity();
+        let affine = Bls12_381G1Cycle::point_to_affine(&identity);
+        assert_eq!(Bls12_381G1Cycle::affine_to_point(&affine), identity);
+    }
+
+    #[test]
+    fn point_to_affine_and_back_round_trips_a_random_point() {
+        let mut rng = ChaCha20Rng::seed_from_u64(8);
+        let point = G1Projective::random(&mut rng);
+        let affine = Bls12_381G1Cycle::point_to_affine(&point);
+        assert_eq!(Bls12_381G1Cycle::affine_to_point(&affine), point);
+    }
+
+    #[test]
+    fn vartime_msm_affine_matches_vartime_msm() {
+        let mut rng = ChaCha20Rng::seed_from_u64(9);
+        let points: Vec<G1Projective> = (0..4).map(|_| G1Projective::random(&mut rng)).collect();
+        let scalars: Vec<Scalar> = (0..4).map(|_| Scalar::random(&mut rng)).collect();
+        let affine = Bls12_381G1Cycle::batch_normalize(&points);
+        assert_eq!(
+            Bls12_381G1Cycle::vartime_msm_affine(&scalars, &affine),
+            Bls12_381G1Cycle::vartime_msm(&scalars, &points)
+        );
+    }
+
+    #[test]
+    fn affine_compress_matches_point_compress() {
+        let mut rng = ChaCha20Rng::seed_from_u64(10);
+        let point = G1Projective::random(&mut rng);
+        let affine = Bls12_381G1Cycle::point_to_affine(&point);
+        assert_eq!(
+            Bls12_381G1Cycle::affine_compress(&affine).as_ref(),
+            Bls12_381G1Cycle::point_compress(&point).as_ref()
+        );
     }
 }
