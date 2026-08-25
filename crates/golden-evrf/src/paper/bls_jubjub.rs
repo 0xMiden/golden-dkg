@@ -7,7 +7,7 @@
 //! base field equal `Gout`'s scalar field, without needing a foreign-field
 //! conversion between them.
 //!
-//! This mirrors [`super::secp_secq`]'s relation and proof structure (see
+//! This mirrors `super::secp_secq`'s relation and proof structure (see
 //! that module's doc for the paper-step breakdown), with one deliberate
 //! gadget-level difference: Secp256k1 is short Weierstrass, so `secp_secq`
 //! uses the paper's "chord rule" exponentiation gadget (Section 4.3), built
@@ -16,12 +16,23 @@
 //! addition law is *unified* (the same formula handles doubling and general
 //! addition, with no exceptional case to dodge), so this module uses a
 //! plain additive ladder over that unified law instead of the chord rule's
-//! correction-generator machinery — see [`edwards_add_r1cs`]. The ladder is
+//! correction-generator machinery — see `edwards_add_r1cs`. The ladder is
 //! windowed the same way `secp_secq`'s chord rule is (2 bits per step,
 //! `secp_secq`'s exact trick, reused here — see
-//! [`edwards_exponentiate_windowed_r1cs`]), so both backends share the same
+//! `edwards_exponentiate_windowed_r1cs`), so both backends share the same
 //! per-bit-halving optimization; what differs is only the underlying
 //! addition formula each curve needs.
+//!
+//! (`super::secp_secq` and this module are each gated behind their own
+//! optional feature — `halo2curves-secp256k1` and `bls12-381-jubjub`
+//! respectively — so the cross-references above are plain code spans, not
+//! intra-doc links: `secp_secq` is not always in scope when this module is
+//! compiled.)
+//!
+//! The prover is not constant-time: witness generation branches on secret
+//! exponent bits (e.g. `edwards_windowed_ladder_witness`), and the
+//! Bulletproofs prover itself runs variable-time MSMs over witness vectors
+//! that embed those bits. Same as `secp_secq`.
 
 use super::{CryptoRngCore, Error, ParticipantIndex, Result, TranscriptRoot};
 
@@ -208,12 +219,11 @@ pub struct BatchedEvrfPublicParams {
 // `BatchedEvrfPublicParams` intentionally has no `serde` impl here, unlike
 // `secp_secq`'s: that impl requires `Cycle::Affine: Serialize`, which
 // `secp_secq` gets from `halo2curves`'s own `derive_serde` feature.
-// `bls12_381` ships no serde support at all, and the orphan rule blocks
-// implementing the foreign `serde::Serialize` trait for the foreign
-// `bls12_381::G1Affine` type from this crate. Serializing these params
-// would need a local wrapper type around `Bls12_381G1Cycle::Affine` (a
-// real refactor of `golden-bls-jubjub`'s `Cycle` impl) — deferred; nothing
-// in this module needs it today.
+// `Bls12_381G1Cycle::Affine` is `blst::blst_p1_affine`, an FFI struct with
+// no serde support and no local type this crate could add one to (the
+// orphan rule blocks implementing the foreign `serde::Serialize` trait for
+// it here). Serializing these params would need a local wrapper type
+// around it instead — deferred; nothing in this module needs it today.
 
 impl BatchedEvrfPublicParams {
     fn validated_shape(threshold: usize, receiver_count: usize) -> Result<(usize, usize)> {
@@ -501,9 +511,23 @@ fn bit_decompose_bounded_n<CS: ConstraintSystem<R1csCycle>>(
 
     cs.constrain(k_lc - k_var);
 
+    // Before the modulus's own highest set bit, `prefix_equal` is
+    // provably the constant `1` (every bit above it is required to be 0
+    // by the modulus's own leading zeros): the `product = prefix_equal *
+    // bit_j` multiplier that follows would just reduce to `product =
+    // bit_j`, so constrain `bit_j = 0` directly instead of paying a gate
+    // to multiply by a known constant.
     let mut prefix_equal = LinearCombination::from(R1csField::ONE);
     let mut prefix_equal_assignment = Some(R1csField::ONE);
+    let mut prefix_is_trivially_one = true;
     for j in (0..num_bits).rev() {
+        let bound_bit = modulus_bit(modulus_le, j);
+        if prefix_is_trivially_one && !bound_bit {
+            cs.constrain(bit_vars[j].into());
+            continue;
+        }
+        prefix_is_trivially_one = false;
+
         let bit_assignment = bit_assignments[j];
         let product_assignment = match (prefix_equal_assignment, bit_assignment) {
             (Some(eq), Some(bit)) => Some((eq, bit)),
@@ -514,7 +538,7 @@ fn bit_decompose_bounded_n<CS: ConstraintSystem<R1csCycle>>(
         cs.constrain(right - bit_vars[j]);
 
         let product_lc: LinearCombination<R1csField> = out.into();
-        if modulus_bit(modulus_le, j) {
+        if bound_bit {
             prefix_equal = product_lc;
             prefix_equal_assignment = match (prefix_equal_assignment, bit_assignment) {
                 (Some(eq), Some(bit)) => Some(eq * bit),
@@ -575,9 +599,35 @@ fn constrain_bits_lt_bound_when<CS: ConstraintSystem<R1csCycle>>(
     }
 
     let condition_lc = LinearCombination::from(condition_var);
+
+    // Every bit at or above the bound's own highest set bit sits where the
+    // bound is implicitly 0, so it must be 0 whenever `condition` holds.
+    // `bit_vars` are already boolean-constrained by the caller's bit
+    // decomposition (which builds `bit_vars` before calling this), so a
+    // single `condition * sum(high bits) = 0` is equivalent to per-bit
+    // chaining through this whole range — a sum of 0/1 terms is 0 iff every
+    // term is 0 — replacing what would otherwise be two gates per high bit
+    // with one gate for the entire range.
+    let highest_bound_bit = (0..num_bits).rev().find(|&j| modulus_bit(bound_le, j));
+    let lower_bits_start = highest_bound_bit.map_or(0, |msb| msb + 1);
+    if lower_bits_start < num_bits {
+        let high_bits_sum = bit_vars[lower_bits_start..]
+            .iter()
+            .fold(LinearCombination::default(), |lc, &bit| {
+                lc + LinearCombination::from(bit)
+            });
+        let (_, _, high_violation) = cs.multiply(condition_lc.clone(), high_bits_sum);
+        cs.constrain(high_violation.into());
+    }
+
+    // Whenever `condition` holds, the check above already forces every bit
+    // above `lower_bits_start` to 0, matching the bound's own implicit
+    // high zeros exactly — so the prefix genuinely-still-equal state
+    // entering this loop is the constant `1`, regardless of whether it was
+    // computed via the (now-elided) per-bit chain above.
     let mut prefix_equal = LinearCombination::from(R1csField::ONE);
     let mut prefix_equal_assignment = Some(R1csField::ONE);
-    for j in (0..num_bits).rev() {
+    for j in (0..lower_bits_start).rev() {
         let bit_assignment = bit_assignments[j];
         let product_assignment = match (prefix_equal_assignment, bit_assignment) {
             (Some(eq), Some(bit)) => Some((eq, bit)),
@@ -620,16 +670,26 @@ fn constrain_bits_lt_bound_when<CS: ConstraintSystem<R1csCycle>>(
 /// `v3 = (v1*v2 - a*u1*u2) / (1 - d*u1*u2*v1*v2)`.
 /// The `u3` numerator is folded into one cross multiply,
 /// `(u1+v1)*(u2+v2) - u1*u2 - v1*v2`, rather than the two multiplies
-/// `u1*v2` and `v1*u2` a direct reading of the formula suggests. Costs 6
-/// explicit multiplier gates, plus 1 more from `u_out`/`v_out`'s two
-/// `cs.allocate` calls pairing into one shared multiplier
-/// (`ConstraintSystem::allocate`'s own documented behavior) — 7 total,
-/// regardless of how many bits `(u_step, v_step)` encodes (a single bit via
+/// `u1*v2` and `v1*u2` a direct reading of the formula suggests.
+///
+/// `u_out`/`v_out` are each allocated via [`ConstraintSystem::allocate_multiplier`]
+/// directly against their own divisor, `(1+t)`/`(1-t)`, instead of a plain
+/// `allocate` followed by a separate `multiply` check:
+/// `allocate_multiplier((u3, 1+t))` gives `u_out * u_out_right = u_out_check`
+/// as one gate, and `u_out_right = 1+t` / `u_out_check = u_out_num` bind the
+/// other two wires via free linear constraints, enforcing exactly the same
+/// relation `u_out*(1+t) = u_out_num` as `allocate` + `multiply` did, in one
+/// fewer gate. Total: 6 multiplier gates (4 explicit `cs.multiply` calls
+/// plus the two `allocate_multiplier` calls), regardless of how many bits
+/// `(u_step, v_step)` encodes (a single bit via
 /// [`edwards_conditional_add_r1cs`], or several via
 /// [`edwards_exponentiate_windowed_r1cs`]'s windowed selection).
 ///
 /// `result` is the prover's witness value of the sum (computed off-circuit
-/// via real Jubjub arithmetic); `None` on the verifier side.
+/// via real Jubjub arithmetic); `witness_coords` is the concrete
+/// `(acc_u, acc_v, u_step, v_step)` values needed to compute `t`'s own
+/// witness value for the `allocate_multiplier` calls above. Both are `None`
+/// on the verifier side.
 fn edwards_add_r1cs<CS: ConstraintSystem<R1csCycle>>(
     cs: &mut CS,
     acc_u: LinearCombination<R1csField>,
@@ -637,6 +697,7 @@ fn edwards_add_r1cs<CS: ConstraintSystem<R1csCycle>>(
     u_step: LinearCombination<R1csField>,
     v_step: LinearCombination<R1csField>,
     result: Option<(R1csField, R1csField)>,
+    witness_coords: Option<(R1csField, R1csField, R1csField, R1csField)>,
 ) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
     let a = edwards_a();
     let d = edwards_d();
@@ -650,15 +711,24 @@ fn edwards_add_r1cs<CS: ConstraintSystem<R1csCycle>>(
     let (_, _, cross) = cs.multiply(acc_u + acc_v, u_step + v_step);
 
     let u_out_num = LinearCombination::from(cross) - m1 - m2;
-    let u_out = cs.allocate(result.map(|(u, _)| u))?;
-    let (_, _, u_out_check) =
-        cs.multiply(u_out.into(), LinearCombination::from(R1csField::ONE) + t);
+    let v_out_num = LinearCombination::from(m2) - LinearCombination::from(m1) * a;
+
+    let t_value = witness_coords.map(|(au, av, us, vs)| d * (au * us) * (av * vs));
+
+    let u3 = result.map(|(u, _)| u);
+    let (u_out, u_out_right, u_out_check) =
+        cs.allocate_multiplier(u3.zip(t_value.map(|t| R1csField::ONE + t)))?;
+    cs.constrain(
+        LinearCombination::from(u_out_right) - (LinearCombination::from(R1csField::ONE) + t),
+    );
     cs.constrain(LinearCombination::from(u_out_check) - u_out_num);
 
-    let v_out_num = LinearCombination::from(m2) - LinearCombination::from(m1) * a;
-    let v_out = cs.allocate(result.map(|(_, v)| v))?;
-    let (_, _, v_out_check) =
-        cs.multiply(v_out.into(), LinearCombination::from(R1csField::ONE) - t);
+    let v3 = result.map(|(_, v)| v);
+    let (v_out, v_out_right, v_out_check) =
+        cs.allocate_multiplier(v3.zip(t_value.map(|t| R1csField::ONE - t)))?;
+    cs.constrain(
+        LinearCombination::from(v_out_right) - (LinearCombination::from(R1csField::ONE) - t),
+    );
     cs.constrain(LinearCombination::from(v_out_check) - v_out_num);
 
     Ok((u_out, v_out))
@@ -681,6 +751,7 @@ fn edwards_add_r1cs<CS: ConstraintSystem<R1csCycle>>(
 /// Used only for bit 0 of the exponent (the base case) —
 /// [`edwards_exponentiate_windowed_r1cs`] windows every other bit two at a
 /// time via [`edwards_window_step_r1cs`].
+#[allow(clippy::too_many_arguments)]
 fn edwards_conditional_add_r1cs<CS: ConstraintSystem<R1csCycle>>(
     cs: &mut CS,
     acc_u: LinearCombination<R1csField>,
@@ -689,11 +760,15 @@ fn edwards_conditional_add_r1cs<CS: ConstraintSystem<R1csCycle>>(
     base_u: R1csField,
     base_v: R1csField,
     result: Option<(R1csField, R1csField)>,
+    step_witness: Option<(R1csField, R1csField)>,
 ) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
     let u_step = LinearCombination::from(bit) * base_u;
     let v_step = LinearCombination::from(R1csField::ONE)
         + LinearCombination::from(bit) * (base_v - R1csField::ONE);
-    edwards_add_r1cs(cs, acc_u, acc_v, u_step, v_step, result)
+    // The accumulator entering the bit-0 base case is always the identity
+    // `(0, 1)`, a fixed constant — no witness lookup needed for it.
+    let witness_coords = step_witness.map(|(su, sv)| (R1csField::ZERO, R1csField::ONE, su, sv));
+    edwards_add_r1cs(cs, acc_u, acc_v, u_step, v_step, result, witness_coords)
 }
 
 /// One 2-bit-windowed step of the additive ladder, mirroring `secp_secq`'s
@@ -708,7 +783,9 @@ fn edwards_conditional_add_r1cs<CS: ConstraintSystem<R1csCycle>>(
 /// `Q_{b0,b1} = Q00 + (Q10-Q00)*b0 + (Q01-Q00)*b1 + (Q11-Q10-Q01+Q00)*prod`
 /// (with `Q00 = (0,1)`), which is linear in `b0`, `b1`, `prod` and so needs
 /// no extra multiplier beyond `prod` itself before handing the selected
-/// step point to [`edwards_add_r1cs`].
+/// step point to [`edwards_add_r1cs`]. `acc_witness`/`step_witness` are that
+/// call's `witness_coords` split into the accumulator-entering and
+/// selected-candidate halves; both `None` on the verifier side.
 #[allow(clippy::too_many_arguments)]
 fn edwards_window_step_r1cs<CS: ConstraintSystem<R1csCycle>>(
     cs: &mut CS,
@@ -719,6 +796,8 @@ fn edwards_window_step_r1cs<CS: ConstraintSystem<R1csCycle>>(
     prod: Variable<R1csField>,
     candidates: [(R1csField, R1csField); 3],
     result: Option<(R1csField, R1csField)>,
+    acc_witness: Option<(R1csField, R1csField)>,
+    step_witness: Option<(R1csField, R1csField)>,
 ) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
     let [q10, q01, q11] = candidates;
 
@@ -730,7 +809,10 @@ fn edwards_window_step_r1cs<CS: ConstraintSystem<R1csCycle>>(
         + LinearCombination::from(b1) * (q01.1 - R1csField::ONE)
         + LinearCombination::from(prod) * (q11.1 - q10.1 - q01.1 + R1csField::ONE);
 
-    edwards_add_r1cs(cs, acc_u, acc_v, u_step, v_step, result)
+    let witness_coords = acc_witness
+        .zip(step_witness)
+        .map(|((au, av), (su, sv))| (au, av, su, sv));
+    edwards_add_r1cs(cs, acc_u, acc_v, u_step, v_step, result, witness_coords)
 }
 
 /// Compute the shared window AND products `bit_vars[2w-1] * bit_vars[2w]`
@@ -801,7 +883,8 @@ fn edwards_exponentiate_windowed_r1cs<CS: ConstraintSystem<R1csCycle>>(
         return Err(R1CSError::FormatError);
     }
     if let Some(witness) = witness {
-        if witness.window_results.len() != num_windows {
+        if witness.window_results.len() != num_windows || witness.window_steps.len() != num_windows
+        {
             return Err(R1CSError::FormatError);
         }
     }
@@ -814,10 +897,16 @@ fn edwards_exponentiate_windowed_r1cs<CS: ConstraintSystem<R1csCycle>>(
         precomp.bit0.0,
         precomp.bit0.1,
         witness.map(|w| w.bit0_result),
+        witness.map(|w| w.bit0_step),
     )?;
+    // Tracks the accumulator's concrete value alongside its wire, so each
+    // window step below can derive its own `edwards_add_r1cs`
+    // multiplier-fold witness without re-deriving it from scratch.
+    let mut acc_value = witness.map(|w| w.bit0_result);
 
     for w in 1..=num_windows {
         let step_result = witness.map(|w_| w_.window_results[w - 1]);
+        let step_point = witness.map(|w_| w_.window_steps[w - 1]);
         let (u_var, v_var) = edwards_window_step_r1cs(
             cs,
             acc_u.into(),
@@ -827,9 +916,12 @@ fn edwards_exponentiate_windowed_r1cs<CS: ConstraintSystem<R1csCycle>>(
             window_products[w - 1],
             precomp.windows[w - 1],
             step_result,
+            acc_value,
+            step_point,
         )?;
         acc_u = u_var;
         acc_v = v_var;
+        acc_value = step_result;
     }
 
     if let Some((rx, ry)) = result {
@@ -868,21 +960,23 @@ fn precompute_windowed_base_powers(x: &Gin) -> Result<EdwardsWindowPrecomp> {
 
     let affines = batch_affine(&points)?;
     let bit0 = affines[0];
-    let windows = affines[1..]
-        .chunks_exact(3)
-        .map(|c| [c[0], c[1], c[2]])
-        .collect();
+    let windows = affines[1..].as_chunks::<3>().0.to_vec();
     Ok(EdwardsWindowPrecomp { bit0, windows })
 }
 
 /// Off-circuit reference computation of the windowed additive ladder: `L_0`
 /// (after bit 0) and `L_w` at every window boundary (`w = 1..=K_BITS/2`),
 /// using real Jubjub point arithmetic (the prover's witness-generation path
-/// for [`edwards_exponentiate_windowed_r1cs`]).
+/// for [`edwards_exponentiate_windowed_r1cs`]). Also records each step's
+/// own selected step point (`bit0_step`/`window_steps`, aligned with
+/// `bit0_result`/`window_results`), which [`edwards_add_r1cs`] needs to
+/// compute its own multiplier-fold witness value.
 #[derive(Clone, Debug)]
 struct EdwardsWindowWitness {
     bit0_result: (R1csField, R1csField),
+    bit0_step: (R1csField, R1csField),
     window_results: Vec<(R1csField, R1csField)>,
+    window_steps: Vec<(R1csField, R1csField)>,
 }
 
 fn edwards_windowed_ladder_witness(
@@ -894,27 +988,37 @@ fn edwards_windowed_ladder_witness(
     }
     let num_windows = K_BITS / 2;
 
-    let mut acc = Gin::identity();
-    if bits[0] {
-        acc += base_powers[0];
-    }
+    let bit0_step_point = if bits[0] {
+        base_powers[0]
+    } else {
+        Gin::identity()
+    };
+    let mut acc = bit0_step_point;
     let mut running = Vec::with_capacity(1 + num_windows);
+    let mut steps = Vec::with_capacity(1 + num_windows);
     running.push(acc);
+    steps.push(bit0_step_point);
     for w in 1..=num_windows {
         let (j1, j2) = (2 * w - 1, 2 * w);
+        let mut step_point = Gin::identity();
         if bits[j1] {
-            acc += base_powers[j1];
+            step_point += base_powers[j1];
         }
         if bits[j2] {
-            acc += base_powers[j2];
+            step_point += base_powers[j2];
         }
+        acc += step_point;
         running.push(acc);
+        steps.push(step_point);
     }
 
-    let affines = batch_affine(&running)?;
+    let result_affines = batch_affine(&running)?;
+    let step_affines = batch_affine(&steps)?;
     Ok(EdwardsWindowWitness {
-        bit0_result: affines[0],
-        window_results: affines[1..].to_vec(),
+        bit0_result: result_affines[0],
+        bit0_step: step_affines[0],
+        window_results: result_affines[1..].to_vec(),
+        window_steps: step_affines[1..].to_vec(),
     })
 }
 
@@ -944,11 +1048,8 @@ fn bit_options(bits: &[bool]) -> Vec<Option<R1csField>> {
 /// are within `O(sqrt(p))` of each other.
 fn fp_to_fr(fp: &R1csField) -> GinScalar {
     let bytes: [u8; 32] = fp.to_repr();
-    let mut limbs = [0u64; 4];
-    for i in 0..4 {
-        limbs[i] = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
-    }
-    GinScalar::from_raw(limbs)
+    let (chunks, _) = bytes.as_chunks::<8>();
+    GinScalar::from_raw(core::array::from_fn(|i| u64::from_le_bytes(chunks[i])))
 }
 
 /// Convert a `GinScalar` element to `R1csField`. Always exact (an injective
@@ -956,11 +1057,8 @@ fn fp_to_fr(fp: &R1csField) -> GinScalar {
 /// value is already a valid `R1csField` element.
 fn fr_to_fp(fr: &GinScalar) -> R1csField {
     let bytes: [u8; 32] = fr.to_bytes();
-    let mut limbs = [0u64; 4];
-    for i in 0..4 {
-        limbs[i] = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
-    }
-    R1csField::from_raw(limbs)
+    let (chunks, _) = bytes.as_chunks::<8>();
+    R1csField::from_raw(core::array::from_fn(|i| u64::from_le_bytes(chunks[i])))
 }
 
 /// Off-circuit computation of `(pad, m)` such that `r = pad + m*q` with
@@ -994,7 +1092,11 @@ fn fp_canonical_ge(a: &R1csField, b: &R1csField) -> bool {
 
 /// Constrain `pad_var = r - m*q` for a witness-supplied quotient
 /// `m in {0,...,8}`, with `pad_var < q` (`Gin`'s own scalar modulus), so
-/// `pad_var` is safe to use as a `Gin` exponent (e.g. `g_in^pad`).
+/// `pad_var` is safe to use as a `Gin` exponent (e.g. `g_in^pad`). Returns
+/// `pad_var` and its canonical `K_BITS + 1`-bit decomposition (already
+/// produced internally to enforce the `pad_var < q` bound), so a caller
+/// that also needs `pad_var`'s bits (e.g. for a windowed exponentiation)
+/// does not have to decompose it a second time.
 ///
 /// `m` needs 4 bits (`m <= 8 < 16`), range-checked to `m < 9` via
 /// [`bit_decompose_bounded_n`]. The generic `pad < q` check alone is
@@ -1010,12 +1112,12 @@ fn fp_canonical_ge(a: &R1csField, b: &R1csField) -> bool {
 /// forces to imply `m = 8` exactly whenever it is set). Every other
 /// `m in {0,...,7}` is safe under the generic `pad < q` bound alone,
 /// because `p > 8q` rules out the analogous wraparound for those cases (see
-/// `reduce_pad_r1cs_rejects_wrong_quotient` for the adversarial test).
+/// `reduce_pad_soundness_tests` for the adversarial coverage).
 fn reduce_pad_r1cs<CS: ConstraintSystem<R1csCycle>>(
     cs: &mut CS,
     r_lc: LinearCombination<R1csField>,
     witness: Option<(R1csField, u8)>,
-) -> core::result::Result<Variable<R1csField>, R1CSError> {
+) -> core::result::Result<(Variable<R1csField>, Vec<Variable<R1csField>>), R1CSError> {
     let m_bit_assignments: Vec<Option<R1csField>> = (0..4)
         .map(|i| {
             witness.map(|(_, m)| {
@@ -1053,7 +1155,7 @@ fn reduce_pad_r1cs<CS: ConstraintSystem<R1csCycle>>(
         m_bit_vars[3],
     )?;
 
-    Ok(pad_var)
+    Ok((pad_var, pad_bit_vars))
 }
 
 /// Bit assignments for `value` (LSB first, `K_BITS + 1` wide), or all-`None`
@@ -1259,18 +1361,18 @@ fn parse_nested_commitment(
 
 /// Bulletproofs generator capacity for the one-receiver relation. Each
 /// [`edwards_add_r1cs`] call (one per bit-0 base case, one per 2-bit
-/// window) costs 7 multiplier gates — 6 from its explicit `cs.multiply`
-/// calls, plus 1 because its two `cs.allocate` calls (`u_out`, `v_out`)
-/// pair up into one shared multiplier gate
-/// (`ConstraintSystem::allocate`'s own documented behavior) — regardless of
-/// whether the step covers 1 bit or 2, so windowing (`secp_secq`'s
+/// window) costs 6 multiplier gates (see that function's doc), regardless
+/// of whether the step covers 1 bit or 2, so windowing (`secp_secq`'s
 /// chord-rule trick, reused here for the Edwards ladder — see the module
 /// doc) roughly halves the per-bit cost: `K_BITS / 2 = 128` window steps
 /// plus 1 base-case step per exponentiation, instead of `K_BITS + 1 = 257`
 /// single-bit steps. For two exponentiations (`T_1`, `T_2`) sharing one set
 /// of window AND products (`128` more multipliers) over one
-/// `K_BITS + 1`-bit decomposition (`2 * 257 = 514`):
-/// `2 * (7 + 128 * 7) + 128 + 514 = 2448` multipliers, padded to the next
+/// `K_BITS + 1`-bit decomposition (`257` booleanity checks plus `255`
+/// prefix-tracking gates — 2 of the 257 bits sit above
+/// `R1CS_FIELD_MODULUS_LE`'s highest set bit and so cost no prefix-tracking
+/// gate at all, see [`bit_decompose_bounded_n`] — `512` total):
+/// `2 * (6 + 128 * 6) + 128 + 512 = 2188` multipliers, padded to the next
 /// power of two. Checked exactly (not just bounded) in
 /// `one_receiver_prover_uses_exactly_the_expected_multiplier_count`.
 const R1CS_GENS_CAPACITY: usize = 4_096;
@@ -1290,8 +1392,10 @@ fn shared_pc_gens() -> &'static PedersenGens<R1csCycle> {
 /// Process-wide cache for `g_in`'s windowed additive-ladder precompute.
 fn shared_g_in_window_precomp() -> &'static EdwardsWindowPrecomp {
     static PRECOMP: std::sync::OnceLock<EdwardsWindowPrecomp> = std::sync::OnceLock::new();
-    #[allow(clippy::unwrap_used)]
-    PRECOMP.get_or_init(|| precompute_windowed_base_powers(&Gin::generator()).unwrap())
+    PRECOMP.get_or_init(|| {
+        precompute_windowed_base_powers(&Gin::generator())
+            .expect("the generator is not the identity")
+    })
 }
 
 /// Random-oracle domain tag for `H_{G_in,1}`.
@@ -1696,11 +1800,14 @@ fn observe_batched_statement(
 /// failure). Measured and pinned exactly in
 /// `batched_multiplier_count_matches_real_circuit_shape`, which also checks
 /// this formula's prediction covers the real count for several shapes.
-const BATCHED_SHARED_MULTIPLIERS: usize = 1_546;
+const BATCHED_SHARED_MULTIPLIERS: usize = 1_412;
 /// Multipliers added by one receiver relation (S_j exponentiation, k
 /// bit-decompose, T_1/T_2 exponentiations, pad reduction, pad-commitment
 /// exponentiation). Exact, same rationale as [`BATCHED_SHARED_MULTIPLIERS`].
-const BATCHED_RECEIVER_MULTIPLIERS: usize = 5_872;
+/// `reduce_pad_r1cs`'s own bit decomposition of `pad_var` is reused
+/// directly for the pad-commitment exponentiation below, instead of
+/// decomposing `pad_var` a second time.
+const BATCHED_RECEIVER_MULTIPLIERS: usize = 4_574;
 
 /// Count multipliers from the exact public circuit shape.
 fn batched_multiplier_count(threshold: usize, receiver_count: usize) -> Result<usize> {
@@ -1726,11 +1833,11 @@ struct HiddenReceiverWitness {
     /// Additive-ladder witness for `T_{2,j} = H2(msg)^k_j`.
     t2: EdwardsWindowWitness,
     /// `pad_j = beta * T_{1,j}.u + T_{2,j}.u`, reduced into `Gin`'s scalar
-    /// range, and the reduction quotient.
+    /// range, and the reduction quotient. `reduce_pad_r1cs` bit-decomposes
+    /// `pad` itself as part of enforcing `pad < q`, so no separate bit
+    /// vector is carried here.
     pad: R1csField,
     m: u8,
-    /// Bits of `pad_j`.
-    pad_bits: Vec<Option<R1csField>>,
     /// Additive-ladder witness for `g_in^pad_j`.
     pad_commitment: EdwardsWindowWitness,
 }
@@ -1782,11 +1889,11 @@ fn build_hidden_receiver_slot<CS: ConstraintSystem<R1csCycle>>(
     )?;
 
     let r_lc = x_t1 * beta + x_t2;
-    let pad_var = reduce_pad_r1cs(cs, r_lc, witness.map(|w| (w.pad, w.m)))?;
-
-    let verifier_pad_bits = vec![None; K_BITS + 1];
-    let pad_bits = witness.map_or(verifier_pad_bits.as_slice(), |w| w.pad_bits.as_slice());
-    let pad_bit_vars = bit_decompose_q(cs, pad_var, pad_bits)?;
+    // `reduce_pad_r1cs` already bit-decomposes `pad_var` (to enforce
+    // `pad_var < q`); its bit vars are exactly `pad_var`'s canonical
+    // decomposition, so the windowed exponentiation below reuses them
+    // instead of decomposing `pad_var` a second time.
+    let (_pad_var, pad_bit_vars) = reduce_pad_r1cs(cs, r_lc, witness.map(|w| (w.pad, w.m)))?;
     let pad_window_products = edwards_window_products(cs, &pad_bit_vars)?;
 
     let precomp_g_in = shared_g_in_window_precomp();
@@ -1852,7 +1959,6 @@ fn compute_hidden_receiver_witness(
         t2: t2_witness,
         pad,
         m,
-        pad_bits: bit_options(&pad_bool_bits),
         pad_commitment: edwards_windowed_ladder_witness(&pad_bool_bits, &base_power_points(&g_in))?,
     })
 }
@@ -2278,6 +2384,126 @@ mod field_constant_tests {
     }
 }
 
+/// Adversarial coverage for `reduce_pad_r1cs`'s `m = 8` wraparound argument
+/// (see that function's doc comment for the soundness argument these tests
+/// exercise).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod reduce_pad_soundness_tests {
+    use super::*;
+    use bulletproofs_cycle::r1cs::{Prover, Verifier};
+
+    /// Drive `reduce_pad_r1cs` alone: commit `r`, run the gadget with the
+    /// supplied `(pad, m)` witness, prove, then verify. Returns whether the
+    /// proof both built and verified.
+    fn run(r: R1csField, witness: (R1csField, u8)) -> bool {
+        let pc_gens = PedersenGens::<R1csCycle>::default();
+        let bp_gens = BulletproofGens::<R1csCycle>::new(2048, 1);
+
+        let mut transcript = Transcript::new(b"reduce-pad-soundness");
+        let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, &mut transcript);
+        let (v_r, var_r) = prover.commit(r, R1csField::from(9u64));
+        if reduce_pad_r1cs(&mut prover, var_r.into(), Some(witness)).is_err() {
+            return false;
+        }
+        let Ok(proof) = prover.prove(&bp_gens, &mut ChaCha20Rng::seed_from_u64(1)) else {
+            return false;
+        };
+
+        let mut transcript = Transcript::new(b"reduce-pad-soundness");
+        let mut verifier = Verifier::<R1csCycle, _>::new(&mut transcript);
+        let var_r = verifier.commit(v_r);
+        reduce_pad_r1cs(&mut verifier, var_r.into(), None).unwrap();
+        verifier
+            .verify(
+                &proof,
+                &pc_gens,
+                &bp_gens,
+                &mut ChaCha20Rng::seed_from_u64(2),
+            )
+            .is_ok()
+    }
+
+    #[test]
+    fn honest_quotient_verifies() {
+        let mut rng = ChaCha20Rng::seed_from_u64(5);
+        for _ in 0..3 {
+            let r = R1csField::random(&mut rng);
+            let w = reduce_pad_witness(&r);
+            assert!(run(r, w), "honest (pad, m) must verify");
+        }
+    }
+
+    #[test]
+    fn honest_small_r_verifies() {
+        let r = R1csField::from(12345u64);
+        let w = reduce_pad_witness(&r);
+        assert_eq!(w.1, 0);
+        assert!(run(r, w));
+    }
+
+    /// The `m = 8` wraparound: for small `r`, `r - 8q` wraps to
+    /// `r + (p - 8q)`, which still lands under the generic `pad < q` bound.
+    /// Only the extra `pad < p - 8q` bound rules it out.
+    #[test]
+    fn claiming_the_maximum_quotient_for_a_small_r_is_rejected() {
+        let q = gin_scalar_modulus_as_r1cs_field();
+        let r = R1csField::from(12345u64);
+        let fake_pad = r - R1csField::from(8u64) * q;
+        // The fake pad passes the generic `pad < q` bound...
+        assert!(!fp_canonical_ge(&fake_pad, &q), "fake pad must be < q");
+        // ...and is only excluded by the tighter `m == 8` bound.
+        let delta: R1csField = Option::from(R1csField::from_repr(
+            R1CS_FIELD_MODULUS_MINUS_8_GIN_SCALAR_MODULUS_LE,
+        ))
+        .unwrap();
+        assert!(
+            fp_canonical_ge(&fake_pad, &delta),
+            "fake pad must be >= p - 8q"
+        );
+        assert!(
+            !run(r, (fake_pad, 8)),
+            "wraparound quotient must be rejected"
+        );
+    }
+
+    #[test]
+    fn claiming_a_too_large_small_quotient_is_rejected() {
+        let q = gin_scalar_modulus_as_r1cs_field();
+        let r = R1csField::from(12345u64);
+        for m in 1u8..=7 {
+            let fake_pad = r - R1csField::from(u64::from(m)) * q;
+            assert!(!run(r, (fake_pad, m)), "quotient {m} must be rejected");
+        }
+    }
+
+    #[test]
+    fn claiming_a_too_small_quotient_is_rejected() {
+        let q = gin_scalar_modulus_as_r1cs_field();
+        // Pick an r whose true quotient is 8, then understate it.
+        let r = R1csField::from(8u64) * q + R1csField::from(7u64);
+        let (_, m_true) = reduce_pad_witness(&r);
+        assert_eq!(m_true, 8);
+        for m in 0u8..8 {
+            let fake_pad = r - R1csField::from(u64::from(m)) * q;
+            assert!(
+                !run(r, (fake_pad, m)),
+                "understated quotient {m} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_quotient_nine_is_rejected() {
+        let r = R1csField::from(9u64) * gin_scalar_modulus_as_r1cs_field();
+        let fake_pad = r - R1csField::from(9u64) * gin_scalar_modulus_as_r1cs_field();
+        assert!(
+            !run(r, (fake_pad, 9)),
+            "m = 9 must fail the m < 9 range check"
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod edwards_gadget_tests {
@@ -2286,6 +2512,76 @@ mod edwards_gadget_tests {
 
     fn small_gens() -> (PedersenGens<R1csCycle>, BulletproofGens<R1csCycle>) {
         (PedersenGens::default(), BulletproofGens::new(8192, 1))
+    }
+
+    /// Prove and verify `edwards_conditional_add_r1cs` in isolation, from an
+    /// identity accumulator, for both possible bit values: `bit = 0` must
+    /// reduce to the unchanged accumulator (adding the identity), and
+    /// `bit = 1` must reduce to the direct sum with the base point.
+    fn edwards_conditional_add_reduces_correctly_for_both_bits(bit: bool) {
+        let base = Gin::generator();
+        let (base_u, base_v) = affine(&base).unwrap();
+        // The identity's affine coordinates are `(0, 1)`; `affine()` itself
+        // rejects the identity, so it cannot be used for the `bit = 0`
+        // expectation.
+        let (expected_u, expected_v) = if bit {
+            (base_u, base_v)
+        } else {
+            (R1csField::ZERO, R1csField::ONE)
+        };
+
+        let (pc_gens, bp_gens) = small_gens();
+        let mut transcript = Transcript::new(b"edwards-conditional-add-test");
+        let mut prover = Prover::<R1csCycle, _>::new(&pc_gens, &mut transcript);
+        let bit_fp = if bit { R1csField::ONE } else { R1csField::ZERO };
+        let bit_var = prover.allocate(Some(bit_fp)).unwrap();
+        edwards_conditional_add_r1cs(
+            &mut prover,
+            LinearCombination::from(R1csField::ZERO),
+            LinearCombination::from(R1csField::ONE),
+            bit_var,
+            base_u,
+            base_v,
+            Some((expected_u, expected_v)),
+            Some((expected_u, expected_v)),
+        )
+        .unwrap();
+        let proof = prover
+            .prove(&bp_gens, &mut ChaCha20Rng::seed_from_u64(21))
+            .unwrap();
+
+        let mut transcript = Transcript::new(b"edwards-conditional-add-test");
+        let mut verifier = Verifier::<R1csCycle, _>::new(&mut transcript);
+        let verifier_bit_var = verifier.allocate(None).unwrap();
+        edwards_conditional_add_r1cs(
+            &mut verifier,
+            LinearCombination::from(R1csField::ZERO),
+            LinearCombination::from(R1csField::ONE),
+            verifier_bit_var,
+            base_u,
+            base_v,
+            Some((expected_u, expected_v)),
+            None,
+        )
+        .unwrap();
+        verifier
+            .verify(
+                &proof,
+                &pc_gens,
+                &bp_gens,
+                &mut ChaCha20Rng::seed_from_u64(22),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn edwards_conditional_add_reduces_correctly_for_bit_zero() {
+        edwards_conditional_add_reduces_correctly_for_both_bits(false);
+    }
+
+    #[test]
+    fn edwards_conditional_add_reduces_correctly_for_bit_one() {
+        edwards_conditional_add_reduces_correctly_for_both_bits(true);
     }
 
     /// Prove and verify a standalone `Y = k * X` statement using the
@@ -2483,7 +2779,7 @@ mod one_receiver_tests {
         .unwrap();
 
         let multipliers = ConstraintSystem::<R1csCycle>::metrics(&prover).multipliers;
-        assert_eq!(multipliers, 2448);
+        assert_eq!(multipliers, 2188);
         assert!(
             multipliers <= R1CS_GENS_CAPACITY,
             "circuit needs {multipliers} multipliers but R1CS_GENS_CAPACITY is only {R1CS_GENS_CAPACITY}"
@@ -2609,7 +2905,7 @@ mod batched_tests {
         // than left at a loose guessed margin (see their doc comments).
         assert_eq!(
             (shared, per_receiver),
-            (1546, 5872),
+            (1412, 4574),
             "real batched circuit shape changed; update BATCHED_SHARED_MULTIPLIERS / \
              BATCHED_RECEIVER_MULTIPLIERS in lockstep"
         );
@@ -2637,6 +2933,28 @@ mod batched_tests {
             BatchedEvrfPublicParams::setup(statement.threshold, statement.receivers.len()).unwrap();
         let proof = evrf_batched_prove(&params, &statement, &witness, &mut rng).unwrap();
         evrf_batched_verify(&params, &statement, &proof, &mut rng).unwrap();
+    }
+
+    #[test]
+    fn batched_proof_wire_len_matches_a_real_proof() {
+        let mut rng = ChaCha20Rng::seed_from_u64(101);
+        let sk1 = GinScalar::random(&mut rng);
+        let pk2 = Gin::generator() * GinScalar::random(&mut rng);
+        let pk3 = Gin::generator() * GinScalar::random(&mut rng);
+        let msg = [4u8; MESSAGE_BYTES];
+        let beta = R1csField::from(11u64);
+
+        let (statement, witness) = testing::build_batched(&msg, sk1, &[pk2, pk3], beta);
+        let params =
+            BatchedEvrfPublicParams::setup(statement.threshold, statement.receivers.len()).unwrap();
+        let proof = evrf_batched_prove(&params, &statement, &witness, &mut rng).unwrap();
+
+        let predicted = BatchedEvrfPublicParams::batched_proof_wire_len(
+            statement.threshold,
+            statement.receivers.len(),
+        )
+        .unwrap();
+        assert_eq!(predicted, proof.len());
     }
 
     #[test]
