@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/bls12_381",
     "crates/bulletproofs-cycle",
     "crates/golden-bls-jubjub",
     "crates/golden-core",
@@ -58,14 +57,6 @@ smallvec = "1"
 subtle = "2.6"
 thiserror = "2"
 zeroize = "1.8"
-
-# `crates/bls12_381` adds `G1Affine::x()`/`y()`/`from_raw_unchecked()` so a
-# `Cycle` implementation can drive true batch-affine MSM bucket accumulation
-# (see `golden-bls-jubjub`'s MSM module) without private-field access.
-# `jubjub`'s own `bls12_381` dependency is patched too, so `jubjub::Fq`
-# stays the exact same type as this workspace's `bls12_381::Scalar`.
-[patch.crates-io]
-bls12_381 = { path = "crates/bls12_381" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
