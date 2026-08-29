@@ -118,16 +118,9 @@ impl EvrfProofBackend<JubjubGoldenGroup> for BlsJubjubBackend {
         if statements.is_empty() || statements.len() != witnesses.len() {
             return Err(Error::ProofVerificationFailed);
         }
-        let first = &statements[0];
-        let msg = first.msg_i.0;
-        let pk1 = first.dealer_public_key.0;
-        let beta = fr_to_fp(&first.beta.0);
-        let threshold = first.threshold;
-        let commitment_coefficients: Vec<Gin> = first
-            .commitment_coefficients
-            .iter()
-            .map(|coefficient| coefficient.0)
-            .collect();
+        let statement = batched_statement(statements)?;
+        let threshold = statement.threshold;
+
         let sk1 = witnesses[0].identity_secret.0;
         let polynomial_coefficients = &witnesses[0].polynomial_coefficients;
         if polynomial_coefficients.len() != threshold {
@@ -137,45 +130,21 @@ impl EvrfProofBackend<JubjubGoldenGroup> for BlsJubjubBackend {
             .first()
             .ok_or(Error::ProofVerificationFailed)?
             .0;
-
-        let mut receivers = Vec::with_capacity(statements.len());
-        let mut statement_roots = Vec::with_capacity(statements.len());
-        for (statement, witness) in statements.iter().zip(witnesses.iter()) {
-            ensure_same_batch_context(statement, first)?;
+        for witness in witnesses.iter() {
             if witness.identity_secret.0 != sk1
                 || witness.polynomial_coefficients.as_slice() != polynomial_coefficients.as_slice()
             {
                 return Err(Error::ProofVerificationFailed);
             }
-
-            let pkj = statement.receiver_public_key.0;
-            let rec = BatchedReceiverStatement {
-                receiver: statement.receiver,
-                pkj,
-                share_commitment: statement.share_commitment.0,
-                pad_commitment: statement.pad_commitment.0,
-                encrypted_share: statement.encrypted_share.0,
-            };
-            statement_roots.push(statement.root());
-            receivers.push(rec);
         }
 
-        let batched_statement = BatchedEvrfStatement {
-            msg,
-            pk1,
-            beta,
-            threshold,
-            commitment_coefficients,
-            statement_roots,
-            receivers,
-        };
         let batched_witness = BatchedEvrfWitness {
             sk1,
             polynomial_constant,
         };
-        validate_batched_statement_shape(&batched_statement)?;
-        let params = BatchedEvrfPublicParams::shared(threshold, batched_statement.receivers.len())?;
-        evrf_batched_prove(&params, &batched_statement, &batched_witness, rng)
+        validate_batched_statement_shape(&statement)?;
+        let params = BatchedEvrfPublicParams::shared(threshold, statement.receivers.len())?;
+        evrf_batched_prove(&params, &statement, &batched_witness, rng)
     }
 
     fn verify_batch(statements: &[EvrfStatement<JubjubGoldenGroup>], proof: &[u8]) -> Result<()> {
