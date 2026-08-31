@@ -1,10 +1,10 @@
-//! Shared harness for the Secp/Secq Golden eVRF and DKG benchmarks.
+//! Shared harness for the Secp/Secq Golden DKG benchmarks.
 //!
-//! Mirrors the wiring in `crates/golden-evrf/tests/dkg_integration.rs` so the
-//! benches drive the real public DKG surface (`create_dealing`, `verify_dealing`,
-//! `complete`) bound to `SecpSecqBackend`, plus the in-crate batched eVRF
-//! entry points (`evrf_batched_prove`, `evrf_batched_verify`) for Table 4
-//! isolation of the Bulletproofs prover/verifier.
+//! The harness drives the public `deal` / opaque bytes / `complete` workflow
+//! with explicitly prepared `SecpSecqBulletproofs` state. A pair of private
+//! recording adapters captures the flat proof inputs already constructed by
+//! core when a benchmark needs to isolate the production prover or verifier;
+//! it does not recreate a second statement-building seam.
 //!
 //! Numbers from these benches are NOT comparable 1:1 with Tables 4 and 5 of
 //! the paper. The paper zkalc-estimates BLS12-381; this tree implements the
@@ -17,27 +17,28 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::type_complexity)]
 
+use std::sync::Mutex;
+
 use golden_core::{
-    DkgConfig, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
+    complete, deal, DealerProofRef, DealerProofStatement, DealerProofSystem, DealerProofWitness,
+    DkgConfig, GoldenGroup, GoldenScalar, OwnDealing, ParticipantIndex, ParticipantRegistry,
+    Result, SessionId,
 };
-use golden_evrf::paper::secp_secq::{
-    evrf_batched_prove, evrf_batched_verify, testing, BatchedEvrfPublicParams,
-    BatchedEvrfStatement, BatchedEvrfWitness, Gin, GinScalar, R1csField,
-};
-use golden_evrf::paper::MESSAGE_BYTES;
+use golden_evrf::paper::secp_secq::SecpSecqBulletproofs;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+use rand_core::CryptoRngCore;
 
 /// Table 4 columns: number of receiver statements covered by one batched
 /// proof. The paper sweeps `n_e in {1, 9, 49, 99}` (DKG application: `n_e`
 /// receivers for an `(n_e + 1)`-participant DKG).
 pub const NE_VALUES: &[usize] = &[1, 9, 49, 99];
 
-/// Threshold used by the Table 4 helpers. The isolated batched fixture has
-/// two Feldman coefficients, so full-DKG fixtures must use the same threshold.
+/// Threshold used by the Table 4 helpers.
 pub const TABLE4_THRESHOLD: usize = 2;
 
-/// Table 5 columns: number of DKG participants in an n-of-n configuration.
+/// Table 5 columns: number of DKG participants in an `(n - 1)`-of-`n`
+/// configuration.
 pub const N_VALUES: &[usize] = &[2, 10, 50, 100];
 
 fn selected_values(variable: &str, defaults: &[usize]) -> Vec<usize> {
@@ -65,39 +66,20 @@ pub fn table5_n_values() -> Vec<usize> {
     selected_values("GOLDEN_TABLE5_N_VALUES", N_VALUES)
 }
 
-/// Sample size passed to criterion for the slowest benches. Matches the
-/// `crates/bulletproofs-cycle/benches/r1cs.rs` convention: at `n_e = 99` a
-/// single prove iteration is paper-estimated around 13.5s, so the default
-/// `sample_size = 10` keeps wall time bounded.
+/// Sample size passed to criterion for the slowest benches.
 pub const SLOW_SAMPLE_SIZE: usize = 10;
 
 /// Deterministic seed used across all bench setup so reruns are reproducible.
 pub const BENCH_SEED: [u8; 32] = [7u8; 32];
 
-/// Build a `ParticipantIndex` for value `v` (1-indexed; 0 is reserved for the
-/// polynomial secret).
+/// Build a `ParticipantIndex` for value `v`.
 pub fn idx(v: u32) -> ParticipantIndex {
     ParticipantIndex::new(v).unwrap()
 }
 
-/// Deterministic identity secret for participant `p` (paper-style: `100 + p`).
+/// Deterministic identity secret for participant `p`.
 pub fn identity_secret(p: ParticipantIndex) -> Secp256k1Scalar {
     Secp256k1Scalar::from_u64(100 + u64::from(p.get())).unwrap()
-}
-
-/// Caller-selected scalar coefficient retained only by the legacy DKG seam.
-pub fn legacy_beta() -> Secp256k1Scalar {
-    Secp256k1Scalar::from_u64(77).unwrap()
-}
-
-/// Build a deterministic receiver public key for a synthetic receiver with
-/// index `j` (1-indexed), used to drive the eVRF prover in isolation without
-/// paying the cost of a full DKG `create_dealing`.
-pub fn synthetic_pkj(j: usize) -> Gin {
-    // Distinct per-receiver secret; only the public key is needed by the
-    // batched eVRF statement.
-    let sk = GinScalar::from(1_000 + j as u64);
-    Gin::generator() * sk
 }
 
 /// Build a `DkgConfig` for `n` participants at threshold `t`.
@@ -118,48 +100,196 @@ pub fn build_config(n: usize, t: usize) -> DkgConfig<Secp256k1GoldenGroup> {
     DkgConfig::new_random(t, SessionId([42u8; 32]), registry).unwrap()
 }
 
-/// Build a batched eVRF statement/witness pair covering exactly `n_e`
-/// receivers, using the in-crate `testing::build_batched` helper. Returns
-/// everything needed to call `evrf_batched_prove` / `evrf_batched_verify`.
-pub fn build_batched_at_ne(
-    n_e: usize,
-) -> (
-    BatchedEvrfStatement,
-    BatchedEvrfWitness,
-    Vec<Gin>,
-    R1csField,
-) {
-    // Distinct dealer message and sk1 from the test setup.
-    let mut msg = [0u8; MESSAGE_BYTES];
-    msg[0] = 0x42;
-    let sk1 = GinScalar::from(7u64);
-    let pkjs: Vec<Gin> = (0..n_e).map(synthetic_pkj).collect();
-    let beta = R1csField::from(77u64);
-    let (statement, witness) = testing::build_batched(&msg, sk1, &pkjs, beta);
-    assert_eq!(statement.threshold, TABLE4_THRESHOLD);
-    (statement, witness, pkjs, beta)
+type CapturedProverInputs = (
+    DealerProofStatement<Secp256k1GoldenGroup>,
+    DealerProofWitness<Secp256k1GoldenGroup>,
+    Vec<u8>,
+);
+
+/// Private adapter which delegates to production and records the exact flat
+/// inputs core supplied to the prover.
+struct RecordingProver<'a> {
+    inner: &'a SecpSecqBulletproofs,
+    captured: Mutex<Option<CapturedProverInputs>>,
 }
 
-/// Build and prove one batched eVRF proof covering `n_e` receivers. Returns
-/// `(params, statement, proof)` so callers can verify or measure size.
-pub fn prove_one_batched(n_e: usize) -> (BatchedEvrfPublicParams, BatchedEvrfStatement, Vec<u8>) {
-    let (statement, witness, _pkjs, _beta) = build_batched_at_ne(n_e);
-    let params = BatchedEvrfPublicParams::setup(
-        statement.threshold,
-        statement.dealings.len(),
-        statement.dealings[0].receivers.len(),
+impl<'a> RecordingProver<'a> {
+    fn new(inner: &'a SecpSecqBulletproofs) -> Self {
+        Self {
+            inner,
+            captured: Mutex::new(None),
+        }
+    }
+
+    fn take(&self) -> CapturedProverInputs {
+        self.captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("deal must invoke the production prover exactly once")
+    }
+}
+
+impl DealerProofSystem<Secp256k1GoldenGroup> for RecordingProver<'_> {
+    fn prove(
+        &self,
+        config: &DkgConfig<Secp256k1GoldenGroup>,
+        statement: &DealerProofStatement<Secp256k1GoldenGroup>,
+        witness: &DealerProofWitness<Secp256k1GoldenGroup>,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<Vec<u8>> {
+        let proof = self.inner.prove(config, statement, witness, rng)?;
+        let previous = self.captured.lock().unwrap().replace((
+            statement.clone(),
+            witness.clone(),
+            proof.clone(),
+        ));
+        assert!(previous.is_none(), "one deal must produce one dealer proof");
+        Ok(proof)
+    }
+
+    fn verify(
+        &self,
+        config: &DkgConfig<Secp256k1GoldenGroup>,
+        statement: &DealerProofStatement<Secp256k1GoldenGroup>,
+        proof: &[u8],
+    ) -> Result<()> {
+        self.inner.verify(config, statement, proof)
+    }
+
+    fn verify_batch(
+        &self,
+        config: &DkgConfig<Secp256k1GoldenGroup>,
+        proofs: &[DealerProofRef<'_, Secp256k1GoldenGroup>],
+    ) -> Result<()> {
+        self.inner.verify_batch(config, proofs)
+    }
+}
+
+/// Inputs needed to isolate one production dealer proof.
+pub struct DealerProofFixture {
+    pub config: DkgConfig<Secp256k1GoldenGroup>,
+    pub proof_system: SecpSecqBulletproofs,
+    pub statement: DealerProofStatement<Secp256k1GoldenGroup>,
+    pub witness: DealerProofWitness<Secp256k1GoldenGroup>,
+    pub proof: Vec<u8>,
+}
+
+/// Build one real Main Golden dealer proof covering exactly `n_e` receivers.
+pub fn dealer_proof_fixture(n_e: usize) -> DealerProofFixture {
+    let config = build_config(n_e + 1, TABLE4_THRESHOLD);
+    let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
+    let dealer = idx(1);
+    let (statement, witness, proof) = {
+        let recorder = RecordingProver::new(&proof_system);
+        let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
+        deal(
+            &recorder,
+            &config,
+            dealer,
+            &identity_secret(dealer),
+            &mut rng,
+        )
+        .unwrap();
+        recorder.take()
+    };
+    proof_system.verify(&config, &statement, &proof).unwrap();
+    DealerProofFixture {
+        config,
+        proof_system,
+        statement,
+        witness,
+        proof,
+    }
+}
+
+/// Private adapter which delegates one honest completion and records the
+/// ordered flat statement/proof collection supplied to batch verification.
+struct RecordingVerifier<'a> {
+    inner: &'a SecpSecqBulletproofs,
+    captured: Mutex<Option<Vec<(DealerProofStatement<Secp256k1GoldenGroup>, Vec<u8>)>>>,
+}
+
+impl<'a> RecordingVerifier<'a> {
+    fn new(inner: &'a SecpSecqBulletproofs) -> Self {
+        Self {
+            inner,
+            captured: Mutex::new(None),
+        }
+    }
+
+    fn take(&self) -> Vec<(DealerProofStatement<Secp256k1GoldenGroup>, Vec<u8>)> {
+        self.captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("complete must invoke batch verification")
+    }
+}
+
+impl DealerProofSystem<Secp256k1GoldenGroup> for RecordingVerifier<'_> {
+    fn prove(
+        &self,
+        config: &DkgConfig<Secp256k1GoldenGroup>,
+        statement: &DealerProofStatement<Secp256k1GoldenGroup>,
+        witness: &DealerProofWitness<Secp256k1GoldenGroup>,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<Vec<u8>> {
+        self.inner.prove(config, statement, witness, rng)
+    }
+
+    fn verify(
+        &self,
+        config: &DkgConfig<Secp256k1GoldenGroup>,
+        statement: &DealerProofStatement<Secp256k1GoldenGroup>,
+        proof: &[u8],
+    ) -> Result<()> {
+        self.inner.verify(config, statement, proof)
+    }
+
+    fn verify_batch(
+        &self,
+        config: &DkgConfig<Secp256k1GoldenGroup>,
+        proofs: &[DealerProofRef<'_, Secp256k1GoldenGroup>],
+    ) -> Result<()> {
+        self.inner.verify_batch(config, proofs)?;
+        let captured = proofs
+            .iter()
+            .map(|item| (item.statement.clone(), item.proof.to_vec()))
+            .collect();
+        let previous = self.captured.lock().unwrap().replace(captured);
+        assert!(
+            previous.is_none(),
+            "honest completion must batch-verify exactly once"
+        );
+        Ok(())
+    }
+}
+
+/// Complete once through the public workflow and return the exact ordered
+/// proof inputs observed by the optimized verifier.
+pub fn capture_verified_proofs(
+    proof_system: &SecpSecqBulletproofs,
+    config: &DkgConfig<Secp256k1GoldenGroup>,
+    participant: ParticipantIndex,
+    own_dealing: &OwnDealing<Secp256k1GoldenGroup>,
+    peer_dealer_messages: &[(ParticipantIndex, Vec<u8>)],
+) -> Vec<(DealerProofStatement<Secp256k1GoldenGroup>, Vec<u8>)> {
+    let recorder = RecordingVerifier::new(proof_system);
+    complete(
+        &recorder,
+        config,
+        &identity_secret(participant),
+        own_dealing,
+        peer_dealer_messages,
     )
-    .expect("valid public parameter shape");
-    let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
-    let proof = evrf_batched_prove(&params, &statement, &witness, &mut rng).unwrap();
-    // Sanity: the proof must verify before any bench iterates on it.
-    let mut rng = ChaCha20Rng::from_seed(BENCH_SEED);
-    evrf_batched_verify(&params, &statement, &proof, &mut rng).unwrap();
-    (params, statement, proof)
+    .unwrap();
+    recorder.take()
 }
 
 mod fixture_cache;
 #[allow(unused_imports)]
 pub use fixture_cache::{
-    cached_dealer_messages, cached_round1_setup, regenerate_dealer_messages, verify_dealer_messages,
+    cached_dealer_bytes, cached_proof_lengths, cached_round1_setup, regenerate_dealer_messages,
+    validate_dealer_fixture,
 };

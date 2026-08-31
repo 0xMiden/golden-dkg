@@ -1,0 +1,832 @@
+diff --git a/crates/golden-core/src/dkg.rs b/crates/golden-core/src/dkg.rs
+index c8f4cb4..2fab398 100644
+--- a/crates/golden-core/src/dkg.rs
++++ b/crates/golden-core/src/dkg.rs
+@@ -289,8 +289,9 @@ pub struct EvrfReceiverWitness<G: GoldenGroup> {
+ /// Private openings for one dealing, in its statement receiver order.
+ #[derive(Clone, Eq, PartialEq)]
+ pub struct EvrfDealingWitness<G: GoldenGroup> {
+-    /// Opening of the dealing's constant Feldman commitment.
+-    pub polynomial_constant: G::Scalar,
++    /// Opening of the dealing's non-identity constant Feldman commitment.
++    /// `None` denotes a configured zero-sharing.
++    pub polynomial_constant: Option<G::Scalar>,
+     /// Receiver openings in canonical order.
+     pub receivers: Vec<EvrfReceiverWitness<G>>,
+ }
+@@ -312,7 +313,20 @@ impl<G: GoldenGroup> EvrfWitness<G> {
+                 .dealings
+                 .iter()
+                 .zip(&statement.dealings)
+-                .any(|(private, public)| private.receivers.len() != public.receivers.len())
++                .any(|(private, public)| {
++                    let Some(constant_commitment) = public.commitment_coefficients.first() else {
++                        return true;
++                    };
++                    let constant_mismatch = match &private.polynomial_constant {
++                        None => !bool::from(G::is_identity(constant_commitment)),
++                        Some(polynomial_constant) => {
++                            bool::from(polynomial_constant.is_zero())
++                                || bool::from(G::is_identity(constant_commitment))
++                                || G::mul_generator(polynomial_constant) != *constant_commitment
++                        }
++                    };
++                    private.receivers.len() != public.receivers.len() || constant_mismatch
++                })
+         {
+             return Err(Error::ProofVerificationFailed);
+         }
+@@ -528,12 +542,15 @@ where
+     let mut witness_dealings = Vec::with_capacity(config.instances.len());
+ 
+     for (position, kind) in config.instances.iter().copied().enumerate() {
+-        let polynomial_secret = match kind {
+-            DkgInstanceKind::Random => G::Scalar::random(rng),
+-            DkgInstanceKind::Zero => G::Scalar::zero(),
++        let polynomial_constant = match kind {
++            DkgInstanceKind::Random => Some(random_nonzero_scalar::<G::Scalar>(rng)),
++            DkgInstanceKind::Zero => None,
+         };
+-        let polynomial =
+-            Polynomial::random_with_secret(polynomial_secret.clone(), config.threshold, rng)?;
++        let polynomial = Polynomial::random_with_secret(
++            polynomial_constant.clone().unwrap_or_else(G::Scalar::zero),
++            config.threshold,
++            rng,
++        )?;
+         let commitment = FeldmanCommitment::<G>::commit(&polynomial)?;
+         let nonce = DealerMessageNonce::random(rng);
+         let message = effective_evrf_message(config.root, dealer, position, nonce);
+@@ -586,7 +603,7 @@ where
+             receivers: proof_receivers,
+         });
+         witness_dealings.push(EvrfDealingWitness {
+-            polynomial_constant: polynomial_secret,
++            polynomial_constant,
+             receivers: witness_receivers,
+         });
+         bodies.push(DealingBody {
+@@ -658,10 +675,15 @@ where
+                 actual: body.commitment.coefficients().len(),
+             });
+         }
+-        if kind == DkgInstanceKind::Zero
+-            && !bool::from(G::is_identity(&body.commitment.coefficients()[0]))
+-        {
+-            return Err(Error::NonzeroConstantCommitment(position));
++        let constant_is_identity = bool::from(G::is_identity(&body.commitment.coefficients()[0]));
++        match kind {
++            DkgInstanceKind::Random if constant_is_identity => {
++                return Err(Error::IdentityConstantCommitment(position));
++            }
++            DkgInstanceKind::Zero if !constant_is_identity => {
++                return Err(Error::NonzeroConstantCommitment(position));
++            }
++            _ => {}
+         }
+         ensure_public_share_keys(body, message.dealer, config)?;
+ 
+@@ -1052,6 +1074,15 @@ fn derive_default_pad<G: GoldenGroup>(
+     G::Scalar::hash_to_scalar(b"golden-dkg-pad-v2", &transcript.root())
+ }
+ 
++fn random_nonzero_scalar<S: GoldenScalar>(rng: &mut impl CryptoRngCore) -> S {
++    loop {
++        let scalar = S::random(rng);
++        if !bool::from(scalar.is_zero()) {
++            return scalar;
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::sync::atomic::{AtomicUsize, Ordering};
+@@ -1315,6 +1346,51 @@ mod tests {
+         assert_ne!(config.root(), reversed.root());
+     }
+ 
++    #[test]
++    fn witness_constant_option_must_match_public_constant_commitment() {
++        let statement_with = |constant_commitment| EvrfStatement::<TinyGroup> {
++            dealer_public_key: TinyGroup::generator(),
++            beta: TinyScalar::one(),
++            dealer_message_root: [0u8; 32],
++            dealings: vec![EvrfDealingStatement {
++                message: EvrfMessage([0u8; DEALER_MESSAGE_NONCE_BYTES]),
++                commitment_coefficients: vec![constant_commitment],
++                receivers: Vec::new(),
++            }],
++        };
++        let witness_with = |polynomial_constant| EvrfWitness::<TinyGroup> {
++            identity_secret: TinyScalar::one(),
++            dealings: vec![EvrfDealingWitness {
++                polynomial_constant,
++                receivers: Vec::new(),
++            }],
++        };
++
++        let one = TinyScalar::one();
++        let two = TinyScalar::from_u64(2).unwrap();
++        let cases = [
++            (TinyGroup::generator(), None),
++            (TinyGroup::identity(), Some(one)),
++            (TinyGroup::generator(), Some(TinyScalar::zero())),
++            (TinyGroup::mul_generator(&two), Some(one)),
++        ];
++        for (constant_commitment, polynomial_constant) in cases {
++            assert_eq!(
++                witness_with(polynomial_constant)
++                    .validate_shape(&statement_with(constant_commitment))
++                    .unwrap_err(),
++                Error::ProofVerificationFailed
++            );
++        }
++
++        witness_with(None)
++            .validate_shape(&statement_with(TinyGroup::identity()))
++            .unwrap();
++        witness_with(Some(one))
++            .validate_shape(&statement_with(TinyGroup::generator()))
++            .unwrap();
++    }
++
+     #[test]
+     fn effective_message_binds_configuration_dealer_position_and_nonce() {
+         let configuration = mixed_config().root();
+@@ -1646,22 +1722,40 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn zero_constant_is_rejected_before_proof_verification() {
++    fn configured_constant_policy_is_rejected_before_proof_verification() {
+         let config = mixed_config();
+         let mut rng = ChaCha20Rng::from_seed([17; 32]);
+-        let mut message =
++        let original =
+             create_dealing::<TinyGroup, FakeBackend>(idx(1), &secret(idx(1)), &config, &mut rng)
+                 .unwrap()
+                 .message()
+                 .clone();
+-        let mut coefficients = message.dealings[1].commitment.coefficients().to_vec();
+-        coefficients[0] = TinyGroup::generator();
+-        message.dealings[1].commitment =
+-            FeldmanCommitment::from_coefficients(coefficients).unwrap();
+-        assert_eq!(
+-            verify_dealing::<TinyGroup, FakeBackend>(&message, &config).unwrap_err(),
+-            Error::NonzeroConstantCommitment(1)
+-        );
++
++        for (position, replacement, expected) in [
++            (
++                0,
++                TinyGroup::identity(),
++                Error::IdentityConstantCommitment(0),
++            ),
++            (
++                1,
++                TinyGroup::generator(),
++                Error::NonzeroConstantCommitment(1),
++            ),
++        ] {
++            let mut message = original.clone();
++            let mut coefficients = message.dealings[position]
++                .commitment
++                .coefficients()
++                .to_vec();
++            coefficients[0] = replacement;
++            message.dealings[position].commitment =
++                FeldmanCommitment::from_coefficients(coefficients).unwrap();
++            assert_eq!(
++                verify_dealing::<TinyGroup, FakeBackend>(&message, &config).unwrap_err(),
++                expected
++            );
++        }
+     }
+ 
+     #[test]
+diff --git a/crates/golden-core/src/error.rs b/crates/golden-core/src/error.rs
+index 2b49af6..18233c1 100644
+--- a/crates/golden-core/src/error.rs
++++ b/crates/golden-core/src/error.rs
+@@ -74,6 +74,10 @@ pub enum Error {
+     #[error("nonzero constant commitment in zero-sharing dealing {0}")]
+     NonzeroConstantCommitment(usize),
+ 
++    /// A random-sharing dealing had an identity constant commitment.
++    #[error("identity constant commitment in random-sharing dealing {0}")]
++    IdentityConstantCommitment(usize),
++
+     /// An identity secret key did not match the registered identity public key.
+     #[error("identity secret key does not match registered public key")]
+     IdentityKeyMismatch,
+diff --git a/crates/golden-evrf/src/paper.rs b/crates/golden-evrf/src/paper.rs
+index d77fb69..f9564ee 100644
+--- a/crates/golden-evrf/src/paper.rs
++++ b/crates/golden-evrf/src/paper.rs
+@@ -106,8 +106,8 @@ pub mod secp_secq {
+ 
+     /// Versioned proof-stream grammar for the standalone one-receiver relation.
+     const ONE_RECEIVER_PROOF_ID: &[u8] = b"golden-paper-evrf-one-receiver-v3";
+-    /// Proof protocol identifier for the batched dealer relation and v7 stream grammar.
+-    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v7";
++    /// Proof protocol identifier for the batched dealer relation and v8 stream grammar.
++    const BATCHED_PROOF_ID: &[u8] = b"golden-paper-evrf-batched-v8";
+ 
+     /// Largest supported padded generator table for the batched dealer relation.
+     const MAX_BATCHED_GENERATOR_CAPACITY: usize = 1 << 20;
+@@ -193,8 +193,11 @@ pub mod secp_secq {
+     pub struct BatchedDealingStatement {
+         /// Effective eVRF message for this dealing.
+         pub msg: [u8; MESSAGE_BYTES],
+-        /// Ordered Feldman commitment coefficients for this dealing's polynomial.
+-        pub commitment_coefficients: Vec<Gin>,
++        /// Non-identity constant Feldman commitment, or `None` for a
++        /// configured zero-sharing.
++        pub constant_commitment: Option<Gin>,
++        /// Ordered commitments to the polynomial's nonconstant coefficients.
++        pub nonconstant_commitments: Vec<Gin>,
+         /// Per-receiver statements, in the canonical ordered receiver list.
+         pub receivers: Vec<BatchedReceiverStatement>,
+     }
+@@ -424,9 +427,10 @@ pub mod secp_secq {
+     pub struct BatchedEvrfWitness {
+         /// Dealer identity secret `sk_1` in `Fq` (shared across the batch).
+         pub sk1: GinScalar,
+-        /// Openings `a_0` of the constant Feldman commitments
+-        /// `A_0 = a_0 * G_in`, in canonical dealing order.
+-        pub polynomial_constants: Vec<GinScalar>,
++        /// Openings `a_0` of the optional constant Feldman commitments
++        /// `A_0 = a_0 * G_in`, in canonical dealing order. `None` denotes a
++        /// configured zero-sharing.
++        pub polynomial_constants: Vec<Option<GinScalar>>,
+     }
+ 
+     impl core::fmt::Debug for BatchedEvrfWitness {
+@@ -1313,7 +1317,10 @@ pub mod secp_secq {
+         rng: &mut impl CryptoRngCore,
+     ) -> Result<()> {
+         let generator = Gin::generator();
+-        if generator * *polynomial_constant != *constant_commitment {
++        if bool::from(polynomial_constant.is_zero())
++            || is_identity(constant_commitment)
++            || generator * *polynomial_constant != *constant_commitment
++        {
+             return Err(Error::ProofVerificationFailed);
+         }
+ 
+@@ -1335,6 +1342,9 @@ pub mod secp_secq {
+         stream: &mut VerifierProofStream<'_>,
+         constant_commitment: &Gin,
+     ) -> Result<()> {
++        if is_identity(constant_commitment) {
++            return Err(Error::ProofVerificationFailed);
++        }
+         let nonce_commitment =
+             stream.receive_point::<GinStreamCurve>(b"constant-term.a", IdentityPolicy::Reject)?;
+         let challenge =
+@@ -1843,9 +1853,12 @@ pub mod secp_secq {
+         let canonical_receivers = &statement.dealings[0].receivers;
+         for dealing in &statement.dealings {
+             if dealing.receivers.is_empty()
+-                || dealing.commitment_coefficients.is_empty()
+-                || dealing.commitment_coefficients.len() != statement.threshold
++                || dealing.nonconstant_commitments.len().saturating_add(1) != statement.threshold
+                 || dealing.receivers.len() != canonical_receivers.len()
++                || dealing
++                    .constant_commitment
++                    .as_ref()
++                    .is_some_and(is_identity)
+             {
+                 return Err(Error::ProofVerificationFailed);
+             }
+@@ -1864,8 +1877,11 @@ pub mod secp_secq {
+                 }
+                 previous_receiver = Some(rec.receiver);
+ 
+-                if feldman_share_commitment(&dealing.commitment_coefficients, rec.receiver)
+-                    != rec.share_commitment
++                if feldman_share_commitment(
++                    dealing.constant_commitment.as_ref(),
++                    &dealing.nonconstant_commitments,
++                    rec.receiver,
++                ) != rec.share_commitment
+                 {
+                     return Err(Error::ProofVerificationFailed);
+                 }
+@@ -1879,11 +1895,15 @@ pub mod secp_secq {
+         Ok(())
+     }
+ 
+-    fn feldman_share_commitment(coefficients: &[Gin], receiver: ParticipantIndex) -> Gin {
++    fn feldman_share_commitment(
++        constant_commitment: Option<&Gin>,
++        nonconstant_commitments: &[Gin],
++        receiver: ParticipantIndex,
++    ) -> Gin {
+         let x = Fq::from(u64::from(receiver.get()));
+-        let mut x_pow = Fq::ONE;
+-        let mut result = Gin::identity();
+-        for coefficient in coefficients {
++        let mut x_pow = x;
++        let mut result = constant_commitment.copied().unwrap_or_else(Gin::identity);
++        for coefficient in nonconstant_commitments {
+             result += *coefficient * x_pow;
+             x_pow *= x;
+         }
+@@ -1907,12 +1927,23 @@ pub mod secp_secq {
+             stream.observe_bytes(b"dealing-idx", &(dealing_index as u64).to_le_bytes());
+             stream.observe_bytes(b"msg", &dealing.msg);
+             stream.observe_bytes(
+-                b"commitment-len",
+-                &(dealing.commitment_coefficients.len() as u64).to_le_bytes(),
++                b"constant-present",
++                &[u8::from(dealing.constant_commitment.is_some())],
++            );
++            if let Some(constant_commitment) = &dealing.constant_commitment {
++                stream.observe_point::<GinStreamCurve>(
++                    b"constant-commitment",
++                    constant_commitment,
++                    IdentityPolicy::Reject,
++                )?;
++            }
++            stream.observe_bytes(
++                b"nonconstant-commitment-len",
++                &(dealing.nonconstant_commitments.len() as u64).to_le_bytes(),
+             );
+-            for coefficient in &dealing.commitment_coefficients {
++            for coefficient in &dealing.nonconstant_commitments {
+                 stream.observe_point::<GinStreamCurve>(
+-                    b"commitment",
++                    b"nonconstant-commitment",
+                     coefficient,
+                     IdentityPolicy::Allow,
+                 )?;
+@@ -2255,12 +2286,18 @@ pub mod secp_secq {
+             .iter()
+             .zip(witness.polynomial_constants.iter())
+         {
+-            constant_term_prove(
+-                &mut stream,
+-                &dealing.commitment_coefficients[0],
+-                polynomial_constant,
+-                rng,
+-            )?;
++            match (&dealing.constant_commitment, polynomial_constant) {
++                (Some(constant_commitment), Some(polynomial_constant)) => {
++                    constant_term_prove(
++                        &mut stream,
++                        constant_commitment,
++                        polynomial_constant,
++                        rng,
++                    )?;
++                }
++                (None, None) => {}
++                _ => return Err(Error::ProofVerificationFailed),
++            }
+         }
+         stream.finish_checked()
+     }
+@@ -2333,6 +2370,30 @@ pub mod secp_secq {
+             .map_err(|_| Error::ProofVerificationFailed)
+     }
+ 
++    /// Validate proof framing and canonical encodings before allocating public
++    /// parameters. This deliberately does not verify the constant-term Schnorr
++    /// challenges: the nested R1CS verifier must first replay its transcript
++    /// before those challenges can be derived correctly.
++    pub(super) fn preflight_batched_proof_stream(
++        statement: &BatchedEvrfStatement,
++        proof: &[u8],
++    ) -> Result<()> {
++        let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
++        observe_batched_statement(&mut stream, statement)?;
++        stream.receive_nested(|_, payload| {
++            parse_canonical_r1cs_proof(payload)?;
++            Ok(())
++        })?;
++        for dealing in &statement.dealings {
++            if dealing.constant_commitment.is_some() {
++                stream
++                    .receive_point::<GinStreamCurve>(b"constant-term.a", IdentityPolicy::Reject)?;
++                stream.receive_scalar::<GinStreamCurve>(b"constant-term.t")?;
++            }
++        }
++        stream.finish()
++    }
++
+     fn prepare_batched_proof(
+         params: &BatchedEvrfPublicParams,
+         statement: &BatchedEvrfStatement,
+@@ -2346,7 +2407,9 @@ pub mod secp_secq {
+             prepare_batched_r1cs(params, statement, &r1cs_proof, rng, transcript)
+         })?;
+         for dealing in &statement.dealings {
+-            constant_term_verify(&mut stream, &dealing.commitment_coefficients[0])?;
++            if let Some(constant_commitment) = &dealing.constant_commitment {
++                constant_term_verify(&mut stream, constant_commitment)?;
++            }
+         }
+         stream.finish()?;
+         Ok(equation)
+@@ -2559,7 +2622,6 @@ pub mod secp_secq {
+                     let h2 = h_gin_2(msg);
+                     let constant = GinScalar::from(10 + dealing_index as u64);
+                     let linear = GinScalar::from(1 + dealing_index as u64);
+-                    let commitment_coefficients = vec![g_in * constant, g_in * linear];
+                     let receivers = pkjs
+                         .iter()
+                         .enumerate()
+@@ -2589,7 +2651,8 @@ pub mod secp_secq {
+                         .collect();
+                     BatchedDealingStatement {
+                         msg: *msg,
+-                        commitment_coefficients,
++                        constant_commitment: Some(g_in * constant),
++                        nonconstant_commitments: vec![g_in * linear],
+                         receivers,
+                     }
+                 })
+@@ -2607,7 +2670,7 @@ pub mod secp_secq {
+             let witness = BatchedEvrfWitness {
+                 sk1,
+                 polynomial_constants: (0..messages.len())
+-                    .map(|dealing_index| GinScalar::from(10 + dealing_index as u64))
++                    .map(|dealing_index| Some(GinScalar::from(10 + dealing_index as u64)))
+                     .collect(),
+             };
+             (statement, witness)
+@@ -3341,7 +3404,7 @@ pub mod secp_secq {
+             stream.observe_point::<GinStreamCurve>(
+                 b"test.statement.constant-term",
+                 constant_commitment,
+-                IdentityPolicy::Allow,
++                IdentityPolicy::Reject,
+             )?;
+             // Models the already-consumed nested R1CS transcript prefix.
+             stream.observe_bytes(b"test.r1cs-prefix", b"nested-r1cs");
+@@ -3368,14 +3431,22 @@ pub mod secp_secq {
+         }
+ 
+         #[test]
+-        fn constant_term_round_trips_nonzero_and_zero_openings() {
++        fn constant_term_round_trips_nonzero_opening() {
+             let mut rng = ChaCha20Rng::seed_from_u64(0x0C05_7A07);
+-            for polynomial_constant in [GinScalar::from(19u64), GinScalar::ZERO] {
+-                let constant_commitment = Gin::generator() * polynomial_constant;
+-                let proof =
+-                    prove(&constant_commitment, &polynomial_constant, 1, &mut rng).expect("prove");
+-                verify(&proof, &constant_commitment, 1).expect("verify");
+-            }
++            let polynomial_constant = GinScalar::from(19u64);
++            let constant_commitment = Gin::generator() * polynomial_constant;
++            let proof =
++                prove(&constant_commitment, &polynomial_constant, 1, &mut rng).expect("prove");
++            verify(&proof, &constant_commitment, 1).expect("verify");
++        }
++
++        #[test]
++        fn constant_term_proof_rejects_zero_identity_pair() {
++            let mut rng = ChaCha20Rng::seed_from_u64(0x0C05_7A0A);
++            assert_eq!(
++                prove(&Gin::identity(), &GinScalar::ZERO, 1, &mut rng).unwrap_err(),
++                Error::ProofVerificationFailed
++            );
+         }
+ 
+         #[test]
+@@ -3590,7 +3661,8 @@ pub mod secp_secq {
+                 dealer_message_root: [1u8; 32],
+                 dealings: vec![BatchedDealingStatement {
+                     msg: [9u8; MESSAGE_BYTES],
+-                    commitment_coefficients: vec![g_in * share],
++                    constant_commitment: Some(g_in * share),
++                    nonconstant_commitments: Vec::new(),
+                     receivers: vec![BatchedReceiverStatement {
+                         receiver: ParticipantIndex::new(1).unwrap(),
+                         pkj,
+@@ -3616,10 +3688,10 @@ pub mod secp_secq {
+             assert_eq!(
+                 checkpoint,
+                 [
+-                    162, 11, 118, 95, 193, 62, 252, 149, 129, 10, 157, 118, 8, 158, 11, 135, 92,
+-                    201, 197, 122, 30, 215, 137, 13, 25, 199, 224, 190, 134, 181, 203, 47, 86, 242,
+-                    199, 2, 119, 10, 26, 115, 32, 1, 144, 121, 204, 94, 189, 106, 103, 80, 184, 41,
+-                    7, 169, 31, 37, 39, 231, 222, 102, 55, 98, 90, 156,
++                    183, 21, 18, 68, 231, 190, 81, 30, 250, 9, 71, 245, 91, 248, 56, 106, 216, 235,
++                    150, 4, 34, 40, 172, 172, 220, 15, 97, 252, 84, 7, 20, 28, 180, 108, 101, 16,
++                    33, 228, 33, 145, 61, 28, 114, 20, 197, 121, 11, 86, 188, 5, 187, 224, 152,
++                    169, 116, 200, 125, 52, 163, 72, 236, 77, 214, 94,
+                 ]
+             );
+ 
+@@ -3725,7 +3797,10 @@ pub mod secp_secq {
+         fn batched_statement_rejects_wrong_feldman_commitment() {
+             let g_in = Gin::generator();
+             let mut statement = context_statement();
+-            statement.dealings[0].commitment_coefficients[0] += g_in;
++            *statement.dealings[0]
++                .constant_commitment
++                .as_mut()
++                .expect("nonzero constant") += g_in;
+             assert_eq!(
+                 validate_batched_public_relations(&statement).unwrap_err(),
+                 Error::ProofVerificationFailed
+@@ -3782,7 +3857,7 @@ pub mod secp_secq {
+             let mut statement = context_statement();
+             let dealing = &mut statement.dealings[0];
+             // The threshold-one zero polynomial evaluates to zero at receiver 1.
+-            dealing.commitment_coefficients[0] = Gin::identity();
++            dealing.constant_commitment = None;
+             dealing.receivers[0].share_commitment = Gin::identity();
+             dealing.receivers[0].encrypted_share -= GinScalar::from(13u64);
+ 
+diff --git a/crates/golden-evrf/src/paper/secp_secq/dkg_backend.rs b/crates/golden-evrf/src/paper/secp_secq/dkg_backend.rs
+index 6862488..4e6e66e 100644
+--- a/crates/golden-evrf/src/paper/secp_secq/dkg_backend.rs
++++ b/crates/golden-evrf/src/paper/secp_secq/dkg_backend.rs
+@@ -1,6 +1,8 @@
+ //! Golden DKG adapter for the Secp/Secq paper eVRF.
+ 
+-use golden_core::{Error, EvrfMessage, EvrfProofBackend, EvrfStatement, EvrfWitness, Result};
++use golden_core::{
++    Error, EvrfMessage, EvrfProofBackend, EvrfStatement, EvrfWitness, GoldenGroup, Result,
++};
+ use golden_halo2curves::golden_group::{
+     scalar_to_r1cs_field, Secp256k1Element, Secp256k1GoldenGroup, Secp256k1Scalar,
+ };
+@@ -9,7 +11,7 @@ use rand_core::CryptoRngCore;
+ 
+ use super::{
+     affine, evrf_batched_prove, evrf_batched_verify_many, fp_to_fq, h_gin_1, h_gin_2,
+-    parse_batched_proof_stream, validate_batched_public_relations, BatchedDealingStatement,
++    preflight_batched_proof_stream, validate_batched_public_relations, BatchedDealingStatement,
+     BatchedEvrfPublicParams, BatchedEvrfStatement, BatchedEvrfWitness, BatchedReceiverStatement,
+     Gin, BATCHED_PROOF_ID, MESSAGE_BYTES,
+ };
+@@ -42,26 +44,35 @@ fn batched_statement(
+     let dealings = statement
+         .dealings
+         .iter()
+-        .map(|dealing| BatchedDealingStatement {
+-            msg: dealing.message.0,
+-            commitment_coefficients: dealing
++        .map(|dealing| {
++            let (constant_commitment, nonconstant_commitments) = dealing
+                 .commitment_coefficients
+-                .iter()
+-                .map(|coefficient| coefficient.0)
+-                .collect(),
+-            receivers: dealing
+-                .receivers
+-                .iter()
+-                .map(|receiver| BatchedReceiverStatement {
+-                    receiver: receiver.receiver,
+-                    pkj: receiver.receiver_public_key.0,
+-                    share_commitment: receiver.share_commitment.0,
+-                    pad_commitment: receiver.pad_commitment.0,
+-                    encrypted_share: receiver.encrypted_share.0,
+-                })
+-                .collect(),
++                .split_first()
++                .ok_or(Error::ProofVerificationFailed)?;
++            Ok(BatchedDealingStatement {
++                msg: dealing.message.0,
++                constant_commitment: (!bool::from(Secp256k1GoldenGroup::is_identity(
++                    constant_commitment,
++                )))
++                .then_some(constant_commitment.0),
++                nonconstant_commitments: nonconstant_commitments
++                    .iter()
++                    .map(|coefficient| coefficient.0)
++                    .collect(),
++                receivers: dealing
++                    .receivers
++                    .iter()
++                    .map(|receiver| BatchedReceiverStatement {
++                        receiver: receiver.receiver,
++                        pkj: receiver.receiver_public_key.0,
++                        share_commitment: receiver.share_commitment.0,
++                        pad_commitment: receiver.pad_commitment.0,
++                        encrypted_share: receiver.encrypted_share.0,
++                    })
++                    .collect(),
++            })
+         })
+-        .collect();
++        .collect::<Result<Vec<_>>>()?;
+     let threshold = statement
+         .dealings
+         .first()
+@@ -155,7 +166,12 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
+             polynomial_constants: witness
+                 .dealings
+                 .iter()
+-                .map(|dealing| dealing.polynomial_constant.0)
++                .map(|dealing| {
++                    dealing
++                        .polynomial_constant
++                        .as_ref()
++                        .map(|polynomial_constant| polynomial_constant.0)
++                })
+                 .collect(),
+         };
+         let params = public_params(&statement)?;
+@@ -165,7 +181,7 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
+     fn verify_batch(statement: &EvrfStatement<Secp256k1GoldenGroup>, proof: &[u8]) -> Result<()> {
+         let statement = batched_statement(statement)?;
+         validate_batched_public_relations(&statement)?;
+-        parse_batched_proof_stream(&statement, proof)?;
++        preflight_batched_proof_stream(&statement, proof)?;
+         let params = public_params(&statement)?;
+         evrf_batched_verify_many(&params, &[(&statement, proof)])
+     }
+@@ -184,7 +200,7 @@ impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
+                 return Err(Error::ProofVerificationFailed);
+             }
+             validate_batched_public_relations(statement)?;
+-            parse_batched_proof_stream(statement, proof)?;
++            preflight_batched_proof_stream(statement, proof)?;
+         }
+         let params = public_params(first)?;
+         let instances = statements
+diff --git a/crates/golden-evrf/tests/batched_dealer.rs b/crates/golden-evrf/tests/batched_dealer.rs
+index 5aab826..7db5ba2 100644
+--- a/crates/golden-evrf/tests/batched_dealer.rs
++++ b/crates/golden-evrf/tests/batched_dealer.rs
+@@ -37,7 +37,7 @@ fn public_params(
+ 
+ #[test]
+ #[ignore = "slow: pins the complete batched dealer proof stream"]
+-fn evrf_batched_dealer_matches_v7_vector() {
++fn evrf_batched_dealer_matches_v8_vector() {
+     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0002);
+     let sk1 = GinScalar::random(&mut rng);
+     let pkjs = make_pkjs(&mut rng, 1);
+@@ -51,7 +51,7 @@ fn evrf_batched_dealer_matches_v7_vector() {
+ 
+     assert_eq!(
+         proof.as_slice(),
+-        include_bytes!("vectors/paper-batched-dealer-v7.bin")
++        include_bytes!("vectors/paper-batched-dealer-v8.bin")
+     );
+     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+     paper::evrf_batched_verify(
+@@ -63,6 +63,27 @@ fn evrf_batched_dealer_matches_v7_vector() {
+     .expect("verify");
+ }
+ 
++#[test]
++#[ignore = "slow: verifies the complete pinned batched dealer proof stream"]
++fn evrf_batched_dealer_v8_vector_verifies() {
++    let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0002);
++    let sk1 = GinScalar::random(&mut rng);
++    let pkjs = make_pkjs(&mut rng, 1);
++    let beta = R1csField::from(7u64);
++    let msg = make_msg(0xABCD);
++    let (statement, _) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
++    let proof = include_bytes!("vectors/paper-batched-dealer-v8.bin");
++
++    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
++    paper::evrf_batched_verify(
++        &public_params(&statement),
++        &statement,
++        proof,
++        &mut verify_rng,
++    )
++    .expect("verify pinned proof");
++}
++
+ #[test]
+ #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+ fn evrf_batched_dealer_honest_proof_verifies() {
+@@ -133,7 +154,10 @@ fn evrf_multiple_dealings_and_receivers_verify_and_bind_order() {
+     );
+ 
+     let mut tampered_commitment = statement.clone();
+-    tampered_commitment.dealings[1].commitment_coefficients[0] += Gin::generator();
++    *tampered_commitment.dealings[1]
++        .constant_commitment
++        .as_mut()
++        .expect("nonzero constant") += Gin::generator();
+     assert!(
+         paper::evrf_batched_verify(&params, &tampered_commitment, &proof, &mut verify_rng).is_err()
+     );
+@@ -158,13 +182,15 @@ fn evrf_batched_dealer_accepts_valid_identity_share_commitment() {
+     let pkjs = make_pkjs(&mut rng, 1);
+     let beta = R1csField::from(7u64);
+     let msg = make_msg(0xABCE);
+-    let (mut statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
++    let (mut statement, mut witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+     let dealing = &mut statement.dealings[0];
+     // f(x) = 1 - x evaluates to zero at receiver 1. The fixture's original
+     // share there was 11, so removing it from the ciphertext leaves the pad.
+-    dealing.commitment_coefficients = vec![Gin::generator(), -Gin::generator()];
++    dealing.constant_commitment = Some(Gin::generator());
++    dealing.nonconstant_commitments = vec![-Gin::generator()];
+     dealing.receivers[0].share_commitment = Gin::identity();
+     dealing.receivers[0].encrypted_share -= GinScalar::from(11u64);
++    witness.polynomial_constants[0] = Some(GinScalar::ONE);
+ 
+     let params = public_params(&statement);
+     let proof = paper::evrf_batched_prove(&params, &statement, &witness, &mut rng)
+@@ -176,7 +202,7 @@ fn evrf_batched_dealer_accepts_valid_identity_share_commitment() {
+ 
+ #[test]
+ #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+-fn evrf_batched_dealer_accepts_identity_coefficient_commitment() {
++fn evrf_batched_dealer_accepts_zero_constant_without_schnorr_proof() {
+     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C11);
+     let sk1 = GinScalar::random(&mut rng);
+     let pkjs = make_pkjs(&mut rng, 1);
+@@ -184,13 +210,13 @@ fn evrf_batched_dealer_accepts_identity_coefficient_commitment() {
+     let msg = make_msg(0xABCF);
+     let (mut statement, mut witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
+ 
+-    statement.dealings[0].commitment_coefficients =
+-        vec![Gin::identity(), Gin::generator() * GinScalar::from(11u64)];
+-    witness.polynomial_constant = GinScalar::ZERO;
++    statement.dealings[0].constant_commitment = None;
++    statement.dealings[0].nonconstant_commitments = vec![Gin::generator() * GinScalar::from(11u64)];
++    witness.polynomial_constants[0] = None;
+ 
+     let proof =
+         paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)
+-            .expect("prove zero constant coefficient");
++            .expect("prove zero-sharing");
+     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+     paper::evrf_batched_verify(
+         &public_params(&statement),
+@@ -198,7 +224,7 @@ fn evrf_batched_dealer_accepts_identity_coefficient_commitment() {
+         &proof,
+         &mut verify_rng,
+     )
+-    .expect("verify identity coefficient commitment");
++    .expect("verify zero-sharing without constant-term proof");
+ }
+ 
+ #[test]
+diff --git a/crates/golden-evrf/tests/paper_public_api.rs b/crates/golden-evrf/tests/paper_public_api.rs
+index d55ecdc..5a1afb4 100644
+--- a/crates/golden-evrf/tests/paper_public_api.rs
++++ b/crates/golden-evrf/tests/paper_public_api.rs
+@@ -46,10 +46,10 @@ fn minimal_evrf_statement() -> EvrfStatement<Secp256k1GoldenGroup> {
+ }
+ 
+ #[test]
+-fn batched_backend_uses_v7_proof_protocol_identifier() {
++fn batched_backend_uses_v8_proof_protocol_identifier() {
+     assert_eq!(
+         <SecpSecqBackend as EvrfProofBackend<Secp256k1GoldenGroup>>::PROOF_ID,
+-        b"golden-paper-evrf-batched-v7"
++        b"golden-paper-evrf-batched-v8"
+     );
+ }
+ 
+diff --git a/crates/golden-evrf/tests/prototype_dkg.rs b/crates/golden-evrf/tests/prototype_dkg.rs
+index af00cad..23af603 100644
+--- a/crates/golden-evrf/tests/prototype_dkg.rs
++++ b/crates/golden-evrf/tests/prototype_dkg.rs
+@@ -99,6 +99,7 @@ fn nested_backend_fixture() -> (EvrfStatement<P256Backend>, EvrfWitness<P256Back
+             receivers: public_receivers,
+         });
+         private_dealings.push(EvrfDealingWitness {
++            polynomial_constant: Some(constant),
+             receivers: private_receivers,
+         });
+     }
+diff --git a/crates/golden-evrf/tests/vectors/paper-batched-dealer-v7.bin b/crates/golden-evrf/tests/vectors/paper-batched-dealer-v7.bin
+deleted file mode 100644
+index daddcdecb5a90f7ca826ef318b6df96c19600b5f..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 1323
+zcmV+`1=RWg0010kZ){{`ZY^+OaAk5WWp;9AEn;DGV`yb$Ep|5m0000000jd8fQ>2!
+zINhUIB?MxD%K=dc@!oI-1JbD9XhfKM>?t0tP=K2^6Q4$abn>-j>;Oa}Z{YlgQlcZl
+zQ_}we_fgI>_{xCE`M~f?3#2w{elf#BCH1Mkx0dSe`hgQ7A%vm@-J2_b(Bf{1d#>j^
+zw_g%Fd%ilWXf4$Jkb%p%XqTWi2GojQfWiYCd1M)L^;sg_K-e??72u$Hk#PYGh(bed
+zg3_SrLx3HgUHm_OR@Oj!*$Qy0T}bjy$EnIFs;BC)7BL={_H=-^iGpzgShlhK)04V+
+z!;OgKi_@q*&kd10qW^Oz#yM($BYOPmy^=BOso7OEO+f<Dn-=wYXpQc*)Cb7IT;Qks
+zGT=6h;B8fbJ#OB0IJbsoP~*vI^Ck&+nBGtQ_{NYiWTbNgfR;6OMvtQvdKiYUaQ_#H
+z*%{r=bLmUA8|cm7K+Q)I2xZjp<RMbAD`?wDkeu-(QDz>!{K@4v6lxs#0NKA<iK~e9
+zv9*89%S)2ukh0SVwKzeF+KxJ^O+DdV!~nApMp@<s=1pK=RvgjC;nVgDZW!&oMGc`G
+zj6u^0jwFBsQicK&_h>vWPJBRY_#5_mEWD2e{$jV`f2*F<7+8sbh=)N1hLpeA$yYJE
+zLCuFA2cZmeay@T=k1#W=llM>3fJM#Hj-A-O!kk6lP;zGBZ(G81bx<2Iv7382zb)!|
+z`+x;7Vtz+X>+SfsAtMpIx;h_%B0T}J#K^d93nJN1IbwjB@UqF(h|gOk;}mHA^NQ;5
+zbdR{uwPavHCImO9(<8!wsUWldiE5)~=|;dNVRxK1!$N8<OSi=CSvTIkS0`+UfS3J`
+z|Fm2BBENJkNm|hj*`7#dNbtz<cl)9nq9kAztAHNcEoo#=KcN>Qoqr`e$dOg!E02Q5
+zairXuhr^Fdp+EpwJeewMDYnf8|Bm<1`s@{Dqo!JQa~WaU9s%H{Z|J&!)x~)1(+r4t
+z<%`l37A<GunJ*4}O)EOMw31}4!}vuwfIE-u1%m3CBq#oUTouHyzUJm;<F!C$UyqDa
+zep&ZnJb)@F@4}3&6r+ZFb~efl$UB(uEC}D7J0CGQ*CbZSZjXT2NWTu#7nk`St1=Jx
+zxRXV=3K@BmsQ>Kv#{nlT!agYg1_cQs)MHYlr0=pcpHBB~%OL~pDik05a+rikYKOYM
+zfD$0tZ9cJYA6a~2xVH>CC{&SeHX~*?c}=yp;wK%09stspaBoO;UrOhVrc8iM6(v|V
+z`PFb8ZR~pFiT_H?u0()iH45_HQS+m2FDM{Nkz~dt2Pd+g{c)xfPD<V@AO1=J1V&El
+z-C?!{(gTIGsM7;R9&)N3%qwF1E3XlJNck?efRK4Y_cZzc$%7(*phoyP-*FpRUD;Nh
+zy+!a6u0ZjHo`7wNZvu7|o3NEYK`+2a!uUo8bj13hG4C}hJ642tAWQ&dte+P%;;=RY
+z(F2Yi?rEi&UZ2kf6kBGQmj`7pAHZ$^GYk;r>5&juvyQ>zAHScPd<JhK*HNA3aY#B;
+z*BUS$fR%OxH%Z&dB!EZti%6Abgi_!wB}{&BhkRN<=$zAD&j27W^KnTk6Ny4I9Ce3e
+zOV0hoDDHS%3<b56&Kc7}U4CPH!XRdqwqO<Z#NFC&z4n!k{OkXzu;!Zv6}T+XX-mo3
+hc?m03#=YuB4(fq`-gUci8pbhn;W%W>5|Q!<YOM@4e|7)>
+

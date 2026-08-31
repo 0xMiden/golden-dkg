@@ -1,31 +1,27 @@
-//! End-to-end DKG integration tests against the paper Secp/Secq backend.
+//! Public end-to-end coverage for the production Secp/Secq DKG proof system.
 //!
-//! These drive the public batch-native DKG lifecycle and tamper only cloned
-//! network messages. Most tests are ignored because each dealer proof builds a
-//! full Secp/Secq R1CS instance; run them via `cargo nextest --run-ignored only`.
-//! The single-participant test runs unignored because there are no receiver
-//! relations to prove.
+//! Full proof tests are ignored because preparing generators and building the
+//! Main Golden circuit is expensive. They remain explicitly runnable with
+//! `cargo nextest run -p golden-evrf --test dkg_integration --features
+//! halo2curves-secp256k1 --run-ignored only`.
 
 #![allow(clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
 
 use golden_core::{
-    complete_legacy as complete, create_dealing, verify_dealing,
-    wire::{from_wire_bytes, to_wire_bytes},
-    DealerMessage, DkgConfig, DkgDealing, DkgInstanceKind, GoldenGroup, GoldenScalar,
+    complete, deal, DkgConfig, DkgInstanceKind, Error, GoldenGroup, GoldenScalar, OwnDealing,
     ParticipantIndex, ParticipantRegistry, SessionId,
 };
-use golden_evrf::paper::secp_secq::SecpSecqBackend;
+use golden_evrf::paper::secp_secq::SecpSecqBulletproofs;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
-const PROOF_ID_LEN_BYTES: usize = 4;
-const NESTED_LEN_BYTES: usize = 8;
-
 type Group = Secp256k1GoldenGroup;
 
-fn idx(value: u32) -> ParticipantIndex {
+const DEALER_MESSAGE_MAGIC: &[u8] = b"golden-dkg-dealer";
+
+fn participant(value: u32) -> ParticipantIndex {
     ParticipantIndex::new(value).unwrap()
 }
 
@@ -33,76 +29,47 @@ fn identity_secret(participant: ParticipantIndex) -> Secp256k1Scalar {
     Secp256k1Scalar::from_u64(100 + u64::from(participant.get())).unwrap()
 }
 
-fn legacy_beta() -> Secp256k1Scalar {
-    Secp256k1Scalar::from_u64(77).unwrap()
+fn config(instances: Vec<DkgInstanceKind>) -> DkgConfig<Group> {
+    config_with_participants(2, instances)
 }
 
-fn config(
-    participants: &[ParticipantIndex],
-    threshold: usize,
+fn config_with_participants(
+    participant_count: u32,
     instances: Vec<DkgInstanceKind>,
 ) -> DkgConfig<Group> {
     let registry = ParticipantRegistry::new(
-        participants
-            .iter()
+        (1..=participant_count)
+            .map(participant)
             .map(|participant| {
                 (
-                    *participant,
-                    Group::mul_generator(&identity_secret(*participant)),
+                    participant,
+                    Group::mul_generator(&identity_secret(participant)),
                 )
             })
             .collect(),
     )
     .unwrap();
-    DkgConfig::new(threshold, SessionId([42u8; 32]), registry, instances).unwrap()
-}
-
-fn random_config() -> DkgConfig<Group> {
-    config(&[idx(1), idx(2), idx(3)], 2, vec![DkgInstanceKind::Random])
-}
-
-fn mixed_config() -> DkgConfig<Group> {
-    config(
-        &[idx(1), idx(2)],
-        1,
-        vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
-    )
-}
-
-fn zero_config() -> DkgConfig<Group> {
-    config(&[idx(1), idx(2)], 1, vec![DkgInstanceKind::Zero])
-}
-
-fn single_participant_config() -> DkgConfig<Group> {
-    config(
-        &[idx(1)],
-        1,
-        vec![DkgInstanceKind::Random, DkgInstanceKind::Zero],
-    )
-}
-
-fn tamper_element(point: &<Group as GoldenGroup>::Element) -> <Group as GoldenGroup>::Element {
-    Group::add(point, &Group::generator())
-}
-
-fn tamper_scalar(scalar: &Secp256k1Scalar) -> Secp256k1Scalar {
-    Secp256k1Scalar::add(scalar, &Secp256k1Scalar::one())
+    DkgConfig::new(1, SessionId([42; 32]), registry, instances).unwrap()
 }
 
 fn all_dealings(
+    proof_system: &SecpSecqBulletproofs,
     config: &DkgConfig<Group>,
-    rng: &mut ChaCha20Rng,
-) -> BTreeMap<ParticipantIndex, DkgDealing<Group>> {
+    seed: u8,
+) -> BTreeMap<ParticipantIndex, OwnDealing<Group>> {
     config
         .registry()
         .indexes()
         .map(|dealer| {
-            let dealing = create_dealing::<Group, SecpSecqBackend>(
+            let mut rng = ChaCha20Rng::from_seed(
+                [seed.wrapping_add(u8::try_from(dealer.get()).unwrap()); 32],
+            );
+            let dealing = deal(
+                proof_system,
+                config,
                 dealer,
                 &identity_secret(dealer),
-                config,
-                &legacy_beta(),
-                rng,
+                &mut rng,
             )
             .unwrap();
             (dealer, dealing)
@@ -110,281 +77,183 @@ fn all_dealings(
         .collect()
 }
 
-fn assert_dkg_completes(config: DkgConfig<Group>, decode_messages: bool) {
-    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-    let dealings = all_dealings(&config, &mut rng);
-    let messages = dealings
+fn peer_candidates(
+    dealings: &BTreeMap<ParticipantIndex, OwnDealing<Group>>,
+    receiver: ParticipantIndex,
+) -> Vec<(ParticipantIndex, Vec<u8>)> {
+    dealings
         .iter()
-        .map(|(dealer, dealing)| {
-            let message = if decode_messages {
-                let encoded = to_wire_bytes(dealing.message());
-                let decoded = from_wire_bytes::<DealerMessage<Group>>(&encoded).unwrap();
-                assert_eq!(to_wire_bytes(&decoded), encoded);
-                decoded
-            } else {
-                dealing.message().clone()
-            };
-            (*dealer, message)
-        })
-        .collect::<BTreeMap<_, _>>();
+        .filter(|(dealer, _)| **dealer != receiver)
+        .map(|(dealer, dealing)| (*dealer, dealing.dealer_message_bytes().to_vec()))
+        .collect()
+}
 
-    for message in messages.values() {
-        verify_dealing::<Group, SecpSecqBackend>(message, &config, &legacy_beta()).unwrap();
-    }
+fn header_len() -> usize {
+    DEALER_MESSAGE_MAGIC.len()
+        + 4 // dealer-message codec version
+        + 4 // Golden protocol version
+        + 8 // curve identifier length
+        + Group::CURVE_ID.len()
+        + 32 // configuration root
+        + 4 // encoded dealer
+}
 
-    let receiver = idx(2);
-    let peer_dealings = messages
-        .iter()
-        .filter_map(|(dealer, message)| (*dealer != receiver).then_some((*dealer, message.clone())))
-        .collect();
-    let output = complete::<Group, SecpSecqBackend>(
-        receiver,
+fn proof_offset(config: &DkgConfig<Group>) -> usize {
+    let receiver_count = config.registry().len() - 1;
+    config.instances().iter().fold(header_len(), |len, kind| {
+        let physical_coefficients = match kind {
+            DkgInstanceKind::Random => config.threshold(),
+            DkgInstanceKind::Zero => config.threshold() - 1,
+        };
+        len + 32
+            + physical_coefficients * Group::ELEMENT_REPR_BYTES
+            + receiver_count * (Group::ELEMENT_REPR_BYTES + Secp256k1Scalar::REPR_BYTES)
+    })
+}
+
+fn complete_for(
+    proof_system: &SecpSecqBulletproofs,
+    config: &DkgConfig<Group>,
+    dealings: &BTreeMap<ParticipantIndex, OwnDealing<Group>>,
+    receiver: ParticipantIndex,
+) -> golden_core::Result<golden_core::DkgOutput<Group>> {
+    complete(
+        proof_system,
+        config,
         &identity_secret(receiver),
-        dealings.get(&receiver).unwrap(),
-        &peer_dealings,
-        &config,
-        &legacy_beta(),
+        &dealings[&receiver],
+        &peer_candidates(dealings, receiver),
     )
-    .unwrap();
-
-    assert_eq!(output.configuration_root(), config.root());
-    assert_eq!(output.instances().len(), config.instances().len());
-    for (kind, instance) in config.instances().iter().zip(output.instances()) {
-        assert_eq!(
-            instance.public_key_shares()[&receiver],
-            Group::mul_generator(instance.secret_share())
-        );
-        assert_eq!(instance.public_key_shares().len(), config.registry().len());
-        if *kind == DkgInstanceKind::Zero {
-            assert!(bool::from(Group::is_identity(instance.public_key())));
-        }
-    }
 }
 
 #[test]
-fn single_participant_dkg_completes_without_proving() {
-    let config = single_participant_config();
-    let dealer = idx(1);
+fn single_participant_uses_the_zero_capacity_empty_proof_path() {
+    let config = config_with_participants(1, vec![DkgInstanceKind::Random, DkgInstanceKind::Zero]);
+    let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
+    let dealer = participant(1);
+    let secret = identity_secret(dealer);
     let mut rng = ChaCha20Rng::from_seed([7; 32]);
 
-    let dealing = create_dealing::<Group, SecpSecqBackend>(
-        dealer,
-        &identity_secret(dealer),
-        &config,
-        &legacy_beta(),
-        &mut rng,
-    )
-    .unwrap();
-    assert!(dealing.message().proof.is_empty());
-    assert!(dealing
-        .message()
-        .dealings
-        .iter()
-        .all(|body| body.encrypted_shares.is_empty()));
+    let own_dealing = deal(&proof_system, &config, dealer, &secret, &mut rng).unwrap();
+    assert_eq!(
+        own_dealing.dealer_message_bytes().len(),
+        proof_offset(&config)
+    );
 
-    verify_dealing::<Group, SecpSecqBackend>(dealing.message(), &config, &legacy_beta()).unwrap();
-
-    let output = complete::<Group, SecpSecqBackend>(
-        dealer,
-        &identity_secret(dealer),
-        &dealing,
-        &BTreeMap::new(),
-        &config,
-        &legacy_beta(),
-    )
-    .unwrap();
+    let output = complete(&proof_system, &config, &secret, &own_dealing, &[]).unwrap();
+    assert_eq!(output.participant(), dealer);
+    assert_eq!(output.configuration_root(), config.root());
     assert_eq!(output.instances().len(), 2);
-    for instance in output.instances() {
-        assert_eq!(
-            instance.public_key(),
-            &Group::mul_generator(instance.secret_share())
-        );
-    }
     assert!(bool::from(Group::is_identity(
-        output.instances()[1].public_key()
+        output.instance(1).unwrap().public_key()
     )));
 }
 
 #[test]
-#[ignore = "slow: proves one mixed ordered DKG batch per dealer"]
-fn mixed_dkg_completes_with_batched_evrf_backend() {
-    assert_dkg_completes(mixed_config(), false);
-}
+#[ignore = "slow: builds two full one-instance Main Golden dealer proofs"]
+fn one_instance_one_receiver_bytes_are_canonical_framed_and_bound() {
+    let config = config(vec![DkgInstanceKind::Random]);
+    let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
+    let dealings = all_dealings(&proof_system, &config, 20);
+    let receiver = participant(1);
+    let peer = participant(2);
 
-#[test]
-#[ignore = "slow: completes a zero-sharing paper DKG from decoded peer messages"]
-fn zero_dkg_completes_with_decoded_peer_messages() {
-    assert_dkg_completes(zero_config(), true);
-}
-
-#[test]
-#[ignore = "slow: reuses one proof across public-message tamper cases"]
-fn dkg_rejects_tampered_public_fields() {
-    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-    let config = random_config();
-    let dealer = idx(1);
-    let dealing = create_dealing::<Group, SecpSecqBackend>(
-        dealer,
-        &identity_secret(dealer),
-        &config,
-        &legacy_beta(),
-        &mut rng,
-    )
-    .unwrap();
-    let message = dealing.message();
-    verify_dealing::<Group, SecpSecqBackend>(message, &config, &legacy_beta()).unwrap();
-
-    let receiver = idx(2);
-    let mut wrong_pad = message.clone();
-    let encrypted = wrong_pad.dealings[0]
-        .encrypted_shares
-        .get_mut(&receiver)
-        .unwrap();
-    encrypted.pad_commitment = tamper_element(&encrypted.pad_commitment);
-
-    let mut wrong_encrypted_share = message.clone();
-    let encrypted = wrong_encrypted_share.dealings[0]
-        .encrypted_shares
-        .get_mut(&receiver)
-        .unwrap();
-    encrypted.encrypted_share = tamper_scalar(&encrypted.encrypted_share);
-
-    let mut wrong_commitment = message.clone();
-    let mut coefficients = wrong_commitment.dealings[0]
-        .commitment
-        .coefficients()
-        .to_vec();
-    coefficients[0] = tamper_element(&coefficients[0]);
-    wrong_commitment.dealings[0].commitment =
-        golden_core::FeldmanCommitment::from_coefficients(coefficients).unwrap();
-
-    let mut wrong_configuration = message.clone();
-    wrong_configuration.configuration_root[0] ^= 1;
-
-    let mut swapped_receivers = message.clone();
-    let first = swapped_receivers.dealings[0]
-        .encrypted_shares
-        .get(&idx(2))
-        .cloned()
-        .unwrap();
-    let second = swapped_receivers.dealings[0]
-        .encrypted_shares
-        .get(&idx(3))
-        .cloned()
-        .unwrap();
-    swapped_receivers.dealings[0]
-        .encrypted_shares
-        .insert(idx(2), second);
-    swapped_receivers.dealings[0]
-        .encrypted_shares
-        .insert(idx(3), first);
-
-    let mut missing_receiver = message.clone();
-    missing_receiver.dealings[0]
-        .encrypted_shares
-        .remove(&idx(3));
-
-    let mut extra_self_receiver = message.clone();
-    let placeholder = extra_self_receiver.dealings[0]
-        .encrypted_shares
-        .get(&receiver)
-        .cloned()
-        .unwrap();
-    extra_self_receiver.dealings[0]
-        .encrypted_shares
-        .insert(dealer, placeholder);
-
-    // Preserve the public encrypted-share equation while changing the claimed
-    // paper eVRF pad, so rejection must come from proof verification.
-    let mut wrong_proof_pad = message.clone();
-    let encrypted = wrong_proof_pad.dealings[0]
-        .encrypted_shares
-        .get_mut(&receiver)
-        .unwrap();
-    encrypted.pad_commitment = tamper_element(&encrypted.pad_commitment);
-    encrypted.encrypted_share = tamper_scalar(&encrypted.encrypted_share);
-
-    for tampered in [
-        wrong_pad,
-        wrong_encrypted_share,
-        wrong_commitment,
-        wrong_configuration,
-        swapped_receivers,
-        missing_receiver,
-        extra_self_receiver,
-        wrong_proof_pad,
-    ] {
-        let result = verify_dealing::<Group, SecpSecqBackend>(&tampered, &config, &legacy_beta());
-        assert!(
-            result.is_err(),
-            "tampered dealer message must be rejected, got {result:?}"
-        );
-    }
-}
-
-#[test]
-#[ignore = "slow: builds and verifies one full paper dealer proof"]
-fn dkg_rejects_malformed_or_replayed_proofs() {
-    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-    let config = config(&[idx(1), idx(2)], 1, vec![DkgInstanceKind::Zero]);
-    let dealer = idx(1);
-    let dealing = create_dealing::<Group, SecpSecqBackend>(
-        dealer,
-        &identity_secret(dealer),
-        &config,
-        &legacy_beta(),
-        &mut rng,
-    )
-    .unwrap();
-    let message = dealing.message();
-    verify_dealing::<Group, SecpSecqBackend>(message, &config, &legacy_beta()).unwrap();
-
-    let proof_id_len =
-        u32::from_be_bytes(message.proof[..PROOF_ID_LEN_BYTES].try_into().unwrap()) as usize;
-    let nested_len_offset = PROOF_ID_LEN_BYTES + proof_id_len;
-    let payload_start = nested_len_offset + NESTED_LEN_BYTES;
-    let payload_len = u64::from_be_bytes(
-        message.proof[nested_len_offset..payload_start]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    // A zero dealing ends with the nested R1CS frame: there is no trailing
-    // constant-term Schnorr record.
-    assert_eq!(payload_start + payload_len, message.proof.len());
-
-    let mut wrong_id = message.clone();
-    wrong_id.proof[PROOF_ID_LEN_BYTES] ^= 0x01;
-    let mut malformed_length = message.clone();
-    malformed_length.proof[nested_len_offset..payload_start]
-        .copy_from_slice(&u64::MAX.to_be_bytes());
-    let mut truncated = message.clone();
-    truncated.proof.pop();
-    let mut trailing = message.clone();
-    trailing.proof.push(0);
-    let mut corrupted_payload = message.clone();
-    corrupted_payload.proof[payload_start + payload_len / 2] ^= 0x01;
-    let mut noncanonical_nested = message.clone();
-    noncanonical_nested.proof[nested_len_offset..payload_start]
-        .copy_from_slice(&u64::try_from(payload_len + 1).unwrap().to_be_bytes());
-    noncanonical_nested.proof.push(0);
-
-    for invalid in [
-        wrong_id,
-        malformed_length,
-        truncated,
-        trailing,
-        corrupted_payload,
-        noncanonical_nested,
-    ] {
-        assert!(
-            verify_dealing::<Group, SecpSecqBackend>(&invalid, &config, &legacy_beta()).is_err()
-        );
-    }
-
-    let mut replayed = message.clone();
-    replayed.dealings[0].nonce.0[0] ^= 0x01;
-    assert!(
-        verify_dealing::<Group, SecpSecqBackend>(&replayed, &config, &legacy_beta()).is_err(),
-        "proof replay under a different dealing nonce must be rejected"
+    let expected = complete_for(&proof_system, &config, &dealings, receiver).unwrap();
+    assert_eq!(expected.participant(), receiver);
+    assert_eq!(expected.configuration_root(), config.root());
+    assert_eq!(expected.instances().len(), 1);
+    assert_eq!(
+        expected.instance(0).unwrap().public_key_shares()[&receiver],
+        Group::mul_generator(expected.instance(0).unwrap().secret_share())
     );
+
+    let body_len = proof_offset(&config);
+    let own_bytes = dealings[&receiver].dealer_message_bytes();
+    let peer_bytes = dealings[&peer].dealer_message_bytes();
+    assert!(body_len < own_bytes.len());
+    assert!(body_len < peer_bytes.len());
+
+    let mut changed_message = peer_bytes.to_vec();
+    changed_message[header_len()] ^= 1;
+
+    let mut changed_proof_header = peer_bytes.to_vec();
+    changed_proof_header[body_len] ^= 1;
+
+    let mut truncated_proof = peer_bytes.to_vec();
+    truncated_proof.pop();
+
+    let mut trailing_proof = peer_bytes.to_vec();
+    trailing_proof.push(0);
+
+    let mut replayed_for_another_dealer = peer_bytes[..body_len].to_vec();
+    replayed_for_another_dealer.extend_from_slice(&own_bytes[body_len..]);
+
+    for (case, bytes) in [
+        ("changed effective message", changed_message),
+        ("changed proof header", changed_proof_header),
+        ("truncated proof", truncated_proof),
+        ("trailing proof", trailing_proof),
+        (
+            "proof replayed across dealer keys",
+            replayed_for_another_dealer,
+        ),
+    ] {
+        let error = complete(
+            &proof_system,
+            &config,
+            &identity_secret(receiver),
+            &dealings[&receiver],
+            &[(peer, bytes)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            Error::InvalidDealerProofs {
+                dealers: vec![peer],
+            },
+            "{case}"
+        );
+    }
+
+    let retried = complete_for(&proof_system, &config, &dealings, receiver).unwrap();
+    assert_eq!(retried.completion_root(), expected.completion_root());
+}
+
+#[test]
+#[ignore = "slow: builds the ordered Random/Zero Main Golden proof for both dealers"]
+fn mixed_random_zero_production_dkg_completes_for_every_participant() {
+    let config = config(vec![DkgInstanceKind::Random, DkgInstanceKind::Zero]);
+    let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
+    let dealings = all_dealings(&proof_system, &config, 40);
+    let outputs = config
+        .registry()
+        .indexes()
+        .map(|receiver| complete_for(&proof_system, &config, &dealings, receiver).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(outputs.len(), 2);
+    for output in &outputs {
+        assert_eq!(output.configuration_root(), config.root());
+        assert_eq!(output.instances().len(), 2);
+        assert!(bool::from(Group::is_identity(
+            output.instance(1).unwrap().public_key()
+        )));
+        for instance in output.instances() {
+            assert_eq!(
+                instance.public_key_shares()[&output.participant()],
+                Group::mul_generator(instance.secret_share())
+            );
+        }
+    }
+    assert_eq!(outputs[0].completion_root(), outputs[1].completion_root());
+    for position in 0..2 {
+        assert_eq!(
+            outputs[0].instance(position).unwrap().public_key(),
+            outputs[1].instance(position).unwrap().public_key()
+        );
+        assert_eq!(
+            outputs[0].instance(position).unwrap().public_key_shares(),
+            outputs[1].instance(position).unwrap().public_key_shares()
+        );
+    }
 }

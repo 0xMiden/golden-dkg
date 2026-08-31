@@ -317,8 +317,8 @@ mod tests {
         // scalar field modulus. Cross-check directly against
         // `<Scalar as PrimeField>::MODULUS`, which k256 exposes on the public
         // Scalar type, so a hand-edit to either copy drifts relative to the
-        // other. The base-field modulus was tracked here previously but was
-        // only used by the deleted GoldenEvrfCurve impl; it has been removed.
+        // other. The base-field modulus is provided by `FieldElement` and is
+        // intentionally not duplicated here.
         let scalar_hex = <Scalar as k256::elliptic_curve::PrimeField>::MODULUS;
         assert_eq!(
             hex_be_to_be_bytes(scalar_hex),

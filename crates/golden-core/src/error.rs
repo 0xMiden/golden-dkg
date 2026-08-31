@@ -98,23 +98,6 @@ pub enum Error {
         actual: usize,
     },
 
-    /// A message or output belongs to a different DKG configuration.
-    #[error("DKG configuration mismatch")]
-    ConfigurationMismatch,
-
-    /// A dealer message had the wrong number of dealing bodies.
-    #[error("invalid dealing count: expected {expected}, got {actual}")]
-    InvalidDealingCount {
-        /// Configured instance count.
-        expected: usize,
-        /// Message dealing count.
-        actual: usize,
-    },
-
-    /// A dealing's constant commitment shape disagreed with its configured kind.
-    #[error("commitment kind mismatch in dealing {0}")]
-    CommitmentKindMismatch(usize),
-
     /// An identity secret key did not match the registered identity public key.
     #[error("identity secret key does not match registered public key")]
     IdentityKeyMismatch,
@@ -123,28 +106,7 @@ pub enum Error {
     #[error("unknown participant {0}")]
     UnknownParticipant(u32),
 
-    /// A peer dealing map key did not match the message's dealer.
-    #[error("dealer key mismatch: map key {map_key}, message dealer {message_dealer}")]
-    DealerKeyMismatch {
-        /// Dealer index from the peer-dealing map key.
-        map_key: u32,
-        /// Dealer index claimed by the dealer message.
-        message_dealer: u32,
-    },
-
-    /// A required dealing was missing.
-    #[error("missing dealing from participant {0}")]
-    MissingDealing(u32),
-
-    /// A required share was missing.
-    #[error("missing share for participant {0}")]
-    MissingShare(u32),
-
-    /// A dealing contained a share or proof for an unexpected participant.
-    #[error("unexpected share for participant {0}")]
-    UnexpectedShare(u32),
-
-    /// A proof backend rejected the statement.
+    /// A proof system rejected the statement.
     #[error("proof verification failed")]
     ProofVerificationFailed,
 
@@ -228,10 +190,6 @@ pub enum Error {
         /// Dealer whose receiver share could not be recovered.
         dealer: ParticipantIndex,
     },
-
-    /// A dealer proof failed individual verification after a batch failure.
-    #[error("proof verification failed for dealer {0}")]
-    DealerProofVerificationFailed(u32),
 
     /// A dealing share did not match its Feldman commitment.
     #[error("commitment verification failed")]

@@ -87,6 +87,15 @@ cargo fmt --all --check
 cargo clippy --all --benches --tests --examples --all-features --exclude bulletproofs-cycle -- -D warnings
 cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-ehtdh1/halo2curves-secp256k1,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1
 cargo test --workspace --doc
+cargo run -p golden-evrf --profile optimized --example check_bench_fixtures --features halo2curves-secp256k1,parallel,serde
+```
+
+When a protocol or proof-format change intentionally invalidates the checked-in
+opaque DKG fixtures, regenerate the hard-cut artifacts explicitly and review
+the resulting binary and checksum changes:
+
+```bash
+cargo run -p golden-evrf --profile optimized --example warm_bench_fixtures --features halo2curves-secp256k1,parallel,serde
 ```
 
 ### Versioning

@@ -38,7 +38,7 @@ jobs:
             table4_rows: "9"
             table5_rows: "10"
             table5_metric: total
-          - name: Paper eVRF batched parameter setup
+          - name: Secp/Secq prepared-generator setup
             bench: batched_setup
             timeout: 15
     permissions:
@@ -74,7 +74,7 @@ jobs:
             --measurement-mode walltime \
             --profile optimized \
             -p golden-evrf \
-            --features halo2curves-secp256k1,parallel \
+            --features halo2curves-secp256k1,parallel,serde \
             --bench "${BENCH_NAME}"
 
       - name: Run benchmark

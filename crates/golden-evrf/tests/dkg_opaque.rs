@@ -560,6 +560,7 @@ fn candidate_set_errors_identify_the_exact_dealer() {
 #[test]
 fn malformed_oversized_legacy_and_misrouted_candidates_are_coarsely_attributed() {
     const LEGACY_DEALER_MESSAGE_PREFIX: &[u8] = b"golden-dkg-wire-v4\x07dealer-message-v4";
+    const DEALER_MESSAGE_MAGIC: &[u8] = b"golden-dkg-dealer";
 
     let config = config(3, 2, vec![DkgInstanceKind::Random]);
     let other_config = config_with_session(3, 2, vec![DkgInstanceKind::Random], 43);
@@ -573,9 +574,21 @@ fn malformed_oversized_legacy_and_misrouted_candidates_are_coarsely_attributed()
 
     let mut bad_magic = dealings[&dealer_2].dealer_message_bytes().to_vec();
     bad_magic[0] ^= 1;
+    let mut wrong_codec = dealings[&dealer_2].dealer_message_bytes().to_vec();
+    let codec_offset = DEALER_MESSAGE_MAGIC.len();
+    wrong_codec[codec_offset..codec_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut wrong_protocol = dealings[&dealer_2].dealer_message_bytes().to_vec();
+    let protocol_offset = codec_offset + 4;
+    wrong_protocol[protocol_offset..protocol_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut noncanonical_point = dealings[&dealer_2].dealer_message_bytes().to_vec();
+    let point_offset = first_random_receiver_pad_offset(&config);
+    noncanonical_point[point_offset..point_offset + P256Backend::ELEMENT_REPR_BYTES].fill(0xff);
     let malformed_cases = [
         ("truncated", vec![0u8; 3]),
         ("bad magic", bad_magic),
+        ("wrong codec version", wrong_codec),
+        ("wrong protocol version", wrong_protocol),
+        ("noncanonical point", noncanonical_point),
         ("legacy", LEGACY_DEALER_MESSAGE_PREFIX.to_vec()),
     ];
     for (case, bytes) in malformed_cases {

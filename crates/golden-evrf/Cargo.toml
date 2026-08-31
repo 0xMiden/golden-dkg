@@ -1,7 +1,7 @@
 [package]
 name = "golden-evrf"
 version = "0.3.0"
-description = "Verifiable random function proof backends for Golden distributed key generation"
+description = "Main Golden dealer proofs for Golden distributed key generation"
 edition.workspace = true
 homepage.workspace = true
 license.workspace = true
@@ -13,7 +13,6 @@ publish = ["crates-io"]
 [dependencies]
 golden-core = { workspace = true }
 rand_core = { workspace = true }
-sha2 = { workspace = true }
 bulletproofs-cycle = { workspace = true, optional = true }
 golden-halo2curves = { workspace = true, optional = true }
 ff = { workspace = true, optional = true }
@@ -31,11 +30,11 @@ criterion = "0.5"
 ff = { workspace = true }
 golden-rustcrypto = { workspace = true, features = ["p256"] }
 rand_chacha = { workspace = true }
+sha2 = { workspace = true }
 
 [features]
 default = []
 insecure-revealed-witness = []
-miden-serde = ["golden-core/miden-serde"]
 parallel = ["bulletproofs-cycle?/parallel"]
 serde = [
     "dep:postcard",
@@ -55,19 +54,7 @@ halo2curves-secp256k1 = [
 ]
 
 [[test]]
-name = "one_receiver"
-required-features = ["halo2curves-secp256k1"]
-
-[[test]]
-name = "batched_dealer"
-required-features = ["halo2curves-secp256k1"]
-
-[[test]]
 name = "dkg_integration"
-required-features = ["halo2curves-secp256k1"]
-
-[[test]]
-name = "paper_public_api"
 required-features = ["halo2curves-secp256k1"]
 
 [[test]]
@@ -75,33 +62,33 @@ name = "dkg_opaque"
 required-features = ["insecure-revealed-witness"]
 
 [[test]]
-name = "public_params_serde"
+name = "prepared_generators"
 required-features = ["halo2curves-secp256k1", "serde"]
 
 [[bench]]
 name = "evrf_prove"
 harness = false
-required-features = ["halo2curves-secp256k1", "parallel"]
+required-features = ["halo2curves-secp256k1", "parallel", "serde"]
 
 [[bench]]
 name = "evrf_verify"
 harness = false
-required-features = ["halo2curves-secp256k1", "parallel"]
+required-features = ["halo2curves-secp256k1", "parallel", "serde"]
 
 [[bench]]
 name = "evrf_proof_size"
 harness = false
-required-features = ["halo2curves-secp256k1"]
+required-features = ["halo2curves-secp256k1", "serde"]
 
 [[bench]]
 name = "dkg_round"
 harness = false
-required-features = ["halo2curves-secp256k1", "parallel"]
+required-features = ["halo2curves-secp256k1", "parallel", "serde"]
 
 [[bench]]
 name = "dkg_communication"
 harness = false
-required-features = ["halo2curves-secp256k1"]
+required-features = ["halo2curves-secp256k1", "serde"]
 
 [[bench]]
 name = "batched_setup"
@@ -110,11 +97,11 @@ required-features = ["halo2curves-secp256k1", "parallel"]
 
 [[example]]
 name = "warm_bench_fixtures"
-required-features = ["halo2curves-secp256k1", "parallel"]
+required-features = ["halo2curves-secp256k1", "parallel", "serde"]
 
 [[example]]
 name = "check_bench_fixtures"
-required-features = ["halo2curves-secp256k1", "parallel"]
+required-features = ["halo2curves-secp256k1", "parallel", "serde"]
 
 [lints]
 workspace = true

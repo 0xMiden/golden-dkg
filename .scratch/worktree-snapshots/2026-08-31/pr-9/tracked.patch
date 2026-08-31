@@ -1,0 +1,20 @@
+diff --git a/crates/bulletproofs-cycle/benches/support.rs b/crates/bulletproofs-cycle/benches/support.rs
+index 1ce0403..e7b8a91 100644
+--- a/crates/bulletproofs-cycle/benches/support.rs
++++ b/crates/bulletproofs-cycle/benches/support.rs
+@@ -104,6 +104,7 @@ macro_rules! impl_cycle {
+                 hash(&bytes[..])
+             }
+ 
++            // anyway we could re-use the impl from golden-halo2-curves
+             fn vartime_msm(scalars: &[Self::Scalar], points: &[Self::Point]) -> Self::Point {
+                 // Use a two-point path for IPA folds, and Pippenger for
+                 // larger MSMs.
+@@ -156,6 +157,7 @@ macro_rules! impl_cycle {
+                     return acc;
+                 }
+ 
++                // maybe all(p != identity)
+                 if !points.iter().any(|p| *p == identity) {
+                     let mut bases = vec![Affine::default(); points.len()];
+                     <Self::Point as Curve>::batch_normalize(points, &mut bases);

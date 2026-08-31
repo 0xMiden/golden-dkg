@@ -1,0 +1,3 @@
+# Derive Main Golden beta from a fixed protocol string
+
+Main Golden uses one protocol-wide public coefficient in the full curve base field. Derive it transparently from a fixed versioned protocol string with domain-separated unbiased field sampling; do not accept, store, or serialize beta or a setup identifier in `DkgConfig`. This replaces the paper's randomly sampled public setup value with an explicit random-oracle assumption while avoiding caller-selected configuration grinding and the current scalar-field restriction. Accept this instantiation as part of the protocol design without a separate pre-release security-review gate; the review in ADR 0005 remains scoped to mixed-instance composition.

@@ -50,9 +50,9 @@
 //! * **Golden DKG** lets the participants create a joint public key without one
 //!   party choosing the final private key. EHTDH1 setup creates its decryption
 //!   and context sharings atomically in one ordered DKG batch.
-//! * A **dealer message** is one participant's DKG broadcast. It contains one
-//!   ordered dealing body per configured sharing and one joint proof. Each body
-//!   contains encrypted shares for the other participants.
+//! * A **dealer message** is one participant's bounded, configuration-shaped,
+//!   opaque DKG broadcast. Applications forward its exact bytes; `complete`
+//!   alone parses and validates its ordered sharings and joint proof.
 //! * A **DKG output** is one participant's result after all dealings pass. It
 //!   contains ordered instance outputs, each with public setup data and that
 //!   participant's local share for the corresponding configured sharing.

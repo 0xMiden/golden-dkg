@@ -30,10 +30,7 @@ pub use dealer_proof::{
     DealerProofWitnessReceiverView,
 };
 pub use dkg::{
-    complete_legacy, create_dealing, verify_dealing, verify_dealings, DealerMessage,
-    DealerMessageNonce, DealingBody, DkgConfig, DkgDealing, DkgInstanceKind, DkgInstanceOutput,
-    DkgOutput, EncryptedShare, EvrfDealingStatement, EvrfDealingWitness, EvrfMessage,
-    EvrfProofBackend, EvrfReceiverStatement, EvrfReceiverWitness, EvrfStatement, EvrfWitness,
+    DealerMessageNonce, DkgConfig, DkgInstanceKind, DkgInstanceOutput, DkgOutput, EvrfMessage,
     ParticipantRegistry, SessionId, DEALER_MESSAGE_NONCE_BYTES, PROTOCOL_VERSION,
 };
 pub use error::{DealerMessageError, Error, Result};

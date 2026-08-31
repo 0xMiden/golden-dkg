@@ -1,16 +1,16 @@
 //! Table 4 prover column over the Secp256k1/Secq256k1 cycle:
-//! `evrf_batched_prove` cost as a function of the number of receiver
-//! statements `n_e` covered by one batched proof.
+//! production `DealerProofSystem::prove` cost as a function of the number of
+//! receiver statements `n_e` covered by one dealer proof.
 //!
 //! The timed region is the Bulletproofs R1CS prover only. Statement/witness
-//! construction (chord-rule derivation, Feldman commitments, share pads) is
-//! outside the timed region via `iter_batched`, matching the paper's
-//! "prover runtime" definition (MSM-dominated).
+//! construction is outside the timed region. A private recording adapter gets
+//! the exact flat statement and witness from one public `deal` call; the timed
+//! region invokes the production proof system directly on those inputs.
 //!
 //! Compare against Table 4 (BLS12-381, zkalc):
 //! n_e=1 -> 0.3s, n_e=9 -> 1.8s, n_e=49 -> 6.8s, n_e=99 -> 13.5s.
 //! Direction: scales roughly linearly in `n_e`. Our numbers will differ in
-//! absolute terms because this backend runs over Secp256k1/Secq256k1, not
+//! absolute terms because this proof system runs over Secp256k1/Secq256k1, not
 //! BLS12-381.
 //!
 //! `GOLDEN_TABLE4_NE_VALUES` may select a comma-separated subset for tracked
@@ -25,9 +25,9 @@ mod support;
 
 use codspeed_criterion_compat as criterion;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode};
-use golden_evrf::paper::secp_secq::{evrf_batched_prove, BatchedEvrfPublicParams};
+use golden_core::DealerProofSystem;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-use support::{build_batched_at_ne, table4_ne_values, BENCH_SEED, SLOW_SAMPLE_SIZE};
+use support::{dealer_proof_fixture, table4_ne_values, BENCH_SEED, SLOW_SAMPLE_SIZE};
 
 fn evrf_prove_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("paper/table-4/Secp256k1-Secq256k1/prover");
@@ -35,15 +35,19 @@ fn evrf_prove_bench(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     for n_e in table4_ne_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
-            let params = BatchedEvrfPublicParams::setup(support::TABLE4_THRESHOLD, 1, n_e).unwrap();
+            let fixture = dealer_proof_fixture(n_e);
             b.iter_batched(
-                || {
-                    let (statement, witness, _pkjs, _beta) = build_batched_at_ne(n_e);
-                    let rng = ChaCha20Rng::from_seed(BENCH_SEED);
-                    (statement, witness, rng)
-                },
-                |(statement, witness, mut rng)| {
-                    evrf_batched_prove(&params, &statement, &witness, &mut rng).unwrap();
+                || ChaCha20Rng::from_seed(BENCH_SEED),
+                |mut rng| {
+                    fixture
+                        .proof_system
+                        .prove(
+                            &fixture.config,
+                            &fixture.statement,
+                            &fixture.witness,
+                            &mut rng,
+                        )
+                        .unwrap();
                 },
                 BatchSize::SmallInput,
             )

@@ -1,13 +1,14 @@
-//! Canonical byte encoding for Golden DKG wire values.
+//! Canonical byte encoding for reusable Golden DKG values.
 //!
 //! Standalone wire values start with [`MAGIC`], a one-byte type tag, and a
 //! codec context. Nested fields omit that envelope and are encoded in the order
 //! documented by each type's [`WireEncode`] implementation.
 //!
-//! In the DKG protocol, [`DealerMessage`] is the broadcast message. The other
-//! tagged values are standalone encodings for setup artifacts, nested fields,
-//! tests, or persistence.
+//! Dealer broadcasts deliberately have no context-free decoder: the protocol
+//! exposes them only as configuration-shaped opaque bytes through [`crate::deal`]
+//! and [`crate::complete`].
 
+#[cfg(any(feature = "serde", feature = "miden-serde"))]
 use std::collections::BTreeMap;
 
 #[cfg(feature = "serde")]
@@ -24,9 +25,8 @@ use serde::{
 };
 
 use crate::{
-    DealerMessage, DealerMessageNonce, DealingBody, DkgConfig, DkgInstanceKind, EncryptedShare,
-    Error, FeldmanCommitment, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry,
-    Result, SessionId, TranscriptRoot,
+    DealerMessageNonce, DkgConfig, DkgInstanceKind, Error, FeldmanCommitment, GoldenGroup,
+    GoldenScalar, ParticipantIndex, ParticipantRegistry, Result, SessionId, TranscriptRoot,
 };
 #[cfg(any(feature = "serde", feature = "miden-serde"))]
 use crate::{DkgInstanceOutput, DkgOutput, OwnDealing};
@@ -38,20 +38,12 @@ pub const MAGIC: &[u8; 18] = b"golden-dkg-wire-v4";
 pub const TAG_SESSION_ID: u8 = 0x01;
 /// Standalone tag for [`DealerMessageNonce`].
 pub const TAG_DEALER_MESSAGE_NONCE: u8 = 0x02;
-/// Standalone tag for [`EncryptedShare`].
-pub const TAG_ENCRYPTED_SHARE: u8 = 0x03;
 /// Standalone tag for [`FeldmanCommitment`].
 pub const TAG_FELDMAN_COMMITMENT: u8 = 0x04;
 /// Standalone tag for [`ParticipantRegistry`].
 pub const TAG_PARTICIPANT_REGISTRY: u8 = 0x05;
 /// Standalone tag for [`DkgConfig`].
 pub const TAG_DKG_CONFIG: u8 = 0x06;
-/// Protocol broadcast tag for [`DealerMessage`].
-pub const TAG_DEALER_MESSAGE: u8 = 0x07;
-
-/// Maximum accepted byte length of a dealer's proof.
-pub const MAX_DEALER_PROOF_BYTES: usize = 16 * 1024 * 1024;
-
 /// Coarse allocation ceiling for one trusted-persistence collection.
 #[cfg(any(feature = "serde", feature = "miden-serde"))]
 const MAX_PERSISTED_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
@@ -274,43 +266,6 @@ impl WireDecode for TranscriptRoot {
     }
 }
 
-impl<G: GoldenGroup> WireEncode for EncryptedShare<G> {
-    fn write_wire(&self, out: &mut Vec<u8>) {
-        write_element::<G>(out, &self.pad_commitment);
-        write_scalar::<G>(out, &self.encrypted_share);
-    }
-}
-
-impl<G> WireDecode for EncryptedShare<G>
-where
-    G: GoldenGroup,
-{
-    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
-        Ok(Self {
-            pad_commitment: read_element::<G>(reader)?,
-            encrypted_share: read_scalar::<G>(reader)?,
-        })
-    }
-}
-
-impl<G> WireMessage for EncryptedShare<G>
-where
-    G: GoldenGroup,
-{
-    const TAG: u8 = TAG_ENCRYPTED_SHARE;
-    const CODEC_ID: &'static str = "encrypted-share-v2";
-
-    fn write_wire_context(out: &mut Vec<u8>) {
-        write_context_field(out, Self::CODEC_ID.as_bytes());
-        write_context_field(out, G::BACKEND_ID.as_bytes());
-    }
-
-    fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
-        expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
-        expect_context_field(reader, G::BACKEND_ID.as_bytes())
-    }
-}
-
 impl WireEncode for DkgInstanceKind {
     fn write_wire(&self, out: &mut Vec<u8>) {
         out.push(match self {
@@ -327,51 +282,6 @@ impl WireDecode for DkgInstanceKind {
             1 => Ok(Self::Zero),
             _ => Err(Error::InvalidEncoding),
         }
-    }
-}
-
-impl<G: GoldenGroup> WireEncode for DealingBody<G> {
-    fn write_wire(&self, out: &mut Vec<u8>) {
-        self.nonce.write_wire(out);
-        self.commitment.write_wire(out);
-        write_len(out, self.encrypted_shares.len());
-        for (receiver, encrypted_share) in &self.encrypted_shares {
-            receiver.write_wire(out);
-            encrypted_share.write_wire(out);
-        }
-    }
-
-    fn wire_size_hint(&self) -> usize {
-        let commitment_points =
-            self.commitment.threshold() - 1 + usize::from(self.commitment.constant().is_some());
-        let commitment_len = 1 + 8 + commitment_points * G::ELEMENT_REPR_BYTES;
-        let encrypted_share_len = 4 + G::ELEMENT_REPR_BYTES + G::Scalar::REPR_BYTES;
-        32 + commitment_len + 8 + self.encrypted_shares.len() * encrypted_share_len
-    }
-}
-
-impl<G> WireDecode for DealingBody<G>
-where
-    G: GoldenGroup,
-{
-    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
-        let nonce = DealerMessageNonce::read_wire(reader)?;
-        let commitment = FeldmanCommitment::<G>::read_wire(reader)?;
-        let len = reader.read_len()?;
-        let encrypted_share_len = 4 + G::ELEMENT_REPR_BYTES + G::Scalar::REPR_BYTES;
-        reader.ensure_remaining_items(len, encrypted_share_len)?;
-        let mut encrypted_shares = BTreeMap::new();
-        let mut last = None;
-        for _ in 0..len {
-            let receiver = ParticipantIndex::read_wire(reader)?;
-            ensure_increasing(&mut last, receiver)?;
-            encrypted_shares.insert(receiver, EncryptedShare::<G>::read_wire(reader)?);
-        }
-        Ok(Self {
-            nonce,
-            commitment,
-            encrypted_shares,
-        })
     }
 }
 
@@ -533,80 +443,6 @@ where
     }
 }
 
-impl<G: GoldenGroup> WireEncode for DealerMessage<G> {
-    fn write_wire(&self, out: &mut Vec<u8>) {
-        self.configuration_root.write_wire(out);
-        self.dealer.write_wire(out);
-        write_len(out, self.dealings.len());
-        for dealing in &self.dealings {
-            dealing.write_wire(out);
-        }
-        write_len(out, self.proof.len());
-        out.extend_from_slice(&self.proof);
-    }
-
-    fn wire_size_hint(&self) -> usize {
-        32 // configuration_root
-            + 4 // dealer
-            + 8 // dealings length
-            + self
-                .dealings
-                .iter()
-                .map(WireEncode::wire_size_hint)
-                .sum::<usize>()
-            + 8 + self.proof.len() // proof
-    }
-}
-
-impl<G> WireDecode for DealerMessage<G>
-where
-    G: GoldenGroup,
-{
-    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
-        let configuration_root = TranscriptRoot::read_wire(reader)?;
-        let dealer = ParticipantIndex::read_wire(reader)?;
-        let len = reader.read_len()?;
-        if len == 0 {
-            return Err(Error::InvalidEncoding);
-        }
-        let minimum_dealing_len = 32 + 1 + 8 + 8;
-        reader.ensure_remaining_items(len, minimum_dealing_len)?;
-        let mut dealings = Vec::with_capacity(len);
-        for _ in 0..len {
-            dealings.push(DealingBody::<G>::read_wire(reader)?);
-        }
-        let proof_len = reader.read_len()?;
-        if proof_len > MAX_DEALER_PROOF_BYTES {
-            return Err(Error::InvalidEncoding);
-        }
-        let proof = reader.read_exact(proof_len)?.to_vec();
-        Ok(Self {
-            configuration_root,
-            dealer,
-            dealings,
-            proof,
-        })
-    }
-}
-
-impl<G> WireMessage for DealerMessage<G>
-where
-    G: GoldenGroup,
-{
-    const TAG: u8 = TAG_DEALER_MESSAGE;
-    const CODEC_ID: &'static str = "dealer-message-v4";
-
-    fn write_wire_context(out: &mut Vec<u8>) {
-        write_context_field(out, Self::CODEC_ID.as_bytes());
-        write_context_field(out, G::BACKEND_ID.as_bytes());
-    }
-
-    fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
-        expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
-        expect_context_field(reader, G::BACKEND_ID.as_bytes())
-    }
-}
-
 #[cfg(feature = "miden-serde")]
 impl Serializable for SessionId {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
@@ -701,32 +537,6 @@ impl Serializable for DealerMessageNonce {
 
 #[cfg(feature = "miden-serde")]
 impl Deserializable for DealerMessageNonce {
-    fn read_from<R: ByteReader>(
-        source: &mut R,
-    ) -> core::result::Result<Self, DeserializationError> {
-        read_miden_wire(source)
-    }
-}
-
-#[cfg(feature = "miden-serde")]
-impl<G> Serializable for EncryptedShare<G>
-where
-    G: GoldenGroup,
-{
-    fn write_into<W: ByteWriter>(&self, target: &mut W) {
-        write_miden_wire(self, target);
-    }
-
-    fn get_size_hint(&self) -> usize {
-        miden_wire_size_hint(self)
-    }
-}
-
-#[cfg(feature = "miden-serde")]
-impl<G> Deserializable for EncryptedShare<G>
-where
-    G: GoldenGroup,
-{
     fn read_from<R: ByteReader>(
         source: &mut R,
     ) -> core::result::Result<Self, DeserializationError> {
@@ -1012,32 +822,6 @@ where
 
     fn min_serialized_size() -> usize {
         4 + 32 + 1 + <DkgInstanceOutput<G> as Deserializable>::min_serialized_size()
-    }
-}
-
-#[cfg(feature = "miden-serde")]
-impl<G> Serializable for DealerMessage<G>
-where
-    G: GoldenGroup,
-{
-    fn write_into<W: ByteWriter>(&self, target: &mut W) {
-        write_miden_wire(self, target);
-    }
-
-    fn get_size_hint(&self) -> usize {
-        miden_wire_size_hint(self)
-    }
-}
-
-#[cfg(feature = "miden-serde")]
-impl<G> Deserializable for DealerMessage<G>
-where
-    G: GoldenGroup,
-{
-    fn read_from<R: ByteReader>(
-        source: &mut R,
-    ) -> core::result::Result<Self, DeserializationError> {
-        read_miden_wire(source)
     }
 }
 
@@ -1864,26 +1648,6 @@ impl<'de> Deserialize<'de> for DealerMessageNonce {
 }
 
 #[cfg(feature = "serde")]
-impl<G> Serialize for EncryptedShare<G>
-where
-    G: GoldenGroup,
-{
-    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
-        serialize_wire(self, serializer)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de, G> Deserialize<'de> for EncryptedShare<G>
-where
-    G: GoldenGroup,
-{
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
-        deserialize_wire(deserializer)
-    }
-}
-
-#[cfg(feature = "serde")]
 impl<G> Serialize for FeldmanCommitment<G>
 where
     G: GoldenGroup,
@@ -2003,26 +1767,6 @@ where
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
         deserializer.deserialize_tuple(3, DkgOutputVisitor::<G>(PhantomData))
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<G> Serialize for DealerMessage<G>
-where
-    G: GoldenGroup,
-{
-    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
-        serialize_wire(self, serializer)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de, G> Deserialize<'de> for DealerMessage<G>
-where
-    G: GoldenGroup,
-{
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
-        deserialize_wire(deserializer)
     }
 }
 
@@ -2349,46 +2093,6 @@ mod batch_tests {
             .is_err());
     }
 
-    fn encrypted_share(pad: u64, encrypted: u64) -> EncryptedShare<TinyGroup> {
-        EncryptedShare {
-            pad_commitment: element(pad),
-            encrypted_share: scalar(encrypted),
-        }
-    }
-
-    fn body(nonce: u8, constant: Option<u64>, receiver_offset: u64) -> DealingBody<TinyGroup> {
-        let commitment = match constant {
-            Some(constant) => {
-                FeldmanCommitment::from_coefficients(vec![element(constant), element(constant + 1)])
-                    .unwrap()
-            }
-            None => FeldmanCommitment::from_zero_tail(Vec::new()),
-        };
-        DealingBody {
-            nonce: DealerMessageNonce([nonce; 32]),
-            commitment,
-            encrypted_shares: BTreeMap::from([
-                (
-                    idx(2),
-                    encrypted_share(receiver_offset, receiver_offset + 10),
-                ),
-                (
-                    idx(3),
-                    encrypted_share(receiver_offset + 1, receiver_offset + 11),
-                ),
-            ]),
-        }
-    }
-
-    fn dealer_message() -> DealerMessage<TinyGroup> {
-        DealerMessage {
-            configuration_root: config(vec![DkgInstanceKind::Random, DkgInstanceKind::Zero]).root(),
-            dealer: idx(1),
-            dealings: vec![body(0x11, Some(4), 20), body(0x22, None, 40)],
-            proof: vec![0, 0xff, 7, 0, 9],
-        }
-    }
-
     fn standalone_prefix<T: WireMessage>() -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
@@ -2422,34 +2126,6 @@ mod batch_tests {
 
         assert_eq!(
             from_wire_bytes::<SessionId>(&bytes).unwrap_err(),
-            Error::InvalidEncoding
-        );
-    }
-
-    #[test]
-    fn encrypted_share_round_trips() {
-        let share = EncryptedShare::<TinyGroup> {
-            pad_commitment: TinyScalar::from_u64(2).unwrap(),
-            encrypted_share: TinyScalar::from_u64(4).unwrap(),
-        };
-
-        let decoded = from_wire_bytes::<EncryptedShare<TinyGroup>>(&to_wire_bytes(&share)).unwrap();
-
-        assert_eq!(decoded, share);
-    }
-
-    #[test]
-    fn encrypted_share_rejects_noncanonical_scalar() {
-        let share = EncryptedShare::<TinyGroup> {
-            pad_commitment: TinyScalar::from_u64(2).unwrap(),
-            encrypted_share: TinyScalar::from_u64(4).unwrap(),
-        };
-        let mut bytes = to_wire_bytes(&share);
-        let last = bytes.len() - 1;
-        bytes[last] = 97;
-
-        assert_eq!(
-            from_wire_bytes::<EncryptedShare<TinyGroup>>(&bytes).unwrap_err(),
             Error::InvalidEncoding
         );
     }
@@ -2516,10 +2192,6 @@ mod batch_tests {
             <DkgConfig<TinyGroup> as WireMessage>::CODEC_ID,
             "dkg-config-v3"
         );
-        assert_eq!(
-            <DealerMessage<TinyGroup> as WireMessage>::CODEC_ID,
-            "dealer-message-v4"
-        );
 
         for kinds in [
             vec![DkgInstanceKind::Random],
@@ -2554,31 +2226,6 @@ mod batch_tests {
             from_wire_bytes::<DkgConfig<TinyGroup>>(&encoded).unwrap(),
             expected
         );
-    }
-
-    #[test]
-    fn dealer_message_preserves_body_order_proof_bytes_and_derived_root() {
-        let message = dealer_message();
-        let encoded = to_wire_bytes(&message);
-        let decoded = from_wire_bytes::<DealerMessage<TinyGroup>>(&encoded).unwrap();
-        assert_eq!(decoded, message);
-        assert_eq!(decoded.dealings[0].nonce, DealerMessageNonce([0x11; 32]));
-        assert_eq!(decoded.dealings[1].nonce, DealerMessageNonce([0x22; 32]));
-        assert_eq!(decoded.proof, [0, 0xff, 7, 0, 9]);
-        assert_eq!(decoded.root(), message.root());
-
-        // The nested encoding contains exactly the canonical fields. There is
-        // no serialized claimed dealer-message root between body data and proof.
-        let mut expected_nested = Vec::new();
-        message.configuration_root.write_wire(&mut expected_nested);
-        message.dealer.write_wire(&mut expected_nested);
-        write_len(&mut expected_nested, message.dealings.len());
-        for dealing in &message.dealings {
-            dealing.write_wire(&mut expected_nested);
-        }
-        write_len(&mut expected_nested, message.proof.len());
-        expected_nested.extend_from_slice(&message.proof);
-        assert_eq!(encoded, wrap::<DealerMessage<TinyGroup>>(&expected_nested));
     }
 
     #[test]
@@ -2637,7 +2284,7 @@ mod batch_tests {
         );
 
         let mut wrong_tag = bytes.clone();
-        wrong_tag[MAGIC.len()] = TAG_DEALER_MESSAGE;
+        wrong_tag[MAGIC.len()] = TAG_SESSION_ID;
         assert_eq!(
             from_wire_bytes::<DkgConfig<TinyGroup>>(&wrong_tag).unwrap_err(),
             Error::InvalidEncoding
@@ -2700,51 +2347,6 @@ mod batch_tests {
         );
     }
 
-    #[test]
-    fn dealer_message_rejects_zero_or_impossible_dealing_dimensions() {
-        let message = dealer_message();
-        let payload = standalone_prefix::<DealerMessage<TinyGroup>>().len();
-        let dealing_count_offset = payload + 32 + 4;
-
-        let mut zero = Vec::new();
-        message.configuration_root.write_wire(&mut zero);
-        message.dealer.write_wire(&mut zero);
-        write_len(&mut zero, 0);
-        write_len(&mut zero, 0);
-        assert_eq!(
-            from_wire_bytes::<DealerMessage<TinyGroup>>(&wrap::<DealerMessage<TinyGroup>>(&zero))
-                .unwrap_err(),
-            Error::InvalidEncoding
-        );
-
-        let mut hostile = to_wire_bytes(&message);
-        hostile[dealing_count_offset..dealing_count_offset + 8]
-            .copy_from_slice(&u64::MAX.to_be_bytes());
-        assert_eq!(
-            from_wire_bytes::<DealerMessage<TinyGroup>>(&hostile).unwrap_err(),
-            Error::InvalidEncoding
-        );
-    }
-
-    #[test]
-    fn dealer_message_rejects_oversized_proof_before_reading_it() {
-        let message = dealer_message();
-        let mut nested = Vec::new();
-        message.configuration_root.write_wire(&mut nested);
-        message.dealer.write_wire(&mut nested);
-        write_len(&mut nested, message.dealings.len());
-        for dealing in &message.dealings {
-            dealing.write_wire(&mut nested);
-        }
-        write_len(&mut nested, MAX_DEALER_PROOF_BYTES + 1);
-
-        assert_eq!(
-            from_wire_bytes::<DealerMessage<TinyGroup>>(&wrap::<DealerMessage<TinyGroup>>(&nested))
-                .unwrap_err(),
-            Error::InvalidEncoding
-        );
-    }
-
     #[cfg(feature = "serde")]
     #[test]
     fn serde_byte_sequence_ignores_hostile_size_hint() {
@@ -2765,50 +2367,10 @@ mod batch_tests {
     }
 
     #[test]
-    fn malformed_nested_body_dimensions_and_receiver_order_are_rejected() {
-        let message = dealer_message();
-        let mut nested = Vec::new();
-        message.configuration_root.write_wire(&mut nested);
-        message.dealer.write_wire(&mut nested);
-        write_len(&mut nested, 1);
-        DealerMessageNonce([1; 32]).write_wire(&mut nested);
-        nested.push(2);
-        write_len(&mut nested, 0);
-        write_len(&mut nested, 0);
-        assert_eq!(
-            from_wire_bytes::<DealerMessage<TinyGroup>>(&wrap::<DealerMessage<TinyGroup>>(&nested))
-                .unwrap_err(),
-            Error::InvalidEncoding
-        );
-
-        let mut nested = Vec::new();
-        message.configuration_root.write_wire(&mut nested);
-        message.dealer.write_wire(&mut nested);
-        write_len(&mut nested, 1);
-        DealerMessageNonce([1; 32]).write_wire(&mut nested);
-        FeldmanCommitment::<TinyGroup>::from_coefficients(vec![element(4)])
-            .unwrap()
-            .write_wire(&mut nested);
-        write_len(&mut nested, 2);
-        idx(3).write_wire(&mut nested);
-        encrypted_share(1, 2).write_wire(&mut nested);
-        idx(2).write_wire(&mut nested);
-        encrypted_share(2, 3).write_wire(&mut nested);
-        write_len(&mut nested, 0);
-        assert!(matches!(
-            from_wire_bytes::<DealerMessage<TinyGroup>>(&wrap::<DealerMessage<TinyGroup>>(&nested)),
-            Err(Error::DuplicateParticipantIndex(2))
-        ));
-    }
-
-    #[test]
     fn aggregate_wire_values_reject_every_truncation() {
         assert_all_truncations_rejected::<DkgConfig<TinyGroup>>(&to_wire_bytes(&config(vec![
             DkgInstanceKind::Random,
             DkgInstanceKind::Zero,
         ])));
-        assert_all_truncations_rejected::<DealerMessage<TinyGroup>>(&to_wire_bytes(
-            &dealer_message(),
-        ));
     }
 }

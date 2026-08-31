@@ -2,11 +2,13 @@
 
 use core::marker::PhantomData;
 
-use golden_core::wire::MAX_DEALER_PROOF_BYTES;
-use golden_core::{Error, GoldenGroup, GoldenScalar, Result};
+use golden_core::{max_dealer_message_bytes, Error, Result};
+#[cfg(test)]
+use golden_core::{GoldenGroup, GoldenScalar};
 use merlin::Transcript;
 
 const PROOF_ID_LEN_BYTES: usize = 4;
+const MAX_PROOF_STREAM_BYTES: usize = max_dealer_message_bytes();
 #[cfg(any(test, feature = "halo2curves-secp256k1"))]
 const NESTED_LEN_BYTES: usize = 8;
 
@@ -46,8 +48,10 @@ pub(crate) trait ProofStreamCurve {
 }
 
 /// Proof-stream adapter for a [`GoldenGroup`].
+#[cfg(test)]
 pub(crate) struct GoldenCurve<G: GoldenGroup>(PhantomData<G>);
 
+#[cfg(test)]
 impl<G> ProofStreamCurve for GoldenCurve<G>
 where
     G: GoldenGroup,
@@ -279,7 +283,7 @@ impl ProverProofStream {
 
     /// Finishes proving after enforcing the protocol's dealer-proof byte limit.
     pub(crate) fn finish_checked(self) -> Result<Vec<u8>> {
-        if self.proof.len() > MAX_DEALER_PROOF_BYTES {
+        if self.proof.len() > MAX_PROOF_STREAM_BYTES {
             return Err(stream_error());
         }
         Ok(self.proof)
@@ -302,7 +306,7 @@ pub(crate) struct VerifierProofStream<'proof> {
 impl<'proof> VerifierProofStream<'proof> {
     /// Starts a verifier stream after validating the exact proof-ID header.
     pub(crate) fn new(proof_id: &'static [u8], proof: &'proof [u8]) -> Result<Self> {
-        if proof.len() > MAX_DEALER_PROOF_BYTES {
+        if proof.len() > MAX_PROOF_STREAM_BYTES {
             return Err(stream_error());
         }
         let length_bytes: [u8; PROOF_ID_LEN_BYTES] = proof
@@ -798,11 +802,11 @@ mod tests {
 
     #[test]
     fn proof_stream_enforces_dealer_proof_byte_limit() {
-        let oversized = vec![0u8; MAX_DEALER_PROOF_BYTES + 1];
+        let oversized = vec![0u8; MAX_PROOF_STREAM_BYTES + 1];
         assert_rejected(VerifierProofStream::new(PROOF_ID, &oversized));
 
         let mut prover = ProverProofStream::new(PROOF_ID).unwrap();
-        prover.proof.resize(MAX_DEALER_PROOF_BYTES + 1, 0);
+        prover.proof.resize(MAX_PROOF_STREAM_BYTES + 1, 0);
         assert_rejected(prover.finish_checked());
     }
 

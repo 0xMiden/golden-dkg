@@ -1,8 +1,8 @@
 //! Table 5 runtime columns: per-participant Round 0 and Round 1 cost for an
-//! n-of-n DKG over Secp256k1/Secq256k1.
+//! `(n - 1)`-of-`n` DKG over Secp256k1/Secq256k1.
 //!
-//! - `paper/table-5/Secp256k1-Secq256k1/round-0` times `create_dealing` for
-//!   one dealer at participant count `n`. It includes the batched eVRF prove
+//! - `paper/table-5/Secp256k1-Secq256k1/round-0` times free `deal` for one
+//!   dealer at participant count `n`. It includes the batched eVRF prove
 //!   over `n - 1` receivers, which dominates.
 //! - `paper/table-5/Secp256k1-Secq256k1/round-1` pre-builds all `n` dealings
 //!   outside the timed region, then times `complete` for one receiver. This is one
@@ -26,11 +26,10 @@
 //! separate diagnostic measurements. `GOLDEN_TABLE5_N_VALUES` may select a
 //! comma-separated row subset.
 //!
-//! Setup (building `n` proofs for Round 1) runs inside `bench_with_input`'s
-//! routine body so criterion's regex filter can skip the expensive setup
-//! for benchmarks the user did not select. It is backed by the on-disk
-//! fixture cache in `support_dir/fixture_cache.rs`, so only the first run
-//! for a given `(n, seed)` pays the full ~100x-Round-0 cost.
+//! Setup restores `n` checked-in dealer messages inside `bench_with_input`'s
+//! routine body so criterion's regex filter can skip unselected rows. A missing
+//! verification sidecar triggers one untimed `complete`; proof construction is
+//! reserved for the explicit `warm_bench_fixtures` regeneration command.
 
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
@@ -41,13 +40,10 @@ mod support;
 
 use codspeed_criterion_compat as criterion;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode};
-use golden_core::{complete_legacy as complete, create_dealing};
-use golden_evrf::paper::secp_secq::SecpSecqBackend;
-use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
+use golden_core::{complete, deal};
+use golden_evrf::paper::secp_secq::SecpSecqBulletproofs;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-use support::{
-    build_config, identity_secret, idx, legacy_beta, table5_n_values, BENCH_SEED, SLOW_SAMPLE_SIZE,
-};
+use support::{build_config, identity_secret, idx, table5_n_values, BENCH_SEED, SLOW_SAMPLE_SIZE};
 
 /// Per-participant Round 0: one dealer builds its dealing.
 fn dkg_round0(c: &mut Criterion) {
@@ -56,22 +52,16 @@ fn dkg_round0(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     for n in table5_n_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
-            // n-of-n: threshold = n - 1, matching Table 5. Setup is cheap
+            // (n - 1)-of-n: threshold = n - 1. Setup is cheap
             // (one config); the timed region pays the prove cost per iter.
             let config = build_config(n, n - 1);
+            let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
             let dealer = idx(1);
             let secret = identity_secret(dealer);
             b.iter_batched(
                 || ChaCha20Rng::from_seed(BENCH_SEED),
                 |mut rng| {
-                    create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                        dealer,
-                        &secret,
-                        &config,
-                        &legacy_beta(),
-                        &mut rng,
-                    )
-                    .unwrap();
+                    deal(&proof_system, &config, dealer, &secret, &mut rng).unwrap();
                 },
                 BatchSize::SmallInput,
             )
@@ -88,34 +78,33 @@ fn dkg_round1(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     for n in table5_n_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
-            // Expensive setup: build all `n` dealer messages. Backed by the
-            // fixture cache (see `support_dir/fixture_cache.rs`), so this is
-            // only "expensive" on the first run for a given `(n, seed)`.
-            // Runs only when criterion selects this bench.
+            // Restore all `n` checked-in dealer messages only when criterion
+            // selects this row. A missing sidecar causes one untimed
+            // completion/verification, never proof regeneration.
             let config = build_config(n, n - 1);
+            let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
             let receiver = idx(n as u32);
             let secret = identity_secret(receiver);
-            let (own_dealing, peer_dealings) = support::cached_round1_setup(&config, receiver);
+            let (own_dealing, peer_dealings) =
+                support::cached_round1_setup(&config, &proof_system, receiver);
             // Sanity: receiver must complete successfully before timing.
-            complete::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                receiver,
+            complete(
+                &proof_system,
+                &config,
                 &secret,
                 &own_dealing,
                 &peer_dealings,
-                &config,
-                &legacy_beta(),
             )
             .unwrap();
             b.iter_batched(
                 || (),
                 |_| {
-                    complete::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                        receiver,
+                    complete(
+                        &proof_system,
+                        &config,
                         &secret,
                         &own_dealing,
                         &peer_dealings,
-                        &config,
-                        &legacy_beta(),
                     )
                     .unwrap();
                 },
@@ -136,30 +125,25 @@ fn dkg_total(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     for n in table5_n_values() {
         let config = build_config(n, n - 1);
+        let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
         let participant = idx(n as u32);
         let secret = identity_secret(participant);
-        let mut peer_dealings = support::cached_dealer_messages(&config);
+        let mut peer_dealings = support::cached_dealer_bytes(&config, &proof_system);
         peer_dealings.remove(&participant);
+        let peer_dealings: Vec<_> = peer_dealings.into_iter().collect();
 
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter_batched(
                 || ChaCha20Rng::from_seed(BENCH_SEED),
                 |mut rng| {
-                    let own_dealing = create_dealing::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                        participant,
-                        &secret,
+                    let own_dealing =
+                        deal(&proof_system, &config, participant, &secret, &mut rng).unwrap();
+                    complete(
+                        &proof_system,
                         &config,
-                        &legacy_beta(),
-                        &mut rng,
-                    )
-                    .unwrap();
-                    complete::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                        participant,
                         &secret,
                         &own_dealing,
                         &peer_dealings,
-                        &config,
-                        &legacy_beta(),
                     )
                     .unwrap();
                 },

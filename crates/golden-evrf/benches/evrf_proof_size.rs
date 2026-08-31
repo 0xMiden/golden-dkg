@@ -2,10 +2,11 @@
 //! ("|pi|") and the concatenated size of `n_e` independent proofs ("n_e
 //! proofs"), reported via criterion's `Throughput::Bytes`.
 //!
-//! Proof bytes come from the batch-native `DealerMessage` values in the
-//! checked-in fixture cache. This measures the actual proof representation,
-//! including its dealing-batch shape and constant-term policy, without running
-//! the prover eagerly, so the bench can report all four paper rows.
+//! Proof lengths are captured from `DealerProofSystem::prove` while producing
+//! the checked-in opaque-message fixtures. Fixture loading binds each recorded
+//! length and digest to the proof suffix core observes during `complete`, so
+//! this still measures the actual production proof representation without
+//! exposing a parsed dealer message.
 
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
@@ -15,24 +16,27 @@
 mod support;
 
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
+use golden_evrf::paper::secp_secq::SecpSecqBulletproofs;
 use support::{build_config, idx, table4_ne_values, SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD};
 
 /// Wire byte count of one dealer's batch-native proof covering `n_e` receivers.
 fn one_dealer_proof_bytes(n_e: usize) -> usize {
     let config = build_config(n_e + 1, TABLE4_THRESHOLD);
-    let messages = support::cached_dealer_messages(&config);
-    messages[&idx(1)].proof.len()
+    let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
+    let proof_lengths = support::cached_proof_lengths(&config, &proof_system);
+    proof_lengths[&idx(1)]
 }
 
 /// Total wire byte count of `n_e` independent dealer proofs.
 fn n_independent_proof_byte_sizes_total(n_e: usize) -> usize {
     let n = n_e + 1;
     let config = build_config(n, TABLE4_THRESHOLD);
+    let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
     let receiver = idx(n as u32);
-    let mut messages = support::cached_dealer_messages(&config);
-    messages.remove(&receiver);
-    assert_eq!(messages.len(), n_e);
-    messages.values().map(|message| message.proof.len()).sum()
+    let mut proof_lengths = support::cached_proof_lengths(&config, &proof_system);
+    proof_lengths.remove(&receiver);
+    assert_eq!(proof_lengths.len(), n_e);
+    proof_lengths.values().sum()
 }
 
 fn evrf_proof_size_single(c: &mut Criterion) {

@@ -4,8 +4,8 @@
 
 Rust workspace for distributed key generation, verifiable randomness, and
 context bound threshold encryption over a generic group abstraction. The
-current tree implements Golden DKG, EHTDH1, a Secp256k1/Secq256k1 eVRF
-backend, and the Bulletproofs R1CS layer used by that backend.
+current tree implements Golden DKG, EHTDH1, a Secp256k1/Secq256k1 Main Golden
+proof system, and its Bulletproofs R1CS layer.
 
 The two protocol implementations follow these papers.
 
@@ -18,85 +18,86 @@ The two protocol implementations follow these papers.
 
 The DKG API is batch native. A configuration may request one random sharing,
 one zero sharing, or an arbitrary nonempty ordered mixture of both. Each dealer
-broadcasts one message containing every configured dealing and one joint eVRF
-proof. Completion verifies and aggregates the whole batch atomically, returning
-outputs in configuration order only when every dealing succeeds.
+uses `deal` once and broadcasts only the resulting opaque bytes. `complete`
+parses, validates, verifies, decrypts, and aggregates the whole candidate set
+atomically, returning ordered outputs only when every dealing succeeds.
 
 The workspace has six crates. All crates are published together and require
 Rust 1.93 or later.
 
 * `golden-core`: batch-native Shamir secret sharing, Feldman commitments, DKG
-  messages, transcript binding, and the curve-agnostic `EvrfProofBackend`
-  trait that connects the DKG to a concrete proof system.
-* `golden-evrf`: the eVRF proof backends. Includes a Secp256k1/Secq256k1
-  R1CS backend that proves the full Golden eVRF relation end-to-end via
-  `bulletproofs-cycle`, plus a share-opening prototype backend used for
-  plumbing tests.
+  configuration, opaque dealer messages, transcript binding, and the stateful
+  `DealerProofSystem` seam used by `deal` and `complete`.
+* `golden-evrf`: `SecpSecqBulletproofs`, which proves the full Main Golden
+  relation end-to-end via `bulletproofs-cycle`, plus explicit reusable and
+  persistable `SecpSecqPreparedGenerators`. A revealed-witness implementation
+  exists only behind the non-default `insecure-revealed-witness` test feature.
 * `golden-rustcrypto`: P-256 and secp256k1 `GoldenGroup` adapters backed by
-  the RustCrypto crates, used by the prototype backend and tests.
+  the RustCrypto crates.
 * `golden-ehtdh1`: context-bound threshold encryption over Golden DKG output.
-  It binds each decryption share to the setup, ciphertext, and caller context.
+  Its setup bridge maps exactly `[Random, Zero]` to the decryption and context
+  sharings, requires a nonidentity decryption aggregate key and identity
+  context aggregate key, and binds the configuration and completion roots into
+  the setup context used to bind each share to its ciphertext and caller
+  context.
 * `bulletproofs-cycle`: a minimal fork of `zkcrypto/bulletproofs` 5.0.1
-  with the Ristretto backend replaced by a `Cycle` trait over zkcrypto
+  with the Ristretto group replaced by a `Cycle` trait over zkcrypto
   `group`/`ff`. Range-proof, MPC, and serialization paths were stripped;
   only the R1CS prover/verifier and inner-product proof remain. The
   `bulletproofs-compat` feature opts into upstream Pedersen-generators
   domain separation for byte-parity testing against `zkcrypto/bulletproofs`.
 * `golden-halo2curves`: `Cycle` impls for the `halo2curves`
   Secp256k1/Secq256k1 curve cycle, plus the Secp256k1 `GoldenGroup`
-  adapter used by the Secp/Secq eVRF backend.
+  adapter used by the Secp/Secq proof system.
+
+## Security model
+
+Main Golden targets static corruptions of at most `t - 1` participants in the
+ideal eVRF/ZK hybrid and random-oracle setting, with a consistent authenticated
+registry/setup, authenticated broadcast semantics, and the paper's
+additive-bias key-generation functionality. This implementation does not claim
+adaptive security, fully unbiased key generation, or security with aborts.
+The authenticated deployment process admitting a registry entry is assumed to
+establish knowledge of its identity secret; core validates and binds the public
+key but carries no separate proof-of-knowledge artifact. The protocol-wide
+beta is sampled without bias in the full curve base field from the fixed ASCII
+string `golden-dkg/main-golden-beta/v1` under explicit domain-separated
+random-oracle framing. It may be zero and is neither caller- nor
+session/configuration-sampled setup state.
+
+Arbitrary ordered mixtures of Random and Zero sharings are a repository
+extension. They are not attributed directly to Golden Theorem 3; a dedicated
+composition review remains a release/security-claim gate and does not reopen
+the fixed-beta instantiation.
+
+EHTDH1 has its own assumptions: static corruption of fewer than the threshold
+participants, the random-oracle model, the LOMDH assumption, and semantic
+security of the selected symmetric cipher. It does not claim
+adaptive-corruption security, and Golden setup retains the separate assumptions
+above.
+
+Prepared generators and ordinary Serde/Miden DKG values are trusted application
+persistence, never dealer-message wire formats. Restoration validates their
+structure and canonical encodings; the deployment must authenticate the bytes
+before restoration.
 
 ## Performance
 
-For performance sensitive workloads, one can use the `optimized` profile when compiling.
+For performance-sensitive workloads, use the `optimized` profile. The
+Criterion/CodSpeed suite mirrors the shapes of Tables 4 and 5 from the Golden
+DKG paper over the Secp256k1/Secq256k1 cycle:
 
-The following tables replicate Tables 4 and 5 from the Golden DKG paper.
-All measurements are **real wall-clock timings** (criterion, flat sampling,
-10 samples) over the **Secp256k1/Secq256k1 curve cycle**, not the paper's
-zkalc estimates for BLS12-381.  The eVRF proof backend uses
-`bulletproofs-cycle` R1CS over the halo2curves Secp256k1/Secq256k1 cycle.
+* Table 4 targets one joint dealer proof over `n_e` receivers and measures
+  `DealerProofSystem::{prove, verify, verify_batch}` plus the exact proof suffix
+  produced by the opaque workflow.
+* Table 5 targets `(n - 1)`-of-`n` configurations and measures `deal`,
+  `complete`, their per-participant total, and opaque broadcast size. Prepared
+  generators and peer-dealing construction stay outside the timed regions.
 
-Benchmarked on an **AMD Ryzen 9 9950X** (16 cores / 32 threads, up to
-5.76 GHz) with the `optimized` profile (`lto = "thin"`, `codegen-units = 1`).
-
-### Table 4 — eVRF performance (Secp256k1/Secq256k1)
-
-`n_e` is the number of receiver statements covered by one batched proof.
-“Prover” times the Bulletproofs R1CS prover only.  “Verifier” times a
-single `evrf_batched_verify`.  “Batch verification” times `verify_dealings`
-across `n_e` independent dealer messages (the receiver's Round 1 work).
-`|π|` is the wire size of one batched proof; “n_e proofs” is the
-concatenated size of `n_e` independent proofs.
-
-| n_e | Prover     | Verifier  | Batch verification | \|π\| (single) | n_e proofs (concat) |
-|-----|------------|-----------|--------------------|----------------|---------------------|
-| 1   | 119 ms     | 15.7 ms   | 16.1 ms            | 1.4 kb         | 1.4 kb              |
-| 9   | 885 ms     | 103 ms    | 572 ms             | 1.6 kb         | 14.3 kb             |
-| 49  | 3.12 s     | 420 ms    | 14.8 s             | 1.7 kb         | 84.2 kb             |
-| 99  | 7.33 s     | 846 ms    | 59.2 s             | 1.8 kb         | 176.6 kb            |
-
-Every batched-eVRF proof is single-phase (the relation never defers
-constraints via `specify_randomized_constraints`), so its wire length is an
-exact function of the padded circuit size alone — the same
-next-power-of-two step that sizes the Bulletproof generators. `|π|` and
-`n_e proofs` are computed by `BatchedEvrfPublicParams::batched_proof_wire_len`
-without building a proof, and checked byte-for-byte against a real proof in
-`tests/batched_dealer.rs::batched_proof_wire_len_matches_v5_vector`.
-
-### Table 5 — DKG performance (Secp256k1/Secq256k1, n-of-n)
-
-“Round 0” is `create_dealing` for one dealer (includes the batched eVRF
-proof over `n − 1` receivers).  “Round 1” is `complete` for one receiver
-(verify `n` dealings and aggregate the share).  Per-participant runtime is
-Round 0 + Round 1.  Communication is the per-participant bandwidth
-(`n` broadcast messages, one per dealer).
-
-| n   | Round 0  | Round 1  | Per-participant runtime | Comm. (per participant) |
-|-----|----------|----------|------------------------|------------------------|
-| 2   | 120 ms   | 24.6 ms  | 145 ms                 | 3.2 kb                 |
-| 10  | 932 ms   | 788 ms   | 1.72 s                 | 26.3 kb                |
-| 50  | 3.42 s   | 37.9 s   | 41.3 s                 | 342.0 kb               |
-| 100 | 8.12 s   | 246 s    | 255 s                  | 1.2 MB                 |
+The numeric results previously printed here described the removed legacy proof
+framing and static APIs. They were retired with the hard compatibility cut
+rather than being presented as measurements of the new stateful workflow. Run
+the migrated benches (or the CodSpeed workflow) to produce current results.
 
 ## Useful checks
 
@@ -105,6 +106,7 @@ cargo fmt --all --check
 cargo clippy --all --benches --tests --examples --all-features --exclude bulletproofs-cycle -- -D warnings
 cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-ehtdh1/halo2curves-secp256k1,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1
 cargo test --workspace --doc
+cargo run -p golden-evrf --profile optimized --example check_bench_fixtures --features halo2curves-secp256k1,parallel,serde
 ```
 
 ## Licensing

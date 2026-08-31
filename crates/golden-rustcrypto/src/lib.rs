@@ -1,14 +1,14 @@
-//! RustCrypto backends for the Golden DKG and paper eVRF cores.
+//! RustCrypto curve adapters for Golden DKG.
 //!
-//! Each backend is gated behind a feature flag so downstream crates only pay
+//! Each adapter is gated behind a feature flag so downstream crates only pay
 //! for the curves they use:
 //!
 //! - `p256` (NIST P-256): `GoldenGroup`, `GoldenHashToGroup`, and `GoldenCurve`.
-//! - `k256` (secp256k1): the same capabilities as `p256`. The paper eVRF
-//!   backend still targets the Secp/Secq cycle via `golden-halo2curves`; this
-//!   backend remains the reference for comparison tests against that adapter.
+//! - `k256` (secp256k1): the same capabilities as `p256`. The Main Golden proof
+//!   system targets the Secp/Secq cycle via `golden-halo2curves`; this adapter
+//!   remains the reference for cross-adapter conformance tests.
 //!
-//! Every backend wrapper exposes a single pair of `Scalar` / `Element`
+//! Every adapter wrapper exposes a single pair of `Scalar` / `Element`
 //! newtypes that forward to the underlying RustCrypto implementation. The
 //! wrappers exist so the same concrete type can carry `Zeroize`/`Drop`
 //! hygiene and the `ConstantTimeEq` bound that `GoldenGroup` requires.

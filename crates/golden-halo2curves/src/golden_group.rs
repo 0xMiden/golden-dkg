@@ -3,8 +3,9 @@
 //! The DKG layer speaks the `GoldenGroup` trait over a prime-order group. This
 //! module exposes `Secp256k1GoldenGroup`, whose scalar field is the Secp256k1
 //! scalar field `Fq` and whose element type is the Secp256k1 projective group.
-//! The paper eVRF backend in `golden-evrf` consumes this adapter and downcasts
-//! to the concrete `halo2curves` types when it builds the R1CS statement.
+//! The Main Golden proof system in `golden-evrf` consumes this adapter and
+//! downcasts to the concrete `halo2curves` types when it builds the R1CS
+//! statement.
 
 use core::fmt;
 

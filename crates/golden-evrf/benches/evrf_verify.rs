@@ -2,24 +2,17 @@
 //!
 //! Two groups per `n_e`:
 //!
-//! 1. `paper/table-4/Secp256k1-Secq256k1/verifier` runs
-//!    `evrf_batched_verify` on one proof covering `n_e` statements. Compare
-//!    to the paper's "Verifier" column
-//!    (per-proof cost, scales with statements batched inside one proof):
-//!    n_e=1 -> 0.1s, n_e=9 -> 0.5s, n_e=49 -> 2.5s, n_e=99 -> 4.8s.
+//! 1. `paper/table-4/Secp256k1-Secq256k1/verifier` runs the production
+//!    `DealerProofSystem::verify` on one dealer proof covering `n_e`
+//!    receivers.
+//! 2. `paper/table-4/Secp256k1-Secq256k1/batch-verification` runs the
+//!    production optimized `verify_batch` on `n_e` independent dealer
+//!    proofs. A private recording adapter captures the flat proof inputs from
+//!    one successful public `complete`; no parsed message or alternate
+//!    statement builder is exposed.
 //!
-//! 2. `paper/table-4/Secp256k1-Secq256k1/batch-verification` runs the DKG
-//!    receiver's actual Round 1 work over `n_e` independent dealer messages.
-//!    This checks
-//!    all proof equations with one shared MSM. Compare to the paper's "Batch
-//!    Verification" column: 0.6s / 6.7s / 22.1s at n_e = 9 / 49 / 99.
-//!
-//! Setup (proof building) runs inside `bench_with_input`'s routine body so
-//! criterion's regex filter can skip the expensive setup for benchmarks the
-//! user did not select.
-//!
-//! `GOLDEN_TABLE4_NE_VALUES` may select a comma-separated subset for tracked
-//! runs. Local runs use the complete paper row set by default.
+//! Setup runs inside `bench_with_input`'s routine body so criterion's regex
+//! filter can skip expensive setup for benchmarks the user did not select.
 
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
@@ -28,94 +21,76 @@
 #[path = "support_dir/mod.rs"]
 mod support;
 
-use std::collections::BTreeMap;
-
 use codspeed_criterion_compat as criterion;
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, SamplingMode};
-use golden_core::{verify_dealings, DealerMessage, DkgConfig};
-use golden_evrf::paper::secp_secq::{evrf_batched_verify, SecpSecqBackend};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
+use golden_core::{DealerProofRef, DealerProofStatement, DealerProofSystem, DkgConfig};
+use golden_evrf::paper::secp_secq::SecpSecqBulletproofs;
 use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
-use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use support::{
-    build_config, idx, legacy_beta, prove_one_batched, table4_ne_values, BENCH_SEED,
-    SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD,
+    build_config, dealer_proof_fixture, idx, table4_ne_values, SLOW_SAMPLE_SIZE, TABLE4_THRESHOLD,
 };
 
-/// Time `evrf_batched_verify` on one precomputed proof covering `n_e`
-/// statements. The proof is built once inside the routine body (outside the
-/// timed region) so criterion's filter can skip its construction.
 fn evrf_verify_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("paper/table-4/Secp256k1-Secq256k1/verifier");
     group.sample_size(SLOW_SAMPLE_SIZE);
     group.sampling_mode(SamplingMode::Flat);
     for n_e in table4_ne_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
-            // Expensive setup runs once per benchmark invocation, only when
-            // criterion actually selects this benchmark.
-            let (params, statement, proof) = prove_one_batched(n_e);
-            b.iter_batched(
-                || ChaCha20Rng::from_seed(BENCH_SEED),
-                |mut rng| {
-                    evrf_batched_verify(&params, &statement, &proof, &mut rng).unwrap();
-                },
-                BatchSize::SmallInput,
-            )
+            let fixture = dealer_proof_fixture(n_e);
+            b.iter(|| {
+                fixture
+                    .proof_system
+                    .verify(&fixture.config, &fixture.statement, &fixture.proof)
+                    .unwrap();
+            })
         });
     }
     group.finish();
 }
 
-/// Build `n_e` independent dealer messages for an `(n_e + 1)`-participant
-/// DKG (threshold 2). Each dealer broadcasts one batched proof over its `n_e`
-/// peer receivers. The receiver verifies the `n_e` peer messages as one batch.
-/// This is what a real DKG receiver does in Round 1.
-fn build_n_independent_messages(
-    n_e: usize,
-) -> (
-    DkgConfig<Secp256k1GoldenGroup>,
-    BTreeMap<golden_core::ParticipantIndex, DealerMessage<Secp256k1GoldenGroup>>,
-) {
-    let n = n_e + 1;
-    let config = build_config(n, TABLE4_THRESHOLD);
-    let receiver = idx(n as u32);
-    let mut messages = support::cached_dealer_messages(&config);
-    messages.remove(&receiver);
-    assert_eq!(messages.len(), n_e);
-    (config, messages)
+struct BatchVerificationFixture {
+    config: DkgConfig<Secp256k1GoldenGroup>,
+    proof_system: SecpSecqBulletproofs,
+    proofs: Vec<(DealerProofStatement<Secp256k1GoldenGroup>, Vec<u8>)>,
 }
 
-/// Time `verify_dealings` over `n_e` independent dealer messages. This is the
-/// receiver's Round 1 proof check with cross-proof MSM sharing.
+/// Obtain `n_e` independent, canonically ordered dealer proofs through the
+/// same opaque completion workflow a receiver uses in Round 1.
+fn batch_verification_fixture(n_e: usize) -> BatchVerificationFixture {
+    let n = n_e + 1;
+    let config = build_config(n, TABLE4_THRESHOLD);
+    let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
+    let receiver = idx(n as u32);
+    let (own_dealing, peers) = support::cached_round1_setup(&config, &proof_system, receiver);
+    let mut proofs =
+        support::capture_verified_proofs(&proof_system, &config, receiver, &own_dealing, &peers);
+    proofs.retain(|(statement, _)| statement.dealer() != receiver);
+    assert_eq!(proofs.len(), n_e);
+    BatchVerificationFixture {
+        config,
+        proof_system,
+        proofs,
+    }
+}
+
 fn evrf_verify_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("paper/table-4/Secp256k1-Secq256k1/batch-verification");
     group.sample_size(SLOW_SAMPLE_SIZE);
     group.sampling_mode(SamplingMode::Flat);
     for n_e in table4_ne_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n_e), &n_e, |b, &n_e| {
-            // Expensive setup: build `n_e` peer messages, each carrying
-            // one batched proof. Runs only when criterion selects this bench.
-            let (config, messages) = build_n_independent_messages(n_e);
-            let peer_messages: Vec<_> = messages.values().cloned().collect();
-            let peer_refs: Vec<_> = peer_messages.iter().collect();
-            verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                &peer_refs,
-                &config,
-                &legacy_beta(),
-            )
-            .unwrap();
-            b.iter_batched(
-                || peer_messages.clone(),
-                |msgs| {
-                    let refs: Vec<_> = msgs.iter().collect();
-                    verify_dealings::<Secp256k1GoldenGroup, SecpSecqBackend>(
-                        &refs,
-                        &config,
-                        &legacy_beta(),
-                    )
+            let fixture = batch_verification_fixture(n_e);
+            b.iter(|| {
+                let proofs: Vec<_> = fixture
+                    .proofs
+                    .iter()
+                    .map(|(statement, proof)| DealerProofRef { statement, proof })
+                    .collect();
+                fixture
+                    .proof_system
+                    .verify_batch(&fixture.config, &proofs)
                     .unwrap();
-                },
-                BatchSize::SmallInput,
-            )
+            })
         });
     }
     group.finish();

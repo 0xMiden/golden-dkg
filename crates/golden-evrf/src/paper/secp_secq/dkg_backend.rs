@@ -1,111 +1,27 @@
-//! Golden DKG adapter for the Secp/Secq paper eVRF.
+//! Secp/Secq Bulletproof implementation of the Main Golden dealer relation.
 
 use std::sync::Arc;
 
 use bulletproofs_cycle::generators::BulletproofGens;
 use golden_core::{
     main_golden, DealerProofRef, DealerProofStatement, DealerProofSystem, DealerProofWitness,
-    DkgConfig, DkgInstanceKind, Error, EvrfMessage, EvrfProofBackend, EvrfStatement, EvrfWitness,
-    GoldenGroup, Result,
+    DkgConfig, DkgInstanceKind, Error, GoldenGroup, Result,
 };
-use golden_halo2curves::golden_group::{
-    scalar_to_r1cs_field, Secp256k1Element, Secp256k1GoldenGroup, Secp256k1Scalar,
-};
-use halo2curves::secp256k1::{Fp, Fq};
+use golden_halo2curves::golden_group::Secp256k1GoldenGroup;
+#[cfg(test)]
+use golden_halo2curves::golden_group::Secp256k1Scalar;
+#[cfg(test)]
+use halo2curves::secp256k1::Fp;
 use rand_core::CryptoRngCore;
 
 use super::{
-    affine, evrf_batched_prove, evrf_batched_verify_many, fp_to_fq, h_gin_1, h_gin_2,
     main_golden_batched_prove, main_golden_batched_verify, main_golden_batched_verify_many,
-    parse_batched_proof_stream, parse_main_golden_proof_stream, validate_batched_public_relations,
-    validate_main_golden_public_relations, BatchedDealingStatement, BatchedEvrfPublicParams,
-    BatchedEvrfStatement, BatchedEvrfWitness, BatchedReceiverStatement, Gin,
-    MainGoldenProofContext, R1csCycle, BATCHED_PROOF_ID, MESSAGE_BYTES,
+    parse_main_golden_proof_stream, validate_main_golden_public_relations, DealerCircuitInstance,
+    DealerCircuitParameters, DealerCircuitReceiver, DealerCircuitStatement, DealerCircuitWitness,
+    MainGoldenProofContext, R1csCycle,
 };
 
-/// Compute the paper eVRF pad `r = beta * T_1.x + T_2.x` as an `Fp`
-/// element, where `T_1 = H_{G_in,1}(msg)^k`, `T_2 = H_{G_in,2}(msg)^k`,
-/// and `k = int(S.x)` for `S = PK_j^sk_1`.
-fn compute_pad_fp(msg: &[u8; MESSAGE_BYTES], sk1: &Fq, pkj: &Gin, beta: &Fp) -> Result<Fp> {
-    let sj = *pkj * sk1;
-    let (s_x, _) = affine(&sj)?;
-    let k_fq = fp_to_fq(&s_x);
-    let h1 = h_gin_1(msg);
-    let h2 = h_gin_2(msg);
-    let t1j = h1 * k_fq;
-    let t2j = h2 * k_fq;
-    let (t1_x, _) = affine(&t1j)?;
-    let (t2_x, _) = affine(&t2j)?;
-    Ok(*beta * t1_x + t2_x)
-}
-
-/// Concrete Secp/Secq paper eVRF backend for the DKG.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SecpSecqBackend;
-
-fn batched_statement(
-    statement: &EvrfStatement<Secp256k1GoldenGroup>,
-) -> Result<BatchedEvrfStatement> {
-    preflight_statement_shape(statement)?;
-    let beta = scalar_to_r1cs_field(&statement.beta).ok_or(Error::ProofVerificationFailed)?;
-    let dealings = statement
-        .dealings
-        .iter()
-        .map(|dealing| {
-            let h1 = h_gin_1(&dealing.message.0);
-            let h2 = h_gin_2(&dealing.message.0);
-            BatchedDealingStatement {
-                msg: dealing.message.0,
-                constant_is_explicit: dealing.commitment.constant().is_some(),
-                commitment: dealing.commitment.clone(),
-                receivers: dealing
-                    .receivers
-                    .iter()
-                    .map(|receiver| BatchedReceiverStatement {
-                        receiver: receiver.receiver,
-                        pkj: receiver.receiver_public_key.0,
-                        h1,
-                        h2,
-                        share_commitment: receiver.share_commitment.0,
-                        pad_commitment: receiver.pad_commitment.0,
-                        encrypted_share: receiver.encrypted_share.0,
-                    })
-                    .collect(),
-            }
-        })
-        .collect();
-    let threshold = statement
-        .dealings
-        .first()
-        .ok_or(Error::ProofVerificationFailed)?
-        .commitment
-        .threshold();
-    Ok(BatchedEvrfStatement {
-        pk1: statement.dealer_public_key.0,
-        beta,
-        threshold,
-        dealer_message_root: statement.dealer_message_root,
-        dealings,
-    })
-}
-
-fn preflight_statement_shape(statement: &EvrfStatement<Secp256k1GoldenGroup>) -> Result<()> {
-    let first_dealing = statement
-        .dealings
-        .first()
-        .ok_or(Error::ProofVerificationFailed)?;
-    let threshold = first_dealing.commitment.threshold();
-    let receiver_count = first_dealing.receivers.len();
-    BatchedEvrfPublicParams::validated_shape(threshold, statement.dealings.len(), receiver_count)?;
-    if statement.dealings.iter().any(|dealing| {
-        dealing.commitment.threshold() != threshold || dealing.receivers.len() != receiver_count
-    }) {
-        return Err(Error::ProofVerificationFailed);
-    }
-    Ok(())
-}
-
-fn same_shape(left: &BatchedEvrfStatement, right: &BatchedEvrfStatement) -> bool {
+fn same_shape(left: &DealerCircuitStatement, right: &DealerCircuitStatement) -> bool {
     left.threshold == right.threshold
         && left.dealings.len() == right.dealings.len()
         && left.dealings.first().map(|dealing| dealing.receivers.len())
@@ -113,28 +29,6 @@ fn same_shape(left: &BatchedEvrfStatement, right: &BatchedEvrfStatement) -> bool
                 .dealings
                 .first()
                 .map(|dealing| dealing.receivers.len())
-}
-
-fn public_params(
-    statement: &BatchedEvrfStatement,
-) -> Result<std::sync::Arc<BatchedEvrfPublicParams>> {
-    #[cfg(test)]
-    PUBLIC_PARAMS_REQUESTS.with(|requests| requests.set(requests.get() + 1));
-
-    let first_dealing = statement
-        .dealings
-        .first()
-        .ok_or(Error::ProofVerificationFailed)?;
-    BatchedEvrfPublicParams::shared(
-        statement.threshold,
-        statement.dealings.len(),
-        first_dealing.receivers.len(),
-    )
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static PUBLIC_PARAMS_REQUESTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// Persistence format version for prepared Secp/Secq generator artifacts.
@@ -454,7 +348,6 @@ struct ProofShape {
     threshold: usize,
     instance_count: usize,
     receiver_count: usize,
-    multiplier_count: usize,
     generator_capacity: usize,
 }
 
@@ -500,12 +393,11 @@ impl SecpSecqBulletproofs {
         Ok(shape)
     }
 
-    fn parameters(&self, shape: ProofShape) -> Arc<BatchedEvrfPublicParams> {
-        Arc::new(BatchedEvrfPublicParams::from_shape(
+    fn parameters(&self, shape: ProofShape) -> Arc<DealerCircuitParameters> {
+        Arc::new(DealerCircuitParameters::from_shape(
             shape.threshold,
             shape.instance_count,
             shape.receiver_count,
-            shape.multiplier_count,
             Arc::clone(&self.prepared.bp_gens),
         ))
     }
@@ -524,19 +416,17 @@ fn prepared_shape(
             threshold,
             instance_count,
             receiver_count,
-            multiplier_count: 0,
             generator_capacity: 0,
         });
     }
 
-    let (multiplier_count, generator_capacity) =
-        BatchedEvrfPublicParams::validated_shape(threshold, instance_count, receiver_count)
+    let (_, generator_capacity) =
+        DealerCircuitParameters::validated_shape(threshold, instance_count, receiver_count)
             .map_err(|_| Error::ProofGenerationFailed)?;
     Ok(ProofShape {
         threshold,
         instance_count,
         receiver_count,
-        multiplier_count,
         generator_capacity,
     })
 }
@@ -553,7 +443,7 @@ fn proof_shape(config: &DkgConfig<Secp256k1GoldenGroup>) -> Result<ProofShape> {
 fn main_golden_statement(
     config: &DkgConfig<Secp256k1GoldenGroup>,
     statement: &DealerProofStatement<Secp256k1GoldenGroup>,
-) -> Result<BatchedEvrfStatement> {
+) -> Result<DealerCircuitStatement> {
     if statement.instance_count() != config.instances().len()
         || config
             .registry()
@@ -623,7 +513,7 @@ fn main_golden_statement(
                 receiver.public_key(),
             )
             .map_err(|_| Error::ProofVerificationFailed)?;
-            receivers.push(BatchedReceiverStatement {
+            receivers.push(DealerCircuitReceiver {
                 receiver: receiver.participant(),
                 pkj: receiver.public_key().0,
                 h1: h1.0,
@@ -636,7 +526,7 @@ fn main_golden_statement(
         if receivers.len() != receiver_count {
             return Err(Error::ProofVerificationFailed);
         }
-        dealings.push(BatchedDealingStatement {
+        dealings.push(DealerCircuitInstance {
             msg: instance.effective_message().0,
             commitment,
             constant_is_explicit,
@@ -644,7 +534,7 @@ fn main_golden_statement(
         });
     }
 
-    let statement = BatchedEvrfStatement {
+    let statement = DealerCircuitStatement {
         pk1: statement.dealer_public_key().0,
         beta: main_golden::beta::<Secp256k1GoldenGroup>()
             .map_err(|_| Error::ProofVerificationFailed)?,
@@ -659,7 +549,7 @@ fn main_golden_statement(
 fn main_golden_witness(
     statement: &DealerProofStatement<Secp256k1GoldenGroup>,
     witness: &DealerProofWitness<Secp256k1GoldenGroup>,
-) -> Result<BatchedEvrfWitness> {
+) -> Result<DealerCircuitWitness> {
     if witness.instance_count() != statement.instance_count() {
         return Err(Error::ProofVerificationFailed);
     }
@@ -671,7 +561,7 @@ fn main_golden_witness(
                 .map(|instance| instance.polynomial_constant().map(|constant| constant.0))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(BatchedEvrfWitness {
+    Ok(DealerCircuitWitness {
         sk1: witness.identity_secret().0,
         polynomial_constants,
     })
@@ -691,75 +581,6 @@ fn normalize_proving_error(error: Error) -> Error {
     match error {
         Error::ProofVerificationFailed => Error::ProofGenerationFailed,
         other => other,
-    }
-}
-
-impl EvrfProofBackend<Secp256k1GoldenGroup> for SecpSecqBackend {
-    const PROOF_ID: &'static [u8] = BATCHED_PROOF_ID;
-
-    fn derive_pad(
-        message: EvrfMessage,
-        beta: &Secp256k1Scalar,
-        identity_secret: &Secp256k1Scalar,
-        peer_public_key: &Secp256k1Element,
-        _receiver_public_key: &Secp256k1Element,
-    ) -> Result<Secp256k1Scalar> {
-        let beta_fp = scalar_to_r1cs_field(beta).ok_or(Error::ProofVerificationFailed)?;
-        let r = compute_pad_fp(&message.0, &identity_secret.0, &peer_public_key.0, &beta_fp)?;
-        Ok(Secp256k1Scalar(fp_to_fq(&r)))
-    }
-
-    fn prove_batch(
-        statement: &EvrfStatement<Secp256k1GoldenGroup>,
-        witness: &EvrfWitness<Secp256k1GoldenGroup>,
-        rng: &mut impl CryptoRngCore,
-    ) -> Result<Vec<u8>> {
-        witness.validate_shape(statement)?;
-        let statement = batched_statement(statement)?;
-        validate_batched_public_relations(&statement)?;
-        let witness = BatchedEvrfWitness {
-            sk1: witness.identity_secret.0,
-            polynomial_constants: witness
-                .dealings
-                .iter()
-                .map(|dealing| dealing.polynomial_constant.map(|constant| constant.0))
-                .collect(),
-        };
-        let params = public_params(&statement)?;
-        evrf_batched_prove(&params, &statement, &witness, rng)
-    }
-
-    fn verify_batch(statement: &EvrfStatement<Secp256k1GoldenGroup>, proof: &[u8]) -> Result<()> {
-        let statement = batched_statement(statement)?;
-        validate_batched_public_relations(&statement)?;
-        parse_batched_proof_stream(&statement, proof)?;
-        let params = public_params(&statement)?;
-        evrf_batched_verify_many(&params, &[(&statement, proof)])
-    }
-
-    fn verify_proof_batch(batches: &[(&EvrfStatement<Secp256k1GoldenGroup>, &[u8])]) -> Result<()> {
-        if batches.is_empty() {
-            return Err(Error::ProofVerificationFailed);
-        }
-        let statements = batches
-            .iter()
-            .map(|(statement, _)| batched_statement(statement))
-            .collect::<Result<Vec<_>>>()?;
-        let first = statements.first().ok_or(Error::ProofVerificationFailed)?;
-        for (statement, (_, proof)) in statements.iter().zip(batches) {
-            if !same_shape(first, statement) {
-                return Err(Error::ProofVerificationFailed);
-            }
-            validate_batched_public_relations(statement)?;
-            parse_batched_proof_stream(statement, proof)?;
-        }
-        let params = public_params(first)?;
-        let instances = statements
-            .iter()
-            .zip(batches)
-            .map(|(statement, (_, proof))| (statement, *proof))
-            .collect::<Vec<_>>();
-        evrf_batched_verify_many(&params, &instances)
     }
 }
 
@@ -853,48 +674,41 @@ impl DealerProofSystem<Secp256k1GoldenGroup> for SecpSecqBulletproofs {
 
 #[cfg(test)]
 mod tests {
-    use crate::proof_stream::ProofStreamCurve;
+    fn assert_proof_vector(name: &str, proof: &[u8]) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/vectors")
+            .join(name);
+        if std::env::var("GOLDEN_UPDATE_PROOF_VECTORS").as_deref() == Ok("1") {
+            std::fs::create_dir_all(
+                path.parent()
+                    .expect("proof vector path must have a parent directory"),
+            )
+            .expect("proof vector directory must be writable");
+            std::fs::write(&path, proof).expect("proof vector must be writable");
+        }
+
+        let expected = std::fs::read(&path)
+            .expect("proof vector must exist; set GOLDEN_UPDATE_PROOF_VECTORS=1 to regenerate it");
+        assert_eq!(
+            proof,
+            expected,
+            "proof vector drifted at {}",
+            path.display()
+        );
+    }
+
+    use crate::proof_stream::{Observe, ProofStreamCurve, ProverProofStream};
     use golden_core::{
-        deal, DealerProofStatement, DealerProofSystem, DealerProofWitness, DkgConfig,
-        EvrfDealingStatement, EvrfReceiverStatement, FeldmanCommitment, GoldenGroup, GoldenScalar,
-        ParticipantIndex, ParticipantRegistry, SessionId,
+        deal, DealerProofStatement, DealerProofSystem, DealerProofWitness, DkgConfig, GoldenGroup,
+        GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
     };
     use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
-    use super::super::{GoutStreamCurve, MAIN_GOLDEN_PROOF_ID};
+    use super::super::{
+        observe_main_golden_statement_with_versions, GoutStreamCurve, MAIN_GOLDEN_PROOF_ID,
+        MAIN_GOLDEN_PROOF_VERSION,
+    };
     use super::*;
-
-    fn minimal_statement() -> EvrfStatement<Secp256k1GoldenGroup> {
-        let receiver = ParticipantIndex::new(2).unwrap();
-        let dealer_secret = Secp256k1Scalar::from_u64(3).unwrap();
-        let receiver_secret = Secp256k1Scalar::from_u64(5).unwrap();
-        let share = Secp256k1Scalar::from_u64(13).unwrap();
-        let pad = Secp256k1Scalar::from_u64(7).unwrap();
-
-        EvrfStatement {
-            dealer_public_key: Secp256k1GoldenGroup::mul_generator(&dealer_secret),
-            beta: Secp256k1Scalar::from_u64(17).unwrap(),
-            dealer_message_root: [3u8; 32],
-            dealings: vec![EvrfDealingStatement {
-                message: EvrfMessage([9u8; MESSAGE_BYTES]),
-                commitment: FeldmanCommitment::from_coefficients(vec![
-                    Secp256k1GoldenGroup::mul_generator(&share),
-                ])
-                .unwrap(),
-                receivers: vec![EvrfReceiverStatement {
-                    receiver,
-                    receiver_public_key: Secp256k1GoldenGroup::mul_generator(&receiver_secret),
-                    share_commitment: Secp256k1GoldenGroup::mul_generator(&share),
-                    pad_commitment: Secp256k1GoldenGroup::mul_generator(&pad),
-                    encrypted_share: Secp256k1Scalar::add(&share, &pad),
-                }],
-            }],
-        }
-    }
-
-    fn public_params_requests() -> usize {
-        PUBLIC_PARAMS_REQUESTS.with(core::cell::Cell::get)
-    }
 
     struct CapturingSecpSecq {
         inner: SecpSecqBulletproofs,
@@ -968,7 +782,7 @@ mod tests {
         }
     }
 
-    fn tamper_nested_r1cs_scalar(mut proof: Vec<u8>) -> Vec<u8> {
+    fn nested_r1cs_scalar(proof: &mut [u8]) -> &mut [u8] {
         const PROOF_ID_LEN_BYTES: usize = 4;
         const NESTED_LEN_BYTES: usize = 8;
 
@@ -998,12 +812,21 @@ mod tests {
         );
         let phase_commitments = if version == 0 { 3 } else { 6 };
         let t_x_start = payload_start + 1 + (phase_commitments + 5) * GoutStreamCurve::POINT_BYTES;
-        let t_x = &mut proof[t_x_start..t_x_start + 32];
+        &mut proof[t_x_start..t_x_start + 32]
+    }
+
+    fn tamper_nested_r1cs_scalar(mut proof: Vec<u8>) -> Vec<u8> {
+        let t_x = nested_r1cs_scalar(&mut proof);
         if t_x.iter().all(|byte| *byte == 0) {
             t_x[0] = 1;
         } else {
             t_x.fill(0);
         }
+        proof
+    }
+
+    fn make_nested_r1cs_scalar_noncanonical(mut proof: Vec<u8>) -> Vec<u8> {
+        nested_r1cs_scalar(&mut proof).fill(0xff);
         proof
     }
 
@@ -1031,12 +854,12 @@ mod tests {
             ),
         ])
         .unwrap();
-        let config = DkgConfig::new_zero(1, SessionId([41u8; 32]), registry.clone()).unwrap();
+        let config = DkgConfig::new_random(1, SessionId([41u8; 32]), registry.clone()).unwrap();
         let preparation_config = DkgConfig::new(
             1,
             SessionId([40u8; 32]),
             registry.clone(),
-            vec![DkgInstanceKind::Zero; 3],
+            vec![DkgInstanceKind::Random; 3],
         )
         .unwrap();
         let prepared = SecpSecqPreparedGenerators::prepare_for(&preparation_config).unwrap();
@@ -1067,8 +890,9 @@ mod tests {
             .inner
             .verify(&config, &captured[0].0, &captured[0].1)
             .unwrap();
+        assert_proof_vector("main-golden-two-receiver-v1.bin", &captured[0].1);
 
-        let other_config = DkgConfig::new_zero(1, SessionId([43u8; 32]), registry).unwrap();
+        let other_config = DkgConfig::new_random(1, SessionId([43u8; 32]), registry).unwrap();
         assert_eq!(
             proof_system
                 .inner
@@ -1139,6 +963,173 @@ mod tests {
                 .inner
                 .verify(&config, &captured[0].0, &tampered_proof)
                 .unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+    }
+
+    #[test]
+    #[ignore = "slow: builds a full Main Golden proof for the general one-instance, one-non-self-receiver shape"]
+    fn main_golden_one_receiver_path_preserves_versioned_proof_behavior() {
+        let config = config_with_shape(2, 1);
+        let dealer = ParticipantIndex::new(1).unwrap();
+        let dealer_secret = Secp256k1Scalar::from_u64(11).unwrap();
+        let capture = CapturingInputs::default();
+        let mut capture_rng = ChaCha20Rng::from_seed([92u8; 32]);
+        deal(&capture, &config, dealer, &dealer_secret, &mut capture_rng).unwrap();
+        let (statement, witness) = capture.inputs.lock().unwrap().take().unwrap();
+
+        let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
+        let mut proof_rng = ChaCha20Rng::from_seed([93u8; 32]);
+        let proof = proof_system
+            .prove(&config, &statement, &witness, &mut proof_rng)
+            .unwrap();
+        proof_system.verify(&config, &statement, &proof).unwrap();
+        assert_proof_vector("main-golden-one-receiver-v1.bin", &proof);
+
+        let circuit_statement = main_golden_statement(&config, &statement).unwrap();
+        let context = main_golden_context(&config, &statement);
+        let mut current_stream = ProverProofStream::new(MAIN_GOLDEN_PROOF_ID).unwrap();
+        observe_main_golden_statement_with_versions(
+            &mut current_stream,
+            golden_core::PROTOCOL_VERSION,
+            MAIN_GOLDEN_PROOF_VERSION,
+            context,
+            &circuit_statement,
+        )
+        .unwrap();
+        let mut current_checkpoint = [0u8; 64];
+        current_stream.challenge(b"version-binding", &mut current_checkpoint);
+
+        for (protocol_version, proof_version) in [
+            (
+                golden_core::PROTOCOL_VERSION.wrapping_add(1),
+                MAIN_GOLDEN_PROOF_VERSION,
+            ),
+            (
+                golden_core::PROTOCOL_VERSION,
+                MAIN_GOLDEN_PROOF_VERSION.wrapping_add(1),
+            ),
+        ] {
+            let mut changed_stream = ProverProofStream::new(MAIN_GOLDEN_PROOF_ID).unwrap();
+            observe_main_golden_statement_with_versions(
+                &mut changed_stream,
+                protocol_version,
+                proof_version,
+                context,
+                &circuit_statement,
+            )
+            .unwrap();
+            let mut changed_checkpoint = [0u8; 64];
+            changed_stream.challenge(b"version-binding", &mut changed_checkpoint);
+            assert_ne!(changed_checkpoint, current_checkpoint);
+        }
+
+        let expected_proof_id = b"golden-dkg/secp-secq-bulletproofs/v1";
+        let encoded_id_len = u32::from_be_bytes(proof[..4].try_into().unwrap()) as usize;
+        assert_eq!(encoded_id_len, expected_proof_id.len());
+        assert_eq!(&proof[4..4 + encoded_id_len], expected_proof_id);
+
+        let changed_message_capture = CapturingInputs::default();
+        let mut changed_message_rng = ChaCha20Rng::from_seed([94u8; 32]);
+        deal(
+            &changed_message_capture,
+            &config,
+            dealer,
+            &dealer_secret,
+            &mut changed_message_rng,
+        )
+        .unwrap();
+        let (changed_message_statement, _) = changed_message_capture
+            .inputs
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        assert_ne!(
+            statement.instance(0).unwrap().effective_message(),
+            changed_message_statement
+                .instance(0)
+                .unwrap()
+                .effective_message()
+        );
+        assert_eq!(
+            proof_system
+                .verify(&config, &changed_message_statement, &proof)
+                .unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+
+        let changed_receiver_secret = Secp256k1Scalar::from_u64(99).unwrap();
+        let changed_registry = ParticipantRegistry::new(vec![
+            (dealer, Secp256k1GoldenGroup::mul_generator(&dealer_secret)),
+            (
+                ParticipantIndex::new(2).unwrap(),
+                Secp256k1GoldenGroup::mul_generator(&changed_receiver_secret),
+            ),
+        ])
+        .unwrap();
+        let changed_key_config =
+            DkgConfig::new_zero(1, config.session_id(), changed_registry).unwrap();
+        let changed_key_capture = CapturingInputs::default();
+        let mut changed_key_rng = ChaCha20Rng::from_seed([95u8; 32]);
+        deal(
+            &changed_key_capture,
+            &changed_key_config,
+            dealer,
+            &dealer_secret,
+            &mut changed_key_rng,
+        )
+        .unwrap();
+        let (changed_key_statement, _) = changed_key_capture.inputs.lock().unwrap().take().unwrap();
+        assert_eq!(
+            proof_system
+                .verify(&changed_key_config, &changed_key_statement, &proof)
+                .unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+
+        let mut legacy_framing = Vec::new();
+        let legacy_proof_id = b"golden-paper-evrf-one-receiver-v3";
+        legacy_framing
+            .extend_from_slice(&u32::try_from(legacy_proof_id.len()).unwrap().to_be_bytes());
+        legacy_framing.extend_from_slice(legacy_proof_id);
+        legacy_framing.extend_from_slice(&proof[4 + encoded_id_len..]);
+        assert_eq!(
+            proof_system
+                .verify(&config, &statement, &legacy_framing)
+                .unwrap_err(),
+            Error::ProofVerificationFailed
+        );
+
+        let mut malformed_framing = proof.clone();
+        malformed_framing[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        let mut trailing = proof.clone();
+        trailing.push(0);
+        for malformed in [
+            malformed_framing,
+            make_nested_r1cs_scalar_noncanonical(proof.clone()),
+            tamper_nested_r1cs_scalar(proof.clone()),
+            trailing,
+        ] {
+            assert_eq!(
+                proof_system
+                    .verify(&config, &statement, &malformed)
+                    .unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+        }
+
+        let mut beta_mismatch = main_golden_statement(&config, &statement).unwrap();
+        beta_mismatch.beta += Fp::from(1u64);
+        let parameters = proof_system.parameters(proof_shape(&config).unwrap());
+        assert_eq!(
+            main_golden_batched_verify(
+                &parameters,
+                main_golden_context(&config, &statement),
+                &beta_mismatch,
+                &proof,
+            )
+            .unwrap_err(),
             Error::ProofVerificationFailed
         );
     }
@@ -1459,31 +1450,5 @@ mod tests {
             SecpSecqPreparedGenerators::from_persistence_bytes(&noncanonical_point).unwrap_err(),
             Error::MalformedPreparedGenerators
         );
-    }
-
-    #[test]
-    fn malformed_proof_is_rejected_before_public_parameter_lookup() {
-        let statement = minimal_statement();
-        let before = public_params_requests();
-
-        assert_eq!(
-            SecpSecqBackend::verify_batch(&statement, &[]).unwrap_err(),
-            Error::ProofVerificationFailed
-        );
-        assert_eq!(public_params_requests(), before);
-    }
-
-    #[test]
-    fn oversized_repeated_receiver_shape_is_rejected_before_conversion_or_params() {
-        let mut statement = minimal_statement();
-        let receiver = statement.dealings[0].receivers[0].clone();
-        statement.dealings[0].receivers = vec![receiver; 295];
-        let before = public_params_requests();
-
-        assert_eq!(
-            SecpSecqBackend::verify_batch(&statement, &[]).unwrap_err(),
-            Error::ProofVerificationFailed
-        );
-        assert_eq!(public_params_requests(), before);
     }
 }

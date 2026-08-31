@@ -1,0 +1,3 @@
+# Treat mixed Random and Zero batching as a reviewed extension
+
+Keep one atomic dealer message and one joint proof for arbitrary ordered Random and Zero instances, with independent polynomials, nonces, effective messages, pads, and proof randomness per instance. Describe this composition as a repository extension rather than attributing it directly to Golden Theorem 3, and require a dedicated composition/security review before making the production security claim; that review gates release, not specification or implementation. The review is scoped to mixed-instance composition and does not reopen the fixed-string beta decision in ADR 0004.

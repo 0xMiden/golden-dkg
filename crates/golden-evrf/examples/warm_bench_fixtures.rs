@@ -1,4 +1,4 @@
-//! Regenerate the checked-in dealer-message fixtures used by the
+//! Regenerate the checked-in opaque dealer-message fixtures used by the
 //! `golden-evrf` benches (see `benches/support_dir/fixture_cache.rs`),
 //! without paying criterion's sampling overhead on top of the
 //! proof-building cost.
@@ -9,7 +9,7 @@
 //!
 //! ```bash
 //! cargo run --profile optimized --example warm_bench_fixtures \
-//!     --features golden-evrf/halo2curves-secp256k1,golden-evrf/parallel
+//!     --features golden-evrf/halo2curves-secp256k1,golden-evrf/parallel,golden-evrf/serde
 //! ```
 //!
 //! `GOLDEN_TABLE4_NE_VALUES` / `GOLDEN_TABLE5_N_VALUES` select a
@@ -25,12 +25,14 @@ mod support;
 
 use std::time::Instant;
 
+use golden_evrf::paper::secp_secq::SecpSecqBulletproofs;
 use support::{build_config, table4_ne_values, table5_n_values, TABLE4_THRESHOLD};
 
 fn warm(table: &str, n: usize, t: usize) {
     let start = Instant::now();
     let config = build_config(n, t);
-    let rebuilt = support::regenerate_dealer_messages(&config);
+    let proof_system = SecpSecqBulletproofs::prepare_for(&config).unwrap();
+    let rebuilt = support::regenerate_dealer_messages(&config, &proof_system);
     let status = if rebuilt { "regenerated" } else { "up to date" };
     println!(
         "{table}: t={t} n={n} -> {status} in {:.1?}",
@@ -44,7 +46,7 @@ fn main() {
         warm("table-4", n_e + 1, TABLE4_THRESHOLD);
     }
 
-    println!("Checking Table 5 fixtures (n-of-n)...");
+    println!("Checking Table 5 fixtures ((n - 1)-of-n)...");
     for n in table5_n_values() {
         warm("table-5", n, n - 1);
     }

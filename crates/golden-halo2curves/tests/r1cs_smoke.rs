@@ -4,8 +4,8 @@
 //! committed, then checks that the verifier accepts an honest proof and
 //! rejects one whose `c` commitment is swapped for a commitment to a
 //! different value, and rejects a proof verified under the wrong transcript
-//! domain. Exercises both `Secp256k1Cycle` and `Secq256k1Cycle` so the paper
-//! eVRF backend's commitment group is covered alongside the input group.
+//! domain. Exercises both `Secp256k1Cycle` and `Secq256k1Cycle` so the Main
+//! Golden proof system's commitment group is covered alongside the input group.
 
 #![allow(non_snake_case)]
 #![allow(clippy::unwrap_used)]

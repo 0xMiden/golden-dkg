@@ -1,0 +1,3 @@
+# Configuration determines the dealer-message grammar
+
+Dealer-message wire bytes omit counts, Random/Zero discriminators, commitment lengths, and receiver indexes that the DKG configuration already determines. A configured DKG session enforces the whole-message bound and parses exactly the configured instance, commitment, and canonical receiver shape, with the proof occupying the remaining suffix; this deliberately makes dealer messages non-self-describing so untrusted bytes cannot select their own grammar or allocation shape, at the cost that they cannot be interpreted without the matching configuration.

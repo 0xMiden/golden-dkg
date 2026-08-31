@@ -1,0 +1,14 @@
+diff --git a/crates/golden-ehtdh1/Cargo.toml b/crates/golden-ehtdh1/Cargo.toml
+index 8d9f453..3efc4f5 100644
+--- a/crates/golden-ehtdh1/Cargo.toml
++++ b/crates/golden-ehtdh1/Cargo.toml
+@@ -37,5 +37,9 @@ serde = ["dep:serde", "golden-core/serde"]
+ name = "threshold_records"
+ required-features = ["prototype-bridge"]
+ 
++[[example]]
++name = "threshold_records_v2"
++required-features = ["prototype-bridge"]
++
+ [lints]
+ workspace = true

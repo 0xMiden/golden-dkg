@@ -1,0 +1,3 @@
+# Configuration owns Random and Zero instance policy
+
+`DkgConfig` is the sole owner of whether each ordered instance is Random or Zero. Internally, Feldman commitments always retain the complete logical coefficient vector, including an identity constant for Zero instances; the configured kind only controls whether that constant is sent on the wire and whether a constant proof of knowledge is required. Parsing reconstructs omitted zero constants, and transcripts observe the complete logical commitment, keeping Feldman arithmetic uniform while preventing message contents from selecting their own proof grammar.
