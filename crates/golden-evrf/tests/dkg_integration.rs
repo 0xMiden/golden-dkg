@@ -363,10 +363,9 @@ fn dkg_accepts_the_deterministic_dealing_and_rejects_malformed_or_replayed_proof
             .try_into()
             .unwrap(),
     ) as usize;
-    // The nested frame contains only the R1CS proof. Protocol v7 appends a
-    // native constant-term proof, encoded as one point and one scalar. The old
-    // assertion treated the nested frame as the complete stream and stopped
-    // this test before it could exercise the malformed and replayed proofs.
+    // The nested frame holds only the R1CS proof; a native constant-term
+    // proof (one point, one scalar) follows it on the shared transcript, so
+    // the full proof stream is longer than the nested frame alone.
     let constant_term_proof_len = <Secp256k1GoldenGroup as GoldenGroup>::ELEMENT_REPR_BYTES
         + <Secp256k1Scalar as GoldenScalar>::REPR_BYTES;
     assert_eq!(

@@ -135,6 +135,8 @@ jobs:
         run: cargo nextest run -p golden-ehtdh1 --features prototype-bridge
       - name: Test Secp/Secq R1CS cycle
         run: cargo nextest run -p golden-halo2curves --features halo2curves-secp256k1
+      - name: Test BLS12-381/Jubjub R1CS cycle
+        run: cargo nextest run -p golden-bls-jubjub
       - name: Test bulletproofs-compat (upstream domain separation)
         run: cargo nextest run -p bulletproofs-cycle --no-default-features --features bulletproofs-compat
       - name: Test EHTDH1 wire serialization adapters
@@ -143,18 +145,28 @@ jobs:
         run: cargo test --workspace --doc
 
   backend-test:
-    name: Test Secp/Secq backend (${{ matrix.backend }})
+    name: Test ${{ matrix.name }}
     runs-on: warp-ubuntu-latest-x64-8x
     strategy:
       fail-fast: false
       matrix:
         include:
-          - backend: sequential
+          - name: Secp/Secq backend (sequential)
+            key: secp-sequential
             bulletproofs_features: ristretto
             evrf_features: serde,miden-serde,halo2curves-secp256k1
-          - backend: parallel
+          - name: Secp/Secq backend (parallel)
+            key: secp-parallel
             bulletproofs_features: ristretto,parallel
             evrf_features: halo2curves-secp256k1,parallel
+          - name: BLS12-381/Jubjub backend (sequential)
+            key: bls-sequential
+            bulletproofs_features: ristretto
+            evrf_features: bls12-381-jubjub
+          - name: BLS12-381/Jubjub backend (parallel)
+            key: bls-parallel
+            bulletproofs_features: ristretto,parallel
+            evrf_features: bls12-381-jubjub,parallel
     env:
       BULLETPROOFS_FEATURES: ${{ matrix.bulletproofs_features }}
       EVRF_FEATURES: ${{ matrix.evrf_features }}
@@ -168,13 +180,13 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: ${{ matrix.backend }}
+          key: ${{ matrix.key }}
       - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
         with:
           tool: cargo-nextest
       - name: Test Ristretto generator backend
         run: cargo nextest run -p bulletproofs-cycle --features "$BULLETPROOFS_FEATURES"
-      - name: Test golden-evrf Secp/Secq backend
+      - name: Test golden-evrf backend
         run: cargo nextest run -p golden-evrf --features "$EVRF_FEATURES"
 
   fixture-check:
@@ -190,10 +202,14 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Check checked-in dealer-message fixtures still verify
+      - name: Check checked-in dealer-message fixtures still verify (Secp/Secq)
         run: |
           cargo run --profile optimized --example check_bench_fixtures \
             --features golden-evrf/halo2curves-secp256k1,golden-evrf/parallel
+      - name: Check checked-in dealer-message fixtures still verify (BLS12-381/Jubjub)
+        run: |
+          cargo run --profile optimized --example check_bench_fixtures_bls \
+            --features golden-evrf/bls12-381-jubjub,golden-evrf/parallel
 
   doc:
     name: Docs
@@ -215,6 +231,8 @@ jobs:
         run: cargo doc --no-deps -p golden-rustcrypto --features p256,k256
       - name: Build documentation (golden-evrf halo2curves backend)
         run: cargo doc --no-deps -p golden-evrf --features halo2curves-secp256k1
+      - name: Build documentation (golden-evrf BLS12-381/Jubjub backend)
+        run: cargo doc --no-deps -p golden-evrf --features bls12-381-jubjub
       - name: Build bulletproofs-cycle docs (cycle-pedersen default)
         run: cargo doc --no-deps -p bulletproofs-cycle
       - name: Build bulletproofs-cycle docs (bulletproofs-compat)

@@ -15,13 +15,18 @@
 
 #![allow(non_snake_case)]
 
-#[cfg(feature = "halo2curves-secp256k1")]
+#[cfg(any(feature = "halo2curves-secp256k1", feature = "bls12-381-jubjub"))]
 use golden_core::{Error, ParticipantIndex, Result, TranscriptRoot};
-#[cfg(feature = "halo2curves-secp256k1")]
+#[cfg(any(feature = "halo2curves-secp256k1", feature = "bls12-381-jubjub"))]
 use rand_core::CryptoRngCore;
 
 /// Byte length of the paper `msg_i` nonce (256-bit security parameter).
 pub const MESSAGE_BYTES: usize = 256 / 8;
+
+/// Concrete BLS12-381/Jubjub paper eVRF backend, feature-gated behind
+/// `bls12-381-jubjub`.
+#[cfg(feature = "bls12-381-jubjub")]
+pub mod bls_jubjub;
 
 /// Concrete Secp/Secq paper eVRF backend, feature-gated behind
 /// `halo2curves-secp256k1`.
@@ -604,10 +609,7 @@ pub mod secp_secq {
         // Batch-normalize every point with a single field inversion.
         let affines = batch_affine(&points)?;
         let (base, window_coords) = affines.split_at(2);
-        let windows = window_coords
-            .chunks_exact(4)
-            .map(|q| [q[0], q[1], q[2], q[3]])
-            .collect();
+        let windows = window_coords.as_chunks::<4>().0.to_vec();
         Ok(ChordPrecomp {
             c0: base[0],
             d0: base[1],

@@ -172,9 +172,11 @@ impl<C: Cycle> VerificationEquation<C> {
         if scalars.len() > points.len() {
             return Err(R1CSError::VerificationError);
         }
-        let shared_len = accumulator_points.len().min(scalars.len());
-        if accumulator_points[..shared_len] != points[..shared_len] {
-            return Err(R1CSError::VerificationError);
+        if !Arc::ptr_eq(accumulator_points, &points) {
+            let shared_len = accumulator_points.len().min(scalars.len());
+            if accumulator_points[..shared_len] != points[..shared_len] {
+                return Err(R1CSError::VerificationError);
+            }
         }
         if scalars.len() > accumulator_points.len() {
             *accumulator_points = points;

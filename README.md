@@ -4,8 +4,9 @@
 
 Rust workspace for distributed key generation, verifiable randomness, and
 context bound threshold encryption over a generic group abstraction. The
-current tree implements Golden DKG, EHTDH1, a Secp256k1/Secq256k1 eVRF
-backend, and the Bulletproofs R1CS layer used by that backend.
+current tree implements Golden DKG, EHTDH1, Secp256k1/Secq256k1 and
+BLS12-381/Jubjub eVRF backends, and the Bulletproofs R1CS layer used by
+both backends.
 
 The two protocol implementations follow these papers.
 
@@ -16,16 +17,16 @@ The two protocol implementations follow these papers.
   Shoup, “[Context-Dependent Threshold Decryption and its Applications](https://eprint.iacr.org/2025/279),”
   Cryptology ePrint Archive, Paper 2025/279, 2025.
 
-The workspace has six crates. All crates are published together and require
+The workspace has seven crates. All crates are published together and require
 Rust 1.93 or later.
 
 * `golden-core`: Shamir secret sharing, Feldman commitments, DKG messages,
   transcript binding, and the curve-agnostic `EvrfProofBackend` trait that
   connects the DKG to a concrete proof system.
 * `golden-evrf`: the eVRF proof backends. Includes a Secp256k1/Secq256k1
-  R1CS backend that proves the full Golden eVRF relation end-to-end via
-  `bulletproofs-cycle`, plus a share-opening prototype backend used for
-  plumbing tests.
+  R1CS backend and a BLS12-381/Jubjub R1CS backend, each proving the full
+  Golden eVRF relation end-to-end via `bulletproofs-cycle`, plus a
+  share-opening prototype backend used for plumbing tests.
 * `golden-rustcrypto`: P-256 and secp256k1 `GoldenGroup` adapters backed by
   the RustCrypto crates, used by the prototype backend and tests.
 * `golden-ehtdh1`: context-bound threshold encryption over Golden DKG output.
@@ -39,6 +40,9 @@ Rust 1.93 or later.
 * `golden-halo2curves`: `Cycle` impls for the `halo2curves`
   Secp256k1/Secq256k1 curve cycle, plus the Secp256k1 `GoldenGroup`
   adapter used by the Secp/Secq eVRF backend.
+* `golden-bls-jubjub`: `Cycle` impls for the BLS12-381 G1 / Jubjub curve
+  pair, plus the Jubjub `GoldenGroup` adapter used by the BLS12-381/Jubjub
+  eVRF backend.
 
 ## Performance
 
@@ -49,6 +53,9 @@ All measurements are **real wall-clock timings** (criterion, flat sampling,
 10 samples) over the **Secp256k1/Secq256k1 curve cycle**, not the paper's
 zkalc estimates for BLS12-381.  The eVRF proof backend uses
 `bulletproofs-cycle` R1CS over the halo2curves Secp256k1/Secq256k1 cycle.
+A BLS12-381/Jubjub eVRF backend and its own bench suite
+(`crates/golden-evrf/benches/bls_*.rs`) also exist; see
+`crates/golden-evrf/src/paper/bls_jubjub.rs` for that backend's design.
 
 Benchmarked on an **AMD Ryzen 9 9950X** (16 cores / 32 threads, up to
 5.76 GHz) with the `optimized` profile (`lto = "thin"`, `codegen-units = 1`).
@@ -97,7 +104,7 @@ Round 0 + Round 1.  Communication is the per-participant bandwidth
 ```bash
 cargo fmt --all --check
 cargo clippy --all --benches --tests --examples --all-features --exclude bulletproofs-cycle -- -D warnings
-cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-ehtdh1/prototype-bridge,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1
+cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-ehtdh1/prototype-bridge,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1,golden-evrf/bls12-381-jubjub
 cargo test --workspace --doc
 ```
 

@@ -540,7 +540,12 @@ where
     ensure_public_share_keys(message, config)?;
 
     let receivers: Vec<ParticipantIndex> = public_share_receivers(config, message.dealer).collect();
-    receivers
+    // Collect per-receiver results into a `Vec` first (order-preserving,
+    // even when computed in parallel), then reduce sequentially: `Result`'s
+    // own `FromParallelIterator` impl picks an arbitrary error when several
+    // receivers fail, which would make the reported `Error::MissingShare`
+    // participant nondeterministic across runs.
+    let results: Vec<Result<_>> = receivers
         .into_par_iter()
         .map(|receiver| {
             let encrypted_share = message
@@ -565,7 +570,8 @@ where
                 message.transcript_root,
             )
         })
-        .collect()
+        .collect();
+    results.into_iter().collect()
 }
 
 /// Verify one dealer message.

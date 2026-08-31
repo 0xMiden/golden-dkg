@@ -1,1 +1,2 @@
 dealer-messages/*.bin binary
+dealer-messages-bls-jubjub/*.bin binary
