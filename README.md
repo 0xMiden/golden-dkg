@@ -20,53 +20,69 @@ The two protocol implementations follow these papers.
 The workspace has seven crates. All crates are published together and require
 Rust 1.93 or later.
 
-* `golden-core`: Shamir secret sharing, Feldman commitments, DKG messages,
-  transcript binding, and the curve-agnostic `EvrfProofBackend` trait that
-  connects the DKG to a concrete proof system.
-* `golden-evrf`: the eVRF proof backends. Includes a Secp256k1/Secq256k1
-  R1CS backend and a BLS12-381/Jubjub R1CS backend, each proving the full
-  Golden eVRF relation end-to-end via `bulletproofs-cycle`, plus a
-  share-opening prototype backend used for plumbing tests.
-* `golden-rustcrypto`: P-256 and secp256k1 `GoldenGroup` adapters backed by
-  the RustCrypto crates, used by the prototype backend and tests.
-* `golden-ehtdh1`: context-bound threshold encryption over Golden DKG output.
-  It binds each decryption share to the setup, ciphertext, and caller context.
-* `bulletproofs-cycle`: a minimal fork of `zkcrypto/bulletproofs` 5.0.1
-  with the Ristretto backend replaced by a `Cycle` trait over zkcrypto
-  `group`/`ff`. Range-proof, MPC, and serialization paths were stripped;
-  only the R1CS prover/verifier and inner-product proof remain. The
-  `bulletproofs-compat` feature opts into upstream Pedersen-generators
-  domain separation for byte-parity testing against `zkcrypto/bulletproofs`.
-* `golden-halo2curves`: `Cycle` impls for the `halo2curves`
-  Secp256k1/Secq256k1 curve cycle, plus the Secp256k1 `GoldenGroup`
-  adapter used by the Secp/Secq eVRF backend.
-* `golden-bls-jubjub`: `Cycle` impls for the BLS12-381 G1 / Jubjub curve
-  pair, plus the Jubjub `GoldenGroup` adapter used by the BLS12-381/Jubjub
-  eVRF backend.
+| Crate | Purpose |
+|---|---|
+| `golden-core` | Shamir sharing, Feldman commitments, DKG messages, transcript binding, and the curve-agnostic `EvrfProofBackend` trait. |
+| `golden-evrf` | Secp256k1/Secq256k1 and BLS12-381/Jubjub R1CS backends for the full Golden eVRF relation. It also contains a share-opening prototype used by plumbing tests. |
+| `golden-rustcrypto` | RustCrypto P-256 and secp256k1 `GoldenGroup` adapters used by the prototype backend and tests. |
+| `golden-ehtdh1` | Context-bound threshold encryption over Golden DKG output. Each decryption share is bound to its setup, ciphertext, and caller context. |
+| `bulletproofs-cycle` | A minimal fork of `zkcrypto/bulletproofs` 5.0.1 whose R1CS prover and verifier operate through a generic `Cycle` trait. The `bulletproofs-compat` feature provides byte-parity testing against the upstream crate. |
+| `golden-halo2curves` | Secp256k1/Secq256k1 `Cycle` implementations and the Secp256k1 `GoldenGroup` adapter. |
+| `golden-bls-jubjub` | BLS12-381 G1 and Jubjub `Cycle` implementations and the Jubjub `GoldenGroup` adapter. |
 
 ## Performance
 
 For performance sensitive workloads, one can use the `optimized` profile when compiling.
 
-The following tables replicate Tables 4 and 5 from the Golden DKG paper.
-All measurements are **real wall-clock timings** (criterion, flat sampling,
-10 samples) over the **Secp256k1/Secq256k1 curve cycle**, not the paper's
-zkalc estimates for BLS12-381.  The eVRF proof backend uses
-`bulletproofs-cycle` R1CS over the halo2curves Secp256k1/Secq256k1 cycle.
-A BLS12-381/Jubjub eVRF backend and its own bench suite
-(`crates/golden-evrf/benches/bls_*.rs`) also exist; see
-`crates/golden-evrf/src/paper/bls_jubjub.rs` for that backend's design.
+The following tables reproduce Tables 4 and 5 from the Golden DKG paper with
+real wall-clock measurements. Criterion uses flat sampling with 10 samples.
+The BLS12-381/Jubjub results exercise BLS12-381 G1 as the Bulletproof
+commitment group and Jubjub as the inner eVRF group. The existing
+Secp256k1/Secq256k1 measurements remain below for comparison.
 
 Benchmarked on an **AMD Ryzen 9 9950X** (16 cores / 32 threads, up to
 5.76 GHz) with the `optimized` profile (`lto = "thin"`, `codegen-units = 1`).
 
-### Table 4 — eVRF performance (Secp256k1/Secq256k1)
+### Table 4 (eVRF performance on BLS12-381/Jubjub)
+
+`n_e` is the number of receiver statements in one batched proof. Prover and
+verifier timings cover the Bulletproofs R1CS operations. Batch verification
+measures `verify_dealings` across `n_e` independent dealer messages. Proof
+sizes are exact wire lengths. The concatenated column contains `n_e`
+independent proofs.
+
+| n_e | Prover | Verifier | Batch verification | \|π\| (single) | n_e proofs (concat) |
+|---:|---:|---:|---:|---:|---:|
+| 1  | 151 ms | 16.4 ms | 17.0 ms | 1.9 kb | 1.9 kb |
+| 9  | 1.17 s | 87.7 ms | 116 ms | 2.2 kb | 19.8 kb |
+| 49 | 4.47 s | 326 ms | 1.81 s | 2.4 kb | 117.0 kb |
+| 99 | 8.79 s | 618 ms | 6.56 s | 2.5 kb | 245.9 kb |
+
+### Table 5 (DKG performance on BLS12-381/Jubjub, n-of-n)
+
+Round 0 measures `create_dealing` for one dealer. Round 1 measures `complete`
+for one receiver using all `n` dealings. Per-participant runtime is the sum of
+the two measured medians. Communication counts `n` serialized dealer
+broadcasts and uses decimal kilobytes.
+
+| n | Round 0 | Round 1 | Per-participant runtime | Comm. (per participant) |
+|---:|---:|---:|---:|---:|
+| 2   | 152 ms | 17.9 ms | 170 ms | 4.3 kb |
+| 10  | 1.19 s | 134 ms | 1.33 s | 32.4 kb |
+| 50  | 4.49 s | 2.49 s | 6.98 s | 375.5 kb |
+| 100 | 8.88 s | 11.8 s | 20.7 s | 1.27 MB |
+
+The paper reports zkalc estimates on AWS EC2 m5.2xlarge. These rows measure the
+real Jubjub circuit on the local Ryzen system, so the curve family now matches
+the paper while the hardware and circuit implementation remain different.
+
+### Table 4 (eVRF performance on Secp256k1/Secq256k1)
 
 `n_e` is the number of receiver statements covered by one batched proof.
 “Prover” times the Bulletproofs R1CS prover only.  “Verifier” times a
 single `evrf_batched_verify`.  “Batch verification” times `verify_dealings`
 across `n_e` independent dealer messages (the receiver's Round 1 work).
-`|π|` is the wire size of one batched proof; “n_e proofs” is the
+`|π|` is the wire size of one batched proof. “n_e proofs” is the
 concatenated size of `n_e` independent proofs.
 
 | n_e | Prover     | Verifier  | Batch verification | \|π\| (single) | n_e proofs (concat) |
@@ -78,13 +94,13 @@ concatenated size of `n_e` independent proofs.
 
 Every batched-eVRF proof is single-phase (the relation never defers
 constraints via `specify_randomized_constraints`), so its wire length is an
-exact function of the padded circuit size alone — the same
+exact function of the padded circuit size alone, using the same
 next-power-of-two step that sizes the Bulletproof generators. `|π|` and
 `n_e proofs` are computed by `BatchedEvrfPublicParams::batched_proof_wire_len`
 without building a proof, and checked byte-for-byte against a real proof in
 `tests/batched_dealer.rs::batched_proof_wire_len_matches_v5_vector`.
 
-### Table 5 — DKG performance (Secp256k1/Secq256k1, n-of-n)
+### Table 5 (DKG performance on Secp256k1/Secq256k1, n-of-n)
 
 “Round 0” is `create_dealing` for one dealer (includes the batched eVRF
 proof over `n − 1` receivers).  “Round 1” is `complete` for one receiver
