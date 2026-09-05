@@ -4,6 +4,3 @@
 .clawpatch/
 /target
 flamegraph.svg
-
-# Proptest data
-proptest-regressions/
