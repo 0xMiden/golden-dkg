@@ -87,10 +87,10 @@ concatenated size of `n_e` independent proofs.
 
 | n_e | Prover     | Verifier  | Batch verification | \|π\| (single) | n_e proofs (concat) |
 |-----|------------|-----------|--------------------|----------------|---------------------|
-| 1   | 119 ms     | 15.7 ms   | 16.1 ms            | 1.4 kb         | 1.4 kb              |
-| 9   | 885 ms     | 103 ms    | 572 ms             | 1.6 kb         | 14.3 kb             |
-| 49  | 3.12 s     | 420 ms    | 14.8 s             | 1.7 kb         | 84.2 kb             |
-| 99  | 7.33 s     | 846 ms    | 59.2 s             | 1.8 kb         | 176.6 kb            |
+| 1   | 116 ms     | 13.9 ms   | 14.5 ms            | 1.4 kb         | 1.4 kb              |
+| 9   | 865 ms     | 90.7 ms   | 134 ms             | 1.6 kb         | 14.3 kb             |
+| 49  | 3.08 s     | 346 ms    | 2.36 s             | 1.7 kb         | 84.2 kb             |
+| 99  | 7.10 s     | 716 ms    | 8.89 s             | 1.8 kb         | 176.6 kb            |
 
 Every batched-eVRF proof is single-phase (the relation never defers
 constraints via `specify_randomized_constraints`), so its wire length is an
@@ -110,10 +110,10 @@ Round 0 + Round 1.  Communication is the per-participant bandwidth
 
 | n   | Round 0  | Round 1  | Per-participant runtime | Comm. (per participant) |
 |-----|----------|----------|------------------------|------------------------|
-| 2   | 120 ms   | 24.6 ms  | 145 ms                 | 3.2 kb                 |
-| 10  | 932 ms   | 788 ms   | 1.72 s                 | 26.3 kb                |
-| 50  | 3.42 s   | 37.9 s   | 41.3 s                 | 342.0 kb               |
-| 100 | 8.12 s   | 246 s    | 255 s                  | 1.2 MB                 |
+| 2   | 123 ms   | 18.3 ms  | 141 ms                 | 3.2 kb                 |
+| 10  | 903 ms   | 160 ms   | 1.06 s                 | 26.3 kb                |
+| 50  | 3.20 s   | 2.61 s   | 5.81 s                 | 342.0 kb               |
+| 100 | 7.48 s   | 10.2 s   | 17.7 s                 | 1.2 MB                 |
 
 ## Useful checks
 
