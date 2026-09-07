@@ -92,7 +92,23 @@ impl<C: Cycle> VerificationEquation<C> {
         equations: Vec<Self>,
         rng: &mut impl CryptoRngCore,
     ) -> Result<(), R1CSError> {
-        let first = equations.first().ok_or(R1CSError::VerificationError)?;
+        Self::verify_batch_iter(equations.into_iter().map(Ok), rng)
+    }
+
+    /// Check lazily prepared equations with one shared generator MSM.
+    ///
+    /// Consumed equations are accumulated immediately, so callers can bound
+    /// preparation memory instead of retaining the entire batch. Any
+    /// preparation error aborts verification. The entropy requirements for
+    /// `rng` are the same as for [`Self::verify_batch`]. When using transcript
+    /// entropy, bind the complete ordered batch before deriving coefficients;
+    /// later equations must not adapt to coefficients already consumed.
+    pub fn verify_batch_iter(
+        equations: impl IntoIterator<Item = Result<Self, R1CSError>>,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<(), R1CSError> {
+        let mut equations = equations.into_iter();
+        let first = equations.next().ok_or(R1CSError::VerificationError)??;
         let pedersen_points = first.pedersen_points;
         let mut pedersen_scalars = [C::Scalar::ZERO; 2];
         let mut g_scalars = Vec::new();
@@ -102,7 +118,8 @@ impl<C: Cycle> VerificationEquation<C> {
         let mut proof_scalars = Vec::new();
         let mut proof_points = Vec::new();
 
-        for equation in equations {
+        for equation in iter::once(Ok(first)).chain(equations) {
+            let equation = equation?;
             if equation.pedersen_points != pedersen_points
                 || equation.proof_scalars.len() != equation.proof_points.len()
             {
@@ -468,7 +485,7 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
         // variable slots the prover allocated before its first call to
         // `specify_randomized_constraints`. Phase-2 multipliers (allocated
         // inside randomized callbacks) are appended after A_I1/A_O1/S1 are
-        // bound to the transcript, so n2 = n - n1 below counts phase-2 slots.
+        // bound to the transcript, so n - n1 counts phase-2 slots.
         let n1 = self.num_vars;
         validate_and_append_point::<C>(transcript, b"A_I1", &proof.A_I1)?;
         validate_and_append_point::<C>(transcript, b"A_O1", &proof.A_O1)?;
@@ -482,10 +499,9 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
         //   n2 = phase-2 slots (committed in A_I2/A_O2/S2)
         //   pad = zero rows added so the IPP shape is a power of two
         // The IPP polynomials pad all three groups to `padded_n` with zeros;
-        // `u_for_g` below marks phase-2 and pad rows with the IPP challenge
-        // `u` so the verifier weights phase-1 vs phase-2 rows correctly.
+        // The coefficients below weight phase-2 and pad rows by the IPP
+        // challenge `u`, preserving the prover's phase split.
         let n = self.num_vars;
-        let n2 = n - n1;
         let padded_n = self.num_vars.next_power_of_two();
         let pad = padded_n - n;
 
@@ -547,43 +563,27 @@ impl<C: Cycle, T: BorrowMut<Transcript>> Verifier<C, T> {
         let delta = inner_product(&yneg_wR[0..n], &wL);
 
         // Phase-1 rows get weight 1, phase-2 and pad rows get weight `u`.
-        // The pad rows are zero in `yneg_wR` and `s_owned`, so weighting them
-        // by `u` is harmless; it just keeps the vector shape aligned with the
-        // IPP generators.
-        let u_for_g: Vec<C::Scalar> = std::iter::repeat_n(C::Scalar::ONE, n1)
-            .chain(std::iter::repeat_n(u, n2 + pad))
-            .collect();
-        let u_for_h = u_for_g.clone();
-
-        let s_owned: Vec<C::Scalar> = s.iter().take(padded_n).copied().collect();
-        let s_rev: Vec<C::Scalar> = s.iter().rev().take(padded_n).copied().collect();
-
+        // Constraint weights are zero on pad rows; the IPP's `s` weights
+        // still span every generator, including padding.
         let g_scalars: Vec<C::Scalar> = yneg_wR
             .iter()
-            .zip(u_for_g.iter())
-            .zip(s_owned.iter())
-            .map(|((yneg_wRi, u_or_1), s_i)| *u_or_1 * (x * yneg_wRi - a * s_i))
-            .collect();
-
-        let wL_pad: Vec<C::Scalar> = wL
-            .iter()
-            .chain(std::iter::repeat_n(&C::Scalar::ZERO, pad))
-            .copied()
-            .collect();
-        let wO_pad: Vec<C::Scalar> = wO
-            .iter()
-            .chain(std::iter::repeat_n(&C::Scalar::ZERO, pad))
-            .copied()
+            .zip(s.iter())
+            .enumerate()
+            .map(|(i, (yneg_wRi, s_i))| {
+                let u_or_1 = if i < n1 { C::Scalar::ONE } else { u };
+                u_or_1 * (x * yneg_wRi - a * s_i)
+            })
             .collect();
 
         let h_scalars: Vec<C::Scalar> = y_inv_vec
             .iter()
-            .zip(u_for_h.iter())
-            .zip(s_rev.iter())
-            .zip(wL_pad.iter())
-            .zip(wO_pad.iter())
-            .map(|((((y_inv_i, u_or_1), s_i_inv), wLi), wOi)| {
-                *u_or_1 * (*y_inv_i * (x * wLi + wOi - b * s_i_inv) - C::Scalar::ONE)
+            .zip(s.iter().rev())
+            .enumerate()
+            .map(|(i, (y_inv_i, s_i_inv))| {
+                let u_or_1 = if i < n1 { C::Scalar::ONE } else { u };
+                let wLi = wL.get(i).copied().unwrap_or(C::Scalar::ZERO);
+                let wOi = wO.get(i).copied().unwrap_or(C::Scalar::ZERO);
+                u_or_1 * (*y_inv_i * (x * wLi + wOi - b * s_i_inv) - C::Scalar::ONE)
             })
             .collect();
 

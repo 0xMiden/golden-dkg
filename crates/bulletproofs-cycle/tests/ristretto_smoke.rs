@@ -19,6 +19,59 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
 
     #[test]
+    fn inner_product_proof_preserves_original_transcript_bytes() {
+        use bulletproofs_cycle::InnerProductProof;
+        use group::Group;
+        use sha3::{Digest, Sha3_256};
+        type C = RistrettoCycle;
+        // Captured before buffer reuse and generator-folding changes.
+        for (n, expected) in [
+            (
+                8,
+                [
+                    126, 70, 115, 182, 31, 48, 173, 2, 237, 116, 29, 101, 170, 95, 134, 151, 206,
+                    130, 95, 130, 118, 247, 136, 42, 167, 81, 200, 132, 215, 108, 70, 247,
+                ],
+            ),
+            (
+                512,
+                [
+                    228, 45, 153, 175, 64, 42, 95, 233, 194, 223, 12, 43, 236, 96, 0, 65, 221, 56,
+                    207, 102, 255, 195, 101, 116, 189, 216, 142, 222, 235, 137, 181, 108,
+                ],
+            ),
+            (
+                4096,
+                [
+                    114, 250, 63, 74, 3, 54, 42, 120, 111, 207, 61, 139, 38, 54, 251, 83, 43, 169,
+                    141, 121, 180, 125, 229, 184, 86, 35, 142, 140, 94, 194, 56, 213,
+                ],
+            ),
+        ] {
+            let gens = BulletproofGens::<C>::new(n, 1);
+            let g: Vec<_> = gens.share(0).G(n).copied().collect();
+            let h: Vec<_> = gens.share(0).H(n).copied().collect();
+            let mut rng = ChaCha20Rng::seed_from_u64(813);
+            let a = (0..n).map(|_| random_scalar::<C>(&mut rng)).collect();
+            let b = (0..n).map(|_| random_scalar::<C>(&mut rng)).collect();
+            let g_factors: Vec<_> = (0..n).map(|_| random_scalar::<C>(&mut rng)).collect();
+            let h_factors: Vec<_> = (0..n).map(|_| random_scalar::<C>(&mut rng)).collect();
+            let proof = InnerProductProof::<C>::create(
+                &mut Transcript::new(b"ipp-byte-parity"),
+                &<C as Cycle>::Point::generator(),
+                &g_factors,
+                &h_factors,
+                &g,
+                &h,
+                a,
+                b,
+            );
+            let digest: [u8; 32] = Sha3_256::digest(proof.to_bytes()).into();
+            assert_eq!(digest, expected, "original IPA bytes changed at n={n}");
+        }
+    }
+
+    #[test]
     fn linear_proof_roundtrips_over_ristretto() {
         let n: usize = 16;
         let mut rng = ChaCha20Rng::from_seed([42; 32]);

@@ -1,5 +1,5 @@
 //! Table 5 runtime columns: per-participant Round 0 and Round 1 cost for an
-//! n-of-n DKG over BLS12-381/Jubjub.
+//! (n-1)-of-n DKG over BLS12-381/Jubjub.
 //!
 //! - `paper/table-5/BLS12-381-Jubjub/round-0` times `create_dealing` for one
 //!   dealer at participant count `n`.

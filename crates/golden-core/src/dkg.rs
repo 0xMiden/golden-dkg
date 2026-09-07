@@ -193,6 +193,31 @@ impl<G: GoldenGroup> EvrfStatement<G> {
     pub fn root(&self) -> TranscriptRoot {
         statement_root(self)
     }
+
+    /// Compute canonical roots while reusing encodings of shared coefficients.
+    ///
+    /// Each result is identical to calling [`Self::root`] on that statement.
+    /// Statements with different coefficients are encoded independently.
+    pub fn batch_roots(statements: &[Self]) -> Vec<TranscriptRoot> {
+        let Some(first) = statements.first() else {
+            return Vec::new();
+        };
+        let coefficients: Vec<_> = first
+            .commitment_coefficients
+            .iter()
+            .map(G::encode_element)
+            .collect();
+        statements
+            .iter()
+            .map(|statement| {
+                if statement.commitment_coefficients == first.commitment_coefficients {
+                    statement_root_with_coefficients(statement, &coefficients)
+                } else {
+                    statement.root()
+                }
+            })
+            .collect()
+    }
 }
 
 /// Private witness used by an eVRF proof backend for one receiver.
@@ -941,6 +966,19 @@ fn statement_for_receiver<G: GoldenGroup>(
 }
 
 fn statement_root<G: GoldenGroup>(statement: &EvrfStatement<G>) -> TranscriptRoot {
+    statement_root_with_coefficients(
+        statement,
+        statement
+            .commitment_coefficients
+            .iter()
+            .map(G::encode_element),
+    )
+}
+
+fn statement_root_with_coefficients<G: GoldenGroup>(
+    statement: &EvrfStatement<G>,
+    coefficients: impl IntoIterator<Item = impl AsRef<[u8]>>,
+) -> TranscriptRoot {
     let mut transcript = TranscriptBuilder::new(b"evrf-statement");
     transcript.u32(b"version", statement.protocol_version);
     transcript.bytes(b"backend", statement.backend_id.as_bytes());
@@ -954,8 +992,8 @@ fn statement_root<G: GoldenGroup>(statement: &EvrfStatement<G>) -> TranscriptRoo
     transcript.element::<G>(b"dealer-pk", &statement.dealer_public_key);
     transcript.element::<G>(b"receiver-pk", &statement.receiver_public_key);
     transcript.usize(b"commitment-len", statement.commitment_coefficients.len());
-    for coefficient in &statement.commitment_coefficients {
-        transcript.element::<G>(b"commitment", coefficient);
+    for coefficient in coefficients {
+        transcript.bytes(b"commitment", coefficient.as_ref());
     }
     transcript.element::<G>(b"share-commitment", &statement.share_commitment);
     transcript.element::<G>(b"pad-commitment", &statement.pad_commitment);
@@ -1234,6 +1272,76 @@ mod tests {
 
     fn config() -> DkgConfig<TinyGroup> {
         config_for(3, 2, 42)
+    }
+
+    #[test]
+    fn batched_statement_roots_preserve_each_statement_binding() {
+        let config = config_for(5, 3, 42);
+        let mut rng = ChaCha20Rng::seed_from_u64(731);
+        let dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
+            idx(1),
+            &identity_secret(idx(1)),
+            &config,
+            &mut rng,
+        )
+        .unwrap();
+        let mut statements = dealing_statements(&dealing.message, &config).unwrap();
+        let reference: Vec<_> = statements.iter().map(EvrfStatement::root).collect();
+        assert_eq!(EvrfStatement::batch_roots(&statements), reference);
+        let mut reordered = statements.clone();
+        reordered.reverse();
+        assert_eq!(
+            EvrfStatement::batch_roots(&reordered),
+            reference.iter().rev().copied().collect::<Vec<_>>()
+        );
+        statements[1].commitment_coefficients[0] = TinyGroup::add(
+            &statements[1].commitment_coefficients[0],
+            &TinyGroup::generator(),
+        );
+        statements[2].commitment_coefficients.pop();
+        statements[3].receiver = idx(2);
+        let changed: Vec<_> = statements.iter().map(EvrfStatement::root).collect();
+        assert_eq!(EvrfStatement::batch_roots(&statements), changed);
+        assert_eq!(reference[0], changed[0]);
+        for i in 1..4 {
+            assert_ne!(reference[i], changed[i]);
+        }
+        assert!(EvrfStatement::<TinyGroup>::batch_roots(&[]).is_empty());
+    }
+
+    #[test]
+    fn statement_root_pins_legacy_canonical_transcript() {
+        let scalar = |value| TinyScalar::from_u64(value).unwrap();
+        let mut statement = EvrfStatement::<TinyGroup> {
+            protocol_version: 1,
+            backend_id: TinyGroup::BACKEND_ID,
+            session_id: SessionId([2; 32]),
+            registry_root: [3; 32],
+            threshold: 3,
+            dealer: idx(1),
+            receiver: idx(2),
+            msg_i: DealerMessageNonce([4; 32]),
+            beta: scalar(5),
+            dealer_public_key: scalar(6),
+            receiver_public_key: scalar(7),
+            commitment_coefficients: vec![scalar(8), scalar(9), scalar(10)],
+            share_commitment: scalar(11),
+            pad_commitment: scalar(12),
+            encrypted_share: scalar(23),
+            transcript_root: [13; 32],
+        };
+        // Independently encoded golden-core-v1 length-prefixed SHA-256 transcript.
+        let expected = [
+            167, 87, 102, 218, 89, 3, 16, 139, 44, 43, 199, 38, 143, 127, 224, 31, 239, 76, 184,
+            226, 71, 15, 174, 89, 112, 193, 39, 48, 203, 62, 18, 228,
+        ];
+        assert_eq!(statement.root(), expected);
+        assert_eq!(
+            EvrfStatement::batch_roots(std::slice::from_ref(&statement)),
+            vec![expected]
+        );
+        statement.commitment_coefficients.swap(0, 1);
+        assert_ne!(statement.root(), expected);
     }
 
     fn config_for(n: usize, threshold: usize, session_byte: u8) -> DkgConfig<TinyGroup> {

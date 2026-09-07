@@ -36,7 +36,7 @@ pub const NE_VALUES: &[usize] = &[1, 9, 49, 99];
 /// Threshold used by the Table 4 helpers, matching `secp_secq`'s.
 pub const TABLE4_THRESHOLD: usize = 2;
 
-/// Table 5 columns: number of DKG participants in an n-of-n configuration,
+/// Table 5 columns: number of DKG participants in an (n-1)-of-n configuration,
 /// matching the paper's `{2, 10, 50, 100}` sweep.
 pub const N_VALUES: &[usize] = &[2, 10, 50, 100];
 

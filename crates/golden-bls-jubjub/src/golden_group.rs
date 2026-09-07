@@ -11,6 +11,7 @@
 //! between the two.
 
 use core::fmt;
+use std::sync::OnceLock;
 
 use ff::{Field, PrimeField};
 use golden_core::{
@@ -21,7 +22,7 @@ use group::{Group, GroupEncoding};
 use jubjub::{AffinePoint, ExtendedPoint, Fq, Fr, SubgroupPoint};
 use rand_core::CryptoRngCore;
 use sha2::{Digest, Sha256};
-use subtle::{Choice, ConstantTimeEq};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 /// Jubjub scalar-field (`Fr`) modulus, little-endian canonical bytes.
 /// `r = 0x0e7db4ea6533afa906673b0101343b00a6682093ccc81082d0970e5ed6f72cb7`.
@@ -41,6 +42,58 @@ const JUBJUB_FQ_MODULUS_LE: [u8; 32] = [
 /// Domain separator prefix for [`JubjubGoldenGroup::hash_to_group`]'s
 /// try-and-increment candidate derivation.
 const HASH_TO_CURVE_PREFIX: &[u8] = b"golden-jubjub-h2c-v1";
+
+/// Multiply the canonical generator by a scalar in constant time, using a
+/// process-wide four-bit table containing only public generator multiples.
+///
+/// Every scalar byte is processed and every entry of every window is scanned
+/// with conditional selection. No branches or table indices depend on the scalar.
+pub fn mul_generator(scalar: &Fr) -> SubgroupPoint {
+    static TABLE: OnceLock<Vec<[SubgroupPoint; 16]>> = OnceLock::new();
+    mul_generator_with_table::<4, 16>(scalar, TABLE.get_or_init(build_generator_table::<4, 16>))
+}
+
+fn build_generator_table<const WIDTH: usize, const ENTRIES: usize>() -> Vec<[SubgroupPoint; ENTRIES]>
+{
+    assert_eq!(ENTRIES, 1 << WIDTH);
+    let mut base = SubgroupPoint::generator();
+    let mut table = Vec::with_capacity(256usize.div_ceil(WIDTH));
+    for _ in 0..256usize.div_ceil(WIDTH) {
+        let mut row = [SubgroupPoint::identity(); ENTRIES];
+        for digit in 1..ENTRIES {
+            row[digit] = row[digit - 1] + base;
+        }
+        table.push(row);
+        for _ in 0..WIDTH {
+            base = base.double();
+        }
+    }
+    table
+}
+
+fn mul_generator_with_table<const WIDTH: usize, const ENTRIES: usize>(
+    scalar: &Fr,
+    table: &[[SubgroupPoint; ENTRIES]],
+) -> SubgroupPoint {
+    let repr = scalar.to_repr();
+    let bytes: &[u8] = repr.as_ref();
+    let mut result = SubgroupPoint::identity();
+    for (window, row) in table.iter().enumerate() {
+        let mut digit = 0u8;
+        for offset in 0..WIDTH {
+            let bit = window * WIDTH + offset;
+            if bit < 256 {
+                digit |= ((bytes[bit / 8] >> (bit % 8)) & 1) << offset;
+            }
+        }
+        let mut selected = SubgroupPoint::identity();
+        for (index, entry) in row.iter().enumerate() {
+            selected.conditional_assign(entry, digit.ct_eq(&(index as u8)));
+        }
+        result += selected;
+    }
+    result
+}
 
 /// Wrapper around the Jubjub scalar field `Fr`.
 #[derive(Clone, Copy, Default)]
@@ -188,6 +241,10 @@ impl GoldenGroup for JubjubGoldenGroup {
         JubjubElement(point.0 * scalar.0)
     }
 
+    fn mul_generator(scalar: &Self::Scalar) -> Self::Element {
+        JubjubElement(mul_generator(&scalar.0))
+    }
+
     fn is_identity(point: &Self::Element) -> Choice {
         point.0.is_identity()
     }
@@ -295,6 +352,57 @@ impl GoldenEvrfCurve for JubjubGoldenGroup {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // Incorrect digit extraction, missing high windows, and table carry errors
+    // must disagree with the independent ordinary group multiplication path.
+    #[test]
+    fn fixed_base_matches_ordinary_multiplication() {
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::SeedableRng;
+
+        let mut scalars = vec![Fr::ZERO, Fr::ONE, -Fr::ONE];
+        let mut power = Fr::ONE;
+        for _ in 0..256 {
+            scalars.extend([power - Fr::ONE, power, power + Fr::ONE, -power]);
+            power = power.double();
+        }
+        // Alternating bits exercise every window's mixed-digit extraction.
+        for byte in [0x55u8, 0xaau8] {
+            let mut scalar = Fr::ZERO;
+            for bit in (0..256).rev() {
+                scalar = scalar.double() + Fr::from(u64::from((byte >> (bit % 8)) & 1));
+            }
+            scalars.push(scalar);
+        }
+        let mut rng = ChaCha20Rng::from_seed([0x47; 32]);
+        scalars.extend((0..128).map(|_| Fr::random(&mut rng)));
+        for scalar in scalars {
+            let expected = SubgroupPoint::generator() * scalar;
+            assert_eq!(mul_generator(&scalar), expected);
+            assert_eq!(
+                JubjubGoldenGroup::mul_generator(&JubjubScalar(scalar)).0,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_base_preserves_group_laws() {
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::SeedableRng;
+
+        let mut rng = ChaCha20Rng::from_seed([0x93; 32]);
+        for _ in 0..32 {
+            let a = Fr::random(&mut rng);
+            let b = Fr::random(&mut rng);
+            assert_eq!(
+                mul_generator(&(a + b)),
+                mul_generator(&a) + mul_generator(&b)
+            );
+            assert_eq!(mul_generator(&(-a)), -mul_generator(&a));
+            assert_eq!(mul_generator(&(a * b)), mul_generator(&a) * b);
+        }
+    }
 
     #[test]
     fn scalar_encoding_round_trips() {

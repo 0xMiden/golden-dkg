@@ -1,5 +1,5 @@
 //! Table 5 runtime columns: per-participant Round 0 and Round 1 cost for an
-//! n-of-n DKG over Secp256k1/Secq256k1.
+//! (n-1)-of-n DKG over Secp256k1/Secq256k1.
 //!
 //! - `paper/table-5/Secp256k1-Secq256k1/round-0` times `create_dealing` for
 //!   one dealer at participant count `n`. It includes the batched eVRF prove
@@ -54,7 +54,7 @@ fn dkg_round0(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     for n in table5_n_values() {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
-            // n-of-n: threshold = n - 1, matching Table 5. Setup is cheap
+            // (n-1)-of-n: threshold = n - 1, matching Table 5. Setup is cheap
             // (one config); the timed region pays the prove cost per iter.
             let config = build_config(n, n - 1);
             let dealer = idx(1);

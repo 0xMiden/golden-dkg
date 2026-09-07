@@ -7,6 +7,7 @@
 //! to the concrete `halo2curves` types when it builds the R1CS statement.
 
 use core::fmt;
+use std::sync::OnceLock;
 
 use ff::{Field, PrimeField};
 use golden_core::{
@@ -17,7 +18,7 @@ use halo2curves::secp256k1::{Fp, Fq, Secp256k1, Secp256k1Affine};
 use halo2curves::serde::Repr;
 use halo2curves::{Coordinates, CurveAffine, CurveExt};
 use rand_core::CryptoRngCore;
-use subtle::{Choice, ConstantTimeEq};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 /// Secp256k1 base-field modulus, little-endian canonical bytes.
 /// `p = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f`.
@@ -32,6 +33,57 @@ const SECP256K1_FQ_MODULUS_LE: [u8; 32] = [
     0x41, 0x41, 0x36, 0xd0, 0x8c, 0x5e, 0xd2, 0xbf, 0x3b, 0xa0, 0x48, 0xaf, 0xe6, 0xdc, 0xae, 0xba,
     0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 ];
+
+/// Multiply the canonical generator by a scalar in constant time, using a
+/// process-wide four-bit table containing only public generator multiples.
+///
+/// Every scalar byte is processed and every entry of every window is scanned
+/// with conditional selection. No branches or table indices depend on the scalar.
+pub fn mul_generator(scalar: &Fq) -> Secp256k1 {
+    static TABLE: OnceLock<Vec<[Secp256k1; 16]>> = OnceLock::new();
+    mul_generator_with_table::<4, 16>(scalar, TABLE.get_or_init(build_generator_table::<4, 16>))
+}
+
+fn build_generator_table<const WIDTH: usize, const ENTRIES: usize>() -> Vec<[Secp256k1; ENTRIES]> {
+    assert_eq!(ENTRIES, 1 << WIDTH);
+    let mut base = Secp256k1::generator();
+    let mut table = Vec::with_capacity(256usize.div_ceil(WIDTH));
+    for _ in 0..256usize.div_ceil(WIDTH) {
+        let mut row = [Secp256k1::identity(); ENTRIES];
+        for digit in 1..ENTRIES {
+            row[digit] = row[digit - 1] + base;
+        }
+        table.push(row);
+        for _ in 0..WIDTH {
+            base = base.double();
+        }
+    }
+    table
+}
+
+fn mul_generator_with_table<const WIDTH: usize, const ENTRIES: usize>(
+    scalar: &Fq,
+    table: &[[Secp256k1; ENTRIES]],
+) -> Secp256k1 {
+    let repr = scalar.to_repr();
+    let bytes: &[u8] = repr.as_ref();
+    let mut result = Secp256k1::identity();
+    for (window, row) in table.iter().enumerate() {
+        let mut digit = 0u8;
+        for offset in 0..WIDTH {
+            let bit = window * WIDTH + offset;
+            if bit < 256 {
+                digit |= ((bytes[bit / 8] >> (bit % 8)) & 1) << offset;
+            }
+        }
+        let mut selected = Secp256k1::identity();
+        for (index, entry) in row.iter().enumerate() {
+            selected.conditional_assign(entry, digit.ct_eq(&(index as u8)));
+        }
+        result += selected;
+    }
+    result
+}
 
 /// Wrapper around the Secp256k1 scalar field `Fq`.
 #[derive(Clone, Copy, Default)]
@@ -183,6 +235,10 @@ impl GoldenGroup for Secp256k1GoldenGroup {
         Secp256k1Element(point.0 * scalar.0)
     }
 
+    fn mul_generator(scalar: &Self::Scalar) -> Self::Element {
+        Secp256k1Element(mul_generator(&scalar.0))
+    }
+
     fn is_identity(point: &Self::Element) -> Choice {
         point.0.is_identity()
     }
@@ -301,6 +357,57 @@ pub fn scalar_to_r1cs_field(scalar: &Secp256k1Scalar) -> Option<Fp> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // Incorrect digit extraction, missing high windows, and table carry errors
+    // must disagree with the independent ordinary group multiplication path.
+    #[test]
+    fn fixed_base_matches_ordinary_multiplication() {
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::SeedableRng;
+
+        let mut scalars = vec![Fq::ZERO, Fq::ONE, -Fq::ONE];
+        let mut power = Fq::ONE;
+        for _ in 0..256 {
+            scalars.extend([power - Fq::ONE, power, power + Fq::ONE, -power]);
+            power = power.double();
+        }
+        // Alternating bits exercise every window's mixed-digit extraction.
+        for byte in [0x55u8, 0xaau8] {
+            let mut scalar = Fq::ZERO;
+            for bit in (0..256).rev() {
+                scalar = scalar.double() + Fq::from(u64::from((byte >> (bit % 8)) & 1));
+            }
+            scalars.push(scalar);
+        }
+        let mut rng = ChaCha20Rng::from_seed([0x47; 32]);
+        scalars.extend((0..128).map(|_| Fq::random(&mut rng)));
+        for scalar in scalars {
+            let expected = Secp256k1::generator() * scalar;
+            assert_eq!(mul_generator(&scalar), expected);
+            assert_eq!(
+                Secp256k1GoldenGroup::mul_generator(&Secp256k1Scalar(scalar)).0,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_base_preserves_group_laws() {
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::SeedableRng;
+
+        let mut rng = ChaCha20Rng::from_seed([0x93; 32]);
+        for _ in 0..32 {
+            let a = Fq::random(&mut rng);
+            let b = Fq::random(&mut rng);
+            assert_eq!(
+                mul_generator(&(a + b)),
+                mul_generator(&a) + mul_generator(&b)
+            );
+            assert_eq!(mul_generator(&(-a)), -mul_generator(&a));
+            assert_eq!(mul_generator(&(a * b)), mul_generator(&a) * b);
+        }
+    }
 
     #[test]
     fn scalar_encoding_round_trips() {
