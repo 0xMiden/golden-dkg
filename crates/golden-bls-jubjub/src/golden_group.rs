@@ -43,49 +43,46 @@ const JUBJUB_FQ_MODULUS_LE: [u8; 32] = [
 /// try-and-increment candidate derivation.
 const HASH_TO_CURVE_PREFIX: &[u8] = b"golden-jubjub-h2c-v1";
 
+/// Four-bit windows covering one 256-bit Jubjub scalar.
+const GENERATOR_WINDOWS: usize = 64;
+/// Precomputed multiples per window: one for every four-bit digit value.
+const GENERATOR_WINDOW_ENTRIES: usize = 16;
+
 /// Multiply the canonical generator by a scalar in constant time, using a
 /// process-wide four-bit table containing only public generator multiples.
 ///
-/// Every scalar byte is processed and every entry of every window is scanned
+/// Every scalar nibble is processed and every entry of every window is scanned
 /// with conditional selection. No branches or table indices depend on the scalar.
 pub fn mul_generator(scalar: &Fr) -> SubgroupPoint {
-    static TABLE: OnceLock<Vec<[SubgroupPoint; 16]>> = OnceLock::new();
-    mul_generator_with_table::<4, 16>(scalar, TABLE.get_or_init(build_generator_table::<4, 16>))
+    static TABLE: OnceLock<Vec<[SubgroupPoint; GENERATOR_WINDOW_ENTRIES]>> = OnceLock::new();
+    mul_generator_with_table(scalar, TABLE.get_or_init(build_generator_table))
 }
 
-fn build_generator_table<const WIDTH: usize, const ENTRIES: usize>() -> Vec<[SubgroupPoint; ENTRIES]>
-{
-    assert_eq!(ENTRIES, 1 << WIDTH);
+fn build_generator_table() -> Vec<[SubgroupPoint; GENERATOR_WINDOW_ENTRIES]> {
     let mut base = SubgroupPoint::generator();
-    let mut table = Vec::with_capacity(256usize.div_ceil(WIDTH));
-    for _ in 0..256usize.div_ceil(WIDTH) {
-        let mut row = [SubgroupPoint::identity(); ENTRIES];
-        for digit in 1..ENTRIES {
+    let mut table = Vec::with_capacity(GENERATOR_WINDOWS);
+    for _ in 0..GENERATOR_WINDOWS {
+        let mut row = [SubgroupPoint::identity(); GENERATOR_WINDOW_ENTRIES];
+        for digit in 1..GENERATOR_WINDOW_ENTRIES {
             row[digit] = row[digit - 1] + base;
         }
         table.push(row);
-        for _ in 0..WIDTH {
-            base = base.double();
-        }
+        // Shift the base past the four bits this window covers.
+        base = base.double().double().double().double();
     }
     table
 }
 
-fn mul_generator_with_table<const WIDTH: usize, const ENTRIES: usize>(
+fn mul_generator_with_table(
     scalar: &Fr,
-    table: &[[SubgroupPoint; ENTRIES]],
+    table: &[[SubgroupPoint; GENERATOR_WINDOW_ENTRIES]],
 ) -> SubgroupPoint {
     let repr = scalar.to_repr();
     let bytes: &[u8] = repr.as_ref();
     let mut result = SubgroupPoint::identity();
     for (window, row) in table.iter().enumerate() {
-        let mut digit = 0u8;
-        for offset in 0..WIDTH {
-            let bit = window * WIDTH + offset;
-            if bit < 256 {
-                digit |= ((bytes[bit / 8] >> (bit % 8)) & 1) << offset;
-            }
-        }
+        // Little-endian nibbles: even windows take the low half of a byte.
+        let digit = (bytes[window / 2] >> (4 * (window % 2))) & 0x0f;
         let mut selected = SubgroupPoint::identity();
         for (index, entry) in row.iter().enumerate() {
             selected.conditional_assign(entry, digit.ct_eq(&(index as u8)));

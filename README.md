@@ -87,8 +87,8 @@ concatenated size of `n_e` independent proofs.
 
 | n_e | Prover     | Verifier  | Batch verification | \|π\| (single) | n_e proofs (concat) |
 |-----|------------|-----------|--------------------|----------------|---------------------|
-| 1   | 116 ms     | 13.9 ms   | 14.5 ms            | 1.4 kb         | 1.4 kb              |
-| 9   | 865 ms     | 90.7 ms   | 134 ms             | 1.6 kb         | 14.3 kb             |
+| 1   | 116 ms     | 13.9 ms   | 14.5 ms            | 1.3 kb         | 1.3 kb              |
+| 9   | 865 ms     | 90.7 ms   | 134 ms             | 1.5 kb         | 13.7 kb             |
 | 49  | 3.08 s     | 346 ms    | 2.36 s             | 1.7 kb         | 84.2 kb             |
 | 99  | 7.10 s     | 716 ms    | 8.89 s             | 1.8 kb         | 176.6 kb            |
 
@@ -98,7 +98,7 @@ exact function of the padded circuit size alone, using the same
 next-power-of-two step that sizes the Bulletproof generators. `|π|` and
 `n_e proofs` are computed by `BatchedEvrfPublicParams::batched_proof_wire_len`
 without building a proof, and checked byte-for-byte against a real proof in
-`tests/batched_dealer.rs::batched_proof_wire_len_matches_v5_vector`.
+`tests/batched_dealer.rs::batched_proof_wire_len_matches_v8_vector`.
 
 ### Table 5 (DKG performance on Secp256k1/Secq256k1, n-of-n)
 
@@ -110,8 +110,8 @@ Round 0 + Round 1.  Communication is the per-participant bandwidth
 
 | n   | Round 0  | Round 1  | Per-participant runtime | Comm. (per participant) |
 |-----|----------|----------|------------------------|------------------------|
-| 2   | 123 ms   | 18.3 ms  | 141 ms                 | 3.2 kb                 |
-| 10  | 903 ms   | 160 ms   | 1.06 s                 | 26.3 kb                |
+| 2   | 123 ms   | 18.3 ms  | 141 ms                 | 3.1 kb                 |
+| 10  | 903 ms   | 160 ms   | 1.06 s                 | 25.6 kb                |
 | 50  | 3.20 s   | 2.61 s   | 5.81 s                 | 342.0 kb               |
 | 100 | 7.48 s   | 10.2 s   | 17.7 s                 | 1.2 MB                 |
 
