@@ -49,7 +49,7 @@ required-features = ["cycle-pedersen", "ristretto"]
 
 [[test]]
 name = "ristretto_parity"
-required-features = ["cycle-pedersen", "ristretto"]
+required-features = ["bulletproofs-compat"]
 
 [[test]]
 name = "r1cs_batch"

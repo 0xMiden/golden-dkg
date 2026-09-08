@@ -60,8 +60,24 @@ impl<C: Cycle> InnerProductProof<C> {
 
         let mut g_coef = G_factors.to_vec();
         let mut h_coef = H_factors.to_vec();
+        // The initial rounds use the original generator set; keep scratch
+        // capacity instead of allocating four full-size buffers per round.
+        let mut scalars_l = Vec::with_capacity(n + 1);
+        let mut points_l = Vec::with_capacity(n + 1);
+        let mut scalars_r = Vec::with_capacity(n + 1);
+        let mut points_r = Vec::with_capacity(n + 1);
 
-        for round in 0..lg_n {
+        // Expanding the first rounds over the original affine bases avoids
+        // many short scalar multiplications. After eight rounds, collapsing
+        // the bases once makes the remaining MSMs shrink geometrically.
+        // This crossover was measured on both Secq and BLS12-381, with one
+        // and four workers; it does not affect transcript or proof bytes.
+        const ORIGINAL_BASE_ROUNDS: usize = 8;
+        // Small proofs do not amortize the one-time collapse. Table 5's
+        // smallest circuit has 4096 generators; retain the original path
+        // below that measured range.
+        let original_rounds = if n < 4096 { lg_n } else { ORIGINAL_BASE_ROUNDS };
+        for round in 0..original_rounds {
             let m = n >> (round + 1);
             let shift = lg_n - round - 1;
             let mask = m - 1;
@@ -72,10 +88,10 @@ impl<C: Cycle> InnerProductProof<C> {
             let c_L = inner_product(a_L, b_R);
             let c_R = inner_product(a_R, b_L);
 
-            let mut scalars_l = Vec::with_capacity(n + 1);
-            let mut points_l = Vec::with_capacity(n + 1);
-            let mut scalars_r = Vec::with_capacity(n + 1);
-            let mut points_r = Vec::with_capacity(n + 1);
+            scalars_l.clear();
+            points_l.clear();
+            scalars_r.clear();
+            points_r.clear();
 
             for j in 0..n {
                 let idx = j & mask;
@@ -98,8 +114,12 @@ impl<C: Cycle> InnerProductProof<C> {
             scalars_r.push(c_R);
             points_r.push(Q_affine);
 
-            let L = C::point_compress(&C::vartime_msm_affine(&scalars_l, &points_l));
-            let R = C::point_compress(&C::vartime_msm_affine(&scalars_r, &points_r));
+            let (L, R) = join(
+                || C::vartime_msm_affine(&scalars_l, &points_l),
+                || C::vartime_msm_affine(&scalars_r, &points_r),
+            );
+            let L = C::point_compress(&L);
+            let R = C::point_compress(&R);
 
             L_vec.push(L.clone());
             R_vec.push(R.clone());
@@ -127,7 +147,101 @@ impl<C: Cycle> InnerProductProof<C> {
             b = b_L;
         }
 
+        if a.len() > 1 {
+            // These full-size buffers are no longer needed by the folded
+            // tail. Release them before materializing its smaller bases.
+            drop((scalars_l, points_l, scalars_r, points_r));
+            let remaining = a.len();
+            let fold = |coefficients: &[C::Scalar], bases: &[C::Affine]| {
+                let points: Vec<_> = (0..remaining)
+                    .into_par_iter()
+                    .map(|i| {
+                        let scalars: Vec<_> = coefficients
+                            .iter()
+                            .skip(i)
+                            .step_by(remaining)
+                            .copied()
+                            .collect();
+                        let points: Vec<_> =
+                            bases.iter().skip(i).step_by(remaining).copied().collect();
+                        C::vartime_msm_affine(&scalars, &points)
+                    })
+                    .collect();
+                C::batch_normalize(&points)
+            };
+            let (folded_g, folded_h) = join(|| fold(&g_coef, G), || fold(&h_coef, H));
+            drop((g_coef, h_coef));
+            return Self::create_folded_tail(
+                transcript, Q_affine, a, b, folded_g, folded_h, L_vec, R_vec,
+            );
+        }
+
         InnerProductProof {
+            L_vec,
+            R_vec,
+            a: a[0],
+            b: b[0],
+        }
+    }
+
+    /// Continue the same IPA after the original generators have been
+    /// collapsed using the challenges and input factors already accumulated.
+    fn create_folded_tail(
+        transcript: &mut Transcript,
+        Q: C::Affine,
+        mut a: &mut [C::Scalar],
+        mut b: &mut [C::Scalar],
+        mut G: Vec<C::Affine>,
+        mut H: Vec<C::Affine>,
+        mut L_vec: Vec<C::Compressed>,
+        mut R_vec: Vec<C::Compressed>,
+    ) -> Self {
+        while a.len() > 1 {
+            let m = a.len() / 2;
+            let (a_L, a_R) = a.split_at_mut(m);
+            let (b_L, b_R) = b.split_at_mut(m);
+            let c_L = inner_product(a_L, b_R);
+            let c_R = inner_product(a_R, b_L);
+            let scalars_l: Vec<_> = a_L.iter().chain(b_R.iter()).copied().chain([c_L]).collect();
+            let scalars_r: Vec<_> = a_R.iter().chain(b_L.iter()).copied().chain([c_R]).collect();
+            let points_l: Vec<_> = G[m..].iter().chain(&H[..m]).copied().chain([Q]).collect();
+            let points_r: Vec<_> = G[..m].iter().chain(&H[m..]).copied().chain([Q]).collect();
+            let (L, R) = join(
+                || C::vartime_msm_affine(&scalars_l, &points_l),
+                || C::vartime_msm_affine(&scalars_r, &points_r),
+            );
+            let L = C::point_compress(&L);
+            let R = C::point_compress(&R);
+            append_point::<C>(transcript, b"L", &L);
+            append_point::<C>(transcript, b"R", &R);
+            L_vec.push(L);
+            R_vec.push(R);
+
+            let u = challenge_scalar::<C>(transcript, b"u");
+            let u_inv = C::scalar_invert(&u);
+            a_L.par_iter_mut()
+                .zip(a_R.par_iter())
+                .for_each(|(l, r)| *l = *l * u + *r * u_inv);
+            b_L.par_iter_mut()
+                .zip(b_R.par_iter())
+                .for_each(|(l, r)| *l = *l * u_inv + *r * u);
+            if m > 1 {
+                // G' = u^-1 G_L + u G_R; H' = u H_L + u^-1 H_R.
+                let g_points: Vec<_> = (0..m)
+                    .into_par_iter()
+                    .map(|i| C::vartime_msm_affine(&[u_inv, u], &[G[i], G[m + i]]))
+                    .collect();
+                let h_points: Vec<_> = (0..m)
+                    .into_par_iter()
+                    .map(|i| C::vartime_msm_affine(&[u, u_inv], &[H[i], H[m + i]]))
+                    .collect();
+                G = C::batch_normalize(&g_points);
+                H = C::batch_normalize(&h_points);
+            }
+            a = a_L;
+            b = b_L;
+        }
+        Self {
             L_vec,
             R_vec,
             a: a[0],

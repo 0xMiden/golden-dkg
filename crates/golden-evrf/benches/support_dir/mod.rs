@@ -37,7 +37,7 @@ pub const NE_VALUES: &[usize] = &[1, 9, 49, 99];
 /// two Feldman coefficients, so full-DKG fixtures must use the same threshold.
 pub const TABLE4_THRESHOLD: usize = 2;
 
-/// Table 5 columns: number of DKG participants in an n-of-n configuration.
+/// Table 5 columns: number of DKG participants in an (n-1)-of-n configuration.
 pub const N_VALUES: &[usize] = &[2, 10, 50, 100];
 
 fn selected_values(variable: &str, defaults: &[usize]) -> Vec<usize> {

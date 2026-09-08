@@ -33,7 +33,7 @@ fn public_params(
 }
 
 #[test]
-fn evrf_batched_dealer_matches_v7_vector() {
+fn evrf_batched_dealer_matches_v8_vector() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0002);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 1);
@@ -47,8 +47,15 @@ fn evrf_batched_dealer_matches_v7_vector() {
 
     assert_eq!(
         proof.as_slice(),
-        include_bytes!("vectors/paper-batched-dealer-v7.bin")
+        include_bytes!("vectors/paper-batched-dealer-v8.bin")
     );
+    assert!(paper::evrf_batched_verify(
+        &public_params(&statement),
+        &statement,
+        include_bytes!("vectors/paper-batched-dealer-v7.bin"),
+        &mut rng
+    )
+    .is_err());
     let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
     paper::evrf_batched_verify(
         &public_params(&statement),
@@ -60,7 +67,7 @@ fn evrf_batched_dealer_matches_v7_vector() {
 }
 
 #[test]
-fn batched_proof_wire_len_matches_v7_vector() {
+fn batched_proof_wire_len_matches_v8_vector() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C_0002);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 1);
@@ -76,7 +83,7 @@ fn batched_proof_wire_len_matches_v7_vector() {
 
     assert_eq!(
         predicted,
-        include_bytes!("vectors/paper-batched-dealer-v7.bin").len()
+        include_bytes!("vectors/paper-batched-dealer-v8.bin").len()
     );
 }
 
@@ -392,7 +399,7 @@ fn evrf_batched_dealer_rejects_proof_replay_across_dealer_keys() {
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn evrf_batched_dealer_four_receivers_verifies() {
     // Regression for generator sizing: this two-coefficient, four-receiver
-    // shape uses 15,349 multipliers and therefore needs 16,384 generators.
+    // shape uses 13,241 multipliers and therefore needs 16,384 generators.
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C9);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 4);
@@ -447,6 +454,22 @@ fn evrf_cross_proof_batch_verifies_and_rejects_mismatched_pairs() {
         ],
     )
     .expect("reordered honest pairs");
+    let other_pkjs = make_pkjs(&mut rng, 1);
+    let (other_statement, other_witness) =
+        paper::testing::build_batched(&make_msg(12), GinScalar::from(7u64), &other_pkjs, beta);
+    let other_proof =
+        paper::evrf_batched_prove(&params, &other_statement, &other_witness, &mut rng)
+            .expect("other receiver key proof");
+    paper::evrf_batched_verify_many(
+        &params,
+        &[
+            (&first_statement, &first_proof),
+            (&other_statement, &other_proof),
+            (&second_statement, &second_proof),
+        ],
+    )
+    .expect("same receiver index with distinct canonical keys");
+
     assert!(paper::evrf_batched_verify_many(
         &params,
         &[

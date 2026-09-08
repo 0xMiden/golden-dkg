@@ -6,7 +6,7 @@
 //! function of the padded circuit size alone —
 //! `BatchedEvrfPublicParams::batched_proof_wire_len` computes it without
 //! building a proof or statement (checked against a real proof in
-//! `tests/batched_dealer.rs::batched_proof_wire_len_matches_v5_vector`).
+//! `tests/batched_dealer.rs::batched_proof_wire_len_matches_v8_vector`).
 //! That lets this bench report all four paper rows instead of
 //! extrapolating from the two cheapest to prove.
 

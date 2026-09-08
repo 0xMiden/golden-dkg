@@ -49,6 +49,7 @@ use bulletproofs_cycle::{
     VerificationEquation,
 };
 use ff::{Field, PrimeField};
+use golden_bls_jubjub::golden_group::mul_generator;
 use golden_bls_jubjub::{Bls12_381G1Cycle, JubjubCycle};
 use group::Group;
 use jubjub::{ExtendedPoint, Fr, SubgroupPoint};
@@ -56,6 +57,7 @@ use merlin::Transcript;
 use p3_maybe_rayon::prelude::*;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use sha2::Digest;
+use std::collections::BTreeMap;
 
 /// R1CS field: BLS12-381's scalar field (also Jubjub's base field `Fq`).
 pub type R1csField = Scalar;
@@ -466,15 +468,6 @@ fn gin_scalar_modulus_as_r1cs_field() -> R1csField {
 // R1CS gadgets
 // ------------------------------------------------------------------
 
-/// Compute `2^j` as an `R1csField` element by repeated doubling.
-fn power_of_two(j: usize) -> R1csField {
-    let mut result = R1csField::ONE;
-    for _ in 0..j {
-        result = result.double();
-    }
-    result
-}
-
 /// Bit-decomposition gadget (paper Section 4.2), generalized to an
 /// arbitrary bit width so the same implementation serves both the
 /// `K_BITS + 1`-wide decompositions ([`bit_decompose`]/[`bit_decompose_q`])
@@ -498,15 +491,17 @@ fn bit_decompose_bounded_n<CS: ConstraintSystem<R1csCycle>>(
     }
     let mut bit_vars = Vec::with_capacity(num_bits);
     let mut k_lc = LinearCombination::default();
+    let mut bit_weight = R1csField::ONE;
 
-    for (j, &bit) in bit_assignments.iter().enumerate() {
+    for &bit in bit_assignments {
         let (left, right, out) =
             cs.allocate_multiplier(bit.map(|bit| (bit, R1csField::ONE - bit)))?;
         cs.constrain(right - (LinearCombination::from(R1csField::ONE) - left));
         cs.constrain(out.into());
         bit_vars.push(left);
 
-        k_lc = k_lc + left * power_of_two(j);
+        k_lc = k_lc + left * bit_weight;
+        bit_weight = bit_weight.double();
     }
 
     cs.constrain(k_lc - k_var);
@@ -841,6 +836,8 @@ fn edwards_window_products<CS: ConstraintSystem<R1csCycle>>(
 /// base `X`, for use with [`edwards_exponentiate_windowed_r1cs`].
 #[derive(Clone, Debug)]
 struct EdwardsWindowPrecomp {
+    /// Public doubling chain reused by native witness generation.
+    powers: Vec<Gin>,
     /// Affine coords of `P_0 = X`, bit 0's candidate point.
     bit0: (R1csField, R1csField),
     /// For `w = 1..=K_BITS/2` (window `w` covers bits `2w-1, 2w`):
@@ -961,7 +958,32 @@ fn precompute_windowed_base_powers(x: &Gin) -> Result<EdwardsWindowPrecomp> {
     let affines = batch_affine(&points)?;
     let bit0 = affines[0];
     let windows = affines[1..].as_chunks::<3>().0.to_vec();
-    Ok(EdwardsWindowPrecomp { bit0, windows })
+    Ok(EdwardsWindowPrecomp {
+        powers,
+        bit0,
+        windows,
+    })
+}
+
+type ReceiverPrecomps = BTreeMap<[u8; 32], EdwardsWindowPrecomp>;
+
+fn receiver_precomps<'a>(
+    statements: impl IntoIterator<Item = &'a BatchedEvrfStatement>,
+) -> Result<ReceiverPrecomps> {
+    let mut points = BTreeMap::new();
+    for statement in statements {
+        for receiver in &statement.receivers {
+            points
+                .entry(JubjubCycle::point_compress(&receiver.pkj))
+                .or_insert(receiver.pkj);
+        }
+    }
+    let points: Vec<_> = points.into_iter().collect();
+    let precomps = points
+        .par_iter()
+        .map(|(key, point)| Ok((*key, precompute_windowed_base_powers(point)?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(precomps.into_iter().collect())
 }
 
 /// Off-circuit reference computation of the windowed additive ladder: `L_0`
@@ -1242,13 +1264,12 @@ fn constant_term_prove(
     polynomial_constant: &GinScalar,
     rng: &mut impl CryptoRngCore,
 ) -> Result<()> {
-    let generator = Gin::generator();
-    if generator * *polynomial_constant != *constant_commitment {
+    if mul_generator(polynomial_constant) != *constant_commitment {
         return Err(Error::ProofVerificationFailed);
     }
 
     let nonce = random_nonzero_scalar::<JubjubCycle>(rng);
-    let nonce_commitment = generator * nonce;
+    let nonce_commitment = mul_generator(&nonce);
     stream.send_point::<GinStreamCurve>(
         b"constant-term.a",
         &nonce_commitment,
@@ -1269,7 +1290,7 @@ fn constant_term_verify(
     let challenge = stream_challenge_scalar::<JubjubCycle>(stream, b"constant-term.challenge");
     let response = stream.receive_scalar::<GinStreamCurve>(b"constant-term.t")?;
 
-    if Gin::generator() * response != nonce_commitment + *constant_commitment * challenge {
+    if mul_generator(&response) != nonce_commitment + *constant_commitment * challenge {
         return Err(Error::ProofVerificationFailed);
     }
 
@@ -1693,7 +1714,36 @@ fn validate_batched_statement_shape(statement: &BatchedEvrfStatement) -> Result<
     Ok(())
 }
 
+const FELDMAN_BATCH_DOMAIN: &[u8] = b"golden-paper-evrf-feldman-batch-jubjub-v1";
+
 fn validate_batched_public_relations(statement: &BatchedEvrfStatement) -> Result<()> {
+    validate_batched_public_relations_impl(statement, None)
+}
+
+/// Measured crossover against small-index Horner validation. Smaller
+/// receiver/threshold dimensions retain the cheaper exact check.
+fn validate_batched_public_relations_for_verifier(
+    statement: &BatchedEvrfStatement,
+    statement_transcript: &Transcript,
+) -> Result<()> {
+    let batch_feldman = statement.threshold.min(statement.receivers.len()) >= 99;
+    validate_batched_public_relations_impl(statement, batch_feldman.then_some(statement_transcript))
+}
+
+#[cfg(test)]
+fn validate_batched_public_relations_with_feldman_batch(
+    statement: &BatchedEvrfStatement,
+) -> Result<()> {
+    validate_batched_statement_shape(statement)?;
+    let mut transcript = Transcript::new(BATCHED_PROOF_ID);
+    observe_batched_statement(&mut transcript, statement)?;
+    validate_batched_public_relations_impl(statement, Some(&transcript))
+}
+
+fn validate_batched_public_relations_impl(
+    statement: &BatchedEvrfStatement,
+    statement_transcript: Option<&Transcript>,
+) -> Result<()> {
     validate_batched_statement_shape(statement)?;
     if is_identity(&statement.pk1) {
         return Err(Error::ProofVerificationFailed);
@@ -1705,16 +1755,97 @@ fn validate_batched_public_relations(statement: &BatchedEvrfStatement) -> Result
         {
             return Err(Error::ProofVerificationFailed);
         }
-        if feldman_share_commitment(&statement.commitment_coefficients, rec.receiver)
-            != rec.share_commitment
+        if statement_transcript.is_none()
+            && feldman_share_commitment(&statement.commitment_coefficients, rec.receiver)
+                != rec.share_commitment
         {
             return Err(Error::ProofVerificationFailed);
         }
-        if Gin::generator() * rec.encrypted_share != rec.share_commitment + rec.pad_commitment {
+        if mul_generator(&rec.encrypted_share) != rec.share_commitment + rec.pad_commitment {
             return Err(Error::ProofVerificationFailed);
         }
         Ok(())
-    })
+    })?;
+    if let Some(transcript) = statement_transcript {
+        if !feldman_batch_matches(statement, transcript)? {
+            return Err(Error::ProofVerificationFailed);
+        }
+    }
+    Ok(())
+}
+
+/// Clone the proof transcript immediately after its complete ordered statement
+/// observation, and separate the validation domain before deriving weights.
+/// The proof transcript itself is untouched. Residuals are statement-defined,
+/// so proof message bytes are unnecessary for this independent equation.
+fn feldman_batch_weights_from_transcript(
+    statement: &BatchedEvrfStatement,
+    statement_transcript: &Transcript,
+) -> Result<Vec<GinScalar>> {
+    validate_batched_statement_shape(statement)?;
+    let mut transcript = statement_transcript.clone();
+    transcript.append_message(b"validation-domain", FELDMAN_BATCH_DOMAIN);
+    let mut weights = Vec::with_capacity(statement.receivers.len());
+    for index in 0..statement.receivers.len() {
+        transcript.append_u64(b"receiver-weight-index", index as u64);
+        loop {
+            let mut bytes = [0u8; 64];
+            transcript.challenge_bytes(b"feldman-weight", &mut bytes);
+            let weight = JubjubCycle::scalar_from_wide(&bytes);
+            if !bool::from(weight.is_zero()) {
+                weights.push(weight);
+                break;
+            }
+        }
+    }
+    Ok(weights)
+}
+
+#[cfg(test)]
+fn feldman_batch_weights(statement: &BatchedEvrfStatement) -> Result<Vec<GinScalar>> {
+    validate_batched_statement_shape(statement)?;
+    let mut transcript = Transcript::new(BATCHED_PROOF_ID);
+    observe_batched_statement(&mut transcript, statement)?;
+    feldman_batch_weights_from_transcript(statement, &transcript)
+}
+
+/// Check sum_j alpha_j S_j - sum_k (sum_j alpha_j j^k) C_k = 0.
+/// Scalars and points are all public, so variable-time MSM is appropriate.
+fn feldman_batch_matches(
+    statement: &BatchedEvrfStatement,
+    statement_transcript: &Transcript,
+) -> Result<bool> {
+    let weights = feldman_batch_weights_from_transcript(statement, statement_transcript)?;
+    let mut coefficient_weights = vec![GinScalar::ZERO; statement.commitment_coefficients.len()];
+    for (rec, &weight) in statement.receivers.iter().zip(&weights) {
+        let x = GinScalar::from(u64::from(rec.receiver.get()));
+        let mut power_weight = weight;
+        for coefficient_weight in &mut coefficient_weights {
+            *coefficient_weight -= power_weight;
+            power_weight *= x;
+        }
+    }
+    let mut scalars = weights;
+    scalars.extend(coefficient_weights);
+    let mut points: Vec<_> = statement
+        .receivers
+        .iter()
+        .map(|rec| rec.share_commitment)
+        .collect();
+    points.extend_from_slice(&statement.commitment_coefficients);
+    // Jubjub's native Pippenger is serial. Independent public chunks
+    // expose parallelism without changing the single checked equation.
+    // Cap at four: smaller chunks lose to bucket overhead on larger pools.
+    let chunk_len = scalars.len().div_ceil(current_num_threads().clamp(1, 4));
+    let partials: Vec<_> = scalars
+        .par_chunks(chunk_len)
+        .zip(points.par_chunks(chunk_len))
+        .map(|(scalars, points)| JubjubCycle::vartime_msm(scalars, points))
+        .collect();
+    let residual = partials
+        .into_iter()
+        .fold(Gin::identity(), |sum, part| sum + part);
+    Ok(is_identity(&residual))
 }
 
 /// Variable-time double-and-add multiplication by a small scalar.
@@ -1852,14 +1983,13 @@ fn build_hidden_receiver_slot<CS: ConstraintSystem<R1csCycle>>(
     precomp_h2: &EdwardsWindowPrecomp,
     beta: R1csField,
     witness: Option<&HiddenReceiverWitness>,
+    precomp_pkj: &EdwardsWindowPrecomp,
 ) -> core::result::Result<(), R1CSError> {
-    let precomp_pkj =
-        precompute_windowed_base_powers(&rec.pkj).map_err(|_| R1CSError::VerificationError)?;
     let (s_u, _) = edwards_exponentiate_windowed_r1cs(
         cs,
         sk_bit_vars,
         sk_window_products,
-        &precomp_pkj,
+        precomp_pkj,
         None,
         witness.map(|w| &w.sk_pkj),
     )?;
@@ -1915,18 +2045,18 @@ fn compute_hidden_receiver_witness(
     sk1: &GinScalar,
     rec: &BatchedReceiverStatement,
     beta: &R1csField,
-    h1: &Gin,
-    h2: &Gin,
+    precomp_h1: &EdwardsWindowPrecomp,
+    precomp_h2: &EdwardsWindowPrecomp,
+    precomp_pkj: &EdwardsWindowPrecomp,
 ) -> Result<HiddenReceiverWitness> {
-    let g_in = Gin::generator();
     let sj = rec.pkj * *sk1;
     let (s_u, _) = affine(&sj)?;
     let mut k_bool_bits = [false; K_BITS + 1];
     decompose_k_fp(&s_u, &mut k_bool_bits);
     let k_bits = bit_options(&k_bool_bits);
 
-    let t1_witness = edwards_windowed_ladder_witness(&k_bool_bits, &base_power_points(h1))?;
-    let t2_witness = edwards_windowed_ladder_witness(&k_bool_bits, &base_power_points(h2))?;
+    let t1_witness = edwards_windowed_ladder_witness(&k_bool_bits, &precomp_h1.powers)?;
+    let t2_witness = edwards_windowed_ladder_witness(&k_bool_bits, &precomp_h2.powers)?;
     let (t1_u, _) = *t1_witness
         .window_results
         .last()
@@ -1940,7 +2070,7 @@ fn compute_hidden_receiver_witness(
     let (pad, m) = reduce_pad_witness(&r);
     let pad_fr = fp_to_fr(&pad);
 
-    let pad_commitment = g_in * pad_fr;
+    let pad_commitment = mul_generator(&pad_fr);
     if JubjubCycle::point_compress(&pad_commitment).as_ref()
         != JubjubCycle::point_compress(&rec.pad_commitment).as_ref()
     {
@@ -1953,13 +2083,16 @@ fn compute_hidden_receiver_witness(
     decompose_k_fp(&pad, &mut pad_bool_bits);
 
     Ok(HiddenReceiverWitness {
-        sk_pkj: edwards_windowed_ladder_witness(&sk_bits, &base_power_points(&rec.pkj))?,
+        sk_pkj: edwards_windowed_ladder_witness(&sk_bits, &precomp_pkj.powers)?,
         k_bits,
         t1: t1_witness,
         t2: t2_witness,
         pad,
         m,
-        pad_commitment: edwards_windowed_ladder_witness(&pad_bool_bits, &base_power_points(&g_in))?,
+        pad_commitment: edwards_windowed_ladder_witness(
+            &pad_bool_bits,
+            &shared_g_in_window_precomp().powers,
+        )?,
     })
 }
 
@@ -1970,9 +2103,7 @@ fn prove_batched_r1cs(
     rng: &mut impl CryptoRngCore,
     transcript: &mut Transcript,
 ) -> Result<Vec<u8>> {
-    let g_in = Gin::generator();
-
-    let pk1_computed = g_in * witness.sk1;
+    let pk1_computed = mul_generator(&witness.sk1);
     if JubjubCycle::point_compress(&pk1_computed).as_ref()
         != JubjubCycle::point_compress(&statement.pk1).as_ref()
     {
@@ -2001,8 +2132,8 @@ fn prove_batched_r1cs(
     let sk_window_products = edwards_window_products(&mut prover, &sk_bit_vars)
         .map_err(|_| Error::ProofVerificationFailed)?;
 
-    let pk1_witness = edwards_windowed_ladder_witness(&sk_bool_bits, &base_power_points(&g_in))?;
     let precomp_g_in = shared_g_in_window_precomp();
+    let pk1_witness = edwards_windowed_ladder_witness(&sk_bool_bits, &precomp_g_in.powers)?;
     let (pk1_u, pk1_v) = affine(&statement.pk1)?;
     edwards_exponentiate_windowed_r1cs(
         &mut prover,
@@ -2014,9 +2145,24 @@ fn prove_batched_r1cs(
     )
     .map_err(|_| Error::ProofVerificationFailed)?;
 
-    for rec in &statement.receivers {
-        let rec_witness =
-            compute_hidden_receiver_witness(&witness.sk1, rec, &statement.beta, &h1, &h2)?;
+    let receiver_inputs = statement
+        .receivers
+        .par_iter()
+        .map(|rec| {
+            let precomp = precompute_windowed_base_powers(&rec.pkj)?;
+            let rec_witness = compute_hidden_receiver_witness(
+                &witness.sk1,
+                rec,
+                &statement.beta,
+                &precomp_h1,
+                &precomp_h2,
+                &precomp,
+            )?;
+            Ok((precomp, rec_witness))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Witness preparation is independent; constraint insertion stays ordered.
+    for (rec, (precomp_pkj, rec_witness)) in statement.receivers.iter().zip(receiver_inputs) {
         build_hidden_receiver_slot(
             &mut prover,
             rec,
@@ -2026,6 +2172,7 @@ fn prove_batched_r1cs(
             &precomp_h2,
             statement.beta,
             Some(&rec_witness),
+            &precomp_pkj,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
     }
@@ -2064,6 +2211,7 @@ pub fn evrf_batched_prove(
 fn build_batched_verifier<T>(
     statement: &BatchedEvrfStatement,
     transcript: T,
+    precomps: &ReceiverPrecomps,
 ) -> Result<Verifier<R1csCycle, T>>
 where
     T: core::borrow::BorrowMut<Transcript>,
@@ -2096,6 +2244,9 @@ where
     .map_err(|_| Error::ProofVerificationFailed)?;
 
     for rec in &statement.receivers {
+        let precomp_pkj = precomps
+            .get(&JubjubCycle::point_compress(&rec.pkj))
+            .ok_or(Error::ProofVerificationFailed)?;
         build_hidden_receiver_slot(
             &mut verifier,
             rec,
@@ -2105,6 +2256,7 @@ where
             &precomp_h2,
             statement.beta,
             None,
+            precomp_pkj,
         )
         .map_err(|_| Error::ProofVerificationFailed)?;
     }
@@ -2118,8 +2270,9 @@ fn prepare_batched_r1cs(
     proof: &R1CSProof<R1csCycle>,
     rng: &mut impl CryptoRngCore,
     transcript: &mut Transcript,
+    precomps: &ReceiverPrecomps,
 ) -> Result<VerificationEquation<R1csCycle>> {
-    let verifier = build_batched_verifier(statement, transcript)?;
+    let verifier = build_batched_verifier(statement, transcript, precomps)?;
     verifier
         .verification_equation(proof, &params.pc_gens, &params.bp_gens, rng)
         .map_err(|_| Error::ProofVerificationFailed)
@@ -2130,12 +2283,14 @@ fn prepare_batched_proof(
     statement: &BatchedEvrfStatement,
     proof: &[u8],
     rng: &mut impl CryptoRngCore,
+    precomps: &ReceiverPrecomps,
 ) -> Result<VerificationEquation<R1csCycle>> {
     let mut stream = VerifierProofStream::new(BATCHED_PROOF_ID, proof)?;
     observe_batched_statement(&mut stream, statement)?;
+    validate_batched_public_relations_for_verifier(statement, stream.transcript_mut())?;
     let equation = stream.receive_nested(|transcript, payload| {
         let r1cs_proof = parse_canonical_r1cs_proof(payload)?;
-        prepare_batched_r1cs(params, statement, &r1cs_proof, rng, transcript)
+        prepare_batched_r1cs(params, statement, &r1cs_proof, rng, transcript, precomps)
     })?;
     constant_term_verify(&mut stream, &statement.commitment_coefficients[0])?;
     stream.finish()?;
@@ -2151,8 +2306,9 @@ pub fn evrf_batched_verify(
     rng: &mut impl CryptoRngCore,
 ) -> Result<()> {
     params.validate_statement(statement)?;
-    validate_batched_public_relations(statement)?;
-    let equation = prepare_batched_proof(params, statement, proof, rng)?;
+    validate_batched_statement_shape(statement)?;
+    let precomps = receiver_precomps([statement])?;
+    let equation = prepare_batched_proof(params, statement, proof, rng, &precomps)?;
     equation
         .verify()
         .map_err(|_| Error::ProofVerificationFailed)
@@ -2179,7 +2335,7 @@ pub fn evrf_batched_verify_many(
     }
     for (statement, _) in instances {
         params.validate_statement(statement)?;
-        validate_batched_public_relations(statement)?;
+        validate_batched_statement_shape(statement)?;
     }
     let mut batch_transcript = Transcript::new(b"golden-paper-evrf-bls-jubjub-proof-batch-v1");
     batch_transcript.append_u64(b"batch-len", instances.len() as u64);
@@ -2192,17 +2348,29 @@ pub fn evrf_batched_verify_many(
     let mut seed = [0u8; 32];
     batch_transcript.challenge_bytes(b"batch-rng", &mut seed);
 
+    let precomps = receiver_precomps(instances.iter().map(|(statement, _)| *statement))?;
+
+    // Retain at most one equation per worker before folding their shared
+    // generator scalars. The complete batch is already bound above.
+    let chunk_size = current_num_threads().max(1);
     let equations = instances
-        .par_iter()
+        .chunks(chunk_size)
         .enumerate()
-        .map(|(index, (statement, proof))| {
-            let mut proof_rng = ChaCha20Rng::from_seed(per_proof_seed(&seed, index));
-            prepare_batched_proof(params, statement, proof, &mut proof_rng)
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .flat_map(|(chunk_index, chunk)| {
+            chunk
+                .par_iter()
+                .enumerate()
+                .map(|(offset, (statement, proof))| {
+                    let index = chunk_index * chunk_size + offset;
+                    let mut proof_rng = ChaCha20Rng::from_seed(per_proof_seed(&seed, index));
+                    prepare_batched_proof(params, statement, proof, &mut proof_rng, &precomps)
+                        .map_err(|_| R1CSError::VerificationError)
+                })
+                .collect::<Vec<_>>()
+        });
 
     let mut rng = ChaCha20Rng::from_seed(seed);
-    VerificationEquation::verify_batch(equations, &mut rng)
+    VerificationEquation::verify_batch_iter(equations, &mut rng)
         .map_err(|_| Error::ProofVerificationFailed)
 }
 
@@ -2833,6 +3001,167 @@ mod one_receiver_tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+mod feldman_batch_tests {
+    use super::*;
+
+    fn statement_for_shape(receivers: usize, threshold: usize) -> BatchedEvrfStatement {
+        let (mut statement, _) = testing::build_batched(
+            &[0x61; MESSAGE_BYTES],
+            GinScalar::from(17u64),
+            &[mul_generator(&GinScalar::from(19u64))],
+            R1csField::from(23u64),
+        );
+        let coefficients: Vec<_> = (0..threshold)
+            .map(|i| GinScalar::from(i as u64 + 11))
+            .collect();
+        statement.threshold = threshold;
+        statement.commitment_coefficients = coefficients.iter().map(mul_generator).collect();
+        let template = statement.receivers[0].clone();
+        let pad = GinScalar::from(7u64);
+        statement.receivers = (1..=receivers)
+            .map(|index| {
+                let mut rec = template.clone();
+                rec.receiver = ParticipantIndex::new(index as u32).unwrap();
+                let x = GinScalar::from(index as u64);
+                let share = coefficients
+                    .iter()
+                    .rev()
+                    .fold(GinScalar::ZERO, |acc, coefficient| acc * x + coefficient);
+                rec.share_commitment = mul_generator(&share);
+                rec.pad_commitment = mul_generator(&pad);
+                rec.encrypted_share = share + pad;
+                rec
+            })
+            .collect();
+        statement.statement_roots = vec![[0x62; 32]; receivers];
+        statement
+    }
+
+    #[test]
+    fn feldman_weights_leave_proof_transcript_unchanged() {
+        let statement = statement_for_shape(9, 9);
+        let mut transcript = Transcript::new(BATCHED_PROOF_ID);
+        observe_batched_statement(&mut transcript, &statement).unwrap();
+        let mut expected = transcript.clone();
+        feldman_batch_weights_from_transcript(&statement, &transcript).unwrap();
+        let mut actual_checkpoint = [0u8; 64];
+        let mut expected_checkpoint = [0u8; 64];
+        transcript.challenge_bytes(b"next-proof-challenge", &mut actual_checkpoint);
+        expected.challenge_bytes(b"next-proof-challenge", &mut expected_checkpoint);
+        assert_eq!(actual_checkpoint, expected_checkpoint);
+    }
+
+    #[test]
+    fn feldman_batch_accepts_honest_table5_shapes() {
+        for receivers in [1, 9, 49, 99] {
+            let statement = statement_for_shape(receivers, receivers);
+            validate_batched_public_relations(&statement).unwrap();
+            validate_batched_public_relations_with_feldman_batch(&statement).unwrap();
+            let mut transcript = Transcript::new(BATCHED_PROOF_ID);
+            observe_batched_statement(&mut transcript, &statement).unwrap();
+            validate_batched_public_relations_for_verifier(&statement, &transcript).unwrap();
+            let weights = feldman_batch_weights(&statement).unwrap();
+            assert_eq!(weights.len(), receivers);
+            assert!(weights.iter().all(|weight| !bool::from(weight.is_zero())));
+        }
+    }
+
+    #[test]
+    fn feldman_batch_rejects_cancelling_share_errors() {
+        let mut statement = statement_for_shape(99, 99);
+        let delta = GinScalar::from(31u64);
+        let point = mul_generator(&delta);
+        statement.receivers[0].share_commitment += point;
+        statement.receivers[0].encrypted_share += delta;
+        statement.receivers[1].share_commitment -= point;
+        statement.receivers[1].encrypted_share -= delta;
+        let unweighted = statement
+            .receivers
+            .iter()
+            .fold(Gin::identity(), |sum, rec| {
+                sum + rec.share_commitment
+                    - feldman_share_commitment(&statement.commitment_coefficients, rec.receiver)
+            });
+        assert!(
+            is_identity(&unweighted),
+            "an unweighted aggregate would accept this attack"
+        );
+        assert!(validate_batched_public_relations(&statement).is_err());
+        assert!(validate_batched_public_relations_with_feldman_batch(&statement).is_err());
+        let mut transcript = Transcript::new(BATCHED_PROOF_ID);
+        observe_batched_statement(&mut transcript, &statement).unwrap();
+        assert!(validate_batched_public_relations_for_verifier(&statement, &transcript).is_err());
+    }
+
+    #[test]
+    fn feldman_batch_rejects_individual_mutations_and_preserves_public_checks() {
+        let statement = statement_for_shape(9, 9);
+        let point = Gin::generator();
+        let mut changed = statement.clone();
+        changed.receivers[0].share_commitment += point;
+        changed.receivers[0].encrypted_share += GinScalar::ONE;
+        assert!(validate_batched_public_relations_with_feldman_batch(&changed).is_err());
+        let mut changed = statement.clone();
+        changed.commitment_coefficients[1] += point;
+        assert!(validate_batched_public_relations_with_feldman_batch(&changed).is_err());
+        let mut changed = statement.clone();
+        changed.receivers[0].encrypted_share += GinScalar::ONE;
+        assert!(validate_batched_public_relations_with_feldman_batch(&changed).is_err());
+        let mut changed = statement.clone();
+        changed.receivers[0].pad_commitment += point;
+        assert!(validate_batched_public_relations_with_feldman_batch(&changed).is_err());
+        let mut changed = statement.clone();
+        changed.receivers[0].pkj = Gin::identity();
+        assert!(validate_batched_public_relations_with_feldman_batch(&changed).is_err());
+        let mut changed = statement.clone();
+        changed.receivers.swap(0, 1);
+        assert!(validate_batched_public_relations_with_feldman_batch(&changed).is_err());
+        let mut changed = statement;
+        changed.statement_roots.pop();
+        assert!(validate_batched_public_relations_with_feldman_batch(&changed).is_err());
+    }
+
+    #[test]
+    fn feldman_weights_bind_statement_context_and_order() {
+        let statement = statement_for_shape(9, 9);
+        let weights = feldman_batch_weights(&statement).unwrap();
+        assert_ne!(weights[0], weights[1]);
+        let mut variants = vec![];
+        let mut changed = statement.clone();
+        changed.msg[0] ^= 1;
+        variants.push(changed);
+        let mut changed = statement.clone();
+        changed.beta += R1csField::ONE;
+        variants.push(changed);
+        let mut changed = statement.clone();
+        changed.pk1 += Gin::generator();
+        variants.push(changed);
+        let mut changed = statement.clone();
+        changed.receivers[0].pkj += Gin::generator();
+        variants.push(changed);
+        let mut changed = statement.clone();
+        changed.statement_roots[0][0] ^= 1;
+        variants.push(changed);
+        let mut changed = statement.clone();
+        changed.commitment_coefficients.swap(0, 1);
+        variants.push(changed);
+        let mut changed = statement.clone();
+        changed.receivers[0].share_commitment += Gin::generator();
+        variants.push(changed);
+        let mut changed = statement.clone();
+        changed.receivers[0].pad_commitment += Gin::generator();
+        variants.push(changed);
+        let mut changed = statement;
+        changed.receivers[0].encrypted_share += GinScalar::ONE;
+        variants.push(changed);
+        for changed in variants {
+            assert_ne!(weights, feldman_batch_weights(&changed).unwrap());
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod batched_tests {
     use super::*;
 
@@ -2876,9 +3205,16 @@ mod batched_tests {
         )
         .unwrap();
         for rec in &statement.receivers {
-            let rec_witness =
-                compute_hidden_receiver_witness(&witness.sk1, rec, &statement.beta, &h1, &h2)
-                    .unwrap();
+            let precomp_pkj = precompute_windowed_base_powers(&rec.pkj).unwrap();
+            let rec_witness = compute_hidden_receiver_witness(
+                &witness.sk1,
+                rec,
+                &statement.beta,
+                &precomp_h1,
+                &precomp_h2,
+                &precomp_pkj,
+            )
+            .unwrap();
             build_hidden_receiver_slot(
                 &mut prover,
                 rec,
@@ -2888,6 +3224,7 @@ mod batched_tests {
                 &precomp_h2,
                 statement.beta,
                 Some(&rec_witness),
+                &precomp_pkj,
             )
             .unwrap();
         }
@@ -2933,6 +3270,64 @@ mod batched_tests {
             BatchedEvrfPublicParams::setup(statement.threshold, statement.receivers.len()).unwrap();
         let proof = evrf_batched_prove(&params, &statement, &witness, &mut rng).unwrap();
         evrf_batched_verify(&params, &statement, &proof, &mut rng).unwrap();
+    }
+
+    #[test]
+    fn receiver_precomputation_binds_keys_and_reuses_public_tables() {
+        let mut rng = ChaCha20Rng::seed_from_u64(309);
+        let keys: Vec<_> = (0..4)
+            .map(|_| Gin::generator() * GinScalar::random(&mut rng))
+            .collect();
+        let (first, witness1) = testing::build_batched(
+            &[8; MESSAGE_BYTES],
+            GinScalar::random(&mut rng),
+            &keys[..2],
+            R1csField::from(7u64),
+        );
+        let (second, witness2) = testing::build_batched(
+            &[9; MESSAGE_BYTES],
+            GinScalar::random(&mut rng),
+            &keys[2..],
+            R1csField::from(7u64),
+        );
+        let cache = receiver_precomps([&first, &first, &second]).unwrap();
+        assert_eq!(cache.len(), 4);
+        for key in keys {
+            let precomp = &cache[&JubjubCycle::point_compress(&key)];
+            let expected = precompute_windowed_base_powers(&key).unwrap();
+            assert_eq!(precomp.windows, expected.windows);
+            assert_eq!(precomp.powers, base_power_points(&key));
+        }
+        let params = BatchedEvrfPublicParams::setup(2, 2).unwrap();
+        let proof1 = evrf_batched_prove(&params, &first, &witness1, &mut rng).unwrap();
+        let proof2 = evrf_batched_prove(&params, &second, &witness2, &mut rng).unwrap();
+        // Fixed reference hashes guard against receiver-precomputation reuse
+        // silently changing proof bytes.
+        let hash1: [u8; 32] = sha2::Sha256::digest(&proof1).into();
+        let hash2: [u8; 32] = sha2::Sha256::digest(&proof2).into();
+        assert_eq!(
+            hash1,
+            [
+                242, 159, 236, 23, 42, 214, 230, 5, 36, 133, 195, 94, 222, 93, 181, 18, 252, 227,
+                157, 210, 179, 65, 48, 180, 97, 48, 233, 21, 129, 46, 31, 59
+            ]
+        );
+        assert_eq!(
+            hash2,
+            [
+                77, 206, 200, 231, 71, 212, 62, 99, 18, 7, 137, 2, 58, 7, 212, 22, 51, 49, 102,
+                167, 12, 92, 6, 134, 215, 170, 187, 223, 182, 84, 159, 132
+            ]
+        );
+        evrf_batched_verify(&params, &first, &proof1, &mut rng).unwrap();
+        evrf_batched_verify(&params, &second, &proof2, &mut rng).unwrap();
+        evrf_batched_verify_many(&params, &[(&first, &proof1), (&second, &proof2)]).unwrap();
+        let mut wrong_key = first.clone();
+        wrong_key.receivers[0].pkj = second.receivers[0].pkj;
+        assert!(
+            evrf_batched_verify_many(&params, &[(&wrong_key, &proof1), (&second, &proof2)])
+                .is_err()
+        );
     }
 
     #[test]

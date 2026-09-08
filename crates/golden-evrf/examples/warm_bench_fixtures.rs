@@ -44,7 +44,7 @@ fn main() {
         warm("table-4", n_e + 1, TABLE4_THRESHOLD);
     }
 
-    println!("Checking Table 5 fixtures (n-of-n)...");
+    println!("Checking Table 5 fixtures ((n-1)-of-n)...");
     for n in table5_n_values() {
         warm("table-5", n, n - 1);
     }

@@ -71,10 +71,8 @@ fn batched_statement(
         .collect();
 
     let mut receivers = Vec::with_capacity(statements.len());
-    let mut statement_roots = Vec::with_capacity(statements.len());
     for statement in statements {
         ensure_same_batch_context(statement, first)?;
-        statement_roots.push(statement.root());
         receivers.push(BatchedReceiverStatement {
             receiver: statement.receiver,
             pkj: statement.receiver_public_key.0,
@@ -84,6 +82,7 @@ fn batched_statement(
         });
     }
 
+    let statement_roots = EvrfStatement::batch_roots(statements);
     Ok(BatchedEvrfStatement {
         msg: first.msg_i.0,
         pk1: first.dealer_public_key.0,
