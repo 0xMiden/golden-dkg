@@ -53,24 +53,24 @@ independent proofs.
 
 | n_e | Prover | Verifier | Batch verification | \|π\| (single) | n_e proofs (concat) |
 |---:|---:|---:|---:|---:|---:|
-| 1  | 151 ms | 16.4 ms | 17.0 ms | 1.9 kb | 1.9 kb |
-| 9  | 1.17 s | 87.7 ms | 116 ms | 2.2 kb | 19.8 kb |
-| 49 | 4.47 s | 326 ms | 1.81 s | 2.4 kb | 117.0 kb |
-| 99 | 8.79 s | 618 ms | 6.56 s | 2.5 kb | 245.9 kb |
+| 1  | 106 ms | 16.2 ms | 17.0 ms | 1.9 kb | 1.9 kb |
+| 9  | 670 ms | 86.1 ms | 111 ms | 2.2 kb | 19.8 kb |
+| 49 | 2.53 s | 307 ms | 1.56 s | 2.4 kb | 117.0 kb |
+| 99 | 4.92 s | 584 ms | 5.64 s | 2.5 kb | 245.9 kb |
 
 ### Table 5 (DKG performance on BLS12-381/Jubjub, n-of-n)
 
 Round 0 measures `create_dealing` for one dealer. Round 1 measures `complete`
 for one receiver using all `n` dealings. Per-participant runtime is the sum of
-the two measured medians. Communication counts `n` serialized dealer
+the two Criterion point estimates. Communication counts `n` serialized dealer
 broadcasts and uses decimal kilobytes.
 
 | n | Round 0 | Round 1 | Per-participant runtime | Comm. (per participant) |
 |---:|---:|---:|---:|---:|
-| 2   | 152 ms | 17.9 ms | 170 ms | 4.3 kb |
-| 10  | 1.19 s | 134 ms | 1.33 s | 32.4 kb |
-| 50  | 4.49 s | 2.49 s | 6.98 s | 375.5 kb |
-| 100 | 8.88 s | 11.8 s | 20.7 s | 1.27 MB |
+| 2   | 106 ms | 17.3 ms | 124 ms | 4.3 kb |
+| 10  | 680 ms | 119 ms | 798 ms | 32.4 kb |
+| 50  | 2.53 s | 1.66 s | 4.19 s | 375.5 kb |
+| 100 | 4.96 s | 6.06 s | 11.0 s | 1.27 MB |
 
 The paper reports zkalc estimates on AWS EC2 m5.2xlarge. These rows measure the
 real Jubjub circuit on the local Ryzen system, so the curve family now matches
@@ -87,10 +87,10 @@ concatenated size of `n_e` independent proofs.
 
 | n_e | Prover     | Verifier  | Batch verification | \|π\| (single) | n_e proofs (concat) |
 |-----|------------|-----------|--------------------|----------------|---------------------|
-| 1   | 116 ms     | 13.9 ms   | 14.5 ms            | 1.3 kb         | 1.3 kb              |
-| 9   | 865 ms     | 90.7 ms   | 134 ms             | 1.5 kb         | 13.7 kb             |
-| 49  | 3.08 s     | 346 ms    | 2.36 s             | 1.7 kb         | 84.2 kb             |
-| 99  | 7.10 s     | 716 ms    | 8.89 s             | 1.8 kb         | 176.6 kb            |
+| 1   | 102 ms     | 14.4 ms   | 15.3 ms            | 1.3 kb         | 1.3 kb              |
+| 9   | 394 ms     | 53.5 ms   | 86.2 ms            | 1.5 kb         | 13.7 kb             |
+| 49  | 2.42 s     | 308 ms    | 2.06 s             | 1.7 kb         | 84.2 kb             |
+| 99  | 4.84 s     | 647 ms    | 7.90 s             | 1.8 kb         | 176.6 kb            |
 
 Every batched-eVRF proof is single-phase (the relation never defers
 constraints via `specify_randomized_constraints`), so its wire length is an
@@ -110,10 +110,10 @@ Round 0 + Round 1.  Communication is the per-participant bandwidth
 
 | n   | Round 0  | Round 1  | Per-participant runtime | Comm. (per participant) |
 |-----|----------|----------|------------------------|------------------------|
-| 2   | 123 ms   | 18.3 ms  | 141 ms                 | 3.1 kb                 |
-| 10  | 903 ms   | 160 ms   | 1.06 s                 | 25.6 kb                |
-| 50  | 3.20 s   | 2.61 s   | 5.81 s                 | 342.0 kb               |
-| 100 | 7.48 s   | 10.2 s   | 17.7 s                 | 1.2 MB                 |
+| 2   | 104 ms   | 16.3 ms  | 120 ms                 | 3.1 kb                 |
+| 10  | 405 ms   | 99.6 ms  | 504 ms                 | 25.6 kb                |
+| 50  | 2.45 s   | 2.21 s   | 4.66 s                 | 342.0 kb               |
+| 100 | 4.99 s   | 8.39 s   | 13.4 s                 | 1.2 MB                 |
 
 ## Useful checks
 
