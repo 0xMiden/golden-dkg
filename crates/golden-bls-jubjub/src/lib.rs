@@ -15,8 +15,10 @@ mod msm_blst;
 mod pippenger;
 
 pub mod cycle;
+pub mod g1;
 pub mod golden_group;
 pub mod jubjub_cycle;
 
 pub use cycle::Bls12_381G1Cycle;
+pub use g1::BlsG1Projective;
 pub use jubjub_cycle::JubjubCycle;

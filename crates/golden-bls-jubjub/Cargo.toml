@@ -24,7 +24,17 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 
 [dev-dependencies]
+criterion = "0.5"
 rand_chacha = { workspace = true }
 
-[lints]
-workspace = true
+[[bench]]
+name = "bls_msm"
+harness = false
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+panic = "deny"
