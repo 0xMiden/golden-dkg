@@ -86,6 +86,15 @@ fn hash_to_curve_try_and_increment(seed: &[u8; 64]) -> BlsG1Projective {
     }
 }
 
+fn checked_affine(point: &blst::blst_p1_affine) -> blstrs::G1Affine {
+    let affine = blstrs::G1Affine::from_raw_unchecked(point.x.into(), point.y.into(), false);
+    assert!(
+        bool::from(affine.is_on_curve() & affine.is_torsion_free()),
+        "affine point must be in the BLS12-381 G1 prime-order subgroup"
+    );
+    affine
+}
+
 impl Cycle for Bls12_381G1Cycle {
     type Scalar = Scalar;
     type Point = BlsG1Projective;
@@ -170,8 +179,7 @@ impl Cycle for Bls12_381G1Cycle {
     }
 
     fn affine_to_point(point: &Self::Affine) -> Self::Point {
-        let affine = blstrs::G1Affine::from_raw_unchecked(point.x.into(), point.y.into(), false);
-        BlsG1Projective(blstrs::G1Projective::from(affine))
+        BlsG1Projective(blstrs::G1Projective::from(checked_affine(point)))
     }
 
     fn batch_normalize(points: &[Self::Point]) -> Vec<Self::Affine> {
@@ -179,8 +187,7 @@ impl Cycle for Bls12_381G1Cycle {
     }
 
     fn affine_compress(point: &Self::Affine) -> Self::Compressed {
-        let affine = blstrs::G1Affine::from_raw_unchecked(point.x.into(), point.y.into(), false);
-        GroupEncoding::to_bytes(&affine)
+        GroupEncoding::to_bytes(&checked_affine(point))
     }
 
     fn vartime_msm(scalars: &[Self::Scalar], points: &[Self::Point]) -> Self::Point {
@@ -380,6 +387,24 @@ mod tests {
         let point = BlsG1Projective::random(&mut rng);
         let affine = Bls12_381G1Cycle::point_to_affine(&point);
         assert_eq!(Bls12_381G1Cycle::affine_to_point(&affine), point);
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    #[should_panic(expected = "affine point must be in the BLS12-381 G1 prime-order subgroup")]
+    fn affine_to_point_rejects_points_outside_the_prime_order_subgroup() {
+        for counter in 0..u64::MAX {
+            let candidate = candidate_compressed_bytes(&[11u8; 64], counter);
+            let Some(affine) = Option::<blstrs::G1Affine>::from(
+                blstrs::G1Affine::from_compressed_unchecked(&candidate),
+            ) else {
+                continue;
+            };
+            if !bool::from(affine.is_torsion_free()) {
+                Bls12_381G1Cycle::affine_to_point(affine.as_ref());
+            }
+        }
+        panic!("failed to find a point outside the prime-order subgroup");
     }
 
     #[test]
