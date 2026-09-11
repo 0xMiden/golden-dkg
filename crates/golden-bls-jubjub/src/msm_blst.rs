@@ -1,8 +1,8 @@
 //! BLS12-381 G1 multi-scalar multiplication backed by `blst`.
 //!
 //! Stored affine bases already use `blst_p1_affine`, so [`msm`] passes them
-//! directly to `MultiPoint::mult`. Projective inputs use `blstrs`' bridge to
-//! blst's batch conversion and Pippenger implementation. Scalars stay in
+//! directly to `MultiPoint::mult`. Projective inputs use blst's batch
+//! conversion and Pippenger implementation. Scalars stay in
 //! `bls12_381::Scalar` because Jubjub and the R1CS field require that exact
 //! type, and cross to blst through their canonical little-endian bytes.
 //!
@@ -17,7 +17,7 @@
 
 use crate::BlsG1Projective;
 use bls12_381::Scalar;
-use blst::{blst_p1, blst_p1_affine, MultiPoint};
+use blst::{blst_p1, blst_p1_affine, p1_affines, MultiPoint};
 use group::Group;
 
 /// Multi-scalar multiplication `sum(scalars[i] * bases[i])` over BLS12-381
@@ -29,10 +29,7 @@ pub(crate) fn msm(scalars: &[Scalar], bases: &[blst_p1_affine]) -> BlsG1Projecti
         return BlsG1Projective::identity();
     }
 
-    let mut scalar_bytes = Vec::with_capacity(scalars.len() * 32);
-    for scalar in scalars {
-        scalar_bytes.extend_from_slice(&scalar.to_bytes());
-    }
+    let scalar_bytes = scalar_bytes(scalars);
     let result: blst_p1 = bases.mult(&scalar_bytes, 255);
     BlsG1Projective(blstrs::G1Projective::from_raw_unchecked(
         result.x.into(),
@@ -49,32 +46,32 @@ pub(crate) fn msm_projective(scalars: &[Scalar], points: &[BlsG1Projective]) -> 
         return BlsG1Projective::identity();
     }
 
-    let scalars: Vec<_> = scalars
-        .iter()
-        .map(BlsG1Projective::scalar_to_blstrs)
-        .collect();
-    let points: Vec<_> = points.iter().map(|point| point.0).collect();
-    BlsG1Projective(blstrs::G1Projective::multi_exp(&points, &scalars))
+    let points: Vec<blst_p1> = points.iter().map(|point| *point.0.as_ref()).collect();
+    let affine = p1_affines::from(&points);
+    let result = affine.mult(&scalar_bytes(scalars), 255);
+    BlsG1Projective(blstrs::G1Projective::from_raw_unchecked(
+        result.x.into(),
+        result.y.into(),
+        result.z.into(),
+    ))
 }
 
 /// Normalize projective points through `blst`.
 pub(crate) fn batch_normalize(points: &[BlsG1Projective]) -> Vec<blst_p1_affine> {
-    let point_ptrs: Vec<*const blst_p1> = points
-        .iter()
-        .map(|point| point.0.as_ref() as *const blst_p1)
-        .collect();
-    let mut affine = vec![blst_p1_affine::default(); points.len()];
-
-    // SAFETY: Every pointer refers to an element of `points`, which remains
-    // alive and immutable for the call. `affine` has initialized storage for
-    // every output. The input and output do not overlap. blst accepts an empty
-    // input when `points.len()` is zero.
-    #[allow(unsafe_code)]
-    unsafe {
-        blst::blst_p1s_to_affine(affine.as_mut_ptr(), point_ptrs.as_ptr(), points.len());
+    if points.is_empty() {
+        return Vec::new();
     }
 
-    affine
+    let points: Vec<blst_p1> = points.iter().map(|point| *point.0.as_ref()).collect();
+    p1_affines::from(&points).as_slice().to_vec()
+}
+
+fn scalar_bytes(scalars: &[Scalar]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(scalars.len() * 32);
+    for scalar in scalars {
+        bytes.extend_from_slice(&scalar.to_bytes());
+    }
+    bytes
 }
 
 /// Clear the BLS12-381 G1 cofactor with its 64-bit effective cofactor.

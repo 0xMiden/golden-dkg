@@ -3,7 +3,9 @@
 use bls12_381::Scalar;
 use bulletproofs_cycle::{generators::BulletproofGens, Cycle};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use ff::Field;
 use golden_bls_jubjub::Bls12_381G1Cycle;
+use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
 type C = Bls12_381G1Cycle;
 
@@ -14,9 +16,8 @@ fn msm_benchmarks(c: &mut Criterion) {
     let generators = BulletproofGens::<C>::new(max_size, 1);
     let affine: Vec<_> = generators.share(0).G(max_size).copied().collect();
     let projective: Vec<_> = affine.iter().map(C::affine_to_point).collect();
-    let scalars: Vec<_> = (0..max_size)
-        .map(|i| Scalar::from((i as u64).wrapping_mul(0x9e37_79b9).wrapping_add(1)))
-        .collect();
+    let mut rng = ChaCha20Rng::seed_from_u64(0x676f_6c64_656e_6d73);
+    let scalars: Vec<_> = (0..max_size).map(|_| Scalar::random(&mut rng)).collect();
 
     for &size in MSM_SIZES {
         let expected = C::vartime_msm_affine(&scalars[..size], &affine[..size]);
