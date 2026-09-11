@@ -53,10 +53,10 @@ independent proofs.
 
 | n_e | Prover | Verifier | Batch verification | \|π\| (single) | n_e proofs (concat) |
 |---:|---:|---:|---:|---:|---:|
-| 1  | 106 ms | 16.2 ms | 17.0 ms | 1.9 kb | 1.9 kb |
-| 9  | 670 ms | 86.1 ms | 111 ms | 2.2 kb | 19.8 kb |
-| 49 | 2.53 s | 307 ms | 1.56 s | 2.4 kb | 117.0 kb |
-| 99 | 4.92 s | 584 ms | 5.64 s | 2.5 kb | 245.9 kb |
+| 1  | 102 ms | 14.2 ms | 15.0 ms | 1.9 kb | 1.9 kb |
+| 9  | 663 ms | 82.1 ms | 108 ms | 2.2 kb | 19.8 kb |
+| 49 | 2.49 s | 302 ms | 1.57 s | 2.4 kb | 117.0 kb |
+| 99 | 4.89 s | 585 ms | 5.27 s | 2.5 kb | 245.9 kb |
 
 ### Table 5 (DKG performance on BLS12-381/Jubjub, n-of-n)
 
@@ -67,10 +67,10 @@ broadcasts and uses decimal kilobytes.
 
 | n | Round 0 | Round 1 | Per-participant runtime | Comm. (per participant) |
 |---:|---:|---:|---:|---:|
-| 2   | 106 ms | 17.3 ms | 124 ms | 4.3 kb |
-| 10  | 680 ms | 119 ms | 798 ms | 32.4 kb |
-| 50  | 2.53 s | 1.66 s | 4.19 s | 375.5 kb |
-| 100 | 4.96 s | 6.06 s | 11.0 s | 1.27 MB |
+| 2   | 103 ms | 15.0 ms | 118 ms | 4.3 kb |
+| 10  | 671 ms | 117 ms | 787 ms | 32.4 kb |
+| 50  | 2.52 s | 1.67 s | 4.19 s | 375.5 kb |
+| 100 | 4.91 s | 5.71 s | 10.6 s | 1.27 MB |
 
 The paper reports zkalc estimates on AWS EC2 m5.2xlarge. These rows measure the
 real Jubjub circuit on the local Ryzen system, so the curve family now matches

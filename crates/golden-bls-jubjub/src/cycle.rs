@@ -5,10 +5,11 @@
 //! Jubjub-typed `Gin` witness value needs no field conversion to become an
 //! R1CS coefficient.
 
-use bls12_381::{G1Affine, G1Projective, Scalar};
+use crate::BlsG1Projective;
+use bls12_381::Scalar;
 use bulletproofs_cycle::Cycle;
 use ff::Field;
-use group::{Curve, GroupEncoding};
+use group::{Group, GroupEncoding};
 use sha2::{Digest, Sha256};
 use subtle::CtOption;
 
@@ -68,35 +69,41 @@ fn candidate_compressed_bytes(seed: &[u8; 64], counter: u64) -> [u8; 48] {
 /// the same standard compressed BLS12-381 encoding, so this produces
 /// identical candidate points to decoding directly with `bls12_381` — only
 /// the arithmetic backend for the recovery differs.
-fn hash_to_curve_try_and_increment(seed: &[u8; 64]) -> G1Projective {
+fn hash_to_curve_try_and_increment(seed: &[u8; 64]) -> BlsG1Projective {
     let mut counter: u64 = 0;
     loop {
         let candidate = candidate_compressed_bytes(seed, counter);
-        let blst_affine: CtOption<blstrs::G1Affine> =
+        let affine: CtOption<blstrs::G1Affine> =
             blstrs::G1Affine::from_compressed_unchecked(&candidate);
-        if let Some(blst_affine) = Option::<blstrs::G1Affine>::from(blst_affine) {
-            let uncompressed = blst_affine.to_uncompressed();
-            let affine: CtOption<G1Affine> = G1Affine::from_uncompressed_unchecked(&uncompressed);
-            if let Some(affine) = Option::<G1Affine>::from(affine) {
-                let point: G1Projective = G1Projective::from(affine).clear_cofactor();
-                if !bool::from(point.is_identity()) {
-                    return point;
-                }
+        if let Some(affine) = Option::<blstrs::G1Affine>::from(affine) {
+            let point = blstrs::G1Projective::from(affine);
+            let cleared = crate::msm_blst::clear_cofactor(&point);
+            if !bool::from(cleared.is_identity()) {
+                return BlsG1Projective(cleared);
             }
         }
         counter += 1;
     }
 }
 
+fn checked_affine(point: &blst::blst_p1_affine) -> blstrs::G1Affine {
+    let affine = blstrs::G1Affine::from_raw_unchecked(point.x.into(), point.y.into(), false);
+    assert!(
+        bool::from(affine.is_on_curve() & affine.is_torsion_free()),
+        "affine point must be in the BLS12-381 G1 prime-order subgroup"
+    );
+    affine
+}
+
 impl Cycle for Bls12_381G1Cycle {
     type Scalar = Scalar;
-    type Point = G1Projective;
+    type Point = BlsG1Projective;
     // `blst`'s native affine representation, not `bls12_381::G1Affine`: see
     // `crate::msm_blst`'s module doc for why. Converting to/from it happens
     // once per stored generator or commitment (here and in
     // `batch_normalize`/`affine_compress`), not once per MSM call.
     type Affine = blst::blst_p1_affine;
-    type Compressed = <G1Projective as GroupEncoding>::Repr;
+    type Compressed = <blstrs::G1Projective as GroupEncoding>::Repr;
     const COMPRESSED_BYTES: usize = 48;
 
     fn scalar_from_wide(bytes: &[u8; 64]) -> Self::Scalar {
@@ -136,15 +143,16 @@ impl Cycle for Bls12_381G1Cycle {
     }
 
     fn point_compress(point: &Self::Point) -> Self::Compressed {
-        GroupEncoding::to_bytes(point)
+        GroupEncoding::to_bytes(&point.0)
     }
 
     fn compressed_decompress(compressed: &Self::Compressed) -> Option<Self::Point> {
-        Option::from(GroupEncoding::from_bytes(compressed))
+        Option::<blstrs::G1Projective>::from(GroupEncoding::from_bytes(compressed))
+            .map(BlsG1Projective)
     }
 
     fn compressed_identity() -> Self::Compressed {
-        GroupEncoding::to_bytes(&G1Projective::identity())
+        GroupEncoding::to_bytes(&blstrs::G1Projective::identity())
     }
 
     fn compressed_is_identity(compressed: &Self::Compressed) -> bool {
@@ -167,27 +175,24 @@ impl Cycle for Bls12_381G1Cycle {
     }
 
     fn point_to_affine(point: &Self::Point) -> Self::Affine {
-        crate::msm_blst::to_blst_affine(&point.to_affine())
+        *blstrs::G1Affine::from(point.0).as_ref()
     }
 
     fn affine_to_point(point: &Self::Affine) -> Self::Point {
-        G1Projective::from(crate::msm_blst::from_blst_affine(point))
+        BlsG1Projective(blstrs::G1Projective::from(checked_affine(point)))
     }
 
     fn batch_normalize(points: &[Self::Point]) -> Vec<Self::Affine> {
-        let mut affine = vec![G1Affine::default(); points.len()];
-        G1Projective::batch_normalize(points, &mut affine);
-        affine.iter().map(crate::msm_blst::to_blst_affine).collect()
+        crate::msm_blst::batch_normalize(points)
     }
 
     fn affine_compress(point: &Self::Affine) -> Self::Compressed {
-        GroupEncoding::to_bytes(&crate::msm_blst::from_blst_affine(point))
+        GroupEncoding::to_bytes(&checked_affine(point))
     }
 
     fn vartime_msm(scalars: &[Self::Scalar], points: &[Self::Point]) -> Self::Point {
         assert_eq!(scalars.len(), points.len());
-        let affine = Self::batch_normalize(points);
-        crate::msm_blst::msm(scalars, &affine)
+        crate::msm_blst::msm_projective(scalars, points)
     }
 
     fn vartime_msm_affine(scalars: &[Self::Scalar], points: &[Self::Affine]) -> Self::Point {
@@ -199,7 +204,7 @@ impl Cycle for Bls12_381G1Cycle {
         scalars: &[Self::Scalar],
         points: &[Option<Self::Point>],
     ) -> Option<Self::Point> {
-        let identity = G1Projective::identity();
+        let identity = BlsG1Projective::identity();
         let filtered: Vec<_> = scalars
             .iter()
             .zip(points.iter())
@@ -221,6 +226,7 @@ impl Cycle for Bls12_381G1Cycle {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use bls12_381::{G1Affine as ReferenceAffine, G1Projective as ReferenceProjective};
     use group::Group;
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -232,7 +238,11 @@ mod tests {
         let b = Bls12_381G1Cycle::point_hash_from_uniform(&bytes);
         assert_eq!(a, b);
         assert!(!bool::from(a.is_identity()));
-        assert!(bool::from(G1Affine::from(a).is_torsion_free()));
+        let encoded = Bls12_381G1Cycle::point_compress(&a);
+        let reference = Option::<ReferenceAffine>::from(ReferenceAffine::from_compressed(
+            encoded.as_ref().try_into().unwrap(),
+        ));
+        assert!(reference.is_some());
     }
 
     #[test]
@@ -246,14 +256,14 @@ mod tests {
     /// `bls12_381`, independent of [`hash_to_curve_try_and_increment`]'s
     /// `blstrs` decode path, to confirm the two backends agree on which
     /// candidates land on the curve and on the resulting point.
-    fn hash_to_curve_try_and_increment_reference(seed: &[u8; 64]) -> G1Projective {
+    fn hash_to_curve_try_and_increment_reference(seed: &[u8; 64]) -> ReferenceProjective {
         let mut counter: u64 = 0;
         loop {
             let candidate = candidate_compressed_bytes(seed, counter);
-            let affine: Option<G1Affine> =
-                Option::from(G1Affine::from_compressed_unchecked(&candidate));
+            let affine: Option<ReferenceAffine> =
+                Option::from(ReferenceAffine::from_compressed_unchecked(&candidate));
             if let Some(affine) = affine {
-                let point: G1Projective = G1Projective::from(affine).clear_cofactor();
+                let point: ReferenceProjective = ReferenceProjective::from(affine).clear_cofactor();
                 if !bool::from(point.is_identity()) {
                     return point;
                 }
@@ -266,9 +276,11 @@ mod tests {
     fn point_hash_from_uniform_matches_pure_bls12_381_reference_decode() {
         for i in 0u8..32 {
             let seed = [i; 64];
+            let actual = Bls12_381G1Cycle::point_hash_from_uniform(&seed);
+            let expected = hash_to_curve_try_and_increment_reference(&seed);
             assert_eq!(
-                Bls12_381G1Cycle::point_hash_from_uniform(&seed),
-                hash_to_curve_try_and_increment_reference(&seed),
+                Bls12_381G1Cycle::point_compress(&actual).as_ref(),
+                GroupEncoding::to_bytes(&expected).as_ref()
             );
         }
     }
@@ -276,7 +288,7 @@ mod tests {
     #[test]
     fn compressed_round_trips() {
         let mut rng = ChaCha20Rng::seed_from_u64(0);
-        let point = G1Projective::random(&mut rng);
+        let point = BlsG1Projective::random(&mut rng);
         let compressed = Bls12_381G1Cycle::point_compress(&point);
         let decoded = Bls12_381G1Cycle::compressed_decompress(&compressed).unwrap();
         assert_eq!(point, decoded);
@@ -291,13 +303,47 @@ mod tests {
         // random point already lands in the subgroup) or rejects it.
         let candidate = candidate_compressed_bytes(&[9u8; 64], 0);
         let Some(affine) =
-            Option::<G1Affine>::from(G1Affine::from_compressed_unchecked(&candidate))
+            Option::<ReferenceAffine>::from(ReferenceAffine::from_compressed_unchecked(&candidate))
         else {
             return;
         };
         let is_torsion_free = bool::from(affine.is_torsion_free());
-        let checked = Bls12_381G1Cycle::compressed_decompress(&GroupEncoding::to_bytes(&affine));
+        let reference_encoding = GroupEncoding::to_bytes(&affine);
+        let encoding = Bls12_381G1Cycle::compressed_from_bytes(reference_encoding.as_ref());
+        let checked = Bls12_381G1Cycle::compressed_decompress(&encoding);
         assert_eq!(checked.is_some(), is_torsion_free);
+    }
+
+    fn assert_compressed_decode_parity(bytes: &[u8; 48]) {
+        let reference = Option::<ReferenceAffine>::from(ReferenceAffine::from_compressed(bytes));
+        let encoded = Bls12_381G1Cycle::compressed_from_bytes(bytes);
+        let actual = Bls12_381G1Cycle::compressed_decompress(&encoded);
+        assert_eq!(actual.is_some(), reference.is_some());
+    }
+
+    #[test]
+    fn malformed_compressed_encodings_match_reference_rejection() {
+        let mut off_curve = [0u8; 48];
+        off_curve[0] = 0x80;
+        off_curve[47] = 2;
+
+        let noncanonical_x = [
+            0x9a, 0x01, 0x11, 0xea, 0x39, 0x7f, 0xe6, 0x9a, 0x4b, 0x1b, 0xa7, 0xb6, 0x43, 0x4b,
+            0xac, 0xd7, 0x64, 0x77, 0x4b, 0x84, 0xf3, 0x85, 0x12, 0xbf, 0x67, 0x30, 0xd2, 0xa0,
+            0xf6, 0xb0, 0xf6, 0x24, 0x1e, 0xab, 0xff, 0xfe, 0xb1, 0x53, 0xff, 0xff, 0xb9, 0xfe,
+            0xff, 0xff, 0xff, 0xff, 0xaa, 0xab,
+        ];
+
+        let mut malformed_identity = [0u8; 48];
+        malformed_identity[0] = 0xc0;
+        malformed_identity[47] = 1;
+
+        for bytes in [off_curve, noncanonical_x, malformed_identity] {
+            assert!(
+                Option::<ReferenceAffine>::from(ReferenceAffine::from_compressed(&bytes)).is_none()
+            );
+            assert_compressed_decode_parity(&bytes);
+        }
     }
 
     #[test]
@@ -323,14 +369,14 @@ mod tests {
     fn vartime_msm_matches_generator_mul_for_single_term() {
         let mut rng = ChaCha20Rng::seed_from_u64(4);
         let scalar = Scalar::random(&mut rng);
-        let point = G1Projective::generator();
+        let point = BlsG1Projective::generator();
         let msm = Bls12_381G1Cycle::vartime_msm(&[scalar], &[point]);
         assert_eq!(msm, point * scalar);
     }
 
     #[test]
     fn point_to_affine_and_back_round_trips_the_identity() {
-        let identity = G1Projective::identity();
+        let identity = BlsG1Projective::identity();
         let affine = Bls12_381G1Cycle::point_to_affine(&identity);
         assert_eq!(Bls12_381G1Cycle::affine_to_point(&affine), identity);
     }
@@ -338,15 +384,34 @@ mod tests {
     #[test]
     fn point_to_affine_and_back_round_trips_a_random_point() {
         let mut rng = ChaCha20Rng::seed_from_u64(8);
-        let point = G1Projective::random(&mut rng);
+        let point = BlsG1Projective::random(&mut rng);
         let affine = Bls12_381G1Cycle::point_to_affine(&point);
         assert_eq!(Bls12_381G1Cycle::affine_to_point(&affine), point);
     }
 
     #[test]
+    #[allow(clippy::panic)]
+    #[should_panic(expected = "affine point must be in the BLS12-381 G1 prime-order subgroup")]
+    fn affine_to_point_rejects_points_outside_the_prime_order_subgroup() {
+        for counter in 0..u64::MAX {
+            let candidate = candidate_compressed_bytes(&[11u8; 64], counter);
+            let Some(affine) = Option::<blstrs::G1Affine>::from(
+                blstrs::G1Affine::from_compressed_unchecked(&candidate),
+            ) else {
+                continue;
+            };
+            if !bool::from(affine.is_torsion_free()) {
+                Bls12_381G1Cycle::affine_to_point(affine.as_ref());
+            }
+        }
+        panic!("failed to find a point outside the prime-order subgroup");
+    }
+
+    #[test]
     fn vartime_msm_affine_matches_vartime_msm() {
         let mut rng = ChaCha20Rng::seed_from_u64(9);
-        let points: Vec<G1Projective> = (0..4).map(|_| G1Projective::random(&mut rng)).collect();
+        let points: Vec<BlsG1Projective> =
+            (0..4).map(|_| BlsG1Projective::random(&mut rng)).collect();
         let scalars: Vec<Scalar> = (0..4).map(|_| Scalar::random(&mut rng)).collect();
         let affine = Bls12_381G1Cycle::batch_normalize(&points);
         assert_eq!(
@@ -358,7 +423,7 @@ mod tests {
     #[test]
     fn affine_compress_matches_point_compress() {
         let mut rng = ChaCha20Rng::seed_from_u64(10);
-        let point = G1Projective::random(&mut rng);
+        let point = BlsG1Projective::random(&mut rng);
         let affine = Bls12_381G1Cycle::point_to_affine(&point);
         assert_eq!(
             Bls12_381G1Cycle::affine_compress(&affine).as_ref(),

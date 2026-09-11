@@ -40,7 +40,7 @@ use crate::proof_stream::{
     decode_point, CycleCurve, IdentityPolicy, Observe, ProofStreamCurve, ProverProofStream,
     VerifierProofStream,
 };
-use bls12_381::{G1Projective, Scalar};
+use bls12_381::Scalar;
 use bulletproofs_cycle::{
     cycle::random_scalar,
     generators::{BulletproofGens, PedersenGens},
@@ -50,7 +50,7 @@ use bulletproofs_cycle::{
 };
 use ff::{Field, PrimeField};
 use golden_bls_jubjub::golden_group::mul_generator;
-use golden_bls_jubjub::{Bls12_381G1Cycle, JubjubCycle};
+use golden_bls_jubjub::{Bls12_381G1Cycle, BlsG1Projective, JubjubCycle};
 use group::Group;
 use jubjub::{ExtendedPoint, Fr, SubgroupPoint};
 use merlin::Transcript;
@@ -69,7 +69,7 @@ pub type Gin = SubgroupPoint;
 pub type GinScalar = Fr;
 /// `G_out` commitment group: BLS12-381 G1. Exposed so integration tests can
 /// construct random `R_j` points without re-deriving the cycle alias.
-pub type Gout = G1Projective;
+pub type Gout = BlsG1Projective;
 /// `G_out` compressed point.
 pub type GoutCompressed = <R1csCycle as Cycle>::Compressed;
 

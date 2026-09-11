@@ -666,6 +666,7 @@ dependencies = [
  "blst",
  "blstrs",
  "bulletproofs-cycle",
+ "criterion",
  "ff",
  "golden-core",
  "group",
