@@ -88,6 +88,43 @@ fn msm_benchmarks(c: &mut Criterion) {
         );
     }
     verifier_group.finish();
+
+    for &(static_len, dynamic_len) in GOLDEN_VERIFIER_SHAPES {
+        let mut paired_group = c.benchmark_group(format!(
+            "bls12-381/msm/golden-verifier-paired/{static_len}-{dynamic_len}"
+        ));
+        paired_group.sample_size(10);
+        paired_group.bench_function("split", |b| {
+            b.iter(|| {
+                let dynamic = C::vartime_msm(
+                    black_box(&scalars[..dynamic_len]),
+                    black_box(&projective[..dynamic_len]),
+                );
+                let g = C::vartime_msm_affine(
+                    black_box(&scalars[..static_len]),
+                    black_box(&affine[..static_len]),
+                );
+                let h = C::vartime_msm_affine(
+                    black_box(&scalars[..static_len]),
+                    black_box(&affine_h[..static_len]),
+                );
+                black_box(dynamic + g + h)
+            });
+        });
+        paired_group.bench_function("mixed", |b| {
+            b.iter(|| {
+                black_box(C::vartime_msm_mixed(
+                    black_box(&[
+                        (&scalars[..static_len], &affine[..static_len]),
+                        (&scalars[..static_len], &affine_h[..static_len]),
+                    ]),
+                    black_box(&scalars[..dynamic_len]),
+                    black_box(&projective[..dynamic_len]),
+                ))
+            });
+        });
+        paired_group.finish();
+    }
 }
 
 criterion_group!(benches, msm_benchmarks);

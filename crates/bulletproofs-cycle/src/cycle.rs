@@ -122,6 +122,26 @@ pub trait Cycle: Clone + Eq + Debug + 'static {
     /// Variable-time multiscalar multiplication over preprocessed affine points.
     fn vartime_msm_affine(scalars: &[Self::Scalar], points: &[Self::Affine]) -> Self::Point;
 
+    /// Variable-time multiscalar multiplication over fixed affine batches and
+    /// dynamic projective points.
+    ///
+    /// Panics if any scalar slice differs in length from its point slice. The
+    /// default keeps the batches separate; curve implementations may combine
+    /// them into one MSM.
+    fn vartime_msm_mixed(
+        affine_batches: &[(&[Self::Scalar], &[Self::Affine])],
+        dynamic_scalars: &[Self::Scalar],
+        dynamic_points: &[Self::Point],
+    ) -> Self::Point {
+        assert_eq!(dynamic_scalars.len(), dynamic_points.len());
+        let mut result = Self::vartime_msm(dynamic_scalars, dynamic_points);
+        for &(scalars, points) in affine_batches {
+            assert_eq!(scalars.len(), points.len());
+            result += Self::vartime_msm_affine(scalars, points);
+        }
+        result
+    }
+
     /// Variable-time multiscalar multiplication where each point may be
     /// missing. Returns `None` if any required point is `None`.
     fn vartime_msm_optional(

@@ -200,6 +200,14 @@ impl Cycle for Bls12_381G1Cycle {
         crate::msm_blst::msm(scalars, points)
     }
 
+    fn vartime_msm_mixed(
+        affine_batches: &[(&[Self::Scalar], &[Self::Affine])],
+        dynamic_scalars: &[Self::Scalar],
+        dynamic_points: &[Self::Point],
+    ) -> Self::Point {
+        crate::msm_blst::msm_mixed(affine_batches, dynamic_scalars, dynamic_points)
+    }
+
     fn vartime_msm_optional(
         scalars: &[Self::Scalar],
         points: &[Option<Self::Point>],
