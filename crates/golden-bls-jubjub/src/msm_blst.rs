@@ -17,8 +17,14 @@
 
 use crate::BlsG1Projective;
 use bls12_381::Scalar;
-use blst::{blst_p1, blst_p1_affine, p1_affines, MultiPoint};
+use blst::{
+    blst_p1, blst_p1_add_or_double, blst_p1_affine, blst_p1_double,
+    blst_p1s_mult_pippenger_scratch_sizeof, blst_p1s_tile_pippenger, p1_affines, MultiPoint,
+};
 use group::Group;
+use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Multi-scalar multiplication `sum(scalars[i] * bases[i])` over BLS12-381
 /// G1, with bases already converted to `blst`'s native affine
@@ -86,15 +92,214 @@ pub(crate) fn msm_mixed(
         return BlsG1Projective::identity();
     }
 
-    let mut points = Vec::with_capacity(total_len);
-    let mut scalars = Vec::with_capacity(total_len);
-    for &(batch_scalars, batch_points) in affine_batches {
-        scalars.extend_from_slice(batch_scalars);
-        points.extend_from_slice(batch_points);
+    if total_len < 32 {
+        let mut points = Vec::with_capacity(total_len);
+        let mut scalars = Vec::with_capacity(total_len);
+        for &(batch_scalars, batch_points) in affine_batches {
+            scalars.extend_from_slice(batch_scalars);
+            points.extend_from_slice(batch_points);
+        }
+        scalars.extend_from_slice(&nonidentity_scalars);
+        points.extend_from_slice(&dynamic_affine);
+        return msm(&scalars, &points);
     }
-    scalars.extend_from_slice(&nonidentity_scalars);
-    points.extend_from_slice(&dynamic_affine);
-    msm(&scalars, &points)
+
+    let mut points = Vec::with_capacity(total_len);
+    let mut scalar_bytes = Vec::with_capacity(total_len * 32);
+    for &(batch_scalars, batch_points) in affine_batches {
+        points.extend(batch_points.iter().map(AffinePointer::from));
+        append_scalar_bytes(&mut scalar_bytes, batch_scalars);
+    }
+    points.extend(dynamic_affine.iter().map(AffinePointer::from));
+    append_scalar_bytes(&mut scalar_bytes, &nonidentity_scalars);
+
+    segmented_mult(&points, &scalar_bytes)
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct AffinePointer(*const blst_p1_affine);
+
+impl From<&blst_p1_affine> for AffinePointer {
+    fn from(point: &blst_p1_affine) -> Self {
+        Self(point)
+    }
+}
+
+// SAFETY: The pointers are created from immutable slices that remain borrowed
+// until every scoped worker has joined. Workers only read through them.
+#[allow(unsafe_code)]
+unsafe impl Send for AffinePointer {}
+// SAFETY: See the `Send` implementation. The pointees are immutable.
+#[allow(unsafe_code)]
+unsafe impl Sync for AffinePointer {}
+
+#[derive(Clone, Copy)]
+struct PippengerTile {
+    x: usize,
+    dx: usize,
+    bit: usize,
+}
+
+/// Evaluate one `blst` Pippenger operation over disjoint affine slices.
+///
+/// This mirrors `blst`'s threaded `MultiPoint` scheduler but passes an array of
+/// point pointers to its tile API. It avoids copying the two large generator
+/// vectors into a temporary contiguous point vector.
+fn segmented_mult(points: &[AffinePointer], scalar_bytes: &[u8]) -> BlsG1Projective {
+    const NBITS: usize = 255;
+    const SCALAR_BYTES: usize = 32;
+
+    debug_assert_eq!(scalar_bytes.len(), points.len() * SCALAR_BYTES);
+    let npoints = points.len();
+    let ncpus = std::thread::available_parallelism().map_or(1, usize::from);
+    // The widest input window makes the fused million-point shape allocate
+    // twice as many buckets per worker as the former half-sized MSMs. Capping
+    // it retains most of the fused speedup without that peak-memory jump.
+    let input_window = pippenger_window_size(npoints).min(16);
+    let (nx, ny, window) = pippenger_breakdown(NBITS, input_window, ncpus);
+
+    let mut tiles = Vec::with_capacity(nx * ny);
+    let chunk = npoints / nx;
+    for row in 0..ny {
+        let bit = window * (ny - row - 1);
+        for column in 0..nx {
+            let x = column * chunk;
+            let dx = if column + 1 == nx { npoints - x } else { chunk };
+            tiles.push(PippengerTile { x, dx, bit });
+        }
+    }
+
+    let outputs = (0..tiles.len())
+        .map(|_| Mutex::new(blst_p1::default()))
+        .collect::<Vec<_>>();
+    let next = AtomicUsize::new(0);
+    let workers = ncpus.min(tiles.len());
+    #[allow(unsafe_code)]
+    let scratch_words =
+        unsafe { blst_p1s_mult_pippenger_scratch_sizeof(0) / std::mem::size_of::<u64>() }
+            << (window - 1);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let mut scratch = vec![0_u64; scratch_words];
+                loop {
+                    let work = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(tile) = tiles.get(work) else {
+                        break;
+                    };
+                    let scalar_ptrs = [
+                        scalar_bytes.as_ptr().wrapping_add(tile.x * SCALAR_BYTES),
+                        ptr::null(),
+                    ];
+                    let mut result = blst_p1::default();
+                    // SAFETY: Every point pointer references a live immutable
+                    // affine input. This tile stays within both the point array
+                    // and the contiguous scalar-byte buffer. `scratch` is
+                    // private to this worker and sized as required by blst.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        blst_p1s_tile_pippenger(
+                            &mut result,
+                            points.as_ptr().add(tile.x).cast(),
+                            tile.dx,
+                            scalar_ptrs.as_ptr(),
+                            NBITS,
+                            scratch.as_mut_ptr(),
+                            tile.bit,
+                            window,
+                        );
+                    }
+                    *outputs[work]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = result;
+                }
+            });
+        }
+    });
+
+    let mut result = blst_p1::default();
+    for row in 0..ny {
+        if row != 0 {
+            for _ in 0..window {
+                // SAFETY: `result` is initialized, and blst permits in-place
+                // doubling.
+                #[allow(unsafe_code)]
+                unsafe {
+                    blst_p1_double(&mut result, &result);
+                }
+            }
+        }
+        for column in 0..nx {
+            let tile = *outputs[row * nx + column]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: Both operands are initialized blst points, and blst
+            // permits the output to alias its first operand.
+            #[allow(unsafe_code)]
+            unsafe {
+                blst_p1_add_or_double(&mut result, &result, &tile);
+            }
+        }
+    }
+
+    BlsG1Projective(blstrs::G1Projective::from_raw_unchecked(
+        result.x.into(),
+        result.y.into(),
+        result.z.into(),
+    ))
+}
+
+fn append_scalar_bytes(bytes: &mut Vec<u8>, scalars: &[Scalar]) {
+    for scalar in scalars {
+        bytes.extend_from_slice(&scalar.to_bytes());
+    }
+}
+
+fn num_bits(value: usize) -> usize {
+    usize::BITS as usize - value.leading_zeros() as usize
+}
+
+fn pippenger_window_size(npoints: usize) -> usize {
+    match num_bits(npoints) {
+        bits if bits > 13 => bits - 4,
+        bits if bits > 5 => bits - 3,
+        _ => 2,
+    }
+}
+
+// Keep this scheduler in sync with blst's Rust `MultiPoint` implementation.
+fn pippenger_breakdown(nbits: usize, window: usize, ncpus: usize) -> (usize, usize, usize) {
+    let mut nx = 1;
+    let mut wnd = window;
+
+    if nbits > window * ncpus {
+        wnd = num_bits(ncpus / 4);
+        if window + wnd > 18 {
+            wnd = window - wnd;
+        } else {
+            wnd = (nbits / window).div_ceil(ncpus);
+            wnd = if (nbits / (window + 1)).div_ceil(ncpus) < wnd {
+                window + 1
+            } else {
+                window
+            };
+        }
+    } else if window > 3 {
+        nx = 2;
+        wnd = window - 2;
+        while wnd > 1 && (nbits / wnd + 1) * nx < ncpus {
+            nx += 1;
+            wnd = window - num_bits(3 * nx / 2);
+        }
+        nx -= 1;
+        wnd = window - num_bits(3 * nx / 2);
+    }
+    let ny = nbits / wnd + 1;
+    wnd = nbits / ny + 1;
+
+    (nx, ny, wnd)
 }
 
 /// Normalize projective points through `blst`.
@@ -233,20 +438,23 @@ mod tests {
     #[test]
     fn mixed_msm_matches_separate_calculation() {
         let mut rng = ChaCha20Rng::seed_from_u64(24);
-        let fixed_points: Vec<_> = (0..7)
+        let fixed_points: Vec<_> = (0..64)
             .map(|_| blstrs::G1Projective::random(&mut rng).to_affine())
             .collect();
         let fixed = raw_bases(&fixed_points);
         let dynamic: Vec<_> = (0..3).map(|_| BlsG1Projective::random(&mut rng)).collect();
-        let scalars: Vec<_> = (0..10).map(|_| Scalar::random(&mut rng)).collect();
+        let scalars: Vec<_> = (0..67).map(|_| Scalar::random(&mut rng)).collect();
 
-        let expected = msm(&scalars[..4], &fixed[..4])
-            + msm(&scalars[4..7], &fixed[4..])
-            + msm_projective(&scalars[7..], &dynamic);
+        let expected = msm(&scalars[..40], &fixed[..40])
+            + msm(&scalars[40..64], &fixed[40..])
+            + msm_projective(&scalars[64..], &dynamic);
         assert_eq!(
             msm_mixed(
-                &[(&scalars[..4], &fixed[..4]), (&scalars[4..7], &fixed[4..])],
-                &scalars[7..],
+                &[
+                    (&scalars[..40], &fixed[..40]),
+                    (&scalars[40..64], &fixed[40..]),
+                ],
+                &scalars[64..],
                 &dynamic,
             ),
             expected
