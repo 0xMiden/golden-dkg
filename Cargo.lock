@@ -744,6 +744,7 @@ name = "golden-halo2curves"
 version = "0.4.0"
 dependencies = [
  "bulletproofs-cycle",
+ "criterion",
  "ff",
  "golden-core",
  "group",
