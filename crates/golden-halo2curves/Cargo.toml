@@ -24,12 +24,18 @@ subtle = { workspace = true }
 halo2curves = { workspace = true, features = ["asm"] }
 
 [dev-dependencies]
+criterion = "0.5"
 merlin = { workspace = true }
 rand_chacha = { workspace = true }
 
 [features]
 default = []
 halo2curves-secp256k1 = []
+
+[[bench]]
+name = "secq_msm"
+harness = false
+required-features = ["halo2curves-secp256k1"]
 
 [lints]
 workspace = true
