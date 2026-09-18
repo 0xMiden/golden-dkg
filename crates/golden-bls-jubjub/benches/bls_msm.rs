@@ -11,10 +11,17 @@ type C = Bls12_381G1Cycle;
 
 const MSM_SIZES: &[usize] = &[2, 16, 256, 8_192, 65_536, 262_144, 524_288];
 
+// Existing Bulletproof verifier equation shapes for Golden's Table 4 rows.
+// Each equation evaluates two fixed-generator MSMs of `static_len` terms
+// and one projective MSM of `dynamic_len` proof and Pedersen terms.
+const GOLDEN_VERIFIER_SHAPES: &[(usize, usize)] =
+    &[(8_192, 39), (65_536, 45), (262_144, 49), (524_288, 51)];
+
 fn msm_benchmarks(c: &mut Criterion) {
     let max_size = *MSM_SIZES.last().expect("MSM sizes are nonempty");
     let generators = BulletproofGens::<C>::new(max_size, 1);
     let affine: Vec<_> = generators.share(0).G(max_size).copied().collect();
+    let affine_h: Vec<_> = generators.share(0).H(max_size).copied().collect();
     let projective: Vec<_> = affine.iter().map(C::affine_to_point).collect();
     let mut rng = ChaCha20Rng::seed_from_u64(0x676f_6c64_656e_6d73);
     let scalars: Vec<_> = (0..max_size).map(|_| Scalar::random(&mut rng)).collect();
@@ -54,6 +61,33 @@ fn msm_benchmarks(c: &mut Criterion) {
         });
     }
     projective_group.finish();
+
+    let mut verifier_group = c.benchmark_group("bls12-381/msm/golden-verifier-split");
+    verifier_group.sample_size(10);
+    for &(static_len, dynamic_len) in GOLDEN_VERIFIER_SHAPES {
+        verifier_group.bench_with_input(
+            BenchmarkId::new("static-dynamic", format!("{static_len}-{dynamic_len}")),
+            &(static_len, dynamic_len),
+            |b, &(static_len, dynamic_len)| {
+                b.iter(|| {
+                    let dynamic = C::vartime_msm(
+                        black_box(&scalars[..dynamic_len]),
+                        black_box(&projective[..dynamic_len]),
+                    );
+                    let g = C::vartime_msm_affine(
+                        black_box(&scalars[..static_len]),
+                        black_box(&affine[..static_len]),
+                    );
+                    let h = C::vartime_msm_affine(
+                        black_box(&scalars[..static_len]),
+                        black_box(&affine_h[..static_len]),
+                    );
+                    black_box(dynamic + g + h)
+                });
+            },
+        );
+    }
+    verifier_group.finish();
 }
 
 criterion_group!(benches, msm_benchmarks);
