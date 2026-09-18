@@ -61,21 +61,32 @@ impl<C: Cycle> VerificationEquation<C> {
     pub fn verify(self) -> Result<(), R1CSError> {
         let g_len = self.g_scalars.len();
         let h_len = self.h_scalars.len();
+        if g_len > self.g_points.len()
+            || h_len > self.h_points.len()
+            || self.proof_scalars.len() != self.proof_points.len()
+        {
+            return Err(R1CSError::VerificationError);
+        }
         let scalars: Vec<C::Scalar> = self
             .pedersen_scalars
             .into_iter()
             .chain(self.proof_scalars)
             .collect();
-        let points: Vec<Option<C::Point>> = self
+        let points: Vec<C::Point> = self
             .pedersen_points
             .into_iter()
             .map(Some)
             .chain(self.proof_points)
-            .collect();
-        let mut check =
-            C::vartime_msm_optional(&scalars, &points).ok_or(R1CSError::VerificationError)?;
-        check += C::vartime_msm_affine(&self.g_scalars, &self.g_points[..g_len]);
-        check += C::vartime_msm_affine(&self.h_scalars, &self.h_points[..h_len]);
+            .collect::<Option<_>>()
+            .ok_or(R1CSError::VerificationError)?;
+        let check = C::vartime_msm_mixed(
+            &[
+                (&self.g_scalars, &self.g_points[..g_len]),
+                (&self.h_scalars, &self.h_points[..h_len]),
+            ],
+            &scalars,
+            &points,
+        );
         if !bool::from(check.is_identity()) {
             return Err(R1CSError::VerificationError);
         }
@@ -121,6 +132,8 @@ impl<C: Cycle> VerificationEquation<C> {
         for equation in iter::once(Ok(first)).chain(equations) {
             let equation = equation?;
             if equation.pedersen_points != pedersen_points
+                || equation.g_scalars.len() > equation.g_points.len()
+                || equation.h_scalars.len() > equation.h_points.len()
                 || equation.proof_scalars.len() != equation.proof_points.len()
             {
                 return Err(R1CSError::VerificationError);
@@ -164,15 +177,20 @@ impl<C: Cycle> VerificationEquation<C> {
         let g_len = g_scalars.len();
         let h_len = h_scalars.len();
         let scalars: Vec<C::Scalar> = pedersen_scalars.into_iter().chain(proof_scalars).collect();
-        let points: Vec<Option<C::Point>> = pedersen_points
+        let points: Vec<C::Point> = pedersen_points
             .into_iter()
             .map(Some)
             .chain(proof_points)
-            .collect();
-        let mut check =
-            C::vartime_msm_optional(&scalars, &points).ok_or(R1CSError::VerificationError)?;
-        check += C::vartime_msm_affine(&g_scalars, &g_points[..g_len]);
-        check += C::vartime_msm_affine(&h_scalars, &h_points[..h_len]);
+            .collect::<Option<_>>()
+            .ok_or(R1CSError::VerificationError)?;
+        let check = C::vartime_msm_mixed(
+            &[
+                (&g_scalars, &g_points[..g_len]),
+                (&h_scalars, &h_points[..h_len]),
+            ],
+            &scalars,
+            &points,
+        );
         if !bool::from(check.is_identity()) {
             return Err(R1CSError::VerificationError);
         }

@@ -56,6 +56,47 @@ pub(crate) fn msm_projective(scalars: &[Scalar], points: &[BlsG1Projective]) -> 
     ))
 }
 
+/// One MSM over several affine batches and a batch of projective points.
+pub(crate) fn msm_mixed(
+    affine_batches: &[(&[Scalar], &[blst_p1_affine])],
+    dynamic_scalars: &[Scalar],
+    dynamic_points: &[BlsG1Projective],
+) -> BlsG1Projective {
+    assert_eq!(dynamic_scalars.len(), dynamic_points.len());
+    let affine_len = affine_batches
+        .iter()
+        .map(|(scalars, points)| {
+            assert_eq!(scalars.len(), points.len());
+            points.len()
+        })
+        .sum::<usize>();
+
+    let mut nonidentity_scalars = Vec::with_capacity(dynamic_scalars.len());
+    let mut nonidentity_points = Vec::with_capacity(dynamic_points.len());
+    for (&scalar, &point) in dynamic_scalars.iter().zip(dynamic_points) {
+        if !bool::from(point.is_identity()) {
+            nonidentity_scalars.push(scalar);
+            nonidentity_points.push(point);
+        }
+    }
+
+    let dynamic_affine = batch_normalize(&nonidentity_points);
+    let total_len = affine_len + dynamic_affine.len();
+    if total_len == 0 {
+        return BlsG1Projective::identity();
+    }
+
+    let mut points = Vec::with_capacity(total_len);
+    let mut scalars = Vec::with_capacity(total_len);
+    for &(batch_scalars, batch_points) in affine_batches {
+        scalars.extend_from_slice(batch_scalars);
+        points.extend_from_slice(batch_points);
+    }
+    scalars.extend_from_slice(&nonidentity_scalars);
+    points.extend_from_slice(&dynamic_affine);
+    msm(&scalars, &points)
+}
+
 /// Normalize projective points through `blst`.
 pub(crate) fn batch_normalize(points: &[BlsG1Projective]) -> Vec<blst_p1_affine> {
     if points.is_empty() {
@@ -187,6 +228,59 @@ mod tests {
             let want = naive_msm(&scalars, &points);
             assert_eq!(got, want, "mismatch at len={len}");
         }
+    }
+
+    #[test]
+    fn mixed_msm_matches_separate_calculation() {
+        let mut rng = ChaCha20Rng::seed_from_u64(24);
+        let fixed_points: Vec<_> = (0..7)
+            .map(|_| blstrs::G1Projective::random(&mut rng).to_affine())
+            .collect();
+        let fixed = raw_bases(&fixed_points);
+        let dynamic: Vec<_> = (0..3).map(|_| BlsG1Projective::random(&mut rng)).collect();
+        let scalars: Vec<_> = (0..10).map(|_| Scalar::random(&mut rng)).collect();
+
+        let expected = msm(&scalars[..4], &fixed[..4])
+            + msm(&scalars[4..7], &fixed[4..])
+            + msm_projective(&scalars[7..], &dynamic);
+        assert_eq!(
+            msm_mixed(
+                &[(&scalars[..4], &fixed[..4]), (&scalars[4..7], &fixed[4..])],
+                &scalars[7..],
+                &dynamic,
+            ),
+            expected
+        );
+        assert_eq!(msm_mixed(&[], &[], &[]), BlsG1Projective::identity());
+    }
+
+    #[test]
+    fn mixed_msm_handles_identity_repetition_and_cancellation() {
+        let mut rng = ChaCha20Rng::seed_from_u64(25);
+        let base = blstrs::G1Projective::random(&mut rng).to_affine();
+        let fixed = raw_bases(&[base, base]);
+        let scalar = Scalar::random(&mut rng);
+
+        assert_eq!(
+            msm_mixed(
+                &[(&[scalar, -scalar], &fixed)],
+                &[scalar],
+                &[BlsG1Projective::identity()],
+            ),
+            BlsG1Projective::identity()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn mixed_msm_rejects_affine_length_mismatch() {
+        msm_mixed(&[(&[Scalar::ONE], &[])], &[], &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn mixed_msm_rejects_dynamic_length_mismatch() {
+        msm_mixed(&[], &[Scalar::ONE], &[]);
     }
 
     #[test]
