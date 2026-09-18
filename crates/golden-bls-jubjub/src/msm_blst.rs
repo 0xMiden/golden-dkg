@@ -220,6 +220,7 @@ fn segmented_mult(points: &[AffinePointer], scalar_bytes: &[u8]) -> BlsG1Project
     });
 
     let mut result = blst_p1::default();
+    let result_ptr = std::ptr::addr_of_mut!(result);
     for row in 0..ny {
         if row != 0 {
             for _ in 0..window {
@@ -227,7 +228,7 @@ fn segmented_mult(points: &[AffinePointer], scalar_bytes: &[u8]) -> BlsG1Project
                 // doubling.
                 #[allow(unsafe_code)]
                 unsafe {
-                    blst_p1_double(&mut result, &result);
+                    blst_p1_double(result_ptr, result_ptr.cast_const());
                 }
             }
         }
@@ -239,7 +240,7 @@ fn segmented_mult(points: &[AffinePointer], scalar_bytes: &[u8]) -> BlsG1Project
             // permits the output to alias its first operand.
             #[allow(unsafe_code)]
             unsafe {
-                blst_p1_add_or_double(&mut result, &result, &tile);
+                blst_p1_add_or_double(result_ptr, result_ptr.cast_const(), &tile);
             }
         }
     }
