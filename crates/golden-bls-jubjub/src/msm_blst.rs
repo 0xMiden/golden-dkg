@@ -147,12 +147,21 @@ struct PippengerTile {
 /// point pointers to its tile API. It avoids copying the two large generator
 /// vectors into a temporary contiguous point vector.
 fn segmented_mult(points: &[AffinePointer], scalar_bytes: &[u8]) -> BlsG1Projective {
+    let ncpus = std::thread::available_parallelism().map_or(1, usize::from);
+    segmented_mult_with_ncpus(points, scalar_bytes, ncpus)
+}
+
+fn segmented_mult_with_ncpus(
+    points: &[AffinePointer],
+    scalar_bytes: &[u8],
+    ncpus: usize,
+) -> BlsG1Projective {
     const NBITS: usize = 255;
     const SCALAR_BYTES: usize = 32;
 
+    debug_assert!(ncpus > 0);
     debug_assert_eq!(scalar_bytes.len(), points.len() * SCALAR_BYTES);
     let npoints = points.len();
-    let ncpus = std::thread::available_parallelism().map_or(1, usize::from);
     // The widest input window makes the fused million-point shape allocate
     // twice as many buckets per worker as the former half-sized MSMs. Capping
     // it retains most of the fused speedup without that peak-memory jump.
@@ -180,44 +189,49 @@ fn segmented_mult(points: &[AffinePointer], scalar_bytes: &[u8]) -> BlsG1Project
         unsafe { blst_p1s_mult_pippenger_scratch_sizeof(0) / std::mem::size_of::<u64>() }
             << (window - 1);
 
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                let mut scratch = vec![0_u64; scratch_words];
-                loop {
-                    let work = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(tile) = tiles.get(work) else {
-                        break;
-                    };
-                    let scalar_ptrs = [
-                        scalar_bytes.as_ptr().wrapping_add(tile.x * SCALAR_BYTES),
-                        ptr::null(),
-                    ];
-                    let mut result = blst_p1::default();
-                    // SAFETY: Every point pointer references a live immutable
-                    // affine input. This tile stays within both the point array
-                    // and the contiguous scalar-byte buffer. `scratch` is
-                    // private to this worker and sized as required by blst.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        blst_p1s_tile_pippenger(
-                            &mut result,
-                            points.as_ptr().add(tile.x).cast(),
-                            tile.dx,
-                            scalar_ptrs.as_ptr(),
-                            NBITS,
-                            scratch.as_mut_ptr(),
-                            tile.bit,
-                            window,
-                        );
-                    }
-                    *outputs[work]
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = result;
-                }
-            });
+    let worker = || {
+        let mut scratch = vec![0_u64; scratch_words];
+        loop {
+            let work = next.fetch_add(1, Ordering::Relaxed);
+            let Some(tile) = tiles.get(work) else {
+                break;
+            };
+            let scalar_ptrs = [
+                scalar_bytes.as_ptr().wrapping_add(tile.x * SCALAR_BYTES),
+                ptr::null(),
+            ];
+            let mut result = blst_p1::default();
+            // SAFETY: Every point pointer references a live immutable
+            // affine input. This tile stays within both the point array
+            // and the contiguous scalar-byte buffer. `scratch` is
+            // private to this worker and sized as required by blst.
+            #[allow(unsafe_code)]
+            unsafe {
+                blst_p1s_tile_pippenger(
+                    &mut result,
+                    points.as_ptr().add(tile.x).cast(),
+                    tile.dx,
+                    scalar_ptrs.as_ptr(),
+                    NBITS,
+                    scratch.as_mut_ptr(),
+                    tile.bit,
+                    window,
+                );
+            }
+            *outputs[work]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = result;
         }
-    });
+    };
+    if workers == 1 {
+        worker();
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(worker);
+            }
+        });
+    }
 
     let mut result = blst_p1::default();
     let result_ptr = std::ptr::addr_of_mut!(result);
@@ -461,6 +475,24 @@ mod tests {
             expected
         );
         assert_eq!(msm_mixed(&[], &[], &[]), BlsG1Projective::identity());
+    }
+
+    #[test]
+    fn segmented_msm_handles_single_cpu() {
+        let mut rng = ChaCha20Rng::seed_from_u64(26);
+        let scalars: Vec<_> = (0..64).map(|_| Scalar::random(&mut rng)).collect();
+        let bases: Vec<_> = (0..64)
+            .map(|_| blstrs::G1Projective::random(&mut rng).to_affine())
+            .collect();
+        let bases = raw_bases(&bases);
+        let points = bases.iter().map(AffinePointer::from).collect::<Vec<_>>();
+        let mut scalar_bytes = Vec::with_capacity(scalars.len() * 32);
+        append_scalar_bytes(&mut scalar_bytes, &scalars);
+
+        assert_eq!(
+            segmented_mult_with_ncpus(&points, &scalar_bytes, 1),
+            msm(&scalars, &bases)
+        );
     }
 
     #[test]
