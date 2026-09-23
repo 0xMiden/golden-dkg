@@ -1749,10 +1749,7 @@ fn validate_batched_public_relations_impl(
         return Err(Error::ProofVerificationFailed);
     }
     statement.receivers.par_iter().try_for_each(|rec| {
-        if is_identity(&rec.pkj)
-            || is_identity(&rec.share_commitment)
-            || is_identity(&rec.pad_commitment)
-        {
+        if is_identity(&rec.pkj) || is_identity(&rec.pad_commitment) {
             return Err(Error::ProofVerificationFailed);
         }
         if statement_transcript.is_none()
@@ -1905,7 +1902,7 @@ fn observe_batched_statement(
         stream.observe_point::<GinStreamCurve>(
             b"share-commitment",
             &rec.share_commitment,
-            IdentityPolicy::Reject,
+            IdentityPolicy::Allow,
         )?;
         stream.observe_point::<GinStreamCurve>(
             b"pad-commitment",

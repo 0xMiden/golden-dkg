@@ -1918,10 +1918,7 @@ pub mod secp_secq {
             return Err(Error::ProofVerificationFailed);
         }
         statement.receivers.par_iter().try_for_each(|rec| {
-            if is_identity(&rec.pkj)
-                || is_identity(&rec.share_commitment)
-                || is_identity(&rec.pad_commitment)
-            {
+            if is_identity(&rec.pkj) || is_identity(&rec.pad_commitment) {
                 return Err(Error::ProofVerificationFailed);
             }
             if statement_transcript.is_none()
@@ -2065,7 +2062,7 @@ pub mod secp_secq {
             stream.observe_point::<GinStreamCurve>(
                 b"share-commitment",
                 &rec.share_commitment,
-                IdentityPolicy::Reject,
+                IdentityPolicy::Allow,
             )?;
             stream.observe_point::<GinStreamCurve>(
                 b"pad-commitment",
@@ -4254,10 +4251,16 @@ pub mod secp_secq {
         }
 
         #[test]
-        fn batched_statement_rejects_identity_share_commitment() {
-            assert_batched_statement_rejects_identity(|statement| {
-                statement.receivers[0].share_commitment = Gin::identity();
-            });
+        fn batched_statement_accepts_identity_share_commitment_for_zero_share() {
+            let pad = GinScalar::from(7u64);
+            let mut statement = context_statement();
+            statement.commitment_coefficients = vec![Gin::identity()];
+            statement.receivers[0].share_commitment = Gin::identity();
+            statement.receivers[0].pad_commitment = Gin::generator() * pad;
+            statement.receivers[0].encrypted_share = pad;
+
+            validate_batched_public_relations(&statement).unwrap();
+            validate_batched_public_relations_with_feldman_batch(&statement).unwrap();
         }
 
         #[test]
