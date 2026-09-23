@@ -14,8 +14,6 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
   # paste is unmaintained but still functional and is used transitively.
   "RUSTSEC-2024-0436",
-  # clear_on_drop is unmaintained; bulletproofs (dev-only, via bulletproofs-cycle) still depends on it.
-  "RUSTSEC-2026-0283",
 ]
 yanked = "warn"
 
