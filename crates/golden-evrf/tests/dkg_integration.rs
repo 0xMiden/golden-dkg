@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use golden_core::{
-    complete, create_dealing, verify_dealing,
+    complete, create_dealing, create_dealing_with_secret, verify_dealing,
     wire::{from_wire_bytes, to_wire_bytes},
     DealerMessage, DkgConfig, EvrfProofBackend, EvrfStatement, GoldenGroup, GoldenScalar,
     ParticipantIndex, ParticipantRegistry, SessionId, PROTOCOL_VERSION,
@@ -233,6 +233,48 @@ fn assert_dkg_completes(config: DkgConfig<Secp256k1GoldenGroup>, decode_messages
     assert_eq!(output.public_key_shares.len(), participant_count);
 }
 
+/// Run a DKG where every dealer shares zero, as the EHTDH1 zero-sharing run does.
+fn assert_zero_sharing_completes(config: DkgConfig<Secp256k1GoldenGroup>) {
+    let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
+    let dealings: BTreeMap<_, _> = config
+        .registry
+        .indexes()
+        .map(|dealer| {
+            (
+                dealer,
+                create_dealing_with_secret::<Secp256k1GoldenGroup, SecpSecqBackend>(
+                    dealer,
+                    &identity_secret(dealer),
+                    Secp256k1Scalar::zero(),
+                    &config,
+                    &mut rng,
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+
+    for (receiver, own_dealing) in &dealings {
+        let peer_dealings = dealings
+            .iter()
+            .filter(|(dealer, _)| *dealer != receiver)
+            .map(|(dealer, dealing)| (*dealer, dealing.message.clone()))
+            .collect();
+        let output = complete::<Secp256k1GoldenGroup, SecpSecqBackend>(
+            *receiver,
+            &identity_secret(*receiver),
+            own_dealing,
+            &peer_dealings,
+            &config,
+        )
+        .unwrap();
+        assert!(bool::from(Secp256k1GoldenGroup::is_identity(
+            &output.public_key
+        )));
+        assert_eq!(output.secret_share.value, Secp256k1Scalar::zero());
+    }
+}
+
 #[test]
 fn single_participant_dkg_completes_without_proving() {
     let config = single_participant_config();
@@ -276,6 +318,12 @@ fn dkg_completes_with_batched_evrf_backend() {
 #[ignore = "slow: completes the real paper DKG from decoded peer messages"]
 fn dkg_completes_with_decoded_peer_messages() {
     assert_dkg_completes(two_participant_config(), true);
+}
+
+#[test]
+#[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
+fn threshold_one_zero_sharing_completes() {
+    assert_zero_sharing_completes(two_participant_config());
 }
 
 #[test]

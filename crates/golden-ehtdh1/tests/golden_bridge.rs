@@ -370,7 +370,7 @@ mod secp_secq {
         scalar(100 + u64::from(participant.get()))
     }
 
-    fn config(session_id: SessionId) -> DkgConfig<PaperGroup> {
+    fn config(session_id: SessionId, threshold: usize) -> DkgConfig<PaperGroup> {
         let registry = ParticipantRegistry::new(
             participants()
                 .iter()
@@ -383,9 +383,7 @@ mod secp_secq {
                 .collect(),
         )
         .unwrap();
-        // A threshold-one zero sharing is the constant-zero polynomial, whose
-        // identity share commitments are rejected by the paper backend.
-        DkgConfig::new(2, session_id, scalar(77), registry).unwrap()
+        DkgConfig::new(threshold, session_id, scalar(77), registry).unwrap()
     }
 
     fn dealings(
@@ -445,12 +443,14 @@ mod secp_secq {
             .collect()
     }
 
-    #[test]
-    #[ignore = "slow: proves paper Secp/Secq eVRF dealings"]
-    fn paper_backend_outputs_open_ehtdh1_payload() {
+    /// Open one sealed payload with every contiguous quorum of `threshold` shares.
+    fn assert_paper_backend_outputs_open_ehtdh1_payload(threshold: usize) {
         let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
-        let decryption_config = config(SessionId([55u8; 32]));
-        let context_config = config(derive_context_session_id(decryption_config.session_id));
+        let decryption_config = config(SessionId([55u8; 32]), threshold);
+        let context_config = config(
+            derive_context_session_id(decryption_config.session_id),
+            threshold,
+        );
         let decryption_outputs = outputs(&decryption_config, &mut rng, |dealer| {
             scalar(60 + u64::from(dealer.get()))
         });
@@ -487,11 +487,23 @@ mod secp_secq {
             })
             .collect::<Vec<_>>();
 
-        let opened = Combiner::new(first.public_key_set.clone(), first.setup_context.clone())
-            .unwrap()
-            .combine_exact(&message, b"dc", &shares)
-            .unwrap();
+        let combiner =
+            Combiner::new(first.public_key_set.clone(), first.setup_context.clone()).unwrap();
+        for quorum in shares.windows(threshold) {
+            let opened = combiner.combine_exact(&message, b"dc", quorum).unwrap();
+            assert_eq!(opened, b"paper");
+        }
+    }
 
-        assert_eq!(opened, b"paper");
+    #[test]
+    #[ignore = "slow: proves paper Secp/Secq eVRF dealings"]
+    fn paper_backend_outputs_open_ehtdh1_payload() {
+        assert_paper_backend_outputs_open_ehtdh1_payload(2);
+    }
+
+    #[test]
+    #[ignore = "slow: proves paper Secp/Secq eVRF dealings"]
+    fn paper_backend_threshold_one_outputs_open_ehtdh1_payload() {
+        assert_paper_backend_outputs_open_ehtdh1_payload(1);
     }
 }

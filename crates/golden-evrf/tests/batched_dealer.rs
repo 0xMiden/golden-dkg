@@ -111,20 +111,38 @@ fn evrf_batched_dealer_honest_proof_verifies() {
 }
 
 #[test]
-fn evrf_batched_dealer_rejects_identity_share_commitment() {
+fn evrf_batched_dealer_accepts_zero_share() {
     let mut rng = ChaCha20Rng::seed_from_u64(0xBA7C10);
     let sk1 = GinScalar::random(&mut rng);
     let pkjs = make_pkjs(&mut rng, 1);
     let beta = R1csField::from(7u64);
     let msg = make_msg(0xABCE);
-    let (mut statement, witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
-    statement.receivers[0].share_commitment = Gin::identity();
+    let (mut statement, mut witness) = paper::testing::build_batched(&msg, sk1, &pkjs, beta);
 
-    assert!(
-        paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)
-            .is_err(),
-        "batched proof should reject identity share commitments before circuit construction"
+    // Re-deal the constant polynomial `f = 0`, so the receiver's share is zero
+    // and its share commitment is the identity.
+    let built_share = GinScalar::from(11u64);
+    assert_eq!(
+        statement.receivers[0].share_commitment,
+        Gin::generator() * built_share
     );
+    statement.threshold = 1;
+    statement.commitment_coefficients = vec![Gin::identity()];
+    statement.receivers[0].share_commitment = Gin::identity();
+    statement.receivers[0].encrypted_share -= built_share;
+    witness.polynomial_constant = GinScalar::ZERO;
+
+    let proof =
+        paper::evrf_batched_prove(&public_params(&statement), &statement, &witness, &mut rng)
+            .expect("prove zero share");
+    let mut verify_rng = ChaCha20Rng::seed_from_u64(0xCAFE);
+    paper::evrf_batched_verify(
+        &public_params(&statement),
+        &statement,
+        &proof,
+        &mut verify_rng,
+    )
+    .expect("verify identity share commitment");
 }
 
 #[test]

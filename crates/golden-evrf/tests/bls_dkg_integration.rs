@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 
 use golden_bls_jubjub::golden_group::{JubjubGoldenGroup, JubjubScalar};
 use golden_core::{
-    complete, create_dealing, verify_dealing, DkgConfig, GoldenGroup, GoldenScalar,
-    ParticipantIndex, ParticipantRegistry, SessionId,
+    complete, create_dealing, create_dealing_with_secret, verify_dealing, DkgConfig, GoldenGroup,
+    GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
 };
 use golden_evrf::paper::bls_jubjub::BlsJubjubBackend;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
@@ -36,6 +36,28 @@ fn config() -> DkgConfig<JubjubGoldenGroup> {
     .unwrap();
     DkgConfig::new(
         2,
+        SessionId([42u8; 32]),
+        JubjubScalar::from_u64(77).unwrap(),
+        registry,
+    )
+    .unwrap()
+}
+
+fn two_participant_config() -> DkgConfig<JubjubGoldenGroup> {
+    let registry = ParticipantRegistry::new(
+        [idx(1), idx(2)]
+            .into_iter()
+            .map(|participant| {
+                (
+                    participant,
+                    JubjubGoldenGroup::mul_generator(&identity_secret(participant)),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    DkgConfig::new(
+        1,
         SessionId([42u8; 32]),
         JubjubScalar::from_u64(77).unwrap(),
         registry,
@@ -109,6 +131,48 @@ fn assert_dkg_completes(config: DkgConfig<JubjubGoldenGroup>) {
     assert_eq!(output.public_key_shares.len(), participant_count);
 }
 
+/// Run a DKG where every dealer shares zero, as the EHTDH1 zero-sharing run does.
+fn assert_zero_sharing_completes(config: DkgConfig<JubjubGoldenGroup>) {
+    let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
+    let dealings: BTreeMap<_, _> = config
+        .registry
+        .indexes()
+        .map(|dealer| {
+            (
+                dealer,
+                create_dealing_with_secret::<JubjubGoldenGroup, BlsJubjubBackend>(
+                    dealer,
+                    &identity_secret(dealer),
+                    JubjubScalar::zero(),
+                    &config,
+                    &mut rng,
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+
+    for (receiver, own_dealing) in &dealings {
+        let peer_dealings = dealings
+            .iter()
+            .filter(|(dealer, _)| *dealer != receiver)
+            .map(|(dealer, dealing)| (*dealer, dealing.message.clone()))
+            .collect();
+        let output = complete::<JubjubGoldenGroup, BlsJubjubBackend>(
+            *receiver,
+            &identity_secret(*receiver),
+            own_dealing,
+            &peer_dealings,
+            &config,
+        )
+        .unwrap();
+        assert!(bool::from(JubjubGoldenGroup::is_identity(
+            &output.public_key
+        )));
+        assert_eq!(output.secret_share.value, JubjubScalar::zero());
+    }
+}
+
 #[test]
 fn single_participant_dkg_completes_without_proving() {
     let config = single_participant_config();
@@ -145,6 +209,11 @@ fn single_participant_dkg_completes_without_proving() {
 #[test]
 fn dkg_completes_with_batched_evrf_backend() {
     assert_dkg_completes(config());
+}
+
+#[test]
+fn threshold_one_zero_sharing_completes() {
+    assert_zero_sharing_completes(two_participant_config());
 }
 
 #[test]
