@@ -27,17 +27,17 @@ bls12_381 = { version = "0.8", default-features = false, features = ["groups", "
 blst = { version = "0.3", default-features = false }
 blstrs = { version = "0.7", default-features = false }
 bulletproofs = { version = "5.0.0", default-features = false }
-bulletproofs-cycle = { path = "crates/bulletproofs-cycle", version = "0.4.0" }
+bulletproofs-cycle = { path = "crates/bulletproofs-cycle", version = "0.5.0" }
 chacha20 = "0.9"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 curve25519-dalek = { version = "4.1.3", default-features = false }
 ff = { version = "0.13", default-features = false }
 group = { version = "0.13", default-features = false }
-golden-bls-jubjub = { path = "crates/golden-bls-jubjub", version = "0.4.0" }
-golden-core = { path = "crates/golden-core", version = "0.4.0" }
-golden-evrf = { path = "crates/golden-evrf", version = "0.4.0" }
-golden-halo2curves = { path = "crates/golden-halo2curves", version = "0.4.0" }
-golden-rustcrypto = { path = "crates/golden-rustcrypto", version = "0.4.0" }
+golden-bls-jubjub = { path = "crates/golden-bls-jubjub", version = "0.5.0" }
+golden-core = { path = "crates/golden-core", version = "0.5.0" }
+golden-evrf = { path = "crates/golden-evrf", version = "0.5.0" }
+golden-halo2curves = { path = "crates/golden-halo2curves", version = "0.5.0" }
+golden-rustcrypto = { path = "crates/golden-rustcrypto", version = "0.5.0" }
 halo2curves = { version = "0.10", default-features = false }
 hex = "0.4"
 hkdf = "0.12"
