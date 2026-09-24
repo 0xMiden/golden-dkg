@@ -227,6 +227,35 @@ package_has_library_target() {
         ' >/dev/null
 }
 
+published_package_has_library_target() {
+    local package="$1"
+    local version="$2"
+    local archive root metadata
+
+    check_command "tar"
+
+    archive="$RELEASE_PLAN_TMPDIR/published-baselines/$package-$version.crate"
+    root="$RELEASE_PLAN_TMPDIR/published-baselines/$package-$version"
+    mkdir -p "$(dirname "$archive")" "$root"
+
+    download_published_crate "$package" "$version" "$archive"
+    tar -xzf "$archive" -C "$root"
+    metadata="$(
+        cargo metadata \
+            --manifest-path "$root/$package-$version/Cargo.toml" \
+            --no-deps \
+            --format-version 1
+    )"
+
+    printf '%s' "$metadata" |
+        jq -e --arg package "$package" '
+          .packages[]
+          | select(.name == $package)
+          | .targets[]
+          | select(.kind | index("lib"))
+        ' >/dev/null
+}
+
 package_rustdoc_name() {
     local package="$1"
 
