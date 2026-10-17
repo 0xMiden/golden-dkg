@@ -461,6 +461,53 @@ mod tests {
     }
 
     #[test]
+    fn quorum_search_recovers_after_invalid_duplicate_in_any_order() {
+        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
+        let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
+        let message = sealing_key
+            .seal_bytes_with_associated_data(&mut rng, b"payload", b"ad")
+            .unwrap();
+        let shares = shares_for(&secret_shares, &setup_context, &message, b"context");
+        let mut invalid = shares[0].clone();
+        invalid.share = G::add(&invalid.share, &G::generator());
+        let candidates = [invalid, shares[0].clone(), shares[1].clone()];
+        let combiner = Combiner::new(public_key_set, setup_context).unwrap();
+
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let arrived: Vec<_> = order.iter().map(|&i| candidates[i].clone()).collect();
+            assert_eq!(
+                combiner
+                    .combine_quorum(&message, b"context", &arrived)
+                    .unwrap(),
+                b"payload",
+                "arrival order {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quorum_search_counts_duplicate_valid_share_once() {
+        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
+        let mut rng = ChaCha20Rng::from_seed([12u8; 32]);
+        let message = sealing_key.seal_bytes(&mut rng, b"payload").unwrap();
+        let shares = shares_for(&secret_shares, &setup_context, &message, b"context");
+        let duplicate = vec![shares[0].clone(), shares[0].clone()];
+
+        let result = Combiner::new(public_key_set, setup_context)
+            .unwrap()
+            .combine_quorum(&message, b"context", &duplicate);
+
+        assert!(matches!(result, Err(CombineError::MalformedShares(ids)) if ids == vec![1]));
+    }
+
+    #[test]
     fn exact_combiner_rejects_malformed_share() {
         let (sealing_key, public_key_set, secret_shares, setup_context) = material();
         let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
