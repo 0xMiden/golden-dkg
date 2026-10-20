@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use golden_bls_jubjub::golden_group::{JubjubGoldenGroup, JubjubScalar};
 use golden_core::{
     complete, create_dealing, create_dealing_with_secret, verify_dealing, DkgConfig, GoldenGroup,
-    GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
+    GoldenScalar, IdentityKeyProof, ParticipantIndex, ParticipantRegistry, SessionId,
 };
 use golden_evrf::paper::bls_jubjub::BlsJubjubBackend;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
@@ -25,15 +25,25 @@ fn identity_secret(participant: ParticipantIndex) -> JubjubScalar {
     JubjubScalar::from_u64(100 + u64::from(participant.get())).unwrap()
 }
 
+fn registry_entry(
+    participant: ParticipantIndex,
+) -> (
+    ParticipantIndex,
+    <JubjubGoldenGroup as GoldenGroup>::Element,
+    IdentityKeyProof<JubjubGoldenGroup>,
+) {
+    let identity_secret = identity_secret(participant);
+    (
+        participant,
+        JubjubGoldenGroup::mul_generator(&identity_secret),
+        IdentityKeyProof::prove(&identity_secret).unwrap(),
+    )
+}
+
 fn config() -> DkgConfig<JubjubGoldenGroup> {
     let participants = [idx(1), idx(2), idx(3)];
-    let registry = ParticipantRegistry::new(
-        participants
-            .iter()
-            .map(|p| (*p, JubjubGoldenGroup::mul_generator(&identity_secret(*p))))
-            .collect(),
-    )
-    .unwrap();
+    let registry =
+        ParticipantRegistry::new(participants.into_iter().map(registry_entry).collect()).unwrap();
     DkgConfig::new(
         2,
         SessionId([42u8; 32]),
@@ -44,18 +54,9 @@ fn config() -> DkgConfig<JubjubGoldenGroup> {
 }
 
 fn two_participant_config() -> DkgConfig<JubjubGoldenGroup> {
-    let registry = ParticipantRegistry::new(
-        [idx(1), idx(2)]
-            .into_iter()
-            .map(|participant| {
-                (
-                    participant,
-                    JubjubGoldenGroup::mul_generator(&identity_secret(participant)),
-                )
-            })
-            .collect(),
-    )
-    .unwrap();
+    let registry =
+        ParticipantRegistry::new([idx(1), idx(2)].into_iter().map(registry_entry).collect())
+            .unwrap();
     DkgConfig::new(
         1,
         SessionId([42u8; 32]),
@@ -66,11 +67,7 @@ fn two_participant_config() -> DkgConfig<JubjubGoldenGroup> {
 }
 
 fn single_participant_config() -> DkgConfig<JubjubGoldenGroup> {
-    let registry = ParticipantRegistry::new(vec![(
-        idx(1),
-        JubjubGoldenGroup::mul_generator(&identity_secret(idx(1))),
-    )])
-    .unwrap();
+    let registry = ParticipantRegistry::new(vec![registry_entry(idx(1))]).unwrap();
     DkgConfig::new(
         1,
         SessionId([42u8; 32]),

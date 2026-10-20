@@ -21,8 +21,8 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     DealerMessage, DealerMessageNonce, DkgConfig, EncryptedShare, Error, FeldmanCommitment,
-    GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, Result, SessionId,
-    TranscriptRoot,
+    GoldenGroup, GoldenScalar, IdentityKeyProof, ParticipantIndex, ParticipantRegistry, Result,
+    SessionId, TranscriptRoot,
 };
 
 /// Magic prefix for every standalone DKG wire value.
@@ -42,6 +42,8 @@ pub const TAG_PARTICIPANT_REGISTRY: u8 = 0x05;
 pub const TAG_DKG_CONFIG: u8 = 0x06;
 /// Protocol broadcast tag for [`DealerMessage`].
 pub const TAG_DEALER_MESSAGE: u8 = 0x07;
+/// Standalone tag for [`IdentityKeyProof`].
+pub const TAG_IDENTITY_KEY_PROOF: u8 = 0x08;
 
 /// Encode a value into its nested canonical wire representation.
 pub trait WireEncode {
@@ -344,12 +346,52 @@ where
     }
 }
 
+impl<G: GoldenGroup> WireEncode for IdentityKeyProof<G> {
+    fn write_wire(&self, out: &mut Vec<u8>) {
+        write_element::<G>(out, &self.nonce_point);
+        write_scalar::<G>(out, &self.response);
+    }
+}
+
+impl<G> WireDecode for IdentityKeyProof<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
+        Ok(Self {
+            nonce_point: read_element::<G>(reader)?,
+            response: read_scalar::<G>(reader)?,
+        })
+    }
+}
+
+impl<G> WireMessage for IdentityKeyProof<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    const TAG: u8 = TAG_IDENTITY_KEY_PROOF;
+    const CODEC_ID: &'static str = "identity-key-proof-v1";
+
+    fn write_wire_context(out: &mut Vec<u8>) {
+        write_context_field(out, Self::CODEC_ID.as_bytes());
+        write_context_field(out, G::BACKEND_ID.as_bytes());
+    }
+
+    fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
+        expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
+        expect_context_field(reader, G::BACKEND_ID.as_bytes())
+    }
+}
+
 impl<G: GoldenGroup> WireEncode for ParticipantRegistry<G> {
     fn write_wire(&self, out: &mut Vec<u8>) {
         write_len(out, self.len());
-        for (participant, public_key) in self.entries() {
+        for (participant, public_key, proof) in self.entries_with_proofs() {
             participant.write_wire(out);
             write_element::<G>(out, public_key);
+            proof.write_wire(out);
         }
     }
 }
@@ -361,14 +403,16 @@ where
 {
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
         let len = reader.read_len()?;
-        let entry_len = 4 + G::ELEMENT_REPR_BYTES;
+        let entry_len = 4 + 2 * G::ELEMENT_REPR_BYTES + G::Scalar::REPR_BYTES;
         reader.ensure_remaining_items(len, entry_len)?;
         let mut entries = Vec::with_capacity(len);
         let mut last = None;
         for _ in 0..len {
             let participant = ParticipantIndex::read_wire(reader)?;
             ensure_increasing(&mut last, participant)?;
-            entries.push((participant, read_element::<G>(reader)?));
+            let public_key = read_element::<G>(reader)?;
+            let proof = IdentityKeyProof::<G>::read_wire(reader)?;
+            entries.push((participant, public_key, proof));
         }
         Self::new(entries)
     }
@@ -380,7 +424,7 @@ where
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_PARTICIPANT_REGISTRY;
-    const CODEC_ID: &'static str = "participant-registry-v1";
+    const CODEC_ID: &'static str = "participant-registry-v2";
 
     fn write_wire_context(out: &mut Vec<u8>) {
         write_context_field(out, Self::CODEC_ID.as_bytes());
@@ -422,7 +466,7 @@ where
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
     const TAG: u8 = TAG_DKG_CONFIG;
-    const CODEC_ID: &'static str = "dkg-config-v1";
+    const CODEC_ID: &'static str = "dkg-config-v2";
 
     fn write_wire_context(out: &mut Vec<u8>) {
         write_context_field(out, Self::CODEC_ID.as_bytes());
@@ -605,6 +649,34 @@ where
 
 #[cfg(feature = "miden-serde")]
 impl<G> Deserializable for FeldmanCommitment<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        read_miden_wire(source)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Serializable for IdentityKeyProof<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        write_miden_wire(self, target);
+    }
+
+    fn get_size_hint(&self) -> usize {
+        miden_wire_size_hint(self)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Deserializable for IdentityKeyProof<G>
 where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,
@@ -809,6 +881,28 @@ where
 
 #[cfg(feature = "serde")]
 impl<'de, G> Deserialize<'de> for FeldmanCommitment<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserialize_wire(deserializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<G> Serialize for IdentityKeyProof<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serialize_wire(self, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G> Deserialize<'de> for IdentityKeyProof<G>
 where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,
@@ -1112,11 +1206,50 @@ mod tests {
         );
     }
 
+    fn registry_entry(
+        participant: ParticipantIndex,
+        identity_secret: u64,
+    ) -> (ParticipantIndex, TinyScalar, IdentityKeyProof<TinyGroup>) {
+        let identity_secret = TinyScalar::from_u64(identity_secret).unwrap();
+        (
+            participant,
+            TinyGroup::mul_generator(&identity_secret),
+            IdentityKeyProof::prove(&identity_secret).unwrap(),
+        )
+    }
+
+    #[test]
+    fn identity_key_proof_round_trips() {
+        let (_, _, proof) = registry_entry(idx(1), 11);
+
+        assert_eq!(
+            from_wire_bytes::<IdentityKeyProof<TinyGroup>>(&to_wire_bytes(&proof)).unwrap(),
+            proof
+        );
+    }
+
+    #[test]
+    fn registry_decode_rejects_invalid_identity_key_proof() {
+        let registry = ParticipantRegistry::<TinyGroup>::new(vec![
+            registry_entry(idx(1), 11),
+            registry_entry(idx(2), 12),
+        ])
+        .unwrap();
+        let mut bytes = to_wire_bytes(&registry);
+        let last = bytes.len() - 1;
+        bytes[last] = (bytes[last] + 1) % 97;
+
+        assert_eq!(
+            from_wire_bytes::<ParticipantRegistry<TinyGroup>>(&bytes).unwrap_err(),
+            Error::InvalidIdentityKeyProof(2)
+        );
+    }
+
     #[test]
     fn registry_round_trips_and_rejects_non_increasing_participants() {
         let registry = ParticipantRegistry::<TinyGroup>::new(vec![
-            (idx(1), TinyScalar::from_u64(11).unwrap()),
-            (idx(2), TinyScalar::from_u64(12).unwrap()),
+            registry_entry(idx(1), 11),
+            registry_entry(idx(2), 12),
         ])
         .unwrap();
         let bytes = to_wire_bytes(&registry);
@@ -1128,7 +1261,7 @@ mod tests {
 
         let mut nested = registry.to_nested_wire_bytes();
         nested[11] = 2;
-        nested[16] = 1;
+        nested[18] = 1;
         let mut top_level = Vec::new();
         top_level.extend_from_slice(MAGIC);
         top_level.push(TAG_PARTICIPANT_REGISTRY);

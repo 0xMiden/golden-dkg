@@ -8,7 +8,8 @@ use golden_core::{
     complete, create_dealing, verify_dealing,
     wire::{from_wire_bytes, to_wire_bytes},
     DealerMessage, DkgConfig, DkgDealing, Error, EvrfProofBackend, EvrfStatement, GoldenGroup,
-    GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId, PROTOCOL_VERSION,
+    GoldenScalar, IdentityKeyProof, ParticipantIndex, ParticipantRegistry, SessionId,
+    PROTOCOL_VERSION,
 };
 use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
@@ -32,9 +33,11 @@ fn config() -> DkgConfig<P256Backend> {
         participants()
             .into_iter()
             .map(|participant| {
+                let identity_secret = identity_secret(participant);
                 (
                     participant,
-                    P256Backend::mul_generator(&identity_secret(participant)),
+                    P256Backend::mul_generator(&identity_secret),
+                    IdentityKeyProof::prove(&identity_secret).unwrap(),
                 )
             })
             .collect(),

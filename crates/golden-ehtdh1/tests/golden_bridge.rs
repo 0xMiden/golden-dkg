@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use golden_core::{
     complete, create_dealing_with_secret, DealerMessage, DkgConfig, DkgDealing, DkgOutput,
-    GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
+    GoldenGroup, GoldenScalar, IdentityKeyProof, ParticipantIndex, ParticipantRegistry, SessionId,
 };
 use golden_ehtdh1::{
     derive_context_session_id, material_from_dkg_outputs, Combiner, Error, UnsealingShare,
@@ -43,9 +43,11 @@ fn config_with_identity_offset(session_id: SessionId, offset: u64) -> DkgConfig<
         participants()
             .iter()
             .map(|participant| {
+                let identity_secret = scalar(100 + offset + u64::from(participant.get()));
                 (
                     *participant,
-                    G::mul_generator(&scalar(100 + offset + u64::from(participant.get()))),
+                    G::mul_generator(&identity_secret),
+                    IdentityKeyProof::prove(&identity_secret).unwrap(),
                 )
             })
             .collect(),
@@ -343,7 +345,8 @@ mod secp_secq {
 
     use golden_core::{
         complete, create_dealing_with_secret, DealerMessage, DkgConfig, DkgDealing, DkgOutput,
-        GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
+        GoldenGroup, GoldenScalar, IdentityKeyProof, ParticipantIndex, ParticipantRegistry,
+        SessionId,
     };
     use golden_ehtdh1::{
         derive_context_session_id, material_from_dkg_outputs, Combiner, UnsealingShare,
@@ -375,9 +378,11 @@ mod secp_secq {
             participants()
                 .iter()
                 .map(|participant| {
+                    let identity_secret = identity_secret(*participant);
                     (
                         *participant,
-                        PaperGroup::mul_generator(&identity_secret(*participant)),
+                        PaperGroup::mul_generator(&identity_secret),
+                        IdentityKeyProof::prove(&identity_secret).unwrap(),
                     )
                 })
                 .collect(),
