@@ -6,14 +6,16 @@ use crate::{Error, GoldenGroup, GoldenScalar, Result};
 /// Schnorr proof of knowledge of the secret behind an identity public key.
 ///
 /// [`ParticipantRegistry::new`](crate::ParticipantRegistry::new) verifies one
-/// proof per registered key, so a participant cannot register a key whose
-/// secret it does not know, such as the negation of another participant's key.
+/// proof per registered key, so a participant cannot register a key derived
+/// from another participant's key, such as its negation, without knowing that
+/// key's secret.
 ///
 /// The proof binds the group backend and the public key. It binds no session
 /// or participant index, so a long-lived identity key can present the same
-/// proof to every registry it joins. The nonce is derived from the identity
-/// secret, so proving needs no randomness and repeated calls return the same
-/// proof.
+/// proof to every registry it joins, and anyone holding the proof can copy it.
+/// Registry entries must therefore come from an authenticated mapping of
+/// participants to keys. The nonce is derived from the identity secret, so
+/// proving needs no randomness and repeated calls return the same proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdentityKeyProof<G: GoldenGroup> {
     /// Schnorr nonce commitment.
