@@ -193,6 +193,10 @@ impl<G: GoldenHashToGroup> Combiner<G> {
     }
 
     /// Crate search variant that runs the paper combiner on a valid `t`-subset.
+    ///
+    /// A failed share does not exclude a later valid share from the same
+    /// participant, so every share from a not yet accepted participant is
+    /// verified. Bound the length of `shares` at the transport layer.
     pub fn combine_quorum(
         &self,
         message: &Ciphertext<G>,
@@ -281,22 +285,23 @@ impl<G: GoldenHashToGroup> Combiner<G> {
         self.combine_verified(message, shares)
     }
 
-    /// Verifies each share once, deduplicating by participant and folding
-    /// unknown participants into `malformed` (used by
-    /// [`Self::combine_quorum`]'s valid-subset search). Returns the valid
-    /// shares and the malformed participant ids.
+    /// Verifies shares in input order and keeps the first valid share per
+    /// participant (used by [`Self::combine_quorum`]'s valid-subset search).
+    /// Failed shares, unknown participants, and later shares from an
+    /// already accepted participant are folded into `malformed`. Returns the
+    /// valid shares and the malformed participant ids.
     fn verify_shares(
         &self,
         message: &Ciphertext<G>,
         decryption_group: &G::Element,
         shares: &[DecryptionShare<G>],
     ) -> (Vec<DecryptionShare<G>>, Vec<u32>) {
-        let mut seen = BTreeSet::new();
+        let mut accepted = BTreeSet::new();
         let mut malformed = Vec::new();
         let mut valid = Vec::new();
 
         for share in shares {
-            if !seen.insert(share.participant) {
+            if accepted.contains(&share.participant) {
                 malformed.push(share.participant.get());
                 continue;
             }
@@ -311,7 +316,10 @@ impl<G: GoldenHashToGroup> Combiner<G> {
                 share,
                 public_share,
             ) {
-                Ok(()) => valid.push(share.clone()),
+                Ok(()) => {
+                    accepted.insert(share.participant);
+                    valid.push(share.clone());
+                }
                 Err(_) => malformed.push(share.participant.get()),
             }
         }
