@@ -19,7 +19,8 @@
 
 use golden_bls_jubjub::golden_group::{JubjubGoldenGroup, JubjubScalar};
 use golden_core::{
-    DkgConfig, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
+    DkgConfig, GoldenGroup, GoldenScalar, IdentityKeyProof, ParticipantIndex, ParticipantRegistry,
+    SessionId,
 };
 use golden_evrf::paper::bls_jubjub::{
     evrf_batched_prove, evrf_batched_verify, testing, BatchedEvrfPublicParams,
@@ -96,7 +97,14 @@ pub fn build_config(n: usize, t: usize) -> DkgConfig<JubjubGoldenGroup> {
     let registry = ParticipantRegistry::new(
         participants
             .iter()
-            .map(|p| (*p, JubjubGoldenGroup::mul_generator(&identity_secret(*p))))
+            .map(|p| {
+                let identity_secret = identity_secret(*p);
+                (
+                    *p,
+                    JubjubGoldenGroup::mul_generator(&identity_secret),
+                    IdentityKeyProof::prove(&identity_secret).unwrap(),
+                )
+            })
             .collect(),
     )
     .unwrap();

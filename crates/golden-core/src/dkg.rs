@@ -7,8 +7,8 @@ use rand_core::CryptoRngCore;
 
 use crate::transcript::{TranscriptBuilder, TranscriptRoot};
 use crate::{
-    Error, FeldmanCommitment, GoldenGroup, GoldenScalar, ParticipantIndex, Polynomial, Result,
-    Share,
+    Error, FeldmanCommitment, GoldenGroup, GoldenScalar, IdentityKeyProof, ParticipantIndex,
+    Polynomial, Result, Share,
 };
 
 /// Protocol version used in transcript binding.
@@ -44,18 +44,26 @@ impl DealerMessageNonce {
 }
 
 /// Public participant registry.
+///
+/// Every registered identity public key comes with a verified
+/// [`IdentityKeyProof`]. The registry root binds the keys, not the proofs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParticipantRegistry<G: GoldenGroup> {
-    participants: BTreeMap<ParticipantIndex, G::Element>,
+    participants: BTreeMap<ParticipantIndex, (G::Element, IdentityKeyProof<G>)>,
     root: TranscriptRoot,
 }
 
 impl<G: GoldenGroup> ParticipantRegistry<G> {
-    /// Build a registry from participant identity public keys.
-    pub fn new(entries: Vec<(ParticipantIndex, G::Element)>) -> Result<Self> {
+    /// Build a registry from participant identity public keys and their proofs
+    /// of knowledge.
+    ///
+    /// Rejects the identity element, a public key registered twice, a public
+    /// key that negates another registered key, and a proof that does not
+    /// verify against its key.
+    pub fn new(entries: Vec<(ParticipantIndex, G::Element, IdentityKeyProof<G>)>) -> Result<Self> {
         let mut participants = BTreeMap::new();
         let mut public_keys = Vec::<(Vec<u8>, ParticipantIndex)>::new();
-        for (participant, public_key) in entries {
+        for (participant, public_key, proof) in entries {
             if participants.contains_key(&participant) {
                 return Err(Error::DuplicateParticipantIndex(participant.get()));
             }
@@ -72,8 +80,21 @@ impl<G: GoldenGroup> ParticipantRegistry<G> {
                     second: participant.get(),
                 });
             }
+            let negated_public_key = G::encode_element(&G::sub(&G::identity(), &public_key));
+            if let Some((_, first)) = public_keys
+                .iter()
+                .find(|(known, _)| known.as_slice() == negated_public_key.as_ref())
+            {
+                return Err(Error::NegatedParticipantPublicKey {
+                    first: first.get(),
+                    second: participant.get(),
+                });
+            }
+            proof
+                .verify(&public_key)
+                .map_err(|_| Error::InvalidIdentityKeyProof(participant.get()))?;
             public_keys.push((encoded_public_key.as_ref().to_vec(), participant));
-            participants.insert(participant, public_key);
+            participants.insert(participant, (public_key, proof));
         }
 
         let root = registry_root::<G>(&participants);
@@ -99,6 +120,7 @@ impl<G: GoldenGroup> ParticipantRegistry<G> {
     pub fn public_key(&self, participant: ParticipantIndex) -> Result<&G::Element> {
         self.participants
             .get(&participant)
+            .map(|(public_key, _)| public_key)
             .ok_or(Error::UnknownParticipant(participant.get()))
     }
 
@@ -111,7 +133,17 @@ impl<G: GoldenGroup> ParticipantRegistry<G> {
     pub fn entries(&self) -> impl Iterator<Item = (ParticipantIndex, &G::Element)> + '_ {
         self.participants
             .iter()
-            .map(|(participant, public_key)| (*participant, public_key))
+            .map(|(participant, (public_key, _))| (*participant, public_key))
+    }
+
+    /// Return participant entries with their identity key proofs in canonical
+    /// order.
+    pub fn entries_with_proofs(
+        &self,
+    ) -> impl Iterator<Item = (ParticipantIndex, &G::Element, &IdentityKeyProof<G>)> + '_ {
+        self.participants
+            .iter()
+            .map(|(participant, (public_key, proof))| (*participant, public_key, proof))
     }
 }
 
@@ -798,12 +830,12 @@ where
 }
 
 fn registry_root<G: GoldenGroup>(
-    participants: &BTreeMap<ParticipantIndex, G::Element>,
+    participants: &BTreeMap<ParticipantIndex, (G::Element, IdentityKeyProof<G>)>,
 ) -> TranscriptRoot {
     let mut transcript = TranscriptBuilder::new(b"registry");
     transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
     transcript.usize(b"len", participants.len());
-    for (participant, public_key) in participants {
+    for (participant, (public_key, _)) in participants {
         transcript.participant(b"participant", *participant);
         transcript.element::<G>(b"public-key", public_key);
     }
@@ -1270,6 +1302,17 @@ mod tests {
         TinyScalar::from_u64(u64::from(participant.get()) * 10).unwrap()
     }
 
+    fn registry_entry(
+        participant: ParticipantIndex,
+        identity_secret: &TinyScalar,
+    ) -> (ParticipantIndex, TinyScalar, IdentityKeyProof<TinyGroup>) {
+        (
+            participant,
+            TinyGroup::mul_generator(identity_secret),
+            IdentityKeyProof::prove(identity_secret).unwrap(),
+        )
+    }
+
     fn config() -> DkgConfig<TinyGroup> {
         config_for(3, 2, 42)
     }
@@ -1348,10 +1391,7 @@ mod tests {
         let entries = (1..=n as u32)
             .map(|value| {
                 let participant = idx(value);
-                (
-                    participant,
-                    TinyGroup::mul_generator(&identity_secret(participant)),
-                )
+                registry_entry(participant, &identity_secret(participant))
             })
             .collect();
         let registry = ParticipantRegistry::new(entries).unwrap();
@@ -1912,18 +1952,9 @@ mod tests {
         )
         .unwrap();
         let registry = ParticipantRegistry::new(vec![
-            (
-                idx(1),
-                TinyGroup::mul_generator(&TinyScalar::from_u64(10).unwrap()),
-            ),
-            (
-                idx(2),
-                TinyGroup::mul_generator(&TinyScalar::from_u64(21).unwrap()),
-            ),
-            (
-                idx(3),
-                TinyGroup::mul_generator(&TinyScalar::from_u64(30).unwrap()),
-            ),
+            registry_entry(idx(1), &TinyScalar::from_u64(10).unwrap()),
+            registry_entry(idx(2), &TinyScalar::from_u64(21).unwrap()),
+            registry_entry(idx(3), &TinyScalar::from_u64(30).unwrap()),
         ])
         .unwrap();
         let wrong_config = DkgConfig::new(2, config.session_id, config.beta, registry).unwrap();
@@ -1937,14 +1968,47 @@ mod tests {
 
     #[test]
     fn duplicate_registry_public_keys_are_rejected() {
-        let public_key = TinyGroup::mul_generator(&identity_secret(idx(1)));
+        let identity_secret = identity_secret(idx(1));
         assert_eq!(
-            ParticipantRegistry::<TinyGroup>::new(vec![(idx(1), public_key), (idx(2), public_key)])
-                .unwrap_err(),
+            ParticipantRegistry::<TinyGroup>::new(vec![
+                registry_entry(idx(1), &identity_secret),
+                registry_entry(idx(2), &identity_secret),
+            ])
+            .unwrap_err(),
             Error::DuplicateParticipantPublicKey {
                 first: 1,
                 second: 2,
             }
+        );
+    }
+
+    #[test]
+    fn negated_registry_public_keys_are_rejected() {
+        let identity_secret = identity_secret(idx(1));
+        assert_eq!(
+            ParticipantRegistry::<TinyGroup>::new(vec![
+                registry_entry(idx(1), &identity_secret),
+                registry_entry(idx(2), &identity_secret.neg()),
+            ])
+            .unwrap_err(),
+            Error::NegatedParticipantPublicKey {
+                first: 1,
+                second: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn registry_rejects_identity_key_proof_for_another_key() {
+        let (_, public_key, _) = registry_entry(idx(2), &identity_secret(idx(2)));
+        let (_, _, other_proof) = registry_entry(idx(3), &identity_secret(idx(3)));
+        assert_eq!(
+            ParticipantRegistry::<TinyGroup>::new(vec![
+                registry_entry(idx(1), &identity_secret(idx(1))),
+                (idx(2), public_key, other_proof),
+            ])
+            .unwrap_err(),
+            Error::InvalidIdentityKeyProof(2)
         );
     }
 
@@ -2417,7 +2481,7 @@ mod tests {
         // collapse every other participant's secret-share multiplication to
         // the identity; the registry must reject this at construction time
         // rather than let a degenerate DKG silently complete.
-        let entries = vec![(idx(1), TinyGroup::identity())];
+        let entries = vec![registry_entry(idx(1), &TinyScalar::zero())];
         assert_eq!(
             ParticipantRegistry::<TinyGroup>::new(entries).unwrap_err(),
             Error::InvalidEncoding
@@ -2433,10 +2497,7 @@ mod tests {
             (1..=3)
                 .map(|value| {
                     let participant = idx(value);
-                    (
-                        participant,
-                        TinyGroup::mul_generator(&identity_secret(participant)),
-                    )
+                    registry_entry(participant, &identity_secret(participant))
                 })
                 .collect(),
         )
@@ -2466,10 +2527,7 @@ mod tests {
             (1..=3)
                 .map(|value| {
                     let participant = idx(value);
-                    (
-                        participant,
-                        TinyGroup::mul_generator(&identity_secret(participant)),
-                    )
+                    registry_entry(participant, &identity_secret(participant))
                 })
                 .collect(),
         )

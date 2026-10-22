@@ -10,6 +10,7 @@ pub mod dkg;
 pub mod error;
 pub mod feldman;
 pub mod group;
+pub mod identity_key;
 pub mod participant;
 pub mod shamir;
 pub mod transcript;
@@ -27,6 +28,7 @@ pub use dkg::{
 pub use error::{Error, Result};
 pub use feldman::FeldmanCommitment;
 pub use group::{FieldByteOrder, GoldenEvrfCurve, GoldenGroup, GoldenHashToGroup, GoldenScalar};
+pub use identity_key::IdentityKeyProof;
 pub use participant::ParticipantIndex;
 pub use shamir::{
     batch_invert, lagrange_coefficients_at_zero, lagrange_interpolate_at_zero, reconstruct_secret,

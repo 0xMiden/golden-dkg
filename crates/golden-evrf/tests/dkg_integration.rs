@@ -5,9 +5,12 @@
 //! to pin rejection of malformed ciphertexts, commitments, and proof bytes.
 //! Most tests are `#[ignore]` because the backend proves a full R1CS instance
 //! per dealing; run via `cargo nextest --run-ignored only`.
-//! `single_participant_dkg_completes_without_proving` is the exception: a
-//! single-participant (n=1) dealing has no eVRF statement to prove, so it
-//! runs unignored.
+//! `single_participant_dkg_completes_without_proving`,
+//! `registry_rejects_negated_identity_key` and
+//! `identity_key_proof_matches_known_answer` are the exceptions: a
+//! single-participant (n=1) dealing has no eVRF statement to prove, and
+//! registry construction and identity key proofs run no eVRF prover, so all
+//! three run unignored.
 
 #![allow(clippy::unwrap_used)]
 
@@ -15,9 +18,9 @@ use std::collections::BTreeMap;
 
 use golden_core::{
     complete, create_dealing, create_dealing_with_secret, verify_dealing,
-    wire::{from_wire_bytes, to_wire_bytes},
-    DealerMessage, DkgConfig, EvrfProofBackend, EvrfStatement, GoldenGroup, GoldenScalar,
-    ParticipantIndex, ParticipantRegistry, SessionId, PROTOCOL_VERSION,
+    wire::{from_wire_bytes, to_wire_bytes, WireEncode},
+    DealerMessage, DkgConfig, Error, EvrfProofBackend, EvrfStatement, GoldenGroup, GoldenScalar,
+    IdentityKeyProof, ParticipantIndex, ParticipantRegistry, SessionId, PROTOCOL_VERSION,
 };
 use golden_evrf::paper::secp_secq::SecpSecqBackend;
 use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
@@ -34,20 +37,25 @@ fn identity_secret(participant: ParticipantIndex) -> Secp256k1Scalar {
     Secp256k1Scalar::from_u64(100 + u64::from(participant.get())).unwrap()
 }
 
+fn registry_entry(
+    participant: ParticipantIndex,
+) -> (
+    ParticipantIndex,
+    <Secp256k1GoldenGroup as GoldenGroup>::Element,
+    IdentityKeyProof<Secp256k1GoldenGroup>,
+) {
+    let identity_secret = identity_secret(participant);
+    (
+        participant,
+        Secp256k1GoldenGroup::mul_generator(&identity_secret),
+        IdentityKeyProof::prove(&identity_secret).unwrap(),
+    )
+}
+
 fn config() -> DkgConfig<Secp256k1GoldenGroup> {
     let participants = [idx(1), idx(2), idx(3)];
-    let registry = ParticipantRegistry::new(
-        participants
-            .iter()
-            .map(|p| {
-                (
-                    *p,
-                    Secp256k1GoldenGroup::mul_generator(&identity_secret(*p)),
-                )
-            })
-            .collect(),
-    )
-    .unwrap();
+    let registry =
+        ParticipantRegistry::new(participants.into_iter().map(registry_entry).collect()).unwrap();
     DkgConfig::new(
         2,
         SessionId([42u8; 32]),
@@ -58,18 +66,9 @@ fn config() -> DkgConfig<Secp256k1GoldenGroup> {
 }
 
 fn two_participant_config() -> DkgConfig<Secp256k1GoldenGroup> {
-    let registry = ParticipantRegistry::new(
-        [idx(1), idx(2)]
-            .into_iter()
-            .map(|participant| {
-                (
-                    participant,
-                    Secp256k1GoldenGroup::mul_generator(&identity_secret(participant)),
-                )
-            })
-            .collect(),
-    )
-    .unwrap();
+    let registry =
+        ParticipantRegistry::new([idx(1), idx(2)].into_iter().map(registry_entry).collect())
+            .unwrap();
     DkgConfig::new(
         1,
         SessionId([42u8; 32]),
@@ -80,11 +79,7 @@ fn two_participant_config() -> DkgConfig<Secp256k1GoldenGroup> {
 }
 
 fn single_participant_config() -> DkgConfig<Secp256k1GoldenGroup> {
-    let registry = ParticipantRegistry::new(vec![(
-        idx(1),
-        Secp256k1GoldenGroup::mul_generator(&identity_secret(idx(1))),
-    )])
-    .unwrap();
+    let registry = ParticipantRegistry::new(vec![registry_entry(idx(1))]).unwrap();
     DkgConfig::new(
         1,
         SessionId([42u8; 32]),
@@ -309,6 +304,53 @@ fn single_participant_dkg_completes_without_proving() {
 }
 
 #[test]
+fn registry_rejects_negated_identity_key() {
+    // This backend's pad depends only on the x-coordinate of the DH point, so
+    // a participant registered with -PK_1 would receive participant 1's pads.
+    let (_, honest_key, honest_proof) = registry_entry(idx(1));
+    let negated_key = Secp256k1GoldenGroup::sub(&Secp256k1GoldenGroup::identity(), &honest_key);
+
+    assert_eq!(
+        ParticipantRegistry::new(vec![
+            registry_entry(idx(1)),
+            (idx(2), negated_key, honest_proof.clone()),
+        ])
+        .unwrap_err(),
+        Error::NegatedParticipantPublicKey {
+            first: 1,
+            second: 2,
+        }
+    );
+    assert_eq!(
+        ParticipantRegistry::new(vec![
+            registry_entry(idx(3)),
+            (idx(2), negated_key, honest_proof),
+        ])
+        .unwrap_err(),
+        Error::InvalidIdentityKeyProof(2)
+    );
+}
+
+#[test]
+fn identity_key_proof_matches_known_answer() {
+    // Registries store these proofs, so a change to the proof transcript must
+    // show up here rather than as stored proofs that stop verifying.
+    let identity_secret = identity_secret(idx(1));
+    let proof = IdentityKeyProof::<Secp256k1GoldenGroup>::prove(&identity_secret).unwrap();
+
+    let expected = [
+        128, 109, 148, 165, 228, 68, 158, 204, 235, 98, 230, 190, 214, 131, 141, 106, 129, 235,
+        143, 237, 228, 80, 112, 84, 150, 113, 46, 122, 184, 236, 161, 60, 106, 136, 231, 7, 49,
+        208, 194, 133, 26, 205, 161, 9, 217, 86, 190, 46, 245, 43, 70, 57, 144, 238, 210, 74, 168,
+        12, 116, 29, 189, 191, 124, 239, 250,
+    ];
+    assert_eq!(proof.to_nested_wire_bytes(), expected);
+    proof
+        .verify(&Secp256k1GoldenGroup::mul_generator(&identity_secret))
+        .unwrap();
+}
+
+#[test]
 #[ignore = "slow: requires building large BulletproofGens; run via --run-ignored only"]
 fn dkg_completes_with_batched_evrf_backend() {
     assert_dkg_completes(config(), false);
@@ -370,18 +412,8 @@ fn dkg_rejects_tampered_transcript_root() {
 fn dkg_accepts_the_deterministic_dealing_and_rejects_malformed_or_replayed_proofs() {
     let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
     let participants = [idx(1), idx(2)];
-    let registry = ParticipantRegistry::new(
-        participants
-            .iter()
-            .map(|participant| {
-                (
-                    *participant,
-                    Secp256k1GoldenGroup::mul_generator(&identity_secret(*participant)),
-                )
-            })
-            .collect(),
-    )
-    .unwrap();
+    let registry =
+        ParticipantRegistry::new(participants.into_iter().map(registry_entry).collect()).unwrap();
     let config = DkgConfig::new(
         1,
         SessionId([42u8; 32]),
