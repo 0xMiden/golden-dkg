@@ -3,6 +3,7 @@ members = [
     "crates/bulletproofs-cycle",
     "crates/golden-core",
     "crates/golden-curves",
+    "crates/golden-bulletproofs",
 ]
 resolver = "2"
 
