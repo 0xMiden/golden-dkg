@@ -565,7 +565,7 @@ fn chord_checkpoint_count(num_windows: usize) -> usize {
 /// - `L_0 = Δ_0` (base case, expressed directly as a linear combination
 ///   of `bit_vars[0]`, no allocation)
 /// - `L_w = L_{w-1} + Δ_w` for each window `w = 1..=lambda/2` (3
-///   multiplication gates per window via the chord-rule formulas, plus
+///   multiplication gates for the chord formulas and one inverse guard, plus
 ///   the shared `and_var` product amortized across every gadget call
 ///   that reuses `window_products`; `x_{L_w}`/`y_{L_w}` are themselves
 ///   linear combinations of the gate outputs rather than separately
@@ -579,12 +579,10 @@ fn chord_checkpoint_count(num_windows: usize) -> usize {
 /// x-only check cannot distinguish `L_λ` from `-L_λ`, which would allow
 /// non-canonical bit aliases (see [`bit_decompose_q`] doc).
 ///
-/// The chord-addition denominator `x_{L_{w-1}} - x_{Δ_w}` is not
-/// explicitly constrained nonzero: a zero denominator would require the
-/// prover to know a discrete-log relation between the base point and the
-/// hash-derived correction generator `G_S`, which is assumed hard (Boneh
-/// et al. 2024/397, proof of Theorem 14, pp. 32-33 — the exceptional
-/// addition case).
+/// Every chord denominator `x_{L_{w-1}} - x_{Δ_w}` has an inverse
+/// constraint, so exceptional additions fail closed. Completeness still
+/// relies on the hash-derived correction generator avoiding those cases;
+/// rejecting them does not supply a completeness or composition proof.
 ///
 /// The running point is re-materialized as an allocated variable pair
 /// every [`CHORD_CHECKPOINT_INTERVAL`] windows (see that constant), so

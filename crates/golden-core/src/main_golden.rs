@@ -1,4 +1,5 @@
 //! Fixed native Main Golden relation shared with concrete proof implementations.
+use crate::error::normalize_validation_error;
 use crate::wire::{count, framed};
 use crate::{
     DealerMessageNonce, DealerProofStatement, DealerProofWitness, DkgConfig, DkgGroup,
@@ -123,16 +124,20 @@ pub fn receiver_pad<G: DkgGroup>(
     peer_identity_key: &G::Point,
 ) -> Result<G::Scalar> {
     let shared = *peer_identity_key * identity_secret;
-    let exponent =
-        G::reduce_base_field(&G::affine_x(&shared).map_err(|_| Error::RelationEvaluationFailed)?);
+    let exponent = G::reduce_base_field(
+        &G::affine_x(&shared)
+            .map_err(|error| normalize_validation_error(error, Error::RelationEvaluationFailed))?,
+    );
     if bool::from(exponent.is_zero()) {
         return Err(Error::RelationEvaluationFailed);
     }
     let own = G::mul_generator(identity_secret);
     let first = h1::<G>(message, &own, peer_identity_key)? * exponent;
     let second = h2::<G>(message, &own, peer_identity_key)? * exponent;
-    let first_x = G::affine_x(&first).map_err(|_| Error::RelationEvaluationFailed)?;
-    let second_x = G::affine_x(&second).map_err(|_| Error::RelationEvaluationFailed)?;
+    let first_x = G::affine_x(&first)
+        .map_err(|error| normalize_validation_error(error, Error::RelationEvaluationFailed))?;
+    let second_x = G::affine_x(&second)
+        .map_err(|error| normalize_validation_error(error, Error::RelationEvaluationFailed))?;
     Ok(G::reduce_base_field(&(beta::<G>()? * first_x + second_x)))
 }
 
@@ -143,14 +148,8 @@ pub fn check_dealer_relation<G: DkgGroup>(
     statement: &DealerProofStatement<G>,
     witness: &DealerProofWitness<G>,
 ) -> Result<()> {
-    check_relation(config, statement, witness).map_err(|error| match error {
-        Error::AllocationFailed
-        | Error::ArithmeticOverflow
-        | Error::ProofOperationFailed
-        | Error::InsufficientProofCapacity { .. }
-        | Error::MalformedPreparedGenerators => error,
-        _ => Error::InvalidProof,
-    })
+    check_relation(config, statement, witness)
+        .map_err(|error| normalize_validation_error(error, Error::InvalidProof))
 }
 fn check_relation<G: DkgGroup>(
     config: &DkgConfig<G>,

@@ -7,7 +7,7 @@ use golden_core::{DkgGroup, Error, FeldmanCommitment, ParticipantIndex, Polynomi
 use group::Group;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
-fn check_adapter<G: DkgGroup>(max_reduction_quotient: u8) {
+fn check_adapter<G: DkgGroup>(max_reduction_quotient: u8, hash_vector: &[u8]) {
     let mut rng = ChaCha20Rng::from_seed([0x47; 32]);
     let mut scalars = vec![G::Scalar::ZERO, G::Scalar::ONE, -G::Scalar::ONE];
     let mut power = G::Scalar::ONE;
@@ -72,9 +72,27 @@ fn check_adapter<G: DkgGroup>(max_reduction_quotient: u8) {
             assert_eq!(G::reduce_base_field(&value), expected);
         }
     }
-    assert_ne!(
-        G::hash_to_point(b"adapter-map-vector", b"one").unwrap(),
-        G::Point::identity()
+    // Independent integer subtraction exercises the largest canonical base value.
+    let maximum = -G::BaseField::ONE;
+    let mut remainder = maximum.to_repr();
+    for _ in 0..max_reduction_quotient {
+        let mut borrow = 0i16;
+        for (byte, modulus_byte) in remainder.as_mut().iter_mut().zip(scalar_modulus) {
+            let difference = i16::from(*byte) - i16::from(modulus_byte) - borrow;
+            *byte = difference as u8;
+            borrow = i16::from(difference < 0);
+        }
+        assert_eq!(borrow, 0);
+    }
+    assert_eq!(
+        G::reduce_base_field(&maximum),
+        G::decode_scalar(remainder.as_ref()).unwrap()
+    );
+    // Pinned against the preserved native mappings at baseline 0e3168f,
+    // with the new protocol point encodings (SEC1 / native Jubjub).
+    assert_eq!(
+        G::encode_point(&G::hash_to_point(b"adapter-map-vector", b"one").unwrap()),
+        hash_vector
     );
     assert_ne!(
         G::hash_to_point(b"adapter-map-vector", b"one").unwrap(),
@@ -136,13 +154,25 @@ fn adjust_integer(bytes: &mut [u8; 32], delta: i8) {
 #[cfg(feature = "secp256k1")]
 #[test]
 fn secp_native_arithmetic_codecs_reduction_and_feldman_agree() {
-    check_adapter::<golden_curves::Secp256k1Group>(1);
+    check_adapter::<golden_curves::Secp256k1Group>(
+        1,
+        &[
+            3, 226, 145, 171, 35, 136, 153, 101, 118, 17, 105, 137, 44, 16, 214, 218, 43, 50, 136,
+            44, 48, 15, 188, 2, 47, 199, 38, 95, 90, 199, 90, 151, 86,
+        ],
+    );
 }
 
 #[cfg(feature = "jubjub")]
 #[test]
 fn jubjub_native_arithmetic_codecs_reduction_and_feldman_agree() {
-    check_adapter::<golden_curves::JubjubGroup>(8);
+    check_adapter::<golden_curves::JubjubGroup>(
+        8,
+        &[
+            213, 181, 179, 103, 190, 172, 57, 69, 121, 208, 142, 148, 220, 89, 115, 210, 45, 107,
+            30, 143, 114, 107, 10, 54, 60, 204, 88, 118, 253, 129, 95, 87,
+        ],
+    );
 }
 
 #[cfg(feature = "secp256k1")]

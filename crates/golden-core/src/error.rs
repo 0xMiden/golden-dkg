@@ -145,3 +145,16 @@ pub enum Error {
     #[error("decryption failed")]
     DecryptionFailed,
 }
+
+/// Coarsen a validation verdict without disguising an operational failure.
+pub(crate) fn normalize_validation_error(error: Error, invalid: Error) -> Error {
+    match error {
+        Error::AllocationFailed
+        | Error::ArithmeticOverflow
+        | Error::ProofOperationFailed
+        | Error::ProofGenerationFailed
+        | Error::InsufficientProofCapacity { .. }
+        | Error::MalformedPreparedGenerators => error,
+        _ => invalid,
+    }
+}

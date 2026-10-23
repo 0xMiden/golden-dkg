@@ -66,7 +66,7 @@ impl DkgGroup for JubjubGroup {
     fn hash_to_point(domain: &[u8], input: &[u8]) -> Result<Point> {
         let domain_len = u64::try_from(domain.len()).map_err(|_| Error::ArithmeticOverflow)?;
         let input_len = u64::try_from(input.len()).map_err(|_| Error::ArithmeticOverflow)?;
-        for counter in 0..=u32::MAX {
+        for counter in 0..u32::MAX {
             let mut hash = Sha256::new();
             hash.update(b"golden-jubjub-h2c-v1");
             hash.update(domain_len.to_be_bytes());

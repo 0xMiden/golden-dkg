@@ -1,4 +1,5 @@
 //! Immutable core-constructed inputs for the fixed Main Golden proof relation.
+use crate::error::normalize_validation_error;
 use crate::secret::Secret;
 use crate::{
     DealerMessageNonce, DkgConfig, DkgGroup, DkgInstanceKind, Error, EvrfMessage, ParticipantIndex,
@@ -113,12 +114,8 @@ impl<G: DkgGroup> DealerProofStatement<G> {
         {
             return Err(Error::InvalidProof);
         }
-        crate::dealer_message::validate_instances(config, self.dealer, &self.instances).map_err(
-            |error| match error {
-                Error::AllocationFailed | Error::ArithmeticOverflow => error,
-                _ => Error::InvalidProof,
-            },
-        )
+        crate::dealer_message::validate_instances(config, self.dealer, &self.instances)
+            .map_err(|error| normalize_validation_error(error, Error::InvalidProof))
     }
 }
 

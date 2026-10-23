@@ -3,6 +3,7 @@
 //! Use disposable identities only. Broadcasts, their copies and persisted local
 //! state reveal the dealer identity secret, shares and pads. This is not a ZK proof.
 use crate::dealer_proof::{InstanceWitness, ReceiverWitness};
+use crate::error::normalize_validation_error;
 use crate::secret::secret;
 use crate::wire::{framed, reserve, Reader};
 use crate::{
@@ -67,10 +68,8 @@ impl<G: DkgGroup> DealerProofSystem<G> for InsecureRevealedWitnessProof {
         statement: &DealerProofStatement<G>,
         proof: &[u8],
     ) -> Result<()> {
-        verify(config, statement, proof).map_err(|error| match error {
-            Error::AllocationFailed | Error::ArithmeticOverflow => error,
-            _ => Error::InvalidProof,
-        })
+        verify(config, statement, proof)
+            .map_err(|error| normalize_validation_error(error, Error::InvalidProof))
     }
 }
 fn append_scalar<G: DkgGroup>(out: &mut Vec<u8>, scalar: &G::Scalar) {

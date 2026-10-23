@@ -128,6 +128,7 @@ fn mixed_workflow<G: DkgGroup>() {
 struct Recording {
     batches: AtomicUsize,
     singles: AtomicUsize,
+    fail_hash_after_batch: bool,
 }
 impl<G: DkgGroup> DealerProofSystem<G> for Recording {
     fn prove(
@@ -152,6 +153,9 @@ impl<G: DkgGroup> DealerProofSystem<G> for Recording {
         self.batches.fetch_add(1, Ordering::SeqCst);
         for item in proofs {
             InsecureRevealedWitnessProof.verify(config, item.statement, item.proof)?;
+        }
+        if self.fail_hash_after_batch {
+            FAIL_HASH_TO_POINT.with(|fail| fail.set(true));
         }
         Ok(())
     }
@@ -285,6 +289,91 @@ fn singleton<G: DkgGroup>() {
     .is_err());
 }
 
+#[cfg(feature = "serde")]
+fn serde_snapshot_roundtrip<T: serde::Serialize + serde::de::DeserializeOwned>(snapshot: &T) -> T {
+    let encoded = zeroize::Zeroizing::new(postcard::to_allocvec(snapshot).unwrap());
+    let restored = postcard::from_bytes(&encoded).unwrap();
+    assert!(postcard::from_bytes::<T>(&encoded[..encoded.len() - 1]).is_err());
+    restored
+}
+
+#[cfg(feature = "miden-serde")]
+fn miden_snapshot_roundtrip<T>(snapshot: &T) -> T
+where
+    T: miden_serde_utils::Serializable + miden_serde_utils::Deserializable,
+{
+    let encoded = zeroize::Zeroizing::new(miden_serde_utils::Serializable::to_bytes(snapshot));
+    let restored = T::read_from_bytes(&encoded).unwrap();
+    assert!(T::read_from_bytes_with_budget(&encoded, encoded.len() - 1).is_err());
+    restored
+}
+
+#[cfg(any(feature = "serde", feature = "miden-serde"))]
+macro_rules! contextual_snapshot_adapter {
+    ($roundtrip:ident, $group:ty, $config:ident, $own:ident, $output:ident, $me:ident) => {{
+        let config_snapshot = $roundtrip(&$config.snapshot().unwrap());
+        let restored_config = config_snapshot.restore().unwrap();
+        assert_eq!(restored_config.root(), $config.root());
+        assert_eq!(restored_config.canonical_bytes(), $config.canonical_bytes());
+
+        let own_snapshot = $roundtrip(&$own[&$me].snapshot().unwrap());
+        let restored_own = own_snapshot.restore(&restored_config, $me).unwrap();
+        assert_eq!(restored_own.participant(), $me);
+        assert_eq!(restored_own.broadcast_bytes(), $own[&$me].broadcast_bytes());
+        let from_own = complete(
+            &InsecureRevealedWitnessProof,
+            &restored_config,
+            &credential::<$group>($me),
+            &restored_own,
+            &peers(&$own, $me),
+        )
+        .unwrap();
+        assert_eq!(from_own.completion_root(), $output.completion_root());
+
+        let public_snapshot = $roundtrip(&$output.public().snapshot().unwrap());
+        let restored_public = public_snapshot.restore(&restored_config).unwrap();
+        assert_eq!(restored_public.config_root(), $config.root());
+        assert_eq!(restored_public.completion_root(), $output.completion_root());
+        assert_eq!(
+            restored_public.to_bytes().unwrap(),
+            $output.public().to_bytes().unwrap()
+        );
+
+        let local_snapshot = $roundtrip(&$output.snapshot().unwrap());
+        let restored_local = local_snapshot.restore(&restored_config, $me).unwrap();
+        assert_eq!(restored_local.participant(), $me);
+        assert_eq!(restored_local.config_root(), $config.root());
+        assert_eq!(restored_local.completion_root(), $output.completion_root());
+        for position in 0..$config.instances().len() {
+            assert_eq!(
+                restored_local.secret_share(position),
+                $output.secret_share(position)
+            );
+            assert_eq!(
+                from_own.secret_share(position),
+                $output.secret_share(position)
+            );
+        }
+
+        let other_config = DkgConfig::new(
+            $config.threshold(),
+            SessionId([9; 32]),
+            $config.registry().clone(),
+            $config.instances().to_vec(),
+        )
+        .unwrap();
+        assert!(own_snapshot
+            .restore(&restored_config, participant(2))
+            .is_err());
+        assert!(local_snapshot
+            .restore(&restored_config, participant(2))
+            .is_err());
+        assert!(own_snapshot.restore(&other_config, $me).is_err());
+        assert!(public_snapshot.restore(&other_config).is_err());
+        assert!(local_snapshot.restore(&other_config, $me).is_err());
+    }};
+}
+
 fn contextual_persistence<G: DkgGroup>() {
     let config = configuration::<G>(3, 2, vec![Random, Zero]);
     let own = dealings(&config);
@@ -353,6 +442,10 @@ fn contextual_persistence<G: DkgGroup>() {
     ] {
         assert!(debug.contains("<redacted>"));
     }
+    #[cfg(feature = "serde")]
+    contextual_snapshot_adapter!(serde_snapshot_roundtrip, G, config, own, output, me);
+    #[cfg(feature = "miden-serde")]
+    contextual_snapshot_adapter!(miden_snapshot_roundtrip, G, config, own, output, me);
 }
 
 macro_rules! both {
@@ -440,15 +533,15 @@ both!(
     batch_error_classes
 );
 
-// Model a native decoding operation that fails independently of the received
-// bytes. Thread-local injection keeps the genuine adapter and parallel cases
-// isolated, and permits configuration/dealing creation before the failure.
+// Native operations can fail independently of received bytes. Thread-local
+// injection isolates parallel cases and lets valid dealings precede the fault.
 std::thread_local! {
     static FAIL_POINT_DECODING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_HASH_TO_POINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct DecodeFailure<G: DkgGroup>(std::marker::PhantomData<G>);
-impl<G: DkgGroup> DkgGroup for DecodeFailure<G> {
+struct NativeFailure<G: DkgGroup>(std::marker::PhantomData<G>);
+impl<G: DkgGroup> DkgGroup for NativeFailure<G> {
     type Scalar = G::Scalar;
     type Point = G::Point;
     type BaseField = G::BaseField;
@@ -473,6 +566,9 @@ impl<G: DkgGroup> DkgGroup for DecodeFailure<G> {
         G::base_field_byte_order()
     }
     fn hash_to_point(domain: &[u8], input: &[u8]) -> Result<Self::Point> {
+        if FAIL_HASH_TO_POINT.with(|fail| fail.get()) {
+            return Err(Error::ProofOperationFailed);
+        }
         G::hash_to_point(domain, input)
     }
     fn affine_x(point: &Self::Point) -> Result<Self::BaseField> {
@@ -485,25 +581,90 @@ impl<G: DkgGroup> DkgGroup for DecodeFailure<G> {
         G::mul_generator(value)
     }
 }
-fn parse_operational_error<G: DkgGroup>() {
-    let config = configuration::<DecodeFailure<G>>(2, 1, vec![Random]);
+fn native_operational_errors<G: DkgGroup>() {
+    let config = configuration::<NativeFailure<G>>(2, 1, vec![Random]);
     let own = dealings(&config);
+    let me = participant(1);
+    let output = complete(
+        &InsecureRevealedWitnessProof,
+        &config,
+        &credential::<G>(me),
+        &own[&me],
+        &peers(&own, me),
+    )
+    .unwrap();
+    let own_snapshot = own[&me].snapshot().unwrap();
+    let output_snapshot = output.snapshot().unwrap();
     let recording = Recording::default();
-    let result = FAIL_POINT_DECODING.with(|fail| {
+    let results = FAIL_POINT_DECODING.with(|fail| {
+        fail.set(true);
+        let results = [
+            verify_dealer_messages(&recording, &config, &board(&own)),
+            own_snapshot.restore(&config, me).map(|_| ()),
+            output_snapshot.restore(&config, me).map(|_| ()),
+        ];
+        fail.set(false);
+        results
+    });
+    for result in results {
+        assert_eq!(result, Err(Error::ProofOperationFailed));
+    }
+    assert_eq!(recording.batches.load(Ordering::SeqCst), 0);
+    assert_eq!(recording.singles.load(Ordering::SeqCst), 0);
+
+    // The insecure verifier must preserve a failed native relation operation,
+    // so public verification never attributes it to the dealer or falls back.
+    let result = FAIL_HASH_TO_POINT.with(|fail| {
         fail.set(true);
         let result = verify_dealer_messages(&recording, &config, &board(&own));
         fail.set(false);
         result
     });
     assert_eq!(result, Err(Error::ProofOperationFailed));
-    assert_eq!(recording.batches.load(Ordering::SeqCst), 0);
+    assert_eq!(recording.batches.load(Ordering::SeqCst), 1);
     assert_eq!(recording.singles.load(Ordering::SeqCst), 0);
+
+    // Inject only after genuinely verifying every proof, reaching local pad
+    // recovery rather than the verifier's independent relation evaluation.
+    let after_proofs = Recording {
+        fail_hash_after_batch: true,
+        ..Recording::default()
+    };
+    let result = complete(
+        &after_proofs,
+        &config,
+        &credential::<G>(me),
+        &own[&me],
+        &peers(&own, me),
+    );
+    FAIL_HASH_TO_POINT.with(|fail| fail.set(false));
+    assert_eq!(result.err(), Some(Error::ProofOperationFailed));
+    assert_eq!(after_proofs.batches.load(Ordering::SeqCst), 1);
+    assert_eq!(after_proofs.singles.load(Ordering::SeqCst), 0);
+
     // The same immutable board remains valid after the operational failure.
     verify_dealer_messages(&recording, &config, &board(&own)).unwrap();
+    let retried = complete(
+        &InsecureRevealedWitnessProof,
+        &config,
+        &credential::<G>(me),
+        &own_snapshot.restore(&config, me).unwrap(),
+        &peers(&own, me),
+    )
+    .unwrap();
+    assert_eq!(retried.completion_root(), output.completion_root());
+    assert_eq!(retried.secret_share(0), output.secret_share(0));
+    assert_eq!(
+        output_snapshot
+            .restore(&config, me)
+            .unwrap()
+            .secret_share(0),
+        output.secret_share(0)
+    );
 }
 both!(
-    operational_parse_failures_do_not_blame_dealers_or_interpret_proofs,
-    parse_operational_error
+    native_operational_failures_remain_operational_across_boundaries,
+    native_operational_errors
 );
 
 // A deliberately faulted native adapter makes negligible-probability pad

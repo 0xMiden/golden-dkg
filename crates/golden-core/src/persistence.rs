@@ -3,6 +3,7 @@
 //! Restoring outputs requires intact authenticated bytes with trusted completion
 //! provenance. Structural validity and self-consistency do not establish a DKG
 //! execution, agreement or activation. Replay a complete board for untrusted imports.
+use crate::error::normalize_validation_error;
 use crate::output::{self, DkgPublicInstance};
 use crate::secret::{secret_vec, Wipeable};
 use crate::wire::{count, framed, reserve, Reader};
@@ -57,7 +58,8 @@ impl<G: DkgGroup> DkgConfig<G> {
     }
     /// Restore a fully validated configuration and rederive its identity.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        restore_config::<G>(payload::<G>(1, bytes)?).map_err(|_| Error::InvalidPersistedState)
+        restore_config::<G>(payload::<G>(1, bytes)?)
+            .map_err(|error| normalize_validation_error(error, Error::InvalidPersistedState))
     }
     /// Construct an explicit serializable configuration snapshot.
     pub fn snapshot(&self) -> Result<DkgConfigSnapshot<G>> {
@@ -136,7 +138,7 @@ impl<G: DkgGroup> OwnDealing<G> {
         bytes: &[u8],
     ) -> Result<Self> {
         restore_own(config, expected_participant, payload::<G>(2, bytes)?)
-            .map_err(|_| Error::InvalidPersistedState)
+            .map_err(|error| normalize_validation_error(error, Error::InvalidPersistedState))
     }
     /// Construct an explicit secret-bearing serializable snapshot.
     pub fn snapshot(&self) -> Result<OwnDealingSnapshot<G>> {
@@ -193,7 +195,8 @@ impl<G: DkgGroup> DkgPublicOutput<G> {
     /// Restore from intact authenticated bytes with trusted completion provenance.
     /// Untrusted imports must replay a complete dealer board instead.
     pub fn from_bytes(config: &DkgConfig<G>, bytes: &[u8]) -> Result<Self> {
-        restore_public(config, payload::<G>(3, bytes)?).map_err(|_| Error::InvalidPersistedState)
+        restore_public(config, payload::<G>(3, bytes)?)
+            .map_err(|error| normalize_validation_error(error, Error::InvalidPersistedState))
     }
     /// Explicit snapshot representation for contextual restoration.
     pub fn snapshot(&self) -> Result<DkgPublicOutputSnapshot<G>> {
@@ -282,7 +285,7 @@ impl<G: DkgGroup> DkgOutput<G> {
         bytes: &[u8],
     ) -> Result<Self> {
         restore_local(config, expected_participant, payload::<G>(4, bytes)?)
-            .map_err(|_| Error::InvalidPersistedState)
+            .map_err(|error| normalize_validation_error(error, Error::InvalidPersistedState))
     }
     /// Construct an explicit secret-bearing serializable snapshot.
     pub fn snapshot(&self) -> Result<DkgOutputSnapshot<G>> {

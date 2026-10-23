@@ -3,6 +3,7 @@ use crate::dealer_message::{self, ParsedDealerMessage};
 use crate::dealer_proof::{
     DealerProofInstance, DealerProofReceiver, InstanceWitness, ReceiverWitness,
 };
+use crate::error::normalize_validation_error;
 use crate::output::DkgPublicInstance;
 use crate::secret::{secret, secret_vec, SecretVec, Wipeable};
 use crate::wire::reserve;
@@ -288,7 +289,9 @@ where
                         identity_secret,
                         message.statement.dealer_public_key(),
                     )
-                    .map_err(|_| Error::ShareDecryptionFailed)?,
+                    .map_err(|error| {
+                        normalize_validation_error(error, Error::ShareDecryptionFailed)
+                    })?,
                 );
                 if bool::from(pad.expose().is_zero())
                     || G::mul_generator(pad.expose()) != receiver.pad_commitment
