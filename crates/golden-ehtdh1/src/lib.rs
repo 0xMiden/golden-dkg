@@ -1,298 +1,61 @@
-//! EHTDH1 context dependent threshold decryption over Golden groups.
+//! Context-dependent threshold encryption using Golden DKG output.
 //!
-//! This crate implements the EHTDH1 protocol from
-//! [ePrint 2025/279](https://eprint.iacr.org/2025/279). Golden DKG remains a
-//! setup step. The online path uses only the
-//! joint public key `X`, public shares `(X_i, Z_i)`, secret shares `(x_i, z_i)`,
-//! and a setup context.
+//! Run Golden with exactly `[Random, Zero]`, then convert its completed local
+//! output with [`material_from_dkg_output`]. Clients use [`SealingKey`]; validators
+//! use [`UnsealingShare`]; [`Combiner`] checks and combines a threshold of shares.
+//! Setup context binds the batch session, configuration, completion and epoch.
 //!
-//! # Protocol shape
+//! Callers own authenticated setup agreement, confidential secret storage,
+//! associated-data policy, transport authentication and replay handling. Restored
+//! DKG output requires trusted completion provenance. The online algorithms retain
+//! EHTDH1's static below-threshold corruption/RO/LOMDH security targets; mixed
+//! setup composition requires independent security approval.
 //!
-//! EHTDH1 uses two independent threshold sharings. The first sharing has
-//! decryption secret `x`. The second sharing has secret zero and binds shares
-//! to context. A validator returns `W_i = x_i R + z_i S`. Here, `R` comes from
-//! the ciphertext, and `S` comes from the setup context and decryption context.
-//! The combiner checks each share against `(X_i, Z_i)` and combines a threshold
-//! set to recover `xR`. It then uses `xR` to unmask the payload.
-//!
-//! # Golden setup bridge
-//!
-//! [`material_from_dkg_outputs`] converts two completed Golden DKG runs into
-//! EHTDH1 material:
-//!
-//! - a normal decryption run for `x`;
-//! - a zero sharing run for `z`, whose session id is derived with
-//!   [`derive_context_session_id`].
-//!
-//! The bridge rejects mismatched thresholds, registries, participants, local
-//! share owners, nonzero zero sharing output, and identity decryption keys. It
-//! binds both DKG transcript roots into [`SetupContext`].
-//!
-//! [`Combiner::new`] checks that a manually supplied [`PublicKeySet`] and
-//! [`SetupContext`] agree on backend id, threshold, participant order, and
-//! context session derivation.
-//!
-//! # Paper mapping
-//!
-//! This crate follows EHTDH1 from ePrint 2025/279 with Golden setup context
-//! binding:
-//!
-//! | Paper value | Crate field or function |
-//! | --- | --- |
-//! | `X` | [`SealingKey::joint_public_key`] and [`PublicKeySet::joint_public_key`] |
-//! | `X_i` | [`PublicShare::decryption`] |
-//! | `Z_i` | [`PublicShare::context`] |
-//! | `x_i` | [`SecretShare::decryption`] |
-//! | `z_i` | [`SecretShare::context`] |
-//! | `R = rG` | [`Ciphertext::ephemeral_public`] |
-//! | `V = rY` | [`Ciphertext::encryption_point`] |
-//! | encryption challenge `e` | [`Ciphertext::challenge`] |
-//! | response `r''` | [`Ciphertext::response`] |
-//! | `S = Hdgd(ad, dc, ctxt)` | internal `decryption_group` over [`SetupContext::root`] |
-//! | `W_i = x_i R + z_i S` | [`DecryptionShare::share`] |
-//!
-//! This crate also binds [`SetupContext::root`] into `Hdgd`. That root commits
-//! to the Golden backend id, participant registry root, both DKG session ids,
-//! both DKG transcript roots, and the caller provided epoch.
-//!
-//! # Security goals
-//!
-//! A payload stays hidden unless the combiner receives a threshold of valid
-//! EHTDH1 decryption shares. This assumes sound Golden DKG outputs, group
-//! operations, hash to group, and randomness.
-//!
-//! Ciphertext checks reject malformed EHTDH1 encryption proofs. Share checks
-//! reject malformed shares and shares made for the wrong context.
-//!
-//! # Caller obligations
-//!
-//! Callers are responsible for:
-//!
-//! - running Golden setup for their threat model;
-//! - distributing `SecretShare` values only to their owning validators;
-//! - choosing a stable application epoch for [`SetupContext`];
-//! - supplying the same associated data to encryption and verification paths;
-//! - checking [`Ciphertext::associated_data`] or using the `*_with_associated_data`
-//!   methods when the application expects a specific associated data value;
-//! - supplying the intended decryption context to validators and combiners;
-//! - handling replay, validator identity, transport authentication, and
-//!   malformed share reporting outside this crate.
-//!
-//! Associated data is stored in the ciphertext and is part of the EHTDH1 proof
-//! transcript. It is not an outside API parameter. If the application expects a
-//! specific value, compare the stored value before accepting plaintext. These
-//! methods do that check: [`Ciphertext::verify_with_associated_data`],
-//! [`UnsealingShare::decrypt_share_with_associated_data`],
-//! [`Combiner::combine_exact_with_associated_data`], and
-//! [`Combiner::combine_quorum_with_associated_data`].
-//!
-//! Types that hold secrets redact `Debug` output. [`SecretShare`] is still
-//! cloneable because callers need to move owned shares through APIs. Keep it in
-//! validator local storage and avoid long lived copies. This crate cannot
-//! promise that every backend scalar is wiped on drop because
-//! [`GoldenScalar`](golden_core::GoldenScalar) does not require zeroization.
-//!
-//! # Non-goals
-//!
-//! This crate does not provide AEAD authentication of plaintext, validator
-//! networking, accountable decryption, refresh, resharing, TEE custody, replay
-//! prevention.
-//!
-//! [`wire`] defines canonical bytes for setup material, keys, ciphertexts, and
-//! decryption shares. The `miden-serde` and `serde` features adapt those same
-//! bytes to their respective serialization traits.
-//!
-//! # Provided APIs
-//!
-//! This crate provides client sealing, validator decryption shares, exact
-//! combining, quorum search, and a bridge from two Golden DKG runs.
-//!
-//! Run the full three party threshold record example with:
-//!
-//! ```text
-//! cargo run -p golden-ehtdh1 --example threshold_records --features prototype-bridge
-//! ```
-//!
-//! # Example
-//!
-//! This example builds a two of three EHTDH1 setup without running Golden DKG.
-//! Production callers should normally use [`material_from_dkg_outputs`].
-//!
-//! ```rust
-//! use std::collections::BTreeMap;
-//!
-//! use golden_core::{GoldenGroup, GoldenScalar, ParticipantIndex, SessionId};
-//! use golden_ehtdh1::{
-//!     derive_context_session_id, Combiner, PublicKeySet, PublicShare, SealingKey,
-//!     SecretShare, SetupContext, UnsealingShare,
-//! };
-//! use golden_rustcrypto::{P256Backend, P256Scalar};
-//! use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-//!
-//! type G = P256Backend;
-//!
-//! fn idx(value: u32) -> ParticipantIndex {
-//!     ParticipantIndex::new(value).unwrap()
-//! }
-//!
-//! fn scalar(value: u64) -> P256Scalar {
-//!     P256Scalar::from_u64(value).unwrap()
-//! }
-//!
-//! fn eval_linear(secret: P256Scalar, coefficient: P256Scalar, x: ParticipantIndex) -> P256Scalar {
-//!     secret.add(&coefficient.mul(&x.to_scalar::<P256Scalar>().unwrap()))
-//! }
-//!
-//! let participants = [idx(1), idx(2), idx(3)];
-//! let decryption_secret = scalar(11);
-//! let decryption_coefficient = scalar(7);
-//! let context_coefficient = scalar(13);
-//! let mut public_shares = BTreeMap::new();
-//! let mut secret_shares = Vec::new();
-//!
-//! for participant in participants {
-//!     let decryption = eval_linear(
-//!         decryption_secret.clone(),
-//!         decryption_coefficient.clone(),
-//!         participant,
-//!     );
-//!     let context = eval_linear(P256Scalar::zero(), context_coefficient.clone(), participant);
-//!     public_shares.insert(
-//!         participant,
-//!         PublicShare {
-//!             decryption: G::mul_generator(&decryption),
-//!             context: G::mul_generator(&context),
-//!         },
-//!     );
-//!     secret_shares.push(SecretShare {
-//!         participant,
-//!         decryption,
-//!         context,
-//!     });
-//! }
-//!
-//! let joint_public_key = G::mul_generator(&decryption_secret);
-//! let public_key_set = PublicKeySet::<G>::new(2, joint_public_key, public_shares)?;
-//! let sealing_key = SealingKey::<G>::new(joint_public_key)?;
-//! let setup_context = SetupContext {
-//!     backend_id: G::BACKEND_ID.to_owned(),
-//!     threshold: 2,
-//!     registry_root: [1u8; 32],
-//!     participants: participants.to_vec(),
-//!     decryption_session_id: SessionId([2u8; 32]),
-//!     context_session_id: derive_context_session_id(SessionId([2u8; 32])),
-//!     decryption_transcript_root: [3u8; 32],
-//!     context_transcript_root: [4u8; 32],
-//!     epoch: [5u8; 32],
-//! };
-//!
-//! let mut seal_rng = ChaCha20Rng::from_seed([6u8; 32]);
-//! let ciphertext = sealing_key.seal_bytes_with_associated_data(
-//!     &mut seal_rng,
-//!     b"payload",
-//!     b"associated data",
-//! )?;
-//! let mut share_rng = ChaCha20Rng::from_seed([7u8; 32]);
-//! let shares = secret_shares
-//!     .iter()
-//!     .map(|share| {
-//!         UnsealingShare::new(share.clone()).decrypt_share(
-//!             &mut share_rng,
-//!             &setup_context,
-//!             &ciphertext,
-//!             b"decryption context",
-//!         )
-//!     })
-//!     .collect::<Result<Vec<_>, _>>()?;
-//!
-//! let opened = Combiner::new(public_key_set, setup_context)?.combine_exact(
-//!     &ciphertext,
-//!     b"decryption context",
-//!     &shares[..2],
-//! )?;
-//! assert_eq!(opened, b"payload");
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
+//! Secret storage is redacted and cleaned up on normal drop. Application-owned
+//! scalar copies and serialized bytes remain the caller's responsibility.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+mod codec;
 pub mod context;
 pub mod decrypt;
 pub mod dkg_bridge;
 pub mod encrypt;
+mod secret;
 pub mod wire;
 
-pub use context::{
-    derive_context_session_id, CombineError, Error, PublicKeySet, PublicShare, SecretShare,
-    SetupContext,
-};
+pub use context::{CombineError, Error, PublicKeySet, PublicShare, SecretShare, SetupContext};
 pub use decrypt::{Combiner, DecryptionShare, UnsealingShare};
-pub use dkg_bridge::{material_from_dkg_outputs, Ehtdh1Material};
+pub use dkg_bridge::{material_from_dkg_output, Ehtdh1Material};
 pub use encrypt::{Ciphertext, SealingKey};
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use golden_core::{GoldenGroup, GoldenScalar, ParticipantIndex, SessionId};
-    use golden_rustcrypto::{P256Backend, P256Scalar};
-    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-
     use super::*;
     use crate::encrypt::{apply_payload_mask, encryption_challenge, encryption_group};
-
-    type G = P256Backend;
+    use golden_core::{DkgGroup, ParticipantIndex, SessionId};
+    use golden_curves::{JubjubGroup, Secp256k1Group};
+    use group::Group;
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+    use std::collections::BTreeMap;
 
     fn idx(value: u32) -> ParticipantIndex {
         ParticipantIndex::new(value).unwrap()
     }
-
-    fn scalar(value: u64) -> P256Scalar {
-        P256Scalar::from_u64(value).unwrap()
+    pub(crate) struct Material<G: DkgGroup> {
+        pub(crate) key: SealingKey<G>,
+        pub(crate) public: PublicKeySet<G>,
+        pub(crate) secrets: Vec<SecretShare<G>>,
+        pub(crate) setup: SetupContext,
     }
-
-    fn participants() -> [ParticipantIndex; 3] {
-        [idx(1), idx(2), idx(3)]
-    }
-
-    fn eval_linear(secret: P256Scalar, coefficient: P256Scalar, x: ParticipantIndex) -> P256Scalar {
-        secret.add(&coefficient.mul(&x.to_scalar::<P256Scalar>().unwrap()))
-    }
-
-    fn setup_context() -> SetupContext {
-        SetupContext {
-            backend_id: G::BACKEND_ID.to_owned(),
-            threshold: 2,
-            registry_root: [1u8; 32],
-            participants: participants().to_vec(),
-            decryption_session_id: SessionId([2u8; 32]),
-            context_session_id: derive_context_session_id(SessionId([2u8; 32])),
-            decryption_transcript_root: [3u8; 32],
-            context_transcript_root: [4u8; 32],
-            epoch: [5u8; 32],
-        }
-    }
-
-    fn material() -> (
-        SealingKey<G>,
-        PublicKeySet<G>,
-        Vec<SecretShare<G>>,
-        SetupContext,
-    ) {
-        let decryption_secret = scalar(11);
-        let decryption_coefficient = scalar(7);
-        let context_coefficient = scalar(13);
+    pub(crate) fn material<G: DkgGroup>() -> Material<G> {
         let mut public_shares = BTreeMap::new();
-        let mut secret_shares = Vec::new();
-
-        for participant in participants() {
-            let decryption = eval_linear(
-                decryption_secret.clone(),
-                decryption_coefficient.clone(),
-                participant,
-            );
-            let context = eval_linear(P256Scalar::zero(), context_coefficient.clone(), participant);
+        let mut secrets = Vec::new();
+        for participant in [idx(1), idx(2), idx(3)] {
+            let x = G::Scalar::from(u64::from(participant.get()));
+            let decryption = G::Scalar::from(11) + G::Scalar::from(7) * x;
+            let context = G::Scalar::from(13) * x;
             public_shares.insert(
                 participant,
                 PublicShare {
@@ -300,278 +63,161 @@ mod tests {
                     context: G::mul_generator(&context),
                 },
             );
-            secret_shares.push(SecretShare {
-                participant,
-                decryption,
-                context,
-            });
+            secrets.push(SecretShare::new(participant, &decryption, &context));
         }
-
-        let joint_public_key = G::mul_generator(&decryption_secret);
-        let public_key_set: PublicKeySet<G> =
-            PublicKeySet::new(2, joint_public_key, public_shares).unwrap();
-        let sealing_key = SealingKey::new(joint_public_key).unwrap();
-        (sealing_key, public_key_set, secret_shares, setup_context())
+        let joint_key = G::mul_generator(&G::Scalar::from(11));
+        let rows: Vec<_> = public_shares
+            .iter()
+            .map(|(id, share)| (*id, share.decryption, share.context))
+            .collect();
+        let config_root = [1; 32];
+        let completion_root =
+            golden_core::output::ehtdh1_completion_root::<G>(config_root, &joint_key, &rows)
+                .unwrap();
+        let context = SetupContext {
+            group_id: G::GROUP_ID.into(),
+            threshold: 2,
+            participants: vec![idx(1), idx(2), idx(3)],
+            session_id: SessionId([2; 32]),
+            config_root,
+            completion_root,
+            epoch: [5; 32],
+        };
+        Material {
+            key: SealingKey::new(joint_key).unwrap(),
+            public: PublicKeySet::new(2, joint_key, public_shares).unwrap(),
+            secrets,
+            setup: context,
+        }
     }
-
-    fn shares_for(
-        secret_shares: &[SecretShare<G>],
-        setup_context: &SetupContext,
+    fn shares_for<G: DkgGroup>(
+        secrets: &[SecretShare<G>],
+        setup: &SetupContext,
         message: &Ciphertext<G>,
-        decryption_context: &[u8],
+        context: &[u8],
     ) -> Vec<DecryptionShare<G>> {
-        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
-        secret_shares
+        let mut rng = ChaCha20Rng::from_seed([9; 32]);
+        secrets
             .iter()
             .map(|share| {
                 UnsealingShare::new(share.clone())
-                    .decrypt_share(&mut rng, setup_context, message, decryption_context)
+                    .decrypt_share(&mut rng, setup, message, context)
                     .unwrap()
             })
             .collect()
     }
-
-    #[test]
-    fn threshold_shares_decrypt_exact() {
-        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
-        let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
-        let plaintext = b"seal this payload";
-        let message = sealing_key
-            .seal_bytes_with_associated_data(&mut rng, plaintext, b"ad")
-            .unwrap();
-        let shares = shares_for(&secret_shares, &setup_context, &message, b"context");
-
-        let opened = Combiner::new(public_key_set, setup_context)
-            .unwrap()
-            .combine_exact(&message, b"context", &shares[..2])
-            .unwrap();
-
-        assert_eq!(opened, plaintext);
+    fn malformed(result: Result<Vec<u8>, CombineError>, expected: &[u32]) {
+        assert!(matches!(result, Err(CombineError::MalformedShares(ref ids)) if ids == expected));
     }
 
-    #[test]
-    fn identity_joint_public_key_is_rejected() {
-        let mut public_shares = BTreeMap::new();
-        public_shares.insert(
-            idx(1),
-            PublicShare {
-                decryption: G::generator(),
-                context: G::generator(),
-            },
-        );
-
-        assert_eq!(
-            SealingKey::<G>::new(G::identity()),
-            Err(Error::InvalidJointPublicKey)
-        );
-        assert_eq!(
-            PublicKeySet::<G>::new(1, G::identity(), public_shares),
-            Err(Error::InvalidJointPublicKey)
-        );
-    }
-
-    #[test]
-    fn inconsistent_decryption_public_shares_are_rejected() {
-        let (_, public_key_set, _, _) = material();
-        let mut public_shares = public_key_set.public_shares.clone();
-        let share = public_shares.get_mut(&idx(3)).unwrap();
-        share.decryption = G::add(&share.decryption, &G::generator());
-
-        assert_eq!(
-            PublicKeySet::<G>::new(2, public_key_set.joint_public_key, public_shares),
-            Err(Error::InvalidPublicKeySet)
-        );
-    }
-
-    #[test]
-    fn inconsistent_context_public_shares_are_rejected() {
-        let (_, public_key_set, _, _) = material();
-        let mut public_shares = public_key_set.public_shares.clone();
-        let share = public_shares.get_mut(&idx(3)).unwrap();
-        share.context = G::add(&share.context, &G::generator());
-
-        assert_eq!(
-            PublicKeySet::<G>::new(2, public_key_set.joint_public_key, public_shares),
-            Err(Error::InvalidPublicKeySet)
-        );
-    }
-
-    #[test]
-    fn seeded_encryption_is_deterministic() {
-        let (sealing_key, _, _, _) = material();
-        let mut first_rng = ChaCha20Rng::from_seed([7u8; 32]);
-        let mut second_rng = ChaCha20Rng::from_seed([7u8; 32]);
-
-        let first = sealing_key
-            .seal_bytes_with_associated_data(&mut first_rng, b"payload", b"ad")
-            .unwrap();
-        let second = sealing_key
-            .seal_bytes_with_associated_data(&mut second_rng, b"payload", b"ad")
-            .unwrap();
-
-        assert_eq!(first, second);
-        first.verify().unwrap();
-    }
-
-    #[test]
-    fn shares_are_bound_to_ciphertext_with_same_context() {
-        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
-        let mut first_rng = ChaCha20Rng::from_seed([7u8; 32]);
-        let mut second_rng = ChaCha20Rng::from_seed([8u8; 32]);
-        let plaintext = b"payload";
-        let associated_data = b"ad";
-        let decryption_context = b"context";
-        let first = sealing_key
-            .seal_bytes_with_associated_data(&mut first_rng, plaintext, associated_data)
-            .unwrap();
-        let second = sealing_key
-            .seal_bytes_with_associated_data(&mut second_rng, plaintext, associated_data)
-            .unwrap();
-        assert_ne!(first, second);
-
-        let shares = shares_for(&secret_shares, &setup_context, &first, decryption_context);
-        let combiner = Combiner::new(public_key_set, setup_context).unwrap();
-        assert_eq!(
-            combiner
-                .combine_exact(&first, decryption_context, &shares[..2])
-                .unwrap(),
-            plaintext
-        );
-
-        let result = combiner.combine_exact(&second, decryption_context, &shares[..2]);
-        assert!(matches!(result, Err(CombineError::MalformedShares(ids)) if ids == vec![1, 2]));
-    }
-
-    #[test]
-    fn quorum_search_ignores_surplus_malformed_share() {
-        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
-        let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
-        let message = sealing_key
+    fn threshold_and_quorums<G: DkgGroup>() {
+        let Material {
+            key,
+            public,
+            secrets,
+            setup,
+        } = material::<G>();
+        let mut rng = ChaCha20Rng::from_seed([1; 32]);
+        let message = key
             .seal_bytes_with_associated_data(&mut rng, b"payload", b"ad")
             .unwrap();
-        let mut shares = shares_for(&secret_shares, &setup_context, &message, b"context");
-        shares[2].share = G::add(&shares[2].share, &G::generator());
-
-        let opened = Combiner::new(public_key_set, setup_context)
-            .unwrap()
-            .combine_quorum(&message, b"context", &shares)
-            .unwrap();
-
-        assert_eq!(opened, b"payload");
-    }
-
-    #[test]
-    fn exact_combiner_rejects_malformed_share() {
-        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
-        let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
-        let message = sealing_key.seal_bytes(&mut rng, b"payload").unwrap();
-        let mut shares = shares_for(&secret_shares, &setup_context, &message, b"context");
-        shares[1].share = G::add(&shares[1].share, &G::generator());
-
-        let result = Combiner::new(public_key_set, setup_context)
-            .unwrap()
-            .combine_exact(&message, b"context", &shares[..2]);
-
-        assert!(matches!(result, Err(CombineError::MalformedShares(ids)) if ids == vec![2]));
-    }
-
-    #[test]
-    fn exact_combiner_rejects_fewer_than_threshold_shares() {
-        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
-        let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
-        let message = sealing_key.seal_bytes(&mut rng, b"payload").unwrap();
-        let shares = shares_for(&secret_shares, &setup_context, &message, b"context");
-
-        let result = Combiner::new(public_key_set, setup_context)
-            .unwrap()
-            .combine_exact(&message, b"context", &shares[..1]);
-
-        assert!(matches!(
-            result,
+        let shares = shares_for(&secrets, &setup, &message, b"context");
+        let combiner = Combiner::new(public, setup).unwrap();
+        for pair in [[0, 1], [0, 2], [1, 2]] {
+            assert_eq!(
+                combiner
+                    .combine_exact(
+                        &message,
+                        b"context",
+                        &[shares[pair[0]].clone(), shares[pair[1]].clone()]
+                    )
+                    .unwrap(),
+                b"payload"
+            );
+        }
+        assert_eq!(
+            combiner.combine_exact(&message, b"context", &shares[..1]),
             Err(CombineError::InsufficientShares {
                 required: 2,
                 provided: 1
             })
-        ));
+        );
+        malformed(
+            combiner.combine_exact(
+                &message,
+                b"context",
+                &[shares[0].clone(), shares[0].clone()],
+            ),
+            &[1],
+        );
+        let mut altered = shares.clone();
+        altered[2].share += G::Point::generator();
+        assert_eq!(
+            combiner
+                .combine_quorum(&message, b"context", &altered)
+                .unwrap(),
+            b"payload"
+        );
+        malformed(
+            combiner.combine_exact(
+                &message,
+                b"context",
+                &[altered[0].clone(), altered[2].clone()],
+            ),
+            &[3],
+        );
     }
 
-    #[test]
-    fn exact_combiner_rejects_duplicate_participant_shares() {
-        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
-        let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
-        let message = sealing_key.seal_bytes(&mut rng, b"payload").unwrap();
-        let shares = shares_for(&secret_shares, &setup_context, &message, b"context");
-        let duplicate = vec![shares[0].clone(), shares[0].clone()];
-
-        let result = Combiner::new(public_key_set, setup_context)
-            .unwrap()
-            .combine_exact(&message, b"context", &duplicate);
-
-        assert!(matches!(result, Err(CombineError::MalformedShares(ids)) if ids == vec![1]));
-    }
-
-    #[test]
-    fn decryption_context_is_bound_to_share_proofs() {
-        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
-        let mut rng = ChaCha20Rng::from_seed([4u8; 32]);
-        let message = sealing_key.seal_bytes(&mut rng, b"payload").unwrap();
-        let shares = shares_for(&secret_shares, &setup_context, &message, b"context");
-
-        let result = Combiner::new(public_key_set, setup_context)
-            .unwrap()
-            .combine_exact(&message, b"different context", &shares[..2]);
-
-        assert!(matches!(result, Err(CombineError::MalformedShares(ids)) if ids == vec![1, 2]));
-    }
-
-    #[test]
-    fn setup_context_is_bound_to_share_proofs() {
-        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
-        let mut rng = ChaCha20Rng::from_seed([5u8; 32]);
-        let message = sealing_key.seal_bytes(&mut rng, b"payload").unwrap();
-        let shares = shares_for(&secret_shares, &setup_context, &message, b"context");
-        let mut wrong_setup_context = setup_context.clone();
-        wrong_setup_context.epoch = [99u8; 32];
-
-        let result = Combiner::new(public_key_set, wrong_setup_context)
-            .unwrap()
-            .combine_exact(&message, b"context", &shares[..2]);
-
-        assert!(matches!(result, Err(CombineError::MalformedShares(ids)) if ids == vec![1, 2]));
-    }
-
-    #[test]
-    fn tampered_associated_data_fails_proof_verification() {
-        let (sealing_key, _, _, _) = material();
-        let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
-        let mut message = sealing_key
-            .seal_bytes_with_associated_data(&mut rng, b"payload", b"ad")
+    fn ciphertext_and_context_binding<G: DkgGroup>() {
+        let Material {
+            key,
+            public,
+            secrets,
+            setup,
+        } = material::<G>();
+        let mut first_rng = ChaCha20Rng::from_seed([7; 32]);
+        let mut same_rng = ChaCha20Rng::from_seed([7; 32]);
+        let mut different_rng = ChaCha20Rng::from_seed([8; 32]);
+        let message = key
+            .seal_bytes_with_associated_data(&mut first_rng, b"payload", b"expected ad")
             .unwrap();
-
-        message.associated_data = b"different ad".to_vec();
-
-        assert_eq!(message.verify(), Err(Error::InvalidCiphertextProof));
-    }
-
-    #[test]
-    fn expected_associated_data_is_checked_explicitly() {
-        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
-        let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
-        let message = sealing_key
-            .seal_bytes_with_associated_data(&mut rng, b"payload", b"expected ad")
+        assert_eq!(
+            message,
+            key.seal_bytes_with_associated_data(&mut same_rng, b"payload", b"expected ad")
+                .unwrap()
+        );
+        let other = key
+            .seal_bytes_with_associated_data(&mut different_rng, b"payload", b"expected ad")
             .unwrap();
-        let shares = shares_for(&secret_shares, &setup_context, &message, b"context");
-        let combiner = Combiner::new(public_key_set, setup_context.clone()).unwrap();
-
-        assert_eq!(message.associated_data(), b"expected ad");
+        message.verify().unwrap();
+        let shares = shares_for(&secrets, &setup, &message, b"context");
+        let combiner = Combiner::new(public.clone(), setup.clone()).unwrap();
+        malformed(
+            combiner.combine_exact(&other, b"context", &shares[..2]),
+            &[1, 2],
+        );
+        malformed(
+            combiner.combine_exact(&message, b"another context", &shares[..2]),
+            &[1, 2],
+        );
+        let mut changed_epoch = setup.clone();
+        changed_epoch.epoch[0] ^= 1;
+        malformed(
+            Combiner::new(public, changed_epoch).unwrap().combine_exact(
+                &message,
+                b"context",
+                &shares[..2],
+            ),
+            &[1, 2],
+        );
         assert_eq!(
             message.verify_with_associated_data(b"wrong ad"),
             Err(Error::AssociatedDataMismatch)
         );
         assert_eq!(
-            UnsealingShare::new(secret_shares[0].clone()).decrypt_share_with_associated_data(
-                &mut rng,
-                &setup_context,
+            UnsealingShare::new(secrets[0].clone()).decrypt_share_with_associated_data(
+                &mut first_rng,
+                &setup,
                 &message,
                 b"context",
                 b"wrong ad"
@@ -587,115 +233,149 @@ mod tests {
             ),
             Err(CombineError::Ciphertext(Error::AssociatedDataMismatch))
         );
-
-        message.verify_with_associated_data(b"expected ad").unwrap();
-        let opened = combiner
-            .combine_exact_with_associated_data(&message, b"context", b"expected ad", &shares[..2])
-            .unwrap();
-        assert_eq!(opened, b"payload");
-    }
-
-    #[test]
-    fn combiner_rejects_inconsistent_setup_context() {
-        let (_, public_key_set, _, setup_context) = material();
-        let mut wrong_threshold = setup_context.clone();
-        wrong_threshold.threshold += 1;
-        let mut wrong_participants = setup_context.clone();
-        wrong_participants.participants.reverse();
-        let mut wrong_context_session = setup_context;
-        wrong_context_session.context_session_id = SessionId([99u8; 32]);
-
         assert_eq!(
-            Combiner::<G>::new(public_key_set.clone(), wrong_threshold),
-            Err(Error::InvalidBridge("setup threshold mismatch"))
+            combiner
+                .combine_exact_with_associated_data(
+                    &message,
+                    b"context",
+                    b"expected ad",
+                    &shares[..2]
+                )
+                .unwrap(),
+            b"payload"
         );
+        for mutate_ad in [false, true] {
+            let mut altered = message.clone();
+            if mutate_ad {
+                altered.associated_data.push(0);
+            } else {
+                altered.encrypted_payload[0] ^= 1;
+            }
+            assert_eq!(altered.verify(), Err(Error::InvalidCiphertextProof));
+        }
+    }
+
+    fn setup_integrity<G: DkgGroup>() {
+        let Material {
+            public,
+            secrets,
+            setup,
+            ..
+        } = material::<G>();
         assert_eq!(
-            Combiner::<G>::new(public_key_set.clone(), wrong_participants),
-            Err(Error::InvalidBridge("setup participant mismatch"))
+            SealingKey::<G>::new(G::Point::identity()),
+            Err(Error::InvalidJointPublicKey)
         );
+        for decryption in [false, true] {
+            let mut altered = public.public_shares.clone();
+            let share = altered.get_mut(&idx(3)).unwrap();
+            if decryption {
+                share.decryption += G::Point::generator();
+            } else {
+                share.context += G::Point::generator();
+            }
+            assert_eq!(
+                PublicKeySet::<G>::new(2, public.joint_public_key, altered),
+                Err(Error::InvalidPublicKeySet)
+            );
+        }
+        let mut contexts = Vec::new();
+        let mut changed = setup.clone();
+        changed.threshold += 1;
+        contexts.push(changed);
+        let mut changed = setup.clone();
+        changed.participants.reverse();
+        contexts.push(changed);
+        let mut changed = setup.clone();
+        changed.group_id.push('x');
+        contexts.push(changed);
+        let mut changed = setup.clone();
+        changed.config_root[0] ^= 1;
+        contexts.push(changed);
+        let mut changed = setup.clone();
+        changed.completion_root[0] ^= 1;
+        contexts.push(changed);
+        for context in contexts {
+            assert!(matches!(
+                Combiner::<G>::new(public.clone(), context),
+                Err(Error::InvalidBridge(_))
+            ));
+        }
+        // Public fields cannot bypass constructor invariants at the combiner.
+        let mut invalid_threshold = public.clone();
+        invalid_threshold.threshold = 0;
+        let mut invalid_context = setup.clone();
+        invalid_context.threshold = 0;
         assert_eq!(
-            Combiner::<G>::new(public_key_set, wrong_context_session),
-            Err(Error::InvalidBridge("setup context session mismatch"))
+            Combiner::new(invalid_threshold, invalid_context),
+            Err(Error::InvalidThreshold)
         );
-    }
-
-    #[test]
-    fn secret_share_debug_is_redacted() {
-        let (_, _, secret_shares, _) = material();
-
-        let debug = format!("{:?}", secret_shares[0]);
-
-        assert!(debug.contains("participant"));
-        assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("decryption: P256Scalar"));
-        assert!(!debug.contains("context: P256Scalar"));
-    }
-
-    #[test]
-    fn different_valid_quorums_recover_same_plaintext() {
-        let (sealing_key, public_key_set, secret_shares, setup_context) = material();
-        let mut rng = ChaCha20Rng::from_seed([12u8; 32]);
-        let message = sealing_key.seal_bytes(&mut rng, b"payload").unwrap();
-        let shares = shares_for(&secret_shares, &setup_context, &message, b"context");
-        let combiner = Combiner::new(public_key_set, setup_context).unwrap();
-
-        let first = combiner
-            .combine_exact(
-                &message,
-                b"context",
-                &[shares[0].clone(), shares[1].clone()],
-            )
-            .unwrap();
-        let second = combiner
-            .combine_exact(
-                &message,
-                b"context",
-                &[shares[1].clone(), shares[2].clone()],
-            )
-            .unwrap();
-
-        assert_eq!(first, b"payload");
-        assert_eq!(second, first);
-    }
-
-    #[test]
-    fn tampered_ciphertext_fails_proof_verification() {
-        let (sealing_key, _, _, _) = material();
-        let mut rng = ChaCha20Rng::from_seed([6u8; 32]);
-        let mut message = sealing_key.seal_bytes(&mut rng, b"payload").unwrap();
-
-        message.encrypted_payload[0] ^= 1;
-
-        assert_eq!(message.verify(), Err(Error::InvalidCiphertextProof));
-    }
-
-    #[test]
-    fn zero_ephemeral_ciphertext_fails_proof_verification() {
-        let mut encrypted_payload = b"payload".to_vec();
-        let ephemeral_public = G::identity();
-        let proof_commitment = G::mul_generator(&scalar(17));
-        apply_payload_mask::<G>(&mut encrypted_payload, &ephemeral_public, &G::identity()).unwrap();
-        let encryption_group = encryption_group::<G>(
-            &ephemeral_public,
-            &proof_commitment,
-            b"ad",
-            &encrypted_payload,
+        // A second internally consistent key set still must match the approved
+        // completion identity; interpolation alone cannot establish this binding.
+        let mut other_public = public.public_shares.clone();
+        for share in other_public.values_mut() {
+            share.decryption += G::Point::generator();
+        }
+        let other = PublicKeySet::<G>::new(
+            2,
+            public.joint_public_key + G::Point::generator(),
+            other_public,
         )
         .unwrap();
-        let encryption_point = G::identity();
-        let encryption_commitment = G::mul(&encryption_group, &scalar(17));
+        assert!(matches!(
+            Combiner::new(other, setup.clone()),
+            Err(Error::InvalidBridge(_))
+        ));
+        let mut changed_session = setup.clone();
+        changed_session.session_id.0[0] ^= 1;
+        assert_ne!(changed_session.root(), setup.root());
+        let debug = format!("{:?}", secrets[0]);
+        assert!(debug.contains("participant") && debug.contains("<redacted>"));
+    }
+
+    fn zero_ephemeral<G: DkgGroup>() {
+        let mut payload = b"payload".to_vec();
+        let ephemeral = G::Point::identity();
+        let response = G::Scalar::from(17);
+        let commitment = G::mul_generator(&response);
+        apply_payload_mask::<G>(&mut payload, &ephemeral, &G::Point::identity()).unwrap();
+        let point = encryption_group::<G>(&ephemeral, &commitment, b"ad", &payload).unwrap();
+        let encryption_point = G::Point::identity();
         let challenge =
-            encryption_challenge::<G>(&encryption_group, &encryption_point, &encryption_commitment)
-                .unwrap();
-        let message: Ciphertext<G> = Ciphertext {
+            encryption_challenge::<G>(&point, &encryption_point, &(point * response)).unwrap();
+        let message = Ciphertext::<G> {
             associated_data: b"ad".to_vec(),
-            encrypted_payload,
-            ephemeral_public,
+            encrypted_payload: payload,
+            ephemeral_public: ephemeral,
             encryption_point,
             challenge,
-            response: scalar(17),
+            response,
         };
-
         assert_eq!(message.verify(), Err(Error::InvalidCiphertextProof));
     }
+    macro_rules! both {
+        ($name:ident, $body:ident) => {
+            #[test]
+            fn $name() {
+                $body::<Secp256k1Group>();
+                $body::<JubjubGroup>();
+            }
+        };
+    }
+    both!(
+        valid_quorums_and_malformed_share_reporting,
+        threshold_and_quorums
+    );
+    both!(
+        ciphertext_context_and_expected_associated_data_are_bound,
+        ciphertext_and_context_binding
+    );
+    both!(
+        keysets_must_match_the_approved_batch_completion,
+        setup_integrity
+    );
+    both!(
+        zero_ephemeral_points_fail_even_with_a_constructed_relation,
+        zero_ephemeral
+    );
 }

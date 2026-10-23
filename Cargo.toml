@@ -4,6 +4,7 @@ members = [
     "crates/golden-core",
     "crates/golden-curves",
     "crates/golden-bulletproofs",
+    "crates/golden-ehtdh1",
 ]
 resolver = "2"
 

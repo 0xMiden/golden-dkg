@@ -1,63 +1,62 @@
 # golden-ehtdh1
 
-Context bound threshold encryption for Golden distributed key generation.
+Context-bound threshold encryption for Golden distributed key generation,
+based on [EHTDH1, ePrint 2025/279](https://eprint.iacr.org/2025/279).
 
-This crate implements EHTDH1 from
-[ePrint 2025/279](https://eprint.iacr.org/2025/279). It converts two completed
-Golden DKG runs into a public sealing key, public verification shares, and one
-secret share for each participant. The first DKG run shares the decryption
-secret. The second shares zero so that each decryption share is bound to one
-decryption context.
+Run Golden once with exactly `[DkgInstanceKind::Random,
+DkgInstanceKind::Zero]`, then call
+`material_from_dkg_output(&config, &output, epoch)`. The Random instance shares
+the decryption secret; the Zero instance supplies context-binding shares. The
+bridge checks configuration binding, instance policies, public-share
+interpolation and the aggregate keys before constructing local EHTDH1 material.
 
-The crate provides:
+## Online operations
 
-* Writers can encrypt data with the public sealing key.
-* Participants can produce shares for one decryption context.
-* Combiners can use an exact threshold set or search a larger quorum.
-* Applications can store and exchange values with the canonical wire encoding.
-* Optional adapters expose the same bytes through Serde or
-  `miden-serde-utils`.
+* Writers encrypt with `SealingKey` without participant secrets or setup context.
+* Participants use `UnsealingShare` to produce a share for one ciphertext and
+  decryption request context.
+* `Combiner` checks an exact threshold set or selects a valid threshold from a
+  larger quorum.
+* Canonical wire bytes support storage and exchange of setup values, keys,
+  ciphertexts and decryption shares.
+
+`SetupContext` binds the single batch session, configuration root, completion
+root and application epoch. A combiner checks that its public key set matches
+that completion identity. Associated data is stored in the ciphertext; use the
+`*_with_associated_data` methods when acceptance requires an externally expected
+value.
 
 ## Threshold record example
 
-The `threshold_records` example shows how to protect large stored records. It
-uses authenticated symmetric encryption for each record value and uses EHTDH1
-only for the 32 byte content key. It also shows setup, wire encoding, quorum
-recovery, and rejection of shares made for different contexts.
-
-Run it with:
+`threshold_records` runs a three-participant, threshold-two setup using
+Secp256k1/Secq256k1 with explicitly prepared generators. It encrypts each large
+record value with XChaCha20Poly1305 and uses EHTDH1 only for the fresh 32-byte
+content key. The flow includes wire encoding, quorum recovery, associated-data
+checks and rejection of shares from a different decryption context.
 
 ```console
-cargo run -p golden-ehtdh1 --example threshold_records --features prototype-bridge
+cargo run -p golden-ehtdh1 --example threshold_records
 ```
 
-## Features
+## Features and caller responsibilities
 
-The crate has no default features.
+The crate has no default features. `serde` and `miden-serde` adapt the same
+canonical wire bytes to Serde and `miden-serde-utils`, respectively. EHTDH1 has
+its own versioned envelope, separate from DKG broadcasts and local snapshots.
+Legacy keys, ciphertexts and setup artifacts are not compatible with this cut.
 
-* `serde` provides Serde adapters that use the canonical wire encoding.
-* `miden-serde` provides `miden-serde-utils` adapters that use the same bytes.
-* `prototype-bridge` enables the fast Golden DKG bridge example and tests.
-* `halo2curves-secp256k1` enables the ignored integration test for the
-  Secp256k1 and Secq256k1 proof backend.
+Applications own authenticated setup agreement, generator provenance, secret
+custody, request authorization, associated-data policy, replay handling and
+record AEAD. Restored DKG outputs require authenticated storage with trusted
+completion provenance. Secret diagnostics are redacted and owned storage is
+cleaned up on normal drop; caller copies and application-owned serialized bytes
+remain the caller's responsibility.
 
-## Security scope
-
-Callers must:
-
-* Protect participant secret shares.
-* Authenticate requests for decryption shares.
-* Supply the intended setup, associated data, and decryption context.
-
-This crate does not encrypt record values. It does not provide authorization,
-networking, replay prevention, secret share refresh, or secret share custody.
-
-See the [crate documentation](https://docs.rs/golden-ehtdh1) for the protocol
-mapping, caller obligations, and API examples. See the
-[Golden DKG repository](https://github.com/0xMiden/golden-dkg) for the full
-workspace.
+The retained security targets do not constitute a new audit. Mixed-instance
+setup composition and both concrete proof backends require the separate
+security release approval described by the
+[workspace design](https://github.com/0xMiden/golden-dkg).
 
 ## License
 
-This crate is available under the MIT License or the Apache License, Version
-2.0, at your option.
+MIT or Apache-2.0, at your option.

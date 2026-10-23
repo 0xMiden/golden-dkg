@@ -1,33 +1,26 @@
-//! Bridge from completed Golden DKG runs to EHTDH1 key material.
-//!
-//! See crate root for the paper-to-crate symbol map.
+//! Conversion from one completed `[Random, Zero]` batch to EHTDH1 material.
 
+use golden_core::{DkgConfig, DkgGroup, DkgInstanceKind, DkgOutput};
+use group::Group;
 use std::{collections::BTreeMap, fmt};
 
-use golden_core::{DkgConfig, DkgOutput, GoldenHashToGroup};
+use crate::{Error, PublicKeySet, PublicShare, SealingKey, SecretShare, SetupContext};
 
-use crate::context::{
-    derive_context_session_id, Error, PublicKeySet, PublicShare, SecretShare, SetupContext,
-};
-use crate::encrypt::SealingKey;
-
-/// EHTDH1 material for one local participant.
+/// Encryption, decryption and context material for one participant.
 #[derive(Clone)]
-pub struct Ehtdh1Material<G: GoldenHashToGroup> {
-    /// Paper `pk = X`, used by clients to seal payloads.
+pub struct Ehtdh1Material<G: DkgGroup> {
+    /// Client encryption key.
     pub sealing_key: SealingKey<G>,
-    /// Paper `pkc = (X; [(X_i, Z_i)]_i)`, plus the threshold.
+    /// Canonical public decryption/context shares.
     pub public_key_set: PublicKeySet<G>,
-    /// Paper `sk_i = (x_i, z_i)` for the local validator.
+    /// Participant-local guarded scalars.
     pub secret_share: SecretShare<G>,
-    /// Golden setup binding added to `Hdgd` and `Hdcd`.
+    /// Trusted batch and application identity.
     pub setup_context: SetupContext,
 }
-
-impl<G: GoldenHashToGroup> fmt::Debug for Ehtdh1Material<G> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Ehtdh1Material")
+impl<G: DkgGroup> fmt::Debug for Ehtdh1Material<G> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ehtdh1Material")
             .field("sealing_key", &self.sealing_key)
             .field("public_key_set", &self.public_key_set)
             .field("secret_share", &"<redacted>")
@@ -36,100 +29,91 @@ impl<G: GoldenHashToGroup> fmt::Debug for Ehtdh1Material<G> {
     }
 }
 
-/// Convert two Golden DKG runs into paper `(pk, pkc, sk_1..sk_N)` material.
+/// Validate a completed batch and construct its EHTDH1 material.
 ///
-/// The paper treats key generation as centralized. This bridge checks matching
-/// threshold, registry, context session, participants, local share owner, zero
-/// key identity, and non-identity decryption key. `PublicKeySet::new` also
-/// checks that `X_i` interpolates to `X` and `Z_i` interpolates to identity.
-pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
-    decryption_config: &DkgConfig<G>,
-    decryption_output: &DkgOutput<G>,
-    context_config: &DkgConfig<G>,
-    context_output: &DkgOutput<G>,
+/// Restored outputs require authenticated trusted completion provenance. These
+/// algebraic and identity checks cannot establish historical proof verification.
+pub fn material_from_dkg_output<G: DkgGroup>(
+    config: &DkgConfig<G>,
+    output: &DkgOutput<G>,
     epoch: [u8; 32],
 ) -> Result<Ehtdh1Material<G>, Error> {
-    if decryption_config.threshold != context_config.threshold {
-        return Err(Error::InvalidBridge("threshold mismatch"));
-    }
-    if decryption_config.registry.root() != context_config.registry.root() {
-        return Err(Error::InvalidBridge("registry root mismatch"));
-    }
-    if context_config.session_id != derive_context_session_id(decryption_config.session_id) {
-        return Err(Error::InvalidBridge("context session mismatch"));
-    }
-    if decryption_output.secret_share.participant != context_output.secret_share.participant {
-        return Err(Error::InvalidBridge("local participant mismatch"));
-    }
-    if decryption_output
-        .public_key_shares
-        .keys()
-        .ne(context_output.public_key_shares.keys())
+    if config.instances() != [DkgInstanceKind::Random, DkgInstanceKind::Zero]
+        || output.config_root() != config.root()
+        || output.public().instance_count() != 2
     {
-        return Err(Error::InvalidBridge("public share participant mismatch"));
+        return Err(Error::InvalidBridge("batch configuration mismatch"));
     }
-    if !bool::from(G::is_identity(&context_output.public_key)) {
-        return Err(Error::InvalidBridge(
-            "zero-sharing public key is not identity",
-        ));
+    let decryption = output
+        .public()
+        .instance(0)
+        .ok_or(Error::InvalidBridge("missing decryption instance"))?;
+    let context = output
+        .public()
+        .instance(1)
+        .ok_or(Error::InvalidBridge("missing context instance"))?;
+    if decryption.kind() != DkgInstanceKind::Random
+        || context.kind() != DkgInstanceKind::Zero
+        || bool::from(decryption.public_key().is_identity())
+        || !bool::from(context.public_key().is_identity())
+    {
+        return Err(Error::InvalidBridge("invalid instance keys"));
     }
-    if bool::from(G::is_identity(&decryption_output.public_key)) {
-        return Err(Error::InvalidBridge("decryption public key is identity"));
-    }
-
-    let participants = decryption_config.registry.indexes().collect::<Vec<_>>();
-    if participants != context_config.registry.indexes().collect::<Vec<_>>() {
+    let participants: Vec<_> = config.registry().indexes().collect();
+    if decryption
+        .public_key_shares()
+        .map(|(id, _)| id)
+        .ne(participants.iter().copied())
+        || context
+            .public_key_shares()
+            .map(|(id, _)| id)
+            .ne(participants.iter().copied())
+        || !participants.contains(&output.participant())
+    {
         return Err(Error::InvalidBridge("participant set mismatch"));
     }
-
     let mut public_shares = BTreeMap::new();
     for participant in &participants {
-        let decryption = decryption_output
-            .public_key_shares
-            .get(participant)
-            .cloned()
-            .ok_or(Error::InvalidBridge("missing decryption public share"))?;
-        let context = context_output
-            .public_key_shares
-            .get(participant)
-            .cloned()
-            .ok_or(Error::InvalidBridge("missing context public share"))?;
         public_shares.insert(
             *participant,
             PublicShare {
-                decryption,
-                context,
+                decryption: *decryption
+                    .public_key_share(*participant)
+                    .ok_or(Error::InvalidBridge("missing decryption share"))?,
+                context: *context
+                    .public_key_share(*participant)
+                    .ok_or(Error::InvalidBridge("missing context share"))?,
             },
         );
     }
-
-    let public_key_set = PublicKeySet::new(
-        decryption_config.threshold,
-        decryption_output.public_key.clone(),
-        public_shares,
-    )?;
-    let secret_share = SecretShare {
-        participant: decryption_output.secret_share.participant,
-        decryption: decryption_output.secret_share.value.clone(),
-        context: context_output.secret_share.value.clone(),
-    };
+    let public_key_set =
+        PublicKeySet::new(config.threshold(), *decryption.public_key(), public_shares)?;
+    let x = output
+        .secret_share(0)
+        .ok_or(Error::InvalidBridge("missing local share"))?;
+    let z = output
+        .secret_share(1)
+        .ok_or(Error::InvalidBridge("missing local share"))?;
+    let own = public_key_set
+        .public_share(output.participant())
+        .ok_or(Error::InvalidBridge("unknown local participant"))?;
+    if G::mul_generator(x) != own.decryption || G::mul_generator(z) != own.context {
+        return Err(Error::InvalidBridge("local opening mismatch"));
+    }
     let setup_context = SetupContext {
-        backend_id: G::BACKEND_ID.to_owned(),
-        threshold: decryption_config.threshold,
-        registry_root: decryption_config.registry.root(),
+        group_id: G::GROUP_ID.to_owned(),
+        threshold: config.threshold(),
         participants,
-        decryption_session_id: decryption_config.session_id,
-        context_session_id: context_config.session_id,
-        decryption_transcript_root: decryption_output.transcript_root,
-        context_transcript_root: context_output.transcript_root,
+        session_id: config.session_id(),
+        config_root: config.root(),
+        completion_root: output.completion_root(),
         epoch,
     };
-    let sealing_key = SealingKey::new(decryption_output.public_key.clone())?;
-
+    let sealing_key = SealingKey::new(*decryption.public_key())?;
     Ok(Ehtdh1Material {
         sealing_key,
         public_key_set,
-        secret_share,
+        secret_share: SecretShare::new(output.participant(), x, z),
         setup_context,
     })
 }

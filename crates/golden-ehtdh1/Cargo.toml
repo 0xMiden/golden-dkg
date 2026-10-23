@@ -1,6 +1,6 @@
 [package]
 name = "golden-ehtdh1"
-version = "0.4.1"
+version.workspace = true
 description = "Context bound threshold encryption for Golden distributed key generation"
 edition.workspace = true
 homepage.workspace = true
@@ -13,6 +13,8 @@ publish = ["crates-io"]
 [dependencies]
 chacha20 = { workspace = true }
 golden-core = { workspace = true }
+ff = { workspace = true }
+group = { workspace = true }
 hkdf = { workspace = true }
 miden-serde-utils = { workspace = true, optional = true }
 rand_core = { workspace = true }
@@ -23,22 +25,17 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 chacha20poly1305 = { workspace = true }
-golden-evrf = { workspace = true, features = ["halo2curves-secp256k1"] }
-golden-halo2curves = { workspace = true, features = ["halo2curves-secp256k1"] }
-golden-rustcrypto = { workspace = true, features = ["p256"] }
+golden-core = { workspace = true, features = ["insecure-revealed-witness"] }
+golden-curves = { workspace = true, features = ["secp256k1", "jubjub"] }
+golden-bulletproofs = { workspace = true, features = ["secp-secq", "jubjub-bls12-381"] }
 rand_chacha = { workspace = true }
 serde_test = { workspace = true }
+postcard = { workspace = true }
 
 [features]
 default = []
 miden-serde = ["dep:miden-serde-utils", "golden-core/miden-serde"]
-prototype-bridge = []
-halo2curves-secp256k1 = []
 serde = ["dep:serde", "golden-core/serde"]
-
-[[example]]
-name = "threshold_records"
-required-features = ["prototype-bridge"]
 
 [lints]
 workspace = true
