@@ -19,8 +19,6 @@ pub mod main_golden;
 pub mod output;
 pub mod participant;
 pub mod persistence;
-#[doc(hidden)]
-pub mod proof;
 mod secret;
 pub mod shamir;
 pub mod transcript;

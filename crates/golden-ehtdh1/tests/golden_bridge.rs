@@ -1,5 +1,6 @@
 //! One opaque `[Random, Zero]` batch is the complete EHTDH1 setup boundary.
 #![allow(clippy::unwrap_used)]
+use ff::Field;
 use golden_core::insecure::InsecureRevealedWitnessProof;
 use golden_core::{
     aggregate_public, complete, deal, DealerMessageRef, DealerProofSystem, DkgConfig, DkgGroup,
@@ -7,7 +8,9 @@ use golden_core::{
     DkgOutput, ParticipantIndex, ParticipantRegistry, SessionId,
 };
 use golden_curves::{JubjubGroup, Secp256k1Group};
-use golden_ehtdh1::{material_from_dkg_output, Combiner, Ehtdh1Material, Error, UnsealingShare};
+use golden_ehtdh1::{
+    material_from_dkg_output, CombineError, Combiner, Ehtdh1Material, Error, UnsealingShare,
+};
 use rand_chacha::{
     rand_core::{CryptoRngCore, SeedableRng},
     ChaCha20Rng,
@@ -85,6 +88,12 @@ fn assert_online<G: DkgGroup>(
         .map(|output| material_from_dkg_output(config, output, [8; 32]).unwrap())
         .collect();
     let first = &materials[0];
+    if config.threshold() > 1 {
+        // Ensure this deterministic setup exercises context-share cancellation.
+        assert!(materials
+            .iter()
+            .any(|material| !bool::from(material.secret_share.context().is_zero())));
+    }
     for material in &materials {
         assert_eq!(material.sealing_key, first.sealing_key);
         assert_eq!(material.public_key_set, first.public_key_set);
@@ -111,8 +120,9 @@ fn assert_online<G: DkgGroup>(
                 .unwrap()
         })
         .collect();
-    let opened = Combiner::new(first.public_key_set.clone(), first.setup_context.clone())
-        .unwrap()
+    let combiner =
+        Combiner::new(first.public_key_set.clone(), first.setup_context.clone()).unwrap();
+    let opened = combiner
         .combine_exact_with_associated_data(
             &message,
             b"request",
@@ -121,6 +131,20 @@ fn assert_online<G: DkgGroup>(
         )
         .unwrap();
     assert_eq!(opened, b"vault payload");
+    let mut mixed = shares[..config.threshold()].to_vec();
+    mixed[0] = UnsealingShare::new(first.secret_share.clone())
+        .decrypt_share_with_associated_data(
+            &mut rng,
+            &first.setup_context,
+            &message,
+            b"other request",
+            b"record id",
+        )
+        .unwrap();
+    assert!(matches!(
+        combiner.combine_exact_with_associated_data(&message, b"request", b"record id", &mixed),
+        Err(CombineError::MalformedShares(_))
+    ));
 }
 fn native_bridge<G: DkgGroup>() {
     for threshold in [1, 2] {
@@ -212,7 +236,7 @@ both!(
 #[ignore = "expensive production Secp/Secq proof and composition gate"]
 fn secp_secq_production_bridge() {
     use golden_bulletproofs::{SecpSecqBulletproofs, SecpSecqPrepared};
-    let config = config::<Secp256k1Group>(2, 1, vec![Random, Zero]);
+    let config = config::<Secp256k1Group>(2, 2, vec![Random, Zero]);
     let prepared = SecpSecqPrepared::prepare_for(&config).unwrap();
     let proofs = SecpSecqBulletproofs::from_prepared(prepared);
     let mut rng = ChaCha20Rng::from_seed([4; 32]);
@@ -223,7 +247,7 @@ fn secp_secq_production_bridge() {
 #[ignore = "expensive production Jubjub/BLS proof and composition gate"]
 fn bls_jubjub_production_bridge() {
     use golden_bulletproofs::{BlsJubjubBulletproofs, BlsJubjubPrepared};
-    let config = config::<JubjubGroup>(2, 1, vec![Random, Zero]);
+    let config = config::<JubjubGroup>(2, 2, vec![Random, Zero]);
     let prepared = BlsJubjubPrepared::prepare_for(&config).unwrap();
     let proofs = BlsJubjubBulletproofs::from_prepared(prepared);
     let mut rng = ChaCha20Rng::from_seed([4; 32]);

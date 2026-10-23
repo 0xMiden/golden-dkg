@@ -3,7 +3,8 @@ use ff::Field;
 use golden_core::{
     aggregate_public, complete, deal, verify_dealer_message, DealerMessageRef, DealerProofRef,
     DealerProofStatement, DealerProofSystem, DealerProofWitness, DkgConfig, DkgGroup,
-    DkgInstanceKind, Error, ParticipantIndex, ParticipantRegistry, Result, SessionId,
+    DkgInstanceKind, DkgOutput, DkgPublicOutput, Error, OwnDealing, ParticipantIndex,
+    ParticipantRegistry, Result, SessionId,
 };
 use group::Group;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
@@ -128,18 +129,154 @@ fn real_workflow<G: DkgGroup, P: DealerProofSystem<G>>(
     assert!(bool::from(output.secret_share(1).unwrap().is_zero()));
     let mut corrupted = own.broadcast_bytes().to_vec();
     *corrupted.last_mut().unwrap() ^= 1;
-    assert_eq!(
-        verify_dealer_message(&capture, &config, one, &corrupted),
-        Err(Error::InvalidDealerProofs { dealers: vec![one] })
-    );
+    assert_invalid_proof(&capture, &config, one, &corrupted, "constant response");
     let (zero, zero_bytes, zero_capacity) = prepare(&configuration::<G>(true));
     assert_eq!(zero_capacity, 0);
     assert!(zero_bytes.len() < 256);
-    let statement = capture.statement.lock().unwrap();
-    assert!(matches!(
-        zero.verify(&config, statement.as_ref().unwrap(), b"malformed"),
-        Err(Error::InsufficientProofCapacity { available: 0, .. })
+    {
+        let statement = capture.statement.lock().unwrap();
+        assert!(matches!(
+            zero.verify(&config, statement.as_ref().unwrap(), b"malformed"),
+            Err(Error::InsufficientProofCapacity { available: 0, .. })
+        ));
+    }
+    // Reuse the restored mixed-shape generator prefix for smaller single-instance
+    // circuits and a repeated-Random batch, without implicit preparation/growth.
+    for (seed, kinds) in [
+        (93u8, vec![DkgInstanceKind::Random]),
+        (94u8, vec![DkgInstanceKind::Zero]),
+        (95u8, vec![DkgInstanceKind::Random, DkgInstanceKind::Random]),
+    ] {
+        let case =
+            DkgConfig::new(2, SessionId([seed; 32]), config.registry().clone(), kinds).unwrap();
+        let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+        let own = deal(&capture, &case, one, &G::Scalar::ONE, &mut rng).unwrap();
+        let peer = deal(&capture, &case, two, &G::Scalar::from(2), &mut rng).unwrap();
+        let own = OwnDealing::from_bytes(&case, one, &own.to_bytes().unwrap()).unwrap();
+        let peer = OwnDealing::from_bytes(&case, two, &peer.to_bytes().unwrap()).unwrap();
+        let board = [
+            DealerMessageRef {
+                expected_dealer: one,
+                bytes: own.broadcast_bytes(),
+            },
+            DealerMessageRef {
+                expected_dealer: two,
+                bytes: peer.broadcast_bytes(),
+            },
+        ];
+        let public = aggregate_public(&capture, &case, &board).unwrap();
+        // These bytes have trusted provenance from the immediately verified board.
+        let restored_public =
+            DkgPublicOutput::from_bytes(&case, &public.to_bytes().unwrap()).unwrap();
+        let output = complete(&capture, &case, &G::Scalar::ONE, &own, &board[1..]).unwrap();
+        let restored_output =
+            DkgOutput::from_bytes(&case, one, &output.to_bytes().unwrap()).unwrap();
+        assert_eq!(public.completion_root(), output.completion_root());
+        assert_eq!(restored_public.completion_root(), output.completion_root());
+        assert_eq!(restored_output.completion_root(), output.completion_root());
+        for position in 0..case.instances().len() {
+            let local = output.secret_share(position).unwrap();
+            assert_eq!(
+                G::mul_generator(local),
+                *public
+                    .instance(position)
+                    .unwrap()
+                    .public_key_share(one)
+                    .unwrap(),
+            );
+            assert_eq!(restored_output.secret_share(position), Some(local));
+        }
+        if case.instances() == [DkgInstanceKind::Random, DkgInstanceKind::Random] {
+            reject_publicly_valid_mutations(&capture, &case, one, own.broadcast_bytes());
+        }
+    }
+}
+
+fn assert_invalid_proof<G: DkgGroup, P: DealerProofSystem<G>>(
+    proofs: &P,
+    config: &DkgConfig<G>,
+    dealer: ParticipantIndex,
+    bytes: &[u8],
+    mutation: &str,
+) {
+    assert_eq!(
+        verify_dealer_message(proofs, config, dealer, bytes),
+        Err(Error::InvalidDealerProofs {
+            dealers: vec![dealer]
+        }),
+        "publicly valid mutation was not rejected at the proof boundary: {mutation}",
+    );
+}
+
+fn reject_publicly_valid_mutations<G: DkgGroup, P: DealerProofSystem<G>>(
+    proofs: &P,
+    config: &DkgConfig<G>,
+    dealer: ParticipantIndex,
+    message: &[u8],
+) {
+    let header = 8 + b"golden-dkg-wire-v4".len() + 32 + 4;
+    let receivers = config.registry().len() - 1;
+    let slot_bytes = G::POINT_BYTES + 32;
+    let block_bytes = 32 + config.threshold() * G::POINT_BYTES + receivers * slot_bytes;
+    let first_constant = header + 32;
+    let first_pad = first_constant + config.threshold() * G::POINT_BYTES;
+    let first_cipher = first_pad + G::POINT_BYTES;
+    let mut mutations = Vec::new();
+
+    let mut nonce = message.to_vec();
+    nonce[header] ^= 1;
+    mutations.push(("nonce", nonce));
+
+    let pad = G::decode_point(&message[first_pad..first_pad + G::POINT_BYTES]).unwrap();
+    let cipher = G::decode_scalar(&message[first_cipher..first_cipher + 32]).unwrap();
+    let mut delta = G::Scalar::ONE;
+    if bool::from((pad + G::mul_generator(&delta)).is_identity()) {
+        delta += G::Scalar::ONE;
+    }
+    let mut paired = message.to_vec();
+    paired[first_pad..first_pad + G::POINT_BYTES]
+        .copy_from_slice(&G::encode_point(&(pad + G::mul_generator(&delta))));
+    paired[first_cipher..first_cipher + 32].copy_from_slice(&G::encode_scalar(&(cipher + delta)));
+    mutations.push(("paired pad/ciphertext", paired));
+
+    let constant =
+        G::decode_point(&message[first_constant..first_constant + G::POINT_BYTES]).unwrap();
+    let mut shifted = message.to_vec();
+    shifted[first_constant..first_constant + G::POINT_BYTES].copy_from_slice(&G::encode_point(
+        &(constant + G::mul_generator(&G::Scalar::ONE)),
     ));
+    // Adding one to A_0 adds one to every receiver's Feldman evaluation;
+    // shift each ciphertext by the same amount to retain the public equation.
+    for receiver in 0..receivers {
+        let offset = first_cipher + receiver * slot_bytes;
+        let value = G::decode_scalar(&message[offset..offset + 32]).unwrap();
+        shifted[offset..offset + 32].copy_from_slice(&G::encode_scalar(&(value + G::Scalar::ONE)));
+    }
+    mutations.push(("constant/ciphertexts", shifted));
+
+    let mut reordered = message.to_vec();
+    let (first, rest) = reordered.split_at_mut(header + block_bytes);
+    first[header..].swap_with_slice(&mut rest[..block_bytes]);
+    mutations.push(("instance block order", reordered));
+
+    // Constant proof widths are fixed by the inner protocol codec; their
+    // positions are omitted from bytes and must remain transcript-bound.
+    let proof_frame = header + config.instances().len() * block_bytes;
+    let proof_start = proof_frame + 8;
+    let mut reader = golden_core::wire::Reader::new(&message[proof_start..]);
+    reader.framed().unwrap(); // expected concrete proof-family identifier
+    reader.framed().unwrap(); // canonical nested R1CS payload
+    let constant_bytes = G::POINT_BYTES + 32;
+    assert_eq!(reader.remaining(), 2 * constant_bytes);
+    let constant_start = message.len() - reader.remaining();
+    let mut swapped = message.to_vec();
+    let (first, second) = swapped[constant_start..].split_at_mut(constant_bytes);
+    first.swap_with_slice(second);
+    mutations.push(("Random constant proof order", swapped));
+
+    for (name, bytes) in mutations {
+        assert_invalid_proof(proofs, config, dealer, &bytes, name);
+    }
 }
 #[cfg(feature = "secp-secq")]
 #[test]
