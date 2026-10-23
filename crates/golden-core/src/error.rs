@@ -1,117 +1,147 @@
-//! Error types for Golden core operations.
+//! Stable, coarse errors for algebra, protocol operations and proof systems.
+use crate::ParticipantIndex;
 
-/// Result type used by `golden-core`.
+/// Result used throughout Golden core and its proof extension interface.
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// Errors returned by Golden core operations.
+/// Public errors never contain secrets, receiver/instance positions or backend diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum Error {
-    /// A participant index was zero.
+    /// Empty registry.
+    #[error("participant registry must not be empty")]
+    EmptyParticipantRegistry,
+    /// Zero interpolation index.
     #[error("participant indexes must be nonzero")]
     ZeroParticipantIndex,
-
-    /// A participant index appeared more than once.
+    /// Duplicate interpolation index.
     #[error("duplicate participant index {0}")]
     DuplicateParticipantIndex(u32),
-
-    /// A participant identity public key appeared more than once.
-    #[error("duplicate participant public key for participants {first} and {second}")]
+    /// Duplicate canonical identity key.
+    #[error("duplicate participant keys for {first} and {second}")]
     DuplicateParticipantPublicKey {
-        /// First participant index using the public key.
+        /// First index.
         first: u32,
-        /// Second participant index using the public key.
+        /// Second index.
         second: u32,
     },
-
-    /// The threshold was invalid for the requested operation.
-    #[error("invalid threshold: threshold={threshold}, participants={participants}")]
+    /// Invalid reconstruction threshold.
+    #[error("invalid threshold: {threshold} for {participants} participants")]
     InvalidThreshold {
         /// Requested threshold.
         threshold: usize,
-        /// Number of participants.
+        /// Registry size.
         participants: usize,
     },
-
-    /// An interpolation denominator was not invertible.
+    /// Empty instance list.
+    #[error("DKG configuration requires at least one instance")]
+    EmptyDkgBatch,
+    /// Checked dimension arithmetic failed.
+    #[error("protocol dimension overflow")]
+    ArithmeticOverflow,
+    /// A bounded allocation could not be reserved.
+    #[error("protocol allocation failed")]
+    AllocationFailed,
+    /// Invalid interpolation denominator.
     #[error("non-invertible interpolation denominator")]
     NonInvertibleDenominator,
-
-    /// A scalar or point encoding was rejected by the backend.
+    /// Rejected canonical encoding.
     #[error("invalid encoding")]
     InvalidEncoding,
-
-    /// A Feldman commitment had no coefficients.
+    /// Empty polynomial commitment.
     #[error("empty Feldman commitment")]
     EmptyCommitment,
-
-    /// A Feldman commitment had the wrong number of coefficients.
-    #[error("invalid commitment degree: expected {expected} coefficients, got {actual}")]
+    /// Unexpected commitment degree.
+    #[error("invalid commitment degree: expected {expected}, got {actual}")]
     InvalidCommitmentDegree {
-        /// Expected coefficient count.
+        /// Expected length.
         expected: usize,
-        /// Actual coefficient count.
+        /// Actual length.
         actual: usize,
     },
-
-    /// A message belongs to a different session.
-    #[error("session mismatch")]
-    SessionMismatch,
-
-    /// A message belongs to a different participant registry.
-    #[error("participant registry mismatch")]
-    RegistryMismatch,
-
-    /// An identity secret key did not match the registered identity public key.
-    #[error("identity secret key does not match registered public key")]
-    IdentityKeyMismatch,
-
-    /// A participant was not present in the registry.
-    #[error("unknown participant {0}")]
-    UnknownParticipant(u32),
-
-    /// A peer dealing map key did not match the message's dealer.
-    #[error("dealer key mismatch: map key {map_key}, message dealer {message_dealer}")]
-    DealerKeyMismatch {
-        /// Dealer index from the peer-dealing map key.
-        map_key: u32,
-        /// Dealer index claimed by the dealer message.
-        message_dealer: u32,
-    },
-
-    /// A local private share did not belong to the expected participant.
-    #[error("private share participant mismatch: expected {expected}, got {actual}")]
-    PrivateShareParticipantMismatch {
-        /// Expected participant index.
-        expected: u32,
-        /// Actual private-share participant index.
-        actual: u32,
-    },
-
-    /// A required dealing was missing.
-    #[error("missing dealing from participant {0}")]
-    MissingDealing(u32),
-
-    /// A required share was missing.
-    #[error("missing share for participant {0}")]
-    MissingShare(u32),
-
-    /// A dealing contained a share or proof for an unexpected participant.
-    #[error("unexpected share for participant {0}")]
-    UnexpectedShare(u32),
-
-    /// A proof backend rejected the statement.
-    #[error("proof verification failed")]
-    ProofVerificationFailed,
-
-    /// A dealer proof failed individual verification after a batch failure.
-    #[error("proof verification failed for dealer {0}")]
-    DealerProofVerificationFailed(u32),
-
-    /// A dealing share did not match its Feldman commitment.
+    /// A share did not open its commitment.
     #[error("commitment verification failed")]
     CommitmentVerificationFailed,
-
-    /// Authenticated decryption failed.
+    /// Wrong borrowed identity credential.
+    #[error("identity secret does not match registered public key")]
+    IdentityKeyMismatch,
+    /// Unknown interpolation index.
+    #[error("unknown participant {0}")]
+    UnknownParticipant(u32),
+    /// The only proof-system verdict that triggers individual fallback.
+    #[error("invalid proof")]
+    InvalidProof,
+    /// Proof production failed without exposing backend details.
+    #[error("proof generation failed")]
+    ProofGenerationFailed,
+    /// Operational proof-system failure, without dealer blame.
+    #[error("proof-system operation failed")]
+    ProofOperationFailed,
+    /// Complete broadcast exceeded the fixed protocol limit.
+    #[error("dealer message exceeds protocol size limit")]
+    DealerMessageTooLarge,
+    /// Native coordinate or exponent evaluation failed; not a retry verdict.
+    #[error("Main Golden relation evaluation failed")]
+    RelationEvaluationFailed,
+    /// Retry the entire local deal operation with fresh randomness.
+    #[error("degenerate local pad; retry the complete deal operation")]
+    DegenerateEvrfOutput,
+    /// Own state belongs to another participant/configuration or has invalid self shares.
+    #[error("own dealing does not match the completion request")]
+    OwnDealingMismatch,
+    /// No candidates supplied to public verification.
+    #[error("candidate board must not be empty")]
+    EmptyBoard,
+    /// A full board omitted one dealer.
+    #[error("missing dealer {dealer:?}")]
+    MissingDealer {
+        /// Missing dealer.
+        dealer: ParticipantIndex,
+    },
+    /// More than one association named a dealer.
+    #[error("duplicate dealer {dealer:?}")]
+    DuplicateDealer {
+        /// Duplicate dealer.
+        dealer: ParticipantIndex,
+    },
+    /// An association named an unregistered dealer.
+    #[error("unexpected dealer {dealer:?}")]
+    UnexpectedDealer {
+        /// Unexpected dealer.
+        dealer: ParticipantIndex,
+    },
+    /// Every public-invalid dealer, in canonical order.
+    #[error("invalid dealer messages: {dealers:?}")]
+    InvalidDealerMessages {
+        /// Invalid dealers.
+        dealers: Vec<ParticipantIndex>,
+    },
+    /// Every individually invalid dealer proof, in canonical order.
+    #[error("invalid dealer proofs: {dealers:?}")]
+    InvalidDealerProofs {
+        /// Invalid dealers.
+        dealers: Vec<ParticipantIndex>,
+    },
+    /// Combined verification failed while every individual proof passed.
+    #[error("batch verification failed")]
+    BatchVerificationFailed,
+    /// Explicitly prepared generators cannot serve the requested shape.
+    #[error("insufficient proof capacity: required={required}, available={available}")]
+    InsufficientProofCapacity {
+        /// Required padded generator count.
+        required: usize,
+        /// Declared available count.
+        available: usize,
+    },
+    /// Invalid prepared-generator artifact.
+    #[error("malformed prepared generators")]
+    MalformedPreparedGenerators,
+    /// Invalid contextual state snapshot.
+    #[error("invalid persisted state")]
+    InvalidPersistedState,
+    /// An accepted broadcast did not yield a valid local share.
+    #[error("share decryption failed")]
+    ShareDecryptionFailed,
+    /// Decryption failed.
     #[error("decryption failed")]
     DecryptionFailed,
 }

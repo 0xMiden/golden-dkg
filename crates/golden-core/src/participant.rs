@@ -1,6 +1,8 @@
 //! Participant identifiers and interpolation points.
 
-use crate::{Error, GoldenScalar, Result};
+use ff::PrimeField;
+
+use crate::{Error, Result};
 
 /// Public participant index.
 ///
@@ -23,7 +25,22 @@ impl ParticipantIndex {
     }
 
     /// Convert this public index into a scalar interpolation point.
-    pub fn to_scalar<S: GoldenScalar>(self) -> Result<S> {
-        S::from_u64(u64::from(self.0))
+    pub fn to_scalar<S: PrimeField>(self) -> Result<S> {
+        // Cryptographic fields contain every u32. For a smaller field, read
+        // p - 1 through parity and integer halving rather than parsing the
+        // opaque PrimeField::MODULUS string. Reject reduced index aliases.
+        if S::NUM_BITS <= u32::BITS {
+            let mut remaining = -S::ONE;
+            let mut largest = 0u64;
+            for bit in 0..S::NUM_BITS {
+                let odd = bool::from(remaining.is_odd());
+                largest |= u64::from(odd) << bit;
+                remaining = (remaining - S::from(u64::from(odd))) * S::TWO_INV;
+            }
+            if u64::from(self.0) > largest {
+                return Err(Error::InvalidEncoding);
+            }
+        }
+        Ok(S::from(u64::from(self.0)))
     }
 }
