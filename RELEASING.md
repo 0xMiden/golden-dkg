@@ -1,15 +1,32 @@
 # Publishing Golden crates
 
-Publish all Golden crates together from the current `main` commit.
+Publish the five Golden workspace crates together from the current `main`
+commit: `golden-core`, `golden-curves`, `golden-bulletproofs`,
+`bulletproofs-cycle`, and `golden-ehtdh1`. The issue #71 release starts the
+`0.5.0` family. The release workflows discover publishable members, versions,
+and dependencies through Cargo metadata; package names and publication order
+are not maintained in a separate release list.
 
 ## Prepare the release
 
-Update each publishable crate to the new release version. Merge the changes
-into `main`.
+Update the shared workspace version and internal dependency requirements for
+every publishable crate. Review the breaking API, format, and crate migration.
+Issue #71 starts fresh configurations and key setup; old persisted states and
+wire messages do not migrate to the new formats. Merge the changes into `main`.
 
-Run `Workspace release dry-run` and `Nightly slow tests` on the commit to be
-released. Run `Package version gate` for the same commit. All three workflows
-must pass.
+Run `CI`, `Workspace release dry-run`, `Nightly slow tests`, and `Package version
+gate` on the exact commit to be released. All must pass. CI covers both native
+curves, both proof backends in sequential and parallel mode, each supported
+feature, documentation, browser recovery crates on WASM, and Rust 1.93. Nightly
+also runs ignored joint proof and EHTDH1 production bridge tests for both groups.
+
+The normal fixture check verifies both checked-in joint dealer-message fixture
+sets. Regenerate fixtures only through the explicit updater after reviewing the
+format or relation change; the CI check must not rewrite them. Confirm the
+independent relation, interface, and Standards/Spec reviews required by
+[`docs/issue-71.md`](docs/issue-71.md). Obtain the separately owned final
+composition/security approval before release. Passing engineering workflows
+does not establish that cryptographic approval.
 
 ## Publish
 
@@ -27,6 +44,22 @@ against crates.io:
 - An existing version must have the same package archive.
 - A new version must be newer than the latest published version.
 - A new version must pass `cargo-semver-checks`.
+
+The package gate derives `cargo-semver-checks --release-type` from each actual
+version change using Rust semver rules, including the pre-1.0 boundary. For
+example, `0.4.x` to `0.5.0` permits intentional breaking changes, while a patch
+within `0.5.x` still rejects them. This applies to both the source and prebuilt
+rustdoc comparison paths. Keep the package version gate enabled for the `0.5.0`
+release; the breaking release does not require a bypass.
+
+Each library comparison covers its defaults and the shared public feature names
+declared by the current and baseline package metadata. This checks both optional
+proof backends once they exist in both releases, without applying renamed features
+to older sources. The insecure revealed-witness feature is excluded. The engine's
+`bulletproofs-compat` mode is checked separately with `cycle-pedersen` disabled.
+Registry fallback uses explicit feature flags instead of the tool's all-feature
+heuristic, and every applicable profile must pass. Removing a public feature also
+requires a breaking version bump; intersection selection cannot hide its removal.
 
 After publication:
 

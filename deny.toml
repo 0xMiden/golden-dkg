@@ -35,6 +35,9 @@ multiple-versions = "deny"
 skip = [
   # halo2derive still depends on syn 1.
   { name = "syn", version = "=1.0.109" },
+  # ff_derive's addition-chain generator uses 0.3 for the tiny-field tests;
+  # halo2curves and halo2derive require 0.4.
+  { name = "num-bigint", version = "=0.3.3" },
 ]
 skip-tree = []
 wildcards = "allow"

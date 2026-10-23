@@ -13,42 +13,13 @@ permissions: {}
 
 jobs:
   codspeed:
-    name: ${{ matrix.name }}
+    name: Joint DKG (both backends)
     runs-on: codspeed-macro
-    timeout-minutes: ${{ matrix.timeout }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Paper Table 4 Secp256k1/Secq256k1 prover
-            bench: evrf_prove
-            timeout: 30
-            table4_rows: "9"
-            table5_rows: "10"
-            table5_metric: split
-          - name: Paper Table 4 Secp256k1/Secq256k1 verifiers
-            bench: evrf_verify
-            timeout: 60
-            table4_rows: "9"
-            table5_rows: "10"
-            table5_metric: split
-          - name: Paper Table 5 Secp256k1/Secq256k1 participant runtime
-            bench: dkg_round
-            timeout: 30
-            table4_rows: "9"
-            table5_rows: "10"
-            table5_metric: total
-          - name: Paper eVRF batched parameter setup
-            bench: batched_setup
-            timeout: 15
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write # CodSpeed uses OIDC to associate measurements with this repository.
     env:
-      BENCH_NAME: ${{ matrix.bench }}
-      GOLDEN_TABLE4_NE_VALUES: ${{ matrix.table4_rows }}
-      GOLDEN_TABLE5_N_VALUES: ${{ matrix.table5_rows }}
-      GOLDEN_TABLE5_METRIC: ${{ matrix.table5_metric }}
       RAYON_NUM_THREADS: "8"
     steps:
       - name: Check out repository
@@ -73,9 +44,9 @@ jobs:
           cargo codspeed build \
             --measurement-mode walltime \
             --profile optimized \
-            -p golden-evrf \
-            --features halo2curves-secp256k1,parallel \
-            --bench "${BENCH_NAME}"
+            -p golden-bulletproofs \
+            --features secp-secq,jubjub-bls12-381,parallel \
+            --bench joint_dkg
 
       - name: Run benchmark
         uses: CodSpeedHQ/action@f22792bfac16f3e14eb9fbea76f4a48e9cc22b93 # v4.19.1
@@ -85,5 +56,5 @@ jobs:
             set -euo pipefail
             cargo codspeed run \
               --measurement-mode walltime \
-              -p golden-evrf \
-              --bench "${BENCH_NAME}"
+              -p golden-bulletproofs \
+              --bench joint_dkg

@@ -24,7 +24,7 @@ zeroize = { workspace = true }
 ff = { workspace = true, features = ["derive"] }
 golden-curves = { workspace = true, features = ["secp256k1", "jubjub"] }
 rand_chacha = { workspace = true }
-serde_test = { workspace = true }
+postcard = { workspace = true }
 
 [features]
 default = []

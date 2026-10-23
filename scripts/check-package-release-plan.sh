@@ -114,7 +114,7 @@ while IFS=$'\t' read -r package local_version; do
 
     echo "Checking semver for $package v$local_version against published v$latest_version"
     baseline_commit="$(baseline_commit_for "$package" "$latest_version" || true)"
-    if run_semver_check "$package" "$latest_version" "$workspace_root" "$baseline_commit"; then
+    if run_semver_check "$package" "$latest_version" "$workspace_root" "$baseline_commit" "$local_version"; then
         would_publish+=("$package v$local_version (latest published: $latest_version)")
     else
         semver_failures+=("$package v$local_version against published v$latest_version")

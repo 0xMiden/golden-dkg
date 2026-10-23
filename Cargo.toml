@@ -36,7 +36,6 @@ golden-core = { path = "crates/golden-core", version = "0.5.0" }
 golden-curves = { path = "crates/golden-curves", version = "0.5.0", default-features = false }
 golden-bulletproofs = { path = "crates/golden-bulletproofs", version = "0.5.0", default-features = false }
 halo2curves = { version = "0.10", default-features = false }
-hex = "0.4"
 hkdf = "0.12"
 jubjub = { version = "0.10", default-features = false, features = ["bits", "alloc"] }
 merlin = { version = "3", default-features = false }
@@ -46,7 +45,6 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 rand_chacha = "0.3"
 rand_core = "0.6"
 serde = { version = "1", default-features = false, features = ["alloc"] }
-serde_test = "1"
 sha2 = "0.10"
 sha3 = { version = "0.10", default-features = false }
 smallvec = "1"

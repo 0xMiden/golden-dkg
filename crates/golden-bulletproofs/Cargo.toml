@@ -26,7 +26,6 @@ bls12_381 = { workspace = true, optional = true }
 blst = { workspace = true, optional = true }
 blstrs = { workspace = true, optional = true }
 jubjub = { workspace = true, optional = true }
-p3-maybe-rayon = { workspace = true }
 
 [dev-dependencies]
 codspeed-criterion-compat = "5.0.1"
@@ -36,7 +35,7 @@ postcard = { workspace = true }
 default = []
 secp-secq = ["golden-curves/secp256k1", "dep:halo2curves"]
 jubjub-bls12-381 = ["golden-curves/jubjub", "dep:bls12_381", "dep:blst", "dep:blstrs", "dep:jubjub"]
-parallel = ["bulletproofs-cycle/parallel", "p3-maybe-rayon/parallel"]
+parallel = ["bulletproofs-cycle/parallel"]
 serde = ["dep:serde"]
 
 [lints.rust]

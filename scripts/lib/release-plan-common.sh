@@ -213,6 +213,39 @@ version_cmp() {
     '
 }
 
+semver_release_type() {
+    local current_version="$1"
+    local baseline_version="$2"
+    local cmp
+
+    cmp="$(version_cmp "$current_version" "$baseline_version")"
+    if [[ "$cmp" -le 0 ]]; then
+        echo "ERROR: cannot classify non-increasing release $baseline_version -> $current_version" >&2
+        return 1
+    fi
+
+    # Rust semver treats a bump of the leftmost nonzero component as breaking:
+    # 1.x -> 2.x, 0.4 -> 0.5, and 0.0.1 -> 0.0.2 are all major releases.
+    # Explicit classification is also needed for prebuilt rustdoc JSON, where
+    # cargo-semver-checks cannot always recover the current package version.
+    awk -v current="$current_version" -v baseline="$baseline_version" '
+        BEGIN {
+            sub(/[-+].*/, "", current)
+            sub(/[-+].*/, "", baseline)
+            split(current, current_parts, ".")
+            split(baseline, baseline_parts, ".")
+
+            if (current_parts[1] + 0 > baseline_parts[1] + 0) {
+                print "major"
+            } else if (current_parts[2] + 0 > baseline_parts[2] + 0) {
+                print (baseline_parts[1] + 0 == 0 ? "major" : "minor")
+            } else {
+                print (baseline_parts[1] + 0 == 0 && baseline_parts[2] + 0 == 0 ? "major" : "patch")
+            }
+        }
+    '
+}
+
 package_has_library_target() {
     local package="$1"
 
@@ -227,25 +260,35 @@ package_has_library_target() {
         ' >/dev/null
 }
 
-published_package_has_library_target() {
+published_package_root() {
     local package="$1"
     local version="$2"
-    local archive root metadata
+    local archive root
 
     check_command "tar"
 
     archive="$RELEASE_PLAN_TMPDIR/published-baselines/$package-$version.crate"
     root="$RELEASE_PLAN_TMPDIR/published-baselines/$package-$version"
-    mkdir -p "$(dirname "$archive")" "$root"
+    if [[ ! -f "$root/$package-$version/Cargo.toml" ]]; then
+        mkdir -p "$(dirname "$archive")" "$root"
+        download_published_crate "$package" "$version" "$archive" || return
+        tar -xzf "$archive" -C "$root" || return
+    fi
+    printf '%s/%s-%s\n' "$root" "$package" "$version"
+}
 
-    download_published_crate "$package" "$version" "$archive"
-    tar -xzf "$archive" -C "$root"
+published_package_has_library_target() {
+    local package="$1"
+    local version="$2"
+    local root metadata
+
+    root="$(published_package_root "$package" "$version")" || return
     metadata="$(
         cargo metadata \
-            --manifest-path "$root/$package-$version/Cargo.toml" \
+            --manifest-path "$root/Cargo.toml" \
             --no-deps \
             --format-version 1
-    )"
+    )" || return
 
     printf '%s' "$metadata" |
         jq -e --arg package "$package" '
@@ -254,6 +297,19 @@ published_package_has_library_target() {
           | .targets[]
           | select(.kind | index("lib"))
         ' >/dev/null
+}
+
+package_feature_names() {
+    local package="$1"
+    local source_root="$2"
+
+    cargo metadata \
+        --manifest-path "$source_root/Cargo.toml" \
+        --no-deps \
+        --format-version 1 |
+        jq -er --arg package "$package" '
+          .packages[] | select(.name == $package) | .features | keys | sort
+        '
 }
 
 package_rustdoc_name() {
@@ -291,14 +347,16 @@ build_rustdoc_json() {
     local source_root="$2"
     local target_dir="$3"
     local rustdoc_name
+    shift 3
 
-    rustdoc_name="$(package_rustdoc_name "$package")"
+    rustdoc_name="$(package_rustdoc_name "$package")" || return
     RUSTC_BOOTSTRAP=1 RUSTDOCFLAGS="-Z unstable-options --output-format json" cargo rustdoc \
         --manifest-path "$source_root/Cargo.toml" \
         --package "$package" \
         --lib \
         --locked \
-        --target-dir "$target_dir" >/dev/null
+        --target-dir "$target_dir" \
+        "$@" >/dev/null || return
 
     printf '%s/doc/%s.json\n' "$target_dir" "$rustdoc_name"
 }
@@ -308,8 +366,20 @@ run_semver_check() {
     local baseline_version="$2"
     local workspace_root="$3"
     local baseline_commit="${4:-}"
+    local current_version="$5"
     local semver_cmd semver_cargo_home semver_target_dir semver_workdir
-    local baseline_root current_json baseline_json
+    local baseline_root current_json baseline_json release_type
+    local current_features baseline_features shared_features public_features compat_features removed_features
+    local index profile features
+    local profiles=(default)
+    local feature_sets=("")
+    local rustdoc_feature_args=()
+    local semver_feature_args=()
+
+    if ! release_type="$(semver_release_type "$current_version" "$baseline_version")"; then
+        return 1
+    fi
+    echo "Rust semver release type for $package: $release_type ($baseline_version -> $current_version)"
 
     check_command "cargo-semver-checks"
     semver_cmd="$(command -v cargo-semver-checks)"
@@ -326,29 +396,80 @@ run_semver_check() {
     if [[ -n "$baseline_commit" ]]; then
         baseline_root="$RELEASE_PLAN_TMPDIR/baseline-source/$package-$baseline_commit"
         mkdir -p "$baseline_root"
-        git archive "$baseline_commit" | tar -x -C "$baseline_root"
-
-        current_json="$(build_rustdoc_json "$package" "$workspace_root" "$RELEASE_PLAN_TMPDIR/rustdoc/current/$package")"
-        baseline_json="$(build_rustdoc_json "$package" "$baseline_root" "$RELEASE_PLAN_TMPDIR/rustdoc/baseline/$package")"
-
-        (
-            cd "$semver_workdir" || return
-            CARGO_HOME="$semver_cargo_home" CARGO_TARGET_DIR="$semver_target_dir" \
-                "$semver_cmd" semver-checks \
-                --current-rustdoc "$current_json" \
-                --baseline-rustdoc "$baseline_json" \
-                --color never
-        )
-        return
+        git archive "$baseline_commit" | tar -x -C "$baseline_root" || return
+    else
+        baseline_root="$(published_package_root "$package" "$baseline_version")" || return
     fi
 
-    (
-        cd "$semver_workdir" || return
-        CARGO_HOME="$semver_cargo_home" CARGO_TARGET_DIR="$semver_target_dir" \
-            "$semver_cmd" semver-checks \
-            --manifest-path "$workspace_root/Cargo.toml" \
-            --package "$package" \
-            --baseline-version "$baseline_version" \
-            --color never
-    )
+    current_features="$(package_feature_names "$package" "$workspace_root")" || return
+    baseline_features="$(package_feature_names "$package" "$baseline_root")" || return
+    removed_features="$(
+        jq -rn --argjson current "$current_features" --argjson baseline "$baseline_features" '
+          $baseline - $current - ["default", "insecure-revealed-witness"] | join(",")
+        '
+    )" || return
+    if [[ "$release_type" != major && -n "$removed_features" ]]; then
+        echo "ERROR: $package removes public features without a breaking version bump: $removed_features" >&2
+        return 1
+    fi
+    shared_features="$(
+        jq -cn --argjson current "$current_features" --argjson baseline "$baseline_features" '
+          $current | map(select(. as $feature | $baseline | index($feature)))
+        '
+    )" || return
+    public_features="$(
+        printf '%s' "$shared_features" |
+            jq -r '. - ["default", "insecure-revealed-witness", "bulletproofs-compat"] | join(",")'
+    )" || return
+    if [[ -n "$public_features" ]]; then
+        profiles+=(public-features)
+        feature_sets+=("$public_features")
+    fi
+    if printf '%s' "$shared_features" | jq -e 'index("bulletproofs-compat") != null' >/dev/null; then
+        compat_features="$(
+            printf '%s' "$shared_features" |
+                jq -r '. - ["default", "insecure-revealed-witness", "cycle-pedersen"] | join(",")'
+        )" || return
+        profiles+=(compat)
+        feature_sets+=("$compat_features")
+    fi
+
+    for index in "${!profiles[@]}"; do
+        profile="${profiles[$index]}"
+        features="${feature_sets[$index]}"
+        echo "Checking $package profile $profile${features:+ ($features)}"
+        rustdoc_feature_args=(--features "")
+        semver_feature_args=(--default-features)
+        if [[ "$profile" != default ]]; then
+            rustdoc_feature_args=(--no-default-features --features "$features")
+            semver_feature_args=(--only-explicit-features --features "$features")
+        fi
+
+        if [[ -n "$baseline_commit" ]]; then
+            current_json="$(build_rustdoc_json "$package" "$workspace_root" "$RELEASE_PLAN_TMPDIR/rustdoc/current/$package/$profile" "${rustdoc_feature_args[@]}")" || return
+            baseline_json="$(build_rustdoc_json "$package" "$baseline_root" "$RELEASE_PLAN_TMPDIR/rustdoc/baseline/$package/$profile" "${rustdoc_feature_args[@]}")" || return
+
+            (
+                cd "$semver_workdir" || return
+                CARGO_HOME="$semver_cargo_home" CARGO_TARGET_DIR="$semver_target_dir" \
+                    "$semver_cmd" semver-checks \
+                    --current-rustdoc "$current_json" \
+                    --baseline-rustdoc "$baseline_json" \
+                    --release-type "$release_type" \
+                    --color never
+            ) || return
+        else
+            (
+                cd "$semver_workdir" || return
+                CARGO_HOME="$semver_cargo_home" CARGO_TARGET_DIR="$semver_target_dir" \
+                    "$semver_cmd" semver-checks \
+                    --manifest-path "$workspace_root/Cargo.toml" \
+                    --package "$package" \
+                    --baseline-version "$baseline_version" \
+                    --release-type "$release_type" \
+                    "${semver_feature_args[@]}" \
+                    --color never
+            ) || return
+        fi
+    done
 }

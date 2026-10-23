@@ -29,7 +29,6 @@ golden-core = { workspace = true, features = ["insecure-revealed-witness"] }
 golden-curves = { workspace = true, features = ["secp256k1", "jubjub"] }
 golden-bulletproofs = { workspace = true, features = ["secp-secq", "jubjub-bls12-381"] }
 rand_chacha = { workspace = true }
-serde_test = { workspace = true }
 postcard = { workspace = true }
 
 [features]

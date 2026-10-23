@@ -2,129 +2,66 @@
 
 [![CI](https://github.com/0xMiden/golden-dkg/actions/workflows/ci.yml/badge.svg)](https://github.com/0xMiden/golden-dkg/actions/workflows/ci.yml)
 
-Rust workspace for distributed key generation, verifiable randomness, and
-context bound threshold encryption over a generic group abstraction. The
-current tree implements Golden DKG, EHTDH1, Secp256k1/Secq256k1 and
-BLS12-381/Jubjub eVRF backends, and the Bulletproofs R1CS layer used by
-both backends.
+Native Golden distributed key generation and context-bound threshold encryption
+over Secp256k1 and Jubjub. Version 0.5 is a hard compatibility cut: configurations,
+keys, broadcasts, ciphertexts, snapshots and prepared artifacts from earlier
+versions require fresh setup. The full refactor contract is in
+[docs/issue-71.md](docs/issue-71.md).
 
-The two protocol implementations follow these papers.
+The protocols follow these papers:
 
-* **Golden DKG.** Benedikt Bünz, Kevin Choi, and Chelsea Komlo,
-  “[Golden: Lightweight Non-Interactive Distributed Key Generation](https://eprint.iacr.org/2025/1924),”
-  Cryptology ePrint Archive, Paper 2025/1924, 2025.
-* **EHTDH1.** Dan Boneh, Benedikt Bünz, Kartik Nayak, Lior Rotem, and Victor
-  Shoup, “[Context-Dependent Threshold Decryption and its Applications](https://eprint.iacr.org/2025/279),”
-  Cryptology ePrint Archive, Paper 2025/279, 2025.
+* Benedikt Bünz, Kevin Choi, and Chelsea Komlo,
+  [Golden: Lightweight Non-Interactive Distributed Key Generation](https://eprint.iacr.org/2025/1924).
+* Dan Boneh, Benedikt Bünz, Kartik Nayak, Lior Rotem, and Victor Shoup,
+  [Context-Dependent Threshold Decryption and its Applications](https://eprint.iacr.org/2025/279).
 
-The workspace has seven crates. All crates are published together and require
-Rust 1.93 or later.
-
-| Crate | Purpose |
+| Package | Responsibility |
 |---|---|
-| `golden-core` | Shamir sharing, Feldman commitments, DKG messages, transcript binding, and the curve-agnostic `EvrfProofBackend` trait. |
-| `golden-evrf` | Secp256k1/Secq256k1 and BLS12-381/Jubjub R1CS backends for the full Golden eVRF relation. It also contains a share-opening prototype used by plumbing tests. |
-| `golden-rustcrypto` | RustCrypto P-256 and secp256k1 `GoldenGroup` adapters used by the prototype backend and tests. |
-| `golden-ehtdh1` | Context-bound threshold encryption over Golden DKG output. Each decryption share is bound to its setup, ciphertext, and caller context. |
-| `bulletproofs-cycle` | A minimal fork of `zkcrypto/bulletproofs` 5.0.1 whose R1CS prover and verifier operate through a generic `Cycle` trait. The `bulletproofs-compat` feature provides byte-parity testing against the upstream crate. |
-| `golden-halo2curves` | Secp256k1/Secq256k1 `Cycle` implementations and the Secp256k1 `GoldenGroup` adapter. |
-| `golden-bls-jubjub` | BLS12-381 G1 and Jubjub `Cycle` implementations and the Jubjub `GoldenGroup` adapter. |
+| [`golden-core`](crates/golden-core) | Native algebra, immutable configuration, opaque broadcasts, verification, atomic completion and contextual persistence. |
+| [`golden-curves`](crates/golden-curves) | Proof-free Secp256k1 and Jubjub adapters with strict canonical codecs. |
+| [`golden-bulletproofs`](crates/golden-bulletproofs) | Joint Main Golden proofs for Secp/Secq and Jubjub/BLS12-381, explicit typed preparation and optimized MSM. |
+| [`bulletproofs-cycle`](crates/bulletproofs-cycle) | Generic Bulletproofs engine with owned generator prefixes. |
+| [`golden-ehtdh1`](crates/golden-ehtdh1) | Online encryption/decryption and one completed `[Random, Zero]` batch bridge. |
 
-## Performance
+Rust 1.93 or later is required. Concrete adapters and proofs are opt-in features;
+core does not depend on either. See each package README for the public API and
+persistence responsibilities. Applications own broadcast agreement, activation,
+authenticated approved-generator storage and trusted completion provenance.
+Independent composition/security approval remains a release requirement.
 
-For performance sensitive workloads, one can use the `optimized` profile when compiling.
+## Checks
 
-The following tables reproduce Tables 4 and 5 from the Golden DKG paper with
-real wall-clock measurements. Criterion uses flat sampling with 10 samples.
-The BLS12-381/Jubjub results exercise BLS12-381 G1 as the Bulletproof
-commitment group and Jubjub as the inner eVRF group. The existing
-Secp256k1/Secq256k1 measurements remain below for comparison.
-
-Benchmarked on an **AMD Ryzen 9 9950X** (16 cores / 32 threads, up to
-5.76 GHz) with the `optimized` profile (`lto = "thin"`, `codegen-units = 1`).
-
-### Table 4 (eVRF performance on BLS12-381/Jubjub)
-
-`n_e` is the number of receiver statements in one batched proof. Prover and
-verifier timings cover the Bulletproofs R1CS operations. Batch verification
-measures `verify_dealings` across `n_e` independent dealer messages. Proof
-sizes are exact wire lengths. The concatenated column contains `n_e`
-independent proofs.
-
-| n_e | Prover | Verifier | Batch verification | \|π\| (single) | n_e proofs (concat) |
-|---:|---:|---:|---:|---:|---:|
-| 1  | 102 ms | 12.1 ms | 13.1 ms | 1.9 kb | 1.9 kb |
-| 9  | 663 ms | 73.7 ms | 102 ms | 2.2 kb | 19.8 kb |
-| 49 | 2.49 s | 287 ms | 1.51 s | 2.4 kb | 117.0 kb |
-| 99 | 4.89 s | 554 ms | 5.55 s | 2.5 kb | 245.9 kb |
-
-### Table 5 (DKG performance on BLS12-381/Jubjub, n-of-n)
-
-Round 0 measures `create_dealing` for one dealer. Round 1 measures `complete`
-for one receiver using all `n` dealings. Per-participant runtime is the sum of
-the two Criterion point estimates. Communication counts `n` serialized dealer
-broadcasts and uses decimal kilobytes.
-
-| n | Round 0 | Round 1 | Per-participant runtime | Comm. (per participant) |
-|---:|---:|---:|---:|---:|
-| 2   | 103 ms | 13.9 ms | 117 ms | 4.3 kb |
-| 10  | 671 ms | 110 ms | 781 ms | 32.4 kb |
-| 50  | 2.52 s | 1.65 s | 4.17 s | 375.5 kb |
-| 100 | 4.91 s | 6.05 s | 11.0 s | 1.27 MB |
-
-The paper reports zkalc estimates on AWS EC2 m5.2xlarge. These rows measure the
-real Jubjub circuit on the local Ryzen system, so the curve family now matches
-the paper while the hardware and circuit implementation remain different.
-
-### Table 4 (eVRF performance on Secp256k1/Secq256k1)
-
-`n_e` is the number of receiver statements covered by one batched proof.
-“Prover” times the Bulletproofs R1CS prover only.  “Verifier” times a
-single `evrf_batched_verify`.  “Batch verification” times `verify_dealings`
-across `n_e` independent dealer messages (the receiver's Round 1 work).
-`|π|` is the wire size of one batched proof. “n_e proofs” is the
-concatenated size of `n_e` independent proofs.
-
-| n_e | Prover     | Verifier  | Batch verification | \|π\| (single) | n_e proofs (concat) |
-|-----|------------|-----------|--------------------|----------------|---------------------|
-| 1   | 102 ms     | 14.4 ms   | 15.3 ms            | 1.3 kb         | 1.3 kb              |
-| 9   | 394 ms     | 53.5 ms   | 86.2 ms            | 1.5 kb         | 13.7 kb             |
-| 49  | 2.42 s     | 308 ms    | 2.06 s             | 1.7 kb         | 84.2 kb             |
-| 99  | 4.84 s     | 647 ms    | 7.90 s             | 1.8 kb         | 176.6 kb            |
-
-Every batched-eVRF proof is single-phase (the relation never defers
-constraints via `specify_randomized_constraints`), so its wire length is an
-exact function of the padded circuit size alone, using the same
-next-power-of-two step that sizes the Bulletproof generators. `|π|` and
-`n_e proofs` are computed by `BatchedEvrfPublicParams::batched_proof_wire_len`
-without building a proof, and checked byte-for-byte against a real proof in
-`tests/batched_dealer.rs::batched_proof_wire_len_matches_v8_vector`.
-
-### Table 5 (DKG performance on Secp256k1/Secq256k1, n-of-n)
-
-“Round 0” is `create_dealing` for one dealer (includes the batched eVRF
-proof over `n − 1` receivers).  “Round 1” is `complete` for one receiver
-(verify `n` dealings and aggregate the share).  Per-participant runtime is
-Round 0 + Round 1.  Communication is the per-participant bandwidth
-(`n` broadcast messages, one per dealer).
-
-| n   | Round 0  | Round 1  | Per-participant runtime | Comm. (per participant) |
-|-----|----------|----------|------------------------|------------------------|
-| 2   | 104 ms   | 16.3 ms  | 120 ms                 | 3.1 kb                 |
-| 10  | 405 ms   | 99.6 ms  | 504 ms                 | 25.6 kb                |
-| 50  | 2.45 s   | 2.21 s   | 4.66 s                 | 342.0 kb               |
-| 100 | 4.99 s   | 8.39 s   | 13.4 s                 | 1.2 MB                 |
-
-## Useful checks
-
-```bash
-cargo fmt --all --check
-cargo clippy --all --benches --tests --examples --all-features --exclude bulletproofs-cycle -- -D warnings
-cargo nextest run --workspace --features golden-rustcrypto/p256,golden-rustcrypto/k256,golden-ehtdh1/prototype-bridge,golden-evrf/halo2curves-secp256k1,golden-halo2curves/halo2curves-secp256k1,golden-evrf/bls12-381-jubjub
-cargo test --workspace --doc
+```sh
+make check
+make lint
+make check-features
+make test
+make test-slow
 ```
+
+`bulletproofs-cycle/bulletproofs-compat` and its default `cycle-pedersen` feature
+are mutually exclusive, so blanket workspace `--all-features` is unsupported.
+The Makefile and CI exercise compatibility mode separately. The core's explicit
+`insecure-revealed-witness` feature is for tests only and reveals secret inputs.
+
+## Measurements and fixtures
+
+Use `--profile optimized` for real proof measurements. The `joint_dkg` benchmark
+prepares generators before timing dealer creation or completion. Earlier protocol
+performance tables do not describe the new circuit or formats; new measurements
+must identify the curve, configuration, hardware, feature set and fixture revision.
+
+```sh
+cargo bench -p golden-bulletproofs --profile optimized \
+  --features secp-secq,jubjub-bls12-381,parallel --bench joint_dkg
+cargo run -p golden-bulletproofs --profile optimized \
+  --features secp-secq,jubjub-bls12-381 --example check_fixtures
+```
+
+Fixture regeneration is explicit: append `-- --regenerate` to the example command,
+review the changed artifacts, then run the check again without that flag.
 
 ## Licensing
 
-Dual-licensed under MIT or Apache-2.0, at your option. See `LICENSE-MIT`
-and `LICENSE-APACHE`.
+Dual-licensed under MIT or Apache-2.0, at your option. See
+[LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).

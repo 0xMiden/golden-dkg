@@ -1,25 +1,26 @@
-# Golden
+# Golden DKG
 
-This workspace is for a minimal, paper-aligned Golden DKG implementation.
+The workspace implements the fixed Main Golden relation over native Secp256k1
+and Jubjub groups. The issue 71 contract is in [docs/issue-71.md](docs/issue-71.md).
+All previous state, formats and APIs are retired in the 0.5 compatibility cut.
 
-Avoid bespoke non-native arithmetic until a working Bulletproofs curve-pair port
-shows that it is unavoidable. The tree supports Secp256k1/Secq256k1 and
-BLS12-381 G1/Jubjub.
+Keep the dependency boundary explicit:
 
-Keep only code that supports one of these jobs:
+* `golden-core` owns native algebra, immutable configuration, opaque broadcasts,
+  public verification, atomic completion and contextual persistence. It has no
+  concrete curve or Bulletproof dependency.
+* `golden-curves` supplies proof-free native adapters.
+* `golden-bulletproofs` owns both concrete joint circuits, typed immutable
+  preparation, commitment-cycle adapters and optimized MSM implementations.
+* `bulletproofs-cycle` is the generic engine with explicitly owned generators.
+* `golden-ehtdh1` implements online encryption/decryption and consumes exactly one
+  completed `[Random, Zero]` batch.
 
-* DKG message plumbing from the Golden paper.
-* A transcript-bound Schnorr/Chaum-Pedersen prototype that keeps plumbing tests alive.
-* The concrete `bulletproofs-cycle` port. Secp/Secq support lives in
-  `golden-halo2curves`, while BLS12-381/Jubjub support lives in
-  `golden-bls-jubjub`.
-* A Golden eVRF backend built on one of those ports (`golden-evrf::paper::secp_secq`, `golden-evrf::paper::bls_jubjub`).
+Keep protocol parsing and circuit gadgets private. Extend the proof interface,
+not the fixed relation. Reuse native field/group operations and existing seams
+before introducing wrappers or extra representations. Public identity comes from
+configuration and ordered instance position, not proof implementation or capacity.
 
-`golden-rustcrypto` supplies the RustCrypto P-256/secp256k1 group and field
-backends used by the prototype and plumbing tests. It remains until the paper
-eVRF backends replace the prototype entirely.
-
-Release gates and measurements can come back after the paper eVRF proofs verify
-end to end. Fuzzing and FROST work are deferred too. Additional curve-pair
-adapters have the same status. The existing `golden-halo2curves` and
-`golden-bls-jubjub` adapters are exempt.
+Applications own admission, broadcast agreement, authenticated approved-generator
+storage, trusted completion provenance and activation. Engineering tests and
+reviews do not replace the separate composition/security release approval.
