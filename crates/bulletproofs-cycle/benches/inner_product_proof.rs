@@ -6,7 +6,7 @@
 //! classic Bulletproofs inner-product argument directly — create and verify —
 //! over both halves of the secp/secq curve cycle.
 //!
-//! The proof shape mirrors `golden-halo2curves/tests/inner_product_proof.rs`
+//! The proof shape mirrors `the concrete Secp/Secq inner-product proof flow`
 //! (itself ported from upstream's `test_helper_create(n)`): commitment
 //! `P = <a,G> + <b',H> + <a,b> Q` with `G_factors = 1`, `H_factors = y^{-i}`.
 
