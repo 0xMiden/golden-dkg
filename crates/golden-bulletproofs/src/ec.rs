@@ -14,6 +14,7 @@ use bulletproofs_cycle::{
 use ff::{Field, PrimeField};
 use golden_core::{DkgGroup, Error, Result};
 use group::Group;
+use p3_maybe_rayon::prelude::*;
 use std::{collections::BTreeMap, sync::Arc};
 
 type Point<C> = <<C as Backend>::Dkg as DkgGroup>::Point;
@@ -143,6 +144,13 @@ impl<C: EcCurve> Engine<C> {
         Ok(())
     }
     pub fn finalize<CS: RandomizableConstraintSystem<C>>(self, cs: &mut CS) -> Result<()> {
+        self.finalize_with_tables(cs, true)
+    }
+    fn finalize_with_tables<CS: RandomizableConstraintSystem<C>>(
+        self,
+        cs: &mut CS,
+        parallel_tables: bool,
+    ) -> Result<()> {
         let mut uses = vec![0usize; self.scalars.len()];
         for operation in &self.operations {
             uses[operation.scalar.0] += 1;
@@ -166,6 +174,8 @@ impl<C: EcCurve> Engine<C> {
             cs.transcript().append_u64(b"ec-window-width", width as u64);
             selections.push(selectors::<C, CS>(cs, &scalar.bits, width));
         }
+        let mut prepared_tables =
+            prepare_public_tables::<C>(&self.operations, &self.scalars, &widths, parallel_tables);
         let mut tables = BTreeMap::new();
         let mut relations = Vec::with_capacity(self.operations.len());
         for operation in self.operations {
@@ -213,11 +223,13 @@ impl<C: EcCurve> Engine<C> {
             let table = match tables.entry(key) {
                 std::collections::btree_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    Arc::clone(entry.insert(Arc::new(prepare_table::<C>(
-                        &operation.base,
-                        scalar.bits.len(),
-                        width,
-                    )?)))
+                    // Consume results where the original lazy construction ran.
+                    // Earlier assertions/witness failures retain precedence over
+                    // failures of tables prepared for later operations.
+                    let table = prepared_tables
+                        .remove(entry.key())
+                        .ok_or(Error::ProofOperationFailed)??;
+                    Arc::clone(entry.insert(table))
                 }
             };
             let witness = scalar
@@ -263,6 +275,44 @@ impl<C: EcCurve> Engine<C> {
         })
         .map_err(|_| Error::InvalidProof)
     }
+}
+
+type TableKey = (Vec<u8>, usize, usize);
+
+/// Prepare each used public table once. Native work can run concurrently, but
+/// result consumption, circuit allocations and proof transcript writes remain
+/// in operation order. In particular, never short-circuit the parallel collect.
+fn prepare_public_tables<C: EcCurve>(
+    operations: &[Operation<C>],
+    scalars: &[Scalar<C>],
+    widths: &[usize],
+    parallel: bool,
+) -> BTreeMap<TableKey, Result<Arc<Table<C::Scalar>>>> {
+    let mut seen = BTreeMap::new();
+    let mut tasks = Vec::new();
+    for operation in operations {
+        let bits = scalars[operation.scalar.0].bits.len();
+        if bits <= 4 {
+            continue;
+        }
+        let key = (
+            <C::Dkg as DkgGroup>::encode_point(&operation.base),
+            bits,
+            widths[operation.scalar.0],
+        );
+        if let std::collections::btree_map::Entry::Vacant(entry) = seen.entry(key) {
+            tasks.push((entry.key().clone(), operation.base));
+            entry.insert(());
+        }
+    }
+    let prepare =
+        |(key, base): &(TableKey, Point<C>)| prepare_table::<C>(base, key.1, key.2).map(Arc::new);
+    let results = if parallel {
+        tasks.par_iter().map(prepare).collect::<Vec<_>>()
+    } else {
+        tasks.iter().map(prepare).collect::<Vec<_>>()
+    };
+    tasks.into_iter().map(|(key, _)| key).zip(results).collect()
 }
 
 fn allocate_point<C: EcCurve, CS: ConstraintSystem<C>>(

@@ -1,20 +1,19 @@
 //! Opaque broadcasts, public verification and atomic participant completion.
 use crate::dealer_message::{self, ParsedDealerMessage};
-use crate::dealer_proof::{
-    DealerProofInstance, DealerProofReceiver, InstanceWitness, ReceiverWitness,
-};
+use crate::dealer_proof::{InstanceInput, InstanceWitness, ReceiverInput, ReceiverWitness};
 use crate::error::normalize_validation_error;
 use crate::output::DkgPublicInstance;
 use crate::secret::{secret, secret_vec, SecretVec, Wipeable};
 use crate::wire::reserve;
 use crate::{
-    DealerMessageNonce, DealerProofRef, DealerProofSystem, DealerProofWitness, DkgConfig, DkgGroup,
-    DkgInstanceKind, DkgOutput, DkgPublicOutput, Error, FeldmanCommitment, ParticipantIndex,
-    Polynomial, Result, TranscriptRoot,
+    DealerMessageNonce, DealerProofRef, DealerProofStatement, DealerProofSystem,
+    DealerProofWitness, DkgConfig, DkgGroup, DkgInstanceKind, DkgOutput, DkgPublicOutput, Error,
+    FeldmanCommitment, ParticipantIndex, Polynomial, Result, TranscriptRoot,
 };
 use core::fmt;
 use ff::Field;
 use group::Group;
+use p3_maybe_rayon::prelude::*;
 use rand_core::CryptoRngCore;
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
@@ -136,10 +135,7 @@ where
             if bool::from(pad.expose().is_zero()) {
                 return Err(Error::DegenerateEvrfOutput);
             }
-            receivers.push(DealerProofReceiver {
-                participant,
-                public_key: *key,
-                share_commitment: G::mul_generator(share.value()),
+            receivers.push(ReceiverInput {
                 pad_commitment: G::mul_generator(pad.expose()),
                 encrypted_share: *share.value() + pad.expose(),
             });
@@ -148,10 +144,8 @@ where
                 pad,
             });
         }
-        instances.push(DealerProofInstance {
-            kind,
+        instances.push(InstanceInput {
             nonce,
-            effective_message,
             coefficients,
             receivers,
         });
@@ -160,7 +154,7 @@ where
             receivers: openings,
         });
     }
-    let statement = dealer_message::statement(config, dealer, instances)?;
+    let statement = DealerProofStatement::new(config, dealer, instances)?;
     let witness = DealerProofWitness {
         identity_secret: secret(*identity_secret),
         instances: private_instances,
@@ -269,23 +263,28 @@ where
     for position in 0..config.instances().len() {
         let mut sum = secret(G::Scalar::ZERO);
         for message in &parsed {
-            let instance = &message.statement.instances[position];
-            let share = if message.statement.dealer == participant {
-                secret(
-                    *own.private_shares
-                        .get(position)
-                        .ok_or(Error::OwnDealingMismatch)?
-                        .expose(),
+            let instance = message
+                .statement
+                .instance(position)
+                .ok_or(Error::InvalidProof)?;
+            let (share, expected_commitment) = if message.statement.dealer() == participant {
+                (
+                    secret(
+                        *own.private_shares
+                            .get(position)
+                            .ok_or(Error::OwnDealingMismatch)?
+                            .expose(),
+                    ),
+                    dealer_message::evaluate::<G>(instance.commitment_coefficients(), participant),
                 )
             } else {
                 let receiver = instance
-                    .receivers
-                    .iter()
-                    .find(|receiver| receiver.participant == participant)
+                    .receivers()
+                    .find(|receiver| receiver.participant() == participant)
                     .ok_or(Error::ShareDecryptionFailed)?;
                 let pad = secret(
                     crate::main_golden::receiver_pad::<G>(
-                        instance.effective_message,
+                        instance.effective_message(),
                         identity_secret,
                         message.statement.dealer_public_key(),
                     )
@@ -294,15 +293,16 @@ where
                     })?,
                 );
                 if bool::from(pad.expose().is_zero())
-                    || G::mul_generator(pad.expose()) != receiver.pad_commitment
+                    || G::mul_generator(pad.expose()) != *receiver.pad_commitment()
                 {
                     return Err(Error::ShareDecryptionFailed);
                 }
-                secret(receiver.encrypted_share - pad.expose())
+                (
+                    secret(*receiver.encrypted_share() - pad.expose()),
+                    *receiver.share_commitment(),
+                )
             };
-            if G::mul_generator(share.expose())
-                != dealer_message::evaluate::<G>(&instance.coefficients, participant)
-            {
+            if G::mul_generator(share.expose()) != expected_commitment {
                 return Err(Error::ShareDecryptionFailed);
             }
             sum.0 += share.expose();
@@ -323,13 +323,25 @@ fn validate_public<'a, G: DkgGroup>(
 ) -> Result<Vec<ParsedDealerMessage<'a, G>>> {
     let mut parsed = reserve(board.len())?;
     let mut invalid = reserve(board.len())?;
-    for (dealer, bytes) in board {
-        match dealer_message::parse(config, *dealer, bytes) {
-            Ok(message) => parsed.push(message),
-            Err(Error::InvalidEncoding | Error::DealerMessageTooLarge | Error::InvalidProof) => {
-                invalid.push(*dealer)
+    let mut ordered = reserve(board.len())?;
+    ordered.extend(board.iter().map(|(&dealer, &bytes)| (dealer, bytes)));
+    // Keep at most one parse result per worker in flight. Collect in board
+    // order before classifying errors, preserving the first operational error
+    // and the complete ordered public-invalid dealer list.
+    let chunk_size = current_num_threads().max(1);
+    for chunk in ordered.chunks(chunk_size) {
+        let results = chunk
+            .par_iter()
+            .map(|(dealer, bytes)| dealer_message::parse(config, *dealer, bytes))
+            .collect::<Vec<_>>();
+        for ((dealer, _), result) in chunk.iter().zip(results) {
+            match result {
+                Ok(message) => parsed.push(message),
+                Err(
+                    Error::InvalidEncoding | Error::DealerMessageTooLarge | Error::InvalidProof,
+                ) => invalid.push(*dealer),
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
     }
     if !invalid.is_empty() {
@@ -384,10 +396,13 @@ fn aggregate_verified<G: DkgGroup>(
         let mut coefficients = reserve(config.threshold())?;
         coefficients.resize(config.threshold(), G::Point::identity());
         for message in messages {
-            for (sum, coefficient) in coefficients
-                .iter_mut()
-                .zip(&message.statement.instances[position].coefficients)
-            {
+            for (sum, coefficient) in coefficients.iter_mut().zip(
+                message
+                    .statement
+                    .instance(position)
+                    .ok_or(Error::InvalidProof)?
+                    .commitment_coefficients(),
+            ) {
                 *sum += coefficient;
             }
         }

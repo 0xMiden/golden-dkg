@@ -1,11 +1,10 @@
 //! Private configuration-shaped broadcast grammar and complete public validation.
-use crate::dealer_proof::{DealerProofInstance, DealerProofReceiver};
-use crate::wire::{count, framed, reserve, Reader};
+use crate::dealer_proof::{InstanceInput, ReceiverInput};
+use crate::wire::{framed, reserve, Reader};
 use crate::{
     DealerMessageNonce, DealerProofStatement, DkgConfig, DkgGroup, DkgInstanceKind, Error,
     ParticipantIndex, Result,
 };
-use ff::PrimeField;
 use group::Group;
 
 pub(crate) const MAX_DEALER_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -52,95 +51,6 @@ pub(crate) fn encoded_prefix_len<G: DkgGroup>(config: &DkgConfig<G>) -> Result<u
 
 pub(crate) use crate::feldman::evaluate;
 
-pub(crate) fn validate_instances<G: DkgGroup>(
-    config: &DkgConfig<G>,
-    dealer: ParticipantIndex,
-    instances: &[DealerProofInstance<G>],
-) -> Result<()> {
-    config.registry().public_key(dealer)?;
-    if instances.len() != config.instances().len() {
-        return Err(Error::InvalidEncoding);
-    }
-    for (position, instance) in instances.iter().enumerate() {
-        let kind = config.instances()[position];
-        if instance.kind != kind
-            || instance.coefficients.len() != config.threshold()
-            || instance.effective_message
-                != crate::main_golden::effective_message(
-                    config.root(),
-                    dealer,
-                    position,
-                    kind,
-                    instance.nonce,
-                )?
-            || instance.receivers.len() != config.registry().len() - 1
-            || (kind == DkgInstanceKind::Zero
-                && !bool::from(instance.coefficients[0].is_identity()))
-        {
-            return Err(Error::InvalidEncoding);
-        }
-        for (receiver, (participant, key)) in instance.receivers.iter().zip(
-            config
-                .registry()
-                .entries()
-                .filter(|(index, _)| *index != dealer),
-        ) {
-            if receiver.participant != participant
-                || receiver.public_key != *key
-                || receiver.share_commitment != evaluate::<G>(&instance.coefficients, participant)
-                || bool::from(receiver.pad_commitment.is_identity())
-                || G::mul_generator(&receiver.encrypted_share)
-                    != receiver.share_commitment + receiver.pad_commitment
-            {
-                return Err(Error::InvalidEncoding);
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn statement<G: DkgGroup>(
-    config: &DkgConfig<G>,
-    dealer: ParticipantIndex,
-    instances: Vec<DealerProofInstance<G>>,
-) -> Result<DealerProofStatement<G>> {
-    validate_instances(config, dealer, &instances)?;
-    let key = *config.registry().public_key(dealer)?;
-    let mut logical = Vec::new();
-    logical.extend_from_slice(&config.root());
-    logical.extend_from_slice(&dealer.get().to_be_bytes());
-    logical.extend_from_slice(&G::encode_point(&key));
-    logical.extend_from_slice(crate::main_golden::beta::<G>()?.to_repr().as_ref());
-    count(&mut logical, instances.len())?;
-    for (position, instance) in instances.iter().enumerate() {
-        count(&mut logical, position)?;
-        logical.push(instance.kind.tag());
-        logical.extend_from_slice(&instance.nonce.0);
-        logical.extend_from_slice(&instance.effective_message.0);
-        count(&mut logical, instance.coefficients.len())?;
-        for coefficient in &instance.coefficients {
-            logical.extend_from_slice(&G::encode_point(coefficient));
-        }
-        count(&mut logical, instance.receivers.len())?;
-        for receiver in &instance.receivers {
-            logical.extend_from_slice(&receiver.participant.get().to_be_bytes());
-            logical.extend_from_slice(&G::encode_point(&receiver.public_key));
-            logical.extend_from_slice(&G::encode_point(&receiver.share_commitment));
-            logical.extend_from_slice(&G::encode_point(&receiver.pad_commitment));
-            logical.extend_from_slice(&G::encode_scalar(&receiver.encrypted_share));
-        }
-    }
-    let root = crate::transcript::hash_payload(b"golden-dkg/dealer-root/v3", &logical)?;
-    Ok(DealerProofStatement {
-        config_root: config.root(),
-        dealer,
-        dealer_public_key: key,
-        instances,
-        logical,
-        root,
-    })
-}
-
 pub(crate) fn encode<G: DkgGroup>(
     config: &DkgConfig<G>,
     statement: &DealerProofStatement<G>,
@@ -159,16 +69,16 @@ pub(crate) fn encode<G: DkgGroup>(
     let mut out = zeroize::Zeroizing::new(reserve(length)?);
     framed(&mut out, MAGIC)?;
     out.extend_from_slice(&config.root());
-    out.extend_from_slice(&statement.dealer.get().to_be_bytes());
-    for instance in &statement.instances {
-        out.extend_from_slice(&instance.nonce.0);
-        let start = usize::from(instance.kind == DkgInstanceKind::Zero);
-        for coefficient in &instance.coefficients[start..] {
+    out.extend_from_slice(&statement.dealer().get().to_be_bytes());
+    for instance in statement.instances() {
+        out.extend_from_slice(&instance.nonce().0);
+        let start = usize::from(instance.kind() == DkgInstanceKind::Zero);
+        for coefficient in &instance.commitment_coefficients()[start..] {
             out.extend_from_slice(&G::encode_point(coefficient));
         }
-        for receiver in &instance.receivers {
-            out.extend_from_slice(&G::encode_point(&receiver.pad_commitment));
-            out.extend_from_slice(&G::encode_scalar(&receiver.encrypted_share));
+        for receiver in instance.receivers() {
+            out.extend_from_slice(&G::encode_point(receiver.pad_commitment()));
+            out.extend_from_slice(&G::encode_scalar(receiver.encrypted_share()));
         }
     }
     framed(&mut out, proof)?;
@@ -199,15 +109,8 @@ pub(crate) fn parse<'a, G: DkgGroup>(
     }
     config.registry().public_key(expected_dealer)?;
     let mut instances = reserve(config.instances().len())?;
-    for (position, kind) in config.instances().iter().copied().enumerate() {
+    for kind in config.instances().iter().copied() {
         let nonce = DealerMessageNonce(reader.array()?);
-        let effective_message = crate::main_golden::effective_message(
-            config.root(),
-            expected_dealer,
-            position,
-            kind,
-            nonce,
-        )?;
         let mut coefficients = reserve(config.threshold())?;
         if kind == DkgInstanceKind::Zero {
             coefficients.push(G::Point::identity());
@@ -216,25 +119,16 @@ pub(crate) fn parse<'a, G: DkgGroup>(
             coefficients.push(G::decode_point(reader.take(G::POINT_BYTES)?)?);
         }
         let mut receivers = reserve(config.registry().len() - 1)?;
-        for (participant, key) in config
-            .registry()
-            .entries()
-            .filter(|(index, _)| *index != expected_dealer)
-        {
+        for _ in 0..config.registry().len() - 1 {
             let pad_commitment = G::decode_point(reader.take(G::POINT_BYTES)?)?;
             let encrypted_share = G::decode_scalar(reader.take(32)?)?;
-            receivers.push(DealerProofReceiver {
-                participant,
-                public_key: *key,
-                share_commitment: evaluate::<G>(&coefficients, participant),
+            receivers.push(ReceiverInput {
                 pad_commitment,
                 encrypted_share,
             });
         }
-        instances.push(DealerProofInstance {
-            kind,
+        instances.push(InstanceInput {
             nonce,
-            effective_message,
             coefficients,
             receivers,
         });
@@ -245,7 +139,7 @@ pub(crate) fn parse<'a, G: DkgGroup>(
         return Err(Error::InvalidEncoding);
     }
     Ok(ParsedDealerMessage {
-        statement: statement(config, expected_dealer, instances)?,
+        statement: DealerProofStatement::new(config, expected_dealer, instances)?,
         proof,
     })
 }

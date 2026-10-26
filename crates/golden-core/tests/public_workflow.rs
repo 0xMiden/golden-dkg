@@ -96,11 +96,17 @@ fn mixed_workflow<G: DkgGroup>() {
             let public =
                 aggregate_public(&InsecureRevealedWitnessProof, &config, &board(&own)).unwrap();
             for id in config.registry().indexes() {
+                // The native constructor and strict decoder must produce the
+                // same statement: the existing proof binds its logical root.
+                let encoded = own[&id].to_bytes().unwrap();
+                let restored = OwnDealing::<G>::from_bytes(&config, id, &encoded).unwrap();
+                assert_eq!(restored.to_bytes().unwrap(), encoded);
+                assert_eq!(restored.broadcast_bytes(), own[&id].broadcast_bytes());
                 let output = complete(
                     &InsecureRevealedWitnessProof,
                     &config,
                     &credential::<G>(id),
-                    &own[&id],
+                    &restored,
                     &peers(&own, id),
                 )
                 .unwrap();
@@ -533,10 +539,42 @@ both!(
     batch_error_classes
 );
 
-// Native operations can fail independently of received bytes. Thread-local
-// injection isolates parallel cases and lets valid dealings precede the fault.
+// Worker-visible point failures preserve native adapter errors under parallel
+// decoding. Only the tests using this fault state take the serialization lock.
+static NATIVE_FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+enum PointDecodeFault {
+    None,
+    All,
+    Encodings(Vec<(Vec<u8>, Error)>),
+}
+static POINT_DECODE_FAULT: std::sync::Mutex<PointDecodeFault> =
+    std::sync::Mutex::new(PointDecodeFault::None);
+struct ScopedPointDecodeFault(PointDecodeFault);
+impl ScopedPointDecodeFault {
+    fn new(fault: PointDecodeFault) -> Self {
+        Self(std::mem::replace(
+            &mut *POINT_DECODE_FAULT.lock().unwrap(),
+            fault,
+        ))
+    }
+}
+impl Drop for ScopedPointDecodeFault {
+    fn drop(&mut self) {
+        *POINT_DECODE_FAULT.lock().unwrap() =
+            std::mem::replace(&mut self.0, PointDecodeFault::None);
+    }
+}
+fn point_decoding_failure(bytes: &[u8]) -> Option<Error> {
+    match &*POINT_DECODE_FAULT.lock().unwrap() {
+        PointDecodeFault::None => None,
+        PointDecodeFault::All => Some(Error::ProofOperationFailed),
+        PointDecodeFault::Encodings(values) => values
+            .iter()
+            .find(|(encoding, _)| encoding.as_slice() == bytes)
+            .map(|(_, error)| error.clone()),
+    }
+}
 std::thread_local! {
-    static FAIL_POINT_DECODING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_HASH_TO_POINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -551,8 +589,8 @@ impl<G: DkgGroup> DkgGroup for NativeFailure<G> {
         G::encode_point(point)
     }
     fn decode_point(bytes: &[u8]) -> Result<Self::Point> {
-        if FAIL_POINT_DECODING.with(|fail| fail.get()) {
-            return Err(Error::ProofOperationFailed);
+        if let Some(error) = point_decoding_failure(bytes) {
+            return Err(error);
         }
         G::decode_point(bytes)
     }
@@ -582,6 +620,7 @@ impl<G: DkgGroup> DkgGroup for NativeFailure<G> {
     }
 }
 fn native_operational_errors<G: DkgGroup>() {
+    let _serial = NATIVE_FAULT_TEST_LOCK.lock().unwrap();
     let config = configuration::<NativeFailure<G>>(2, 1, vec![Random]);
     let own = dealings(&config);
     let me = participant(1);
@@ -596,16 +635,14 @@ fn native_operational_errors<G: DkgGroup>() {
     let own_snapshot = own[&me].snapshot().unwrap();
     let output_snapshot = output.snapshot().unwrap();
     let recording = Recording::default();
-    let results = FAIL_POINT_DECODING.with(|fail| {
-        fail.set(true);
-        let results = [
+    let results = {
+        let _fault = ScopedPointDecodeFault::new(PointDecodeFault::All);
+        [
             verify_dealer_messages(&recording, &config, &board(&own)),
             own_snapshot.restore(&config, me).map(|_| ()),
             output_snapshot.restore(&config, me).map(|_| ()),
-        ];
-        fail.set(false);
-        results
-    });
+        ]
+    };
     for result in results {
         assert_eq!(result, Err(Error::ProofOperationFailed));
     }
@@ -665,6 +702,152 @@ fn native_operational_errors<G: DkgGroup>() {
 both!(
     native_operational_failures_remain_operational_across_boundaries,
     native_operational_errors
+);
+
+fn late_decoder_error_precedes_public_validation<G: DkgGroup>() {
+    let _serial = NATIVE_FAULT_TEST_LOCK.lock().unwrap();
+    let config = configuration::<NativeFailure<G>>(3, 2, vec![Random]);
+    let own = dealings(&config);
+    let dealer = participant(1);
+    let mut malformed = own[&dealer].broadcast_bytes().to_vec();
+    let coefficients = 8 + b"golden-dkg-wire-v4".len() + 32 + 4 + 32;
+    let first_pad = coefficients + config.threshold() * G::POINT_BYTES;
+    let first_scalar = first_pad + G::POINT_BYTES;
+    let second_pad = first_scalar + 32;
+    let changed =
+        G::decode_scalar(&malformed[first_scalar..first_scalar + 32]).unwrap() + G::Scalar::ONE;
+    malformed[first_scalar..first_scalar + 32].copy_from_slice(&G::encode_scalar(&changed));
+    let fault = malformed[second_pad..second_pad + G::POINT_BYTES].to_vec();
+    // Only the later receiver's decoder faults; an eager public check on the
+    // earlier altered ciphertext must not hide this operational error.
+    for offset in (coefficients..first_pad).step_by(G::POINT_BYTES) {
+        assert_ne!(
+            &malformed[offset..offset + G::POINT_BYTES],
+            fault.as_slice()
+        );
+    }
+    assert_ne!(&malformed[first_pad..first_scalar], fault.as_slice());
+    let candidate = [DealerMessageRef {
+        expected_dealer: dealer,
+        bytes: &malformed,
+    }];
+    let recording = Recording::default();
+    let result = {
+        let _fault = ScopedPointDecodeFault::new(PointDecodeFault::Encodings(vec![(
+            fault,
+            Error::ProofOperationFailed,
+        )]));
+        verify_dealer_messages(&recording, &config, &candidate)
+    };
+    assert_eq!(result, Err(Error::ProofOperationFailed));
+    assert_eq!(recording.batches.load(Ordering::SeqCst), 0);
+    assert_eq!(recording.singles.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        verify_dealer_messages(&recording, &config, &candidate),
+        Err(Error::InvalidDealerMessages {
+            dealers: vec![dealer]
+        }),
+    );
+    verify_dealer_messages(&recording, &config, &board(&own)).unwrap();
+}
+both!(
+    a_later_native_decoder_failure_is_not_hidden_by_an_invalid_public_relation,
+    late_decoder_error_precedes_public_validation
+);
+
+fn ordered_public_validation_across_chunks<G: DkgGroup>() {
+    let _serial = NATIVE_FAULT_TEST_LOCK.lock().unwrap();
+    let workers = p3_maybe_rayon::prelude::current_num_threads().max(1);
+    let count = u32::try_from(workers + 1).unwrap();
+    let config = configuration::<NativeFailure<G>>(count, 2, vec![Random]);
+    let recording = Recording::default();
+    // One more dealer than the worker count forces a second bounded chunk.
+    // Reverse transport order so association must restore canonical ordering.
+    let mut malformed = config
+        .registry()
+        .indexes()
+        .map(|dealer| DealerMessageRef {
+            expected_dealer: dealer,
+            bytes: &[],
+        })
+        .collect::<Vec<_>>();
+    malformed.reverse();
+    assert_eq!(
+        verify_dealer_messages(&recording, &config, &malformed),
+        Err(Error::InvalidDealerMessages {
+            dealers: config.registry().indexes().collect(),
+        }),
+    );
+
+    // Only two native dealings are needed, regardless of the worker count.
+    let last = participant(count);
+    let dealers = [participant(1), last];
+    let mut rng = ChaCha20Rng::from_seed([69; 32]);
+    let own = dealers
+        .into_iter()
+        .map(|dealer| {
+            (
+                dealer,
+                deal(
+                    &InsecureRevealedWitnessProof,
+                    &config,
+                    dealer,
+                    &credential::<G>(dealer),
+                    &mut rng,
+                )
+                .unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let coefficient_start = 8 + b"golden-dkg-wire-v4".len() + 32 + 4 + 32;
+    let fault_bytes = dealers.map(|dealer| {
+        own[&dealer].broadcast_bytes()[coefficient_start..coefficient_start + G::POINT_BYTES]
+            .to_vec()
+    });
+    assert_ne!(fault_bytes[0], fault_bytes[1]);
+    // The first operational error follows canonical dealer order, independently
+    // of the error class and the incoming transport order.
+    for (first, later) in [
+        (Error::ProofOperationFailed, Error::AllocationFailed),
+        (Error::AllocationFailed, Error::ProofOperationFailed),
+    ] {
+        let mut candidates = board(&own);
+        candidates.reverse();
+        let result = {
+            let _fault = ScopedPointDecodeFault::new(PointDecodeFault::Encodings(vec![
+                (fault_bytes[1].clone(), later),
+                (fault_bytes[0].clone(), first.clone()),
+            ]));
+            verify_dealer_messages(&recording, &config, &candidates)
+        };
+        assert_eq!(result, Err(first));
+    }
+    // Fill every earlier slot with invalid bytes so the final dealer really is
+    // parsed in the second chunk. Its operational error must take precedence
+    // over the public-invalid list collected from the complete first chunk.
+    let mut candidates = malformed.clone();
+    candidates
+        .iter_mut()
+        .find(|candidate| candidate.expected_dealer == last)
+        .unwrap()
+        .bytes = own[&last].broadcast_bytes();
+    let result = {
+        let _fault = ScopedPointDecodeFault::new(PointDecodeFault::Encodings(vec![(
+            fault_bytes[1].clone(),
+            Error::ProofOperationFailed,
+        )]));
+        verify_dealer_messages(&recording, &config, &candidates)
+    };
+    assert_eq!(result, Err(Error::ProofOperationFailed));
+    assert_eq!(recording.batches.load(Ordering::SeqCst), 0);
+    assert_eq!(recording.singles.load(Ordering::SeqCst), 0);
+    verify_dealer_messages(&recording, &config, &board(&own)).unwrap();
+    assert_eq!(recording.batches.load(Ordering::SeqCst), 1);
+    assert_eq!(recording.singles.load(Ordering::SeqCst), 0);
+}
+both!(
+    public_invalid_lists_and_operational_precedence_survive_worker_chunks,
+    ordered_public_validation_across_chunks
 );
 
 // A deliberately faulted native adapter makes negligible-probability pad

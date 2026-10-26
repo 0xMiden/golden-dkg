@@ -242,3 +242,76 @@ fn jubjub_shared_scalar_and_plan_obligations() {
 fn jubjub_rejects_malformed_certificate_witnesses() {
     check_certificate_witnesses::<crate::outer::cycle::Bls12_381G1Cycle>();
 }
+
+/// Exercise duplicated public tables, shared selectors and the direct tiny-
+/// scalar path together. The same seeded proof must cross-verify in both modes.
+fn check_table_preparation_equivalence<C: EcCurve>() {
+    fn plan<C: EcCurve, CS: RandomizableConstraintSystem<C>>(
+        cs: &mut CS,
+        prover: bool,
+        parallel: bool,
+    ) {
+        let bits = scalar_bits::<C, _>(cs, prover);
+        let mut engine = Engine::<C>::new();
+        let tiny = engine
+            .scalar(
+                bits[..3].to_vec(),
+                prover.then(|| bit_values(VALUE)[..3].to_vec()),
+            )
+            .unwrap();
+        let scalar = engine
+            .scalar(bits, prover.then(|| bit_values(VALUE)))
+            .unwrap();
+        let generator = Point::<C>::generator();
+        let second =
+            <C::Dkg as DkgGroup>::hash_to_point(b"ec-table-equivalence", b"second").unwrap();
+        for base in [generator, second, generator] {
+            let point = engine.mul(cs, &base, scalar).unwrap();
+            let expected = base * <C::Dkg as DkgGroup>::Scalar::from(VALUE);
+            engine.assert_equal(point, &expected).unwrap();
+        }
+        let point = engine.mul(cs, &generator, tiny).unwrap();
+        engine
+            .assert_equal(
+                point,
+                &(generator * <C::Dkg as DkgGroup>::Scalar::from(VALUE & 7)),
+            )
+            .unwrap();
+        engine.finalize_with_tables(cs, parallel).unwrap();
+    }
+    let pc = PedersenGens::<C>::default();
+    let bp = BulletproofGens::<C>::new(256, 1);
+    let mut reference = None;
+    for parallel in [false, true] {
+        let mut rng = ChaCha20Rng::from_seed([74; 32]);
+        let mut prover =
+            Prover::<C, _>::new(&pc, Transcript::new(b"table-preparation-equivalence"));
+        plan::<C, _>(&mut prover, true, parallel);
+        let proof = prover.prove(&bp, &mut rng).unwrap();
+        let encoded = proof.to_bytes();
+        if let Some(reference) = &reference {
+            assert_eq!(reference, &encoded);
+        } else {
+            reference = Some(encoded);
+        }
+        let mut verifier = Verifier::<C, _>::new(Transcript::new(b"table-preparation-equivalence"));
+        plan::<C, _>(&mut verifier, false, !parallel);
+        verifier
+            .verification_equation(&proof, &pc, &bp, &mut rng)
+            .unwrap()
+            .verify()
+            .unwrap();
+    }
+}
+
+#[cfg(feature = "secp-secq")]
+#[test]
+fn secp_parallel_table_preparation_preserves_proof_bytes() {
+    check_table_preparation_equivalence::<crate::outer::secp::SecqCycle>();
+}
+
+#[cfg(feature = "jubjub-bls12-381")]
+#[test]
+fn jubjub_parallel_table_preparation_preserves_proof_bytes() {
+    check_table_preparation_equivalence::<crate::outer::cycle::Bls12_381G1Cycle>();
+}

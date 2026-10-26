@@ -164,10 +164,10 @@ fn restore_own<G: DkgGroup>(
     }
     reader.ensure_items(count, 32)?;
     let mut shares = secret_vec(count)?;
-    for instance in &message.statement.instances {
+    for instance in message.statement.instances() {
         let share = crate::secret::secret(G::decode_scalar(reader.take(32)?)?);
         if G::mul_generator(share.expose())
-            != crate::dealer_message::evaluate::<G>(&instance.coefficients, expected)
+            != crate::dealer_message::evaluate::<G>(instance.commitment_coefficients(), expected)
         {
             return Err(Error::InvalidPersistedState);
         }
