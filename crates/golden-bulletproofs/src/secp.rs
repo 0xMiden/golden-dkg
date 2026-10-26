@@ -1,19 +1,27 @@
-//! Private Secp chord-rule circuit; policy/native evaluation remains in core.
+//! Private Secp circuits; policy/native evaluation remains in core.
 #![allow(non_snake_case)]
 use crate::{
     driver::{Backend, Slot},
+    ec::{Affine, EcCurve, Engine, ScalarRef},
     outer::secp::SecqCycle,
 };
-use bulletproofs_cycle::{ConstraintSystem, Cycle, LinearCombination, R1CSError, Variable};
+#[cfg(test)]
+use bulletproofs_cycle::Cycle;
+use bulletproofs_cycle::{
+    r1cs::RandomizableConstraintSystem, ConstraintSystem, LinearCombination, R1CSError, Variable,
+};
 use ff::{Field, PrimeField};
 use golden_core::{DkgGroup, Error, Result};
 use golden_curves::secp256k1::Secp256k1Group;
 use group::{Curve, Group};
 use halo2curves::secp256k1::{Fp, Fq, Secp256k1, Secp256k1Affine};
-use halo2curves::{Coordinates, CurveAffine, CurveExt};
+#[cfg(test)]
+use halo2curves::CurveExt;
+use halo2curves::{Coordinates, CurveAffine};
 type R1csField = Fp;
 type R1csCycle = SecqCycle;
 type Gin = Secp256k1;
+#[cfg(test)]
 const CHORD_CORRECTION_DOMAIN: &str = "golden-paper-evrf-chord-correction-v1";
 fn affine(point: &Gin) -> Result<(Fp, Fp)> {
     let aff = point.to_affine();
@@ -83,6 +91,7 @@ fn modulus_bit(modulus_le: &[u8; 32], j: usize) -> bool {
 /// Boneh et al. 2024/397: `c_0 = 1`, `c_1 = ... = c_{λ-1} = 2`,
 /// `c_λ = s - (2λ - 1)` where `s = |G_in|`.  Since `s ≡ 0` in `Fq`, this
 /// simplifies to `c_λ = 1 - 2λ`.
+#[cfg(test)]
 fn chord_cj(j: usize, lambda: usize) -> Fq {
     if j == 0 {
         Fq::ONE
@@ -107,6 +116,7 @@ fn chord_cj(j: usize, lambda: usize) -> Fq {
 ///   linear combination of the two window bits and their product (see
 ///   [`window_delta_x_lc`]).
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct ChordPrecomp {
     /// `(x, y)` of `C_0 = c_0 · G_S`, the base case's correction point.
     c0: (Fp, Fp),
@@ -124,6 +134,7 @@ struct ChordPrecomp {
 /// must be even). The correction generator `G_S(X)` is derived from `X`,
 /// so each base gets independent correction points. All coordinates are
 /// native `Fp` elements.
+#[cfg(test)]
 fn precompute_chord(X: &Gin, lambda: usize) -> Result<ChordPrecomp> {
     if lambda == 0 || !lambda.is_multiple_of(2) {
         return Err(Error::InvalidProof);
@@ -336,6 +347,7 @@ fn constrain_bits_lt_bound_when<CS: ConstraintSystem<R1csCycle>>(
 /// Witness values for one chord-rule exponentiation: `L_w` at every
 /// checkpoint boundary (see [`chord_is_checkpoint_window`]) and the
 /// window addition slopes `s_w` needed by the R1CS gadget.
+#[cfg(test)]
 struct ChordWitness {
     /// `(x_{L_w}, y_{L_w})` for each checkpoint window `w`, in
     /// increasing order. The gadget only ever reads the running point at
@@ -352,6 +364,7 @@ struct ChordWitness {
     inverses: Vec<R1csField>,
 }
 
+#[cfg(test)]
 fn chord_compute_witness_precomputed(
     bits: &[bool],
     precomp: &ChordPrecomp,
@@ -445,6 +458,7 @@ fn chord_compute_witness_precomputed(
 
 /// Build the linear combination for `x_{Δ_0}` = `k_0 * (x_{D_0} - x_{C_0})
 /// + x_{C_0}`, the gadget's unpaired base-case bit.
+#[cfg(test)]
 fn delta0_x_lc(
     k0_var: Variable<R1csField>,
     precomp: &ChordPrecomp,
@@ -455,6 +469,7 @@ fn delta0_x_lc(
 }
 
 /// Build the linear combination for `y_{Δ_0}`.
+#[cfg(test)]
 fn delta0_y_lc(
     k0_var: Variable<R1csField>,
     precomp: &ChordPrecomp,
@@ -471,6 +486,7 @@ fn delta0_y_lc(
 /// and_var*(Q11.x-Q10.x-Q01.x+Q00.x)`. A pure linear combination once
 /// `and_var` is known, so window selection costs no multiplier gate of
 /// its own beyond the one shared `and_var` product.
+#[cfg(test)]
 fn window_delta_x_lc(
     s0_var: Variable<R1csField>,
     s1_var: Variable<R1csField>,
@@ -489,6 +505,7 @@ fn window_delta_x_lc(
 
 /// Build the linear combination for `y_{Δ_w}`, the y-coordinate
 /// analogue of [`window_delta_x_lc`].
+#[cfg(test)]
 fn window_delta_y_lc(
     s0_var: Variable<R1csField>,
     s1_var: Variable<R1csField>,
@@ -512,6 +529,7 @@ fn window_delta_y_lc(
 /// across every [`chord_exponentiate_r1cs_with_result`] call that reuses
 /// those bits, so the shared product is paid for once rather than once
 /// per chord.
+#[cfg(test)]
 fn chord_window_products<CS: ConstraintSystem<R1csCycle>>(
     cs: &mut CS,
     bit_vars: &[Variable<R1csField>],
@@ -533,6 +551,7 @@ fn chord_window_products<CS: ConstraintSystem<R1csCycle>>(
 /// instead of an ever-growing linear combination. Bounds the per-step
 /// evaluation cost of the running point at the cost of one multiplier
 /// gate (an allocated pair) per interval.
+#[cfg(test)]
 const CHORD_CHECKPOINT_INTERVAL: usize = 16;
 
 /// Whether window `w` (`w = 1..=num_windows`) is a checkpoint boundary:
@@ -540,12 +559,14 @@ const CHORD_CHECKPOINT_INTERVAL: usize = 16;
 /// [`chord_compute_witness_precomputed`] retains only these boundary coordinates in
 /// [`ChordWitness::checkpoint_coords`]. The final window is always a
 /// checkpoint so the gadget has a concrete result to return.
+#[cfg(test)]
 fn chord_is_checkpoint_window(w: usize, num_windows: usize) -> bool {
     w.is_multiple_of(CHORD_CHECKPOINT_INTERVAL) || w == num_windows
 }
 
 /// Number of checkpoint windows in `1..=num_windows` (the length
 /// [`ChordWitness::checkpoint_coords`] must have for a given chord).
+#[cfg(test)]
 fn chord_checkpoint_count(num_windows: usize) -> usize {
     let full_intervals = num_windows / CHORD_CHECKPOINT_INTERVAL;
     if num_windows.is_multiple_of(CHORD_CHECKPOINT_INTERVAL) {
@@ -591,6 +612,7 @@ fn chord_checkpoint_count(num_windows: usize) -> usize {
 /// preparation counts the resulting exact allocation layout.
 ///
 /// Returns the `(x_{L_λ}, y_{L_λ})` variables.
+#[cfg(test)]
 fn chord_exponentiate_r1cs_with_result<CS: ConstraintSystem<R1csCycle>>(
     cs: &mut CS,
     bit_vars: &[Variable<R1csField>],
@@ -720,6 +742,7 @@ fn chord_exponentiate_r1cs_with_result<CS: ConstraintSystem<R1csCycle>>(
 /// `precompute_chord` produces the same table on every call. PK_1 and every
 /// receiver's pad commitment exponentiate against `g_in`, so this is
 /// computed once per process instead of repeatedly per proof.
+#[cfg(test)]
 fn shared_g_in_chord_precomp() -> &'static ChordPrecomp {
     static PRECOMP: std::sync::OnceLock<ChordPrecomp> = std::sync::OnceLock::new();
     PRECOMP.get_or_init(|| {
@@ -728,6 +751,7 @@ fn shared_g_in_chord_precomp() -> &'static ChordPrecomp {
     })
 }
 /// Derive `G_S(X)` for the chord-rule correction terms used with base `X`.
+#[cfg(test)]
 fn chord_correction_generator(X: &Gin) -> Gin {
     let compressed = group::GroupEncoding::to_bytes(X);
     <Secp256k1 as CurveExt>::hash_to_curve(CHORD_CORRECTION_DOMAIN)(compressed.as_ref())
@@ -785,10 +809,12 @@ fn reduce_scalar_r1cs<CS: ConstraintSystem<R1csCycle>>(
     constrain_bits_lt_bound_when(cs, &bits, &assignments, &SECP256K1_P_MINUS_Q_LE, quotient)?;
     Ok((remainder, bits))
 }
+#[cfg(test)]
 struct SecretPrefix {
     bits: Vec<Variable<Fp>>,
     products: Vec<Variable<Fp>>,
 }
+#[cfg(test)]
 fn prefix<CS: ConstraintSystem<R1csCycle>>(
     cs: &mut CS,
     pk: &Gin,
@@ -821,68 +847,40 @@ fn prefix<CS: ConstraintSystem<R1csCycle>>(
     .map_err(|_| Error::InvalidProof)?;
     Ok(SecretPrefix { bits, products })
 }
-struct SlotWitness {
-    dh: ChordWitness,
-    k: Fp,
-    k_quotient: Fp,
-    k_inverse: Fp,
-    t1: ChordWitness,
-    t2: ChordWitness,
-    pad: Fp,
-    pad_quotient: Fp,
-    pad_point: ChordWitness,
+/// DH and its canonical exponent are independent of the sharing message.
+#[cfg(test)]
+struct ReceiverPrefix {
+    bits: Vec<Variable<Fp>>,
+    products: Vec<Variable<Fp>>,
+    scalar: Option<Fq>,
 }
 fn reduction_witness(value: &Fp) -> (Fp, Fp) {
     let reduced = scalar_to_base(&Secp256k1Group::reduce_base_field(value));
     (reduced, if reduced == *value { Fp::ZERO } else { Fp::ONE })
 }
-fn slot_witness(
-    secret: &Fq,
-    slot: &Slot<Secp256k1Group>,
-    beta: Fp,
-    peer: &ChordPrecomp,
-    h1: &ChordPrecomp,
-    h2: &ChordPrecomp,
-) -> Result<SlotWitness> {
-    let (dh_x, _) = affine(&(slot.peer * *secret))?;
-    let (k, k_quotient) = reduction_witness(&dh_x);
-    let k_inverse = Option::<Fp>::from(k.invert()).ok_or(Error::InvalidProof)?;
-    let mut k_bits = [false; K_BITS + 1];
-    decompose_k_fp(&k, &mut k_bits);
-    let t1 = chord_compute_witness_precomputed(&k_bits, h1)?;
-    let t2 = chord_compute_witness_precomputed(&k_bits, h2)?;
-    let t1_x = t1.checkpoint_coords.last().ok_or(Error::InvalidProof)?.0;
-    let t2_x = t2.checkpoint_coords.last().ok_or(Error::InvalidProof)?.0;
-    let (pad, pad_quotient) = reduction_witness(&(beta * t1_x + t2_x));
-    let mut secret_bits = [false; K_BITS + 1];
-    decompose_k_fp(&scalar_to_base(secret), &mut secret_bits);
-    let mut pad_bits = [false; K_BITS + 1];
-    decompose_k_fp(&pad, &mut pad_bits);
-    Ok(SlotWitness {
-        dh: chord_compute_witness_precomputed(&secret_bits, peer)?,
-        k,
-        k_quotient,
-        k_inverse,
-        t1,
-        t2,
-        pad,
-        pad_quotient,
-        pad_point: chord_compute_witness_precomputed(&pad_bits, shared_g_in_chord_precomp())?,
+fn scalar_bit_witness(value: Option<Fp>) -> Option<Vec<bool>> {
+    value.map(|value| {
+        let mut bits = vec![false; K_BITS + 1];
+        decompose_k_fp(&value, &mut bits);
+        bits
     })
 }
-#[allow(clippy::too_many_arguments)]
-fn receiver_slot<CS: ConstraintSystem<R1csCycle>>(
+#[cfg(test)]
+fn receiver_prefix<CS: ConstraintSystem<R1csCycle>>(
     cs: &mut CS,
-    slot: &Slot<Secp256k1Group>,
+    peer_point: &Gin,
     prefix: &SecretPrefix,
     secret: Option<&Fq>,
-    beta: Fp,
     peer: &ChordPrecomp,
-    h1: &ChordPrecomp,
-    h2: &ChordPrecomp,
-) -> Result<()> {
-    let witness = secret
-        .map(|secret| slot_witness(secret, slot, beta, peer, h1, h2))
+) -> Result<ReceiverPrefix> {
+    let native = secret
+        .map(|secret| affine(&(peer_point * *secret)))
+        .transpose()?
+        .map(|(x, _)| reduction_witness(&x));
+    let secret_bits = scalar_bit_witness(secret.map(scalar_to_base));
+    let dh = secret_bits
+        .as_ref()
+        .map(|bits| chord_compute_witness_precomputed(bits, peer))
         .transpose()?;
     let (dh_x, _) = chord_exponentiate_r1cs_with_result(
         cs,
@@ -890,35 +888,83 @@ fn receiver_slot<CS: ConstraintSystem<R1csCycle>>(
         peer,
         &prefix.products,
         None,
-        witness.as_ref().map(|w| &w.dh),
+        dh.as_ref(),
     )
     .map_err(|_| Error::InvalidProof)?;
-    let (k, k_bits) = reduce_scalar_r1cs(
-        cs,
-        dh_x.into(),
-        witness.as_ref().map(|w| (w.k, w.k_quotient)),
-    )
-    .map_err(|_| Error::InvalidProof)?;
-    let inverse = cs
-        .allocate(witness.as_ref().map(|w| w.k_inverse))
-        .map_err(|_| Error::InvalidProof)?;
+    let (k, bits) = reduce_scalar_r1cs(cs, dh_x.into(), native).map_err(|_| Error::InvalidProof)?;
+    let inverse = native
+        .map(|(k, _)| Option::<Fp>::from(k.invert()).ok_or(Error::InvalidProof))
+        .transpose()?;
+    let inverse = cs.allocate(inverse).map_err(|_| Error::InvalidProof)?;
     let (_, _, product) = cs.multiply(k.into(), inverse.into());
     cs.constrain(product - Fp::ONE);
-    let products = chord_window_products(cs, &k_bits).map_err(|_| Error::InvalidProof)?;
+    let products = chord_window_products(cs, &bits).map_err(|_| Error::InvalidProof)?;
+    Ok(ReceiverPrefix {
+        bits,
+        products,
+        scalar: native.map(|(k, _)| Secp256k1Group::reduce_base_field(&k)),
+    })
+}
+#[cfg(test)]
+struct SlotWitness {
+    t1: ChordWitness,
+    t2: ChordWitness,
+    pad: Fp,
+    pad_quotient: Fp,
+    pad_point: ChordWitness,
+}
+#[cfg(test)]
+fn slot_witness(
+    scalar: &Fq,
+    beta: Fp,
+    h1: &ChordPrecomp,
+    h2: &ChordPrecomp,
+) -> Result<SlotWitness> {
+    let mut k_bits = [false; K_BITS + 1];
+    decompose_k_fp(&scalar_to_base(scalar), &mut k_bits);
+    let t1 = chord_compute_witness_precomputed(&k_bits, h1)?;
+    let t2 = chord_compute_witness_precomputed(&k_bits, h2)?;
+    let t1_x = t1.checkpoint_coords.last().ok_or(Error::InvalidProof)?.0;
+    let t2_x = t2.checkpoint_coords.last().ok_or(Error::InvalidProof)?.0;
+    let (pad, pad_quotient) = reduction_witness(&(beta * t1_x + t2_x));
+    let mut pad_bits = [false; K_BITS + 1];
+    decompose_k_fp(&pad, &mut pad_bits);
+    Ok(SlotWitness {
+        t1,
+        t2,
+        pad,
+        pad_quotient,
+        pad_point: chord_compute_witness_precomputed(&pad_bits, shared_g_in_chord_precomp())?,
+    })
+}
+#[cfg(test)]
+fn receiver_slot<CS: ConstraintSystem<R1csCycle>>(
+    cs: &mut CS,
+    slot: &Slot<Secp256k1Group>,
+    prefix: &ReceiverPrefix,
+    beta: Fp,
+    h1: &ChordPrecomp,
+    h2: &ChordPrecomp,
+) -> Result<()> {
+    let witness = prefix
+        .scalar
+        .as_ref()
+        .map(|scalar| slot_witness(scalar, beta, h1, h2))
+        .transpose()?;
     let (t1_x, _) = chord_exponentiate_r1cs_with_result(
         cs,
-        &k_bits,
+        &prefix.bits,
         h1,
-        &products,
+        &prefix.products,
         None,
         witness.as_ref().map(|w| &w.t1),
     )
     .map_err(|_| Error::InvalidProof)?;
     let (t2_x, _) = chord_exponentiate_r1cs_with_result(
         cs,
-        &k_bits,
+        &prefix.bits,
         h2,
-        &products,
+        &prefix.products,
         None,
         witness.as_ref().map(|w| &w.t2),
     )
@@ -942,12 +988,128 @@ fn receiver_slot<CS: ConstraintSystem<R1csCycle>>(
     Ok(())
 }
 
+impl EcCurve for SecqCycle {
+    fn a() -> Fp {
+        Fp::ZERO
+    }
+    fn b() -> Fp {
+        Fp::from(7)
+    }
+    fn affine(point: &Gin) -> Result<Affine<Fp>> {
+        let (x, y) = affine(point)?;
+        Ok(Affine { x, y })
+    }
+    fn batch_affine(points: &[Gin]) -> Result<Vec<Affine<Fp>>> {
+        batch_affine(points)
+            .map(|points| points.into_iter().map(|(x, y)| Affine { x, y }).collect())
+    }
+    fn native_x<CS: ConstraintSystem<Self>>(
+        _: &mut CS,
+        point: (Variable<Fp>, Variable<Fp>),
+        _: Option<&Gin>,
+    ) -> Result<Variable<Fp>> {
+        Ok(point.0)
+    }
+}
+
+/// Register every EC relation before the common commitment/challenge boundary.
+fn build_deferred<CS: RandomizableConstraintSystem<SecqCycle>>(
+    cs: &mut CS,
+    pk: &Gin,
+    slots: &[Slot<Secp256k1Group>],
+    secret: Option<&Fq>,
+    beta: Fp,
+) -> Result<()> {
+    let mut engine = Engine::<SecqCycle>::new();
+    let value = secret.map(scalar_to_base);
+    let bools = scalar_bit_witness(value);
+    let assignments = (0..=K_BITS)
+        .map(|i| {
+            bools
+                .as_ref()
+                .map(|bits| if bits[i] { Fp::ONE } else { Fp::ZERO })
+        })
+        .collect::<Vec<_>>();
+    let variable = cs.allocate(value).map_err(|_| Error::InvalidProof)?;
+    let bits = bit_decompose_q(cs, variable, &assignments).map_err(|_| Error::InvalidProof)?;
+    let dealer = engine.scalar(bits, bools)?;
+    let anchor = engine.mul(cs, &Gin::generator(), dealer)?;
+    engine.assert_equal(anchor, pk)?;
+
+    // Instance-major slots revisit each receiver. Reuse the certified DH point,
+    // exact reduction, nonzero check and window selectors across those visits.
+    let mut receivers = std::collections::BTreeMap::<Vec<u8>, (ScalarRef, Option<Fq>)>::new();
+    for slot in slots {
+        for point in [&slot.peer, &slot.h1, &slot.h2, &slot.pad] {
+            if bool::from(point.is_identity()) {
+                return Err(Error::InvalidProof);
+            }
+        }
+        let key = Secp256k1Group::encode_point(&slot.peer);
+        let (scalar, native) = match receivers.entry(key) {
+            std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let point = engine.mul(cs, &slot.peer, dealer)?;
+                let x = engine.point_x(cs, point)?;
+                let native = secret
+                    .map(|secret| affine(&(slot.peer * *secret)))
+                    .transpose()?
+                    .map(|(x, _)| reduction_witness(&x));
+                let (k, bits) =
+                    reduce_scalar_r1cs(cs, x.into(), native).map_err(|_| Error::InvalidProof)?;
+                let inverse = native
+                    .map(|(k, _)| Option::<Fp>::from(k.invert()).ok_or(Error::InvalidProof))
+                    .transpose()?;
+                let inverse = cs.allocate(inverse).map_err(|_| Error::InvalidProof)?;
+                let (_, _, product) = cs.multiply(k.into(), inverse.into());
+                cs.constrain(product - Fp::ONE);
+                let scalar = engine.scalar(bits, scalar_bit_witness(native.map(|(k, _)| k)))?;
+                let native = native.map(|(k, _)| Secp256k1Group::reduce_base_field(&k));
+                *entry.insert((scalar, native))
+            }
+        };
+        let t1 = engine.mul(cs, &slot.h1, scalar)?;
+        let t2 = engine.mul(cs, &slot.h2, scalar)?;
+        let t1_x = engine.point_x(cs, t1)?;
+        let t2_x = engine.point_x(cs, t2)?;
+        let native = native
+            .map(|k| -> Result<(Fp, Fp)> {
+                let (x1, _) = affine(&(slot.h1 * k))?;
+                let (x2, _) = affine(&(slot.h2 * k))?;
+                Ok(reduction_witness(&(beta * x1 + x2)))
+            })
+            .transpose()?;
+        let (_, bits) =
+            reduce_scalar_r1cs(cs, t1_x * beta + t2_x, native).map_err(|_| Error::InvalidProof)?;
+        let pad = engine.scalar(bits, scalar_bit_witness(native.map(|(pad, _)| pad)))?;
+        let point = engine.mul(cs, &Gin::generator(), pad)?;
+        engine.assert_equal(point, &slot.pad)?;
+    }
+    engine.finalize(cs)
+}
+
 impl Backend for SecqCycle {
     type Dkg = Secp256k1Group;
-    const PROOF_ID: &'static [u8] = b"golden-dkg/main-golden/secp-secq-bp/v1";
+    const PROOF_ID: &'static [u8] = b"golden-dkg/main-golden/secp-secq-bp/v2";
+    const CIRCUIT_COSTS: crate::shape::CircuitCosts = crate::shape::CircuitCosts {
+        secret_multipliers: 514,
+        reduction_multipliers: 713,
+        reduction_allocations: 1,
+        native_x_multipliers: 0,
+        native_x_allocations: 0,
+    };
     const CYCLE_ID: &'static str = "secq256k1";
-    const MULTIPLIER_COUNTS: [usize; 3] = [1_227, 5_247, 9_268];
-    fn build<CS: ConstraintSystem<Self>>(
+    fn build<CS: RandomizableConstraintSystem<Self>>(
+        cs: &mut CS,
+        pk: &Gin,
+        slots: &[Slot<Secp256k1Group>],
+        secret: Option<&Fq>,
+        beta: Fp,
+    ) -> Result<()> {
+        build_deferred(cs, pk, slots, secret, beta)
+    }
+    #[cfg(test)]
+    fn build_ladder<CS: ConstraintSystem<Self>>(
         cs: &mut CS,
         pk: &Gin,
         slots: &[Slot<Secp256k1Group>],
@@ -971,6 +1133,7 @@ impl Backend for SecqCycle {
         // One allocation/decomposition, one generator relation and one set of
         // dealer-secret window products serve every instance-major receiver slot.
         let shared = prefix(cs, pk, secret)?;
+        let mut receivers = std::collections::BTreeMap::new();
         for slot in slots {
             let peer = tables
                 .get(&Secp256k1Group::encode_point(&slot.peer))
@@ -981,7 +1144,14 @@ impl Backend for SecqCycle {
             let h2 = tables
                 .get(&Secp256k1Group::encode_point(&slot.h2))
                 .ok_or(Error::ProofOperationFailed)?;
-            receiver_slot(cs, slot, &shared, secret, beta, peer, h1, h2)?;
+            let key = Secp256k1Group::encode_point(&slot.peer);
+            let receiver = match receivers.entry(key) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(receiver_prefix(cs, &slot.peer, &shared, secret, peer)?)
+                }
+            };
+            receiver_slot(cs, slot, receiver, beta, h1, h2)?;
         }
         Ok(())
     }

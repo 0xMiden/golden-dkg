@@ -9,6 +9,8 @@
 
 #[cfg(any(feature = "secp-secq", feature = "jubjub-bls12-381"))]
 mod driver;
+#[cfg(any(feature = "secp-secq", feature = "jubjub-bls12-381"))]
+mod ec;
 mod outer;
 #[cfg(any(feature = "secp-secq", feature = "jubjub-bls12-381"))]
 mod prepared;

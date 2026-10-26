@@ -1,5 +1,8 @@
 //! Typed artifact storage, deliberately separate from proof/protocol encoding.
-use crate::{driver::Backend, shape::required_capacity};
+use crate::{
+    driver::Backend,
+    shape::{Layout, Shape},
+};
 use bulletproofs_cycle::{
     generators::{BulletproofGens, PedersenGens},
     Cycle,
@@ -7,17 +10,22 @@ use bulletproofs_cycle::{
 use golden_core::wire::{framed as frame, Reader};
 use golden_core::{DkgConfig, DkgGroup, Error, Result, PROTOCOL_VERSION};
 use group::Group;
+use std::sync::OnceLock;
 
 const MAGIC: &[u8] = b"golden-dkg-prepared";
 const VERSION: u32 = 1;
 
 pub(crate) struct Prepared<C: Backend> {
     pub capacity: usize,
+    // One public shape, containing counts only; never grows generator state.
+    pub layout: OnceLock<(Shape, Layout)>,
     pub generators: Option<(PedersenGens<C>, BulletproofGens<C>)>,
 }
 impl<C: Backend> Prepared<C> {
     pub fn prepare_for(config: &DkgConfig<C::Dkg>) -> Result<Self> {
-        let capacity = required_capacity::<C>(config)?;
+        let shape = Shape::of(config);
+        let layout = shape.layout::<C>()?;
+        let capacity = layout.capacity()?;
         let generators = if capacity == 0 {
             None
         } else {
@@ -28,18 +36,30 @@ impl<C: Backend> Prepared<C> {
         };
         Ok(Self {
             capacity,
+            layout: OnceLock::from((shape, layout)),
             generators,
         })
     }
-    pub fn check_capacity(&self, config: &DkgConfig<C::Dkg>) -> Result<()> {
-        let required = required_capacity::<C>(config)?;
+    pub fn check_capacity(&self, config: &DkgConfig<C::Dkg>) -> Result<Layout> {
+        let shape = Shape::of(config);
+        let layout = match self.layout.get().filter(|(key, _)| *key == shape) {
+            Some((_, layout)) => *layout,
+            None => {
+                let layout = shape.layout::<C>()?;
+                // Restored artifacts remember their first shape. Other shapes
+                // are checked without replacing that bounded, immutable cache.
+                let _ = self.layout.set((shape, layout));
+                layout
+            }
+        };
+        let required = layout.capacity()?;
         if self.capacity < required {
             return Err(Error::InsufficientProofCapacity {
                 required,
                 available: self.capacity,
             });
         }
-        Ok(())
+        Ok(layout)
     }
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -134,6 +154,7 @@ impl<C: Backend> Prepared<C> {
         if capacity == 0 {
             return Ok(Self {
                 capacity,
+                layout: OnceLock::new(),
                 generators: None,
             });
         }
@@ -157,6 +178,7 @@ impl<C: Backend> Prepared<C> {
             .map_err(|_| Error::MalformedPreparedGenerators)?;
         Ok(Self {
             capacity,
+            layout: OnceLock::new(),
             generators: Some((pc, bp)),
         })
     }
