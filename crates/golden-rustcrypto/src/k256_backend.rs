@@ -4,13 +4,12 @@ use core::fmt;
 
 use golden_core::{Error, FieldByteOrder, GoldenGroup, GoldenHashToGroup, GoldenScalar, Result};
 use k256::elliptic_curve::ff::Field;
-use k256::elliptic_curve::hash2curve::{ExpandMsgXmd, GroupDigest};
-use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+use k256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
 use k256::elliptic_curve::Group;
 use k256::elliptic_curve::PrimeField;
-use k256::{AffinePoint, EncodedPoint, FieldBytes, ProjectivePoint, Scalar, Secp256k1};
+use k256::hash2curve::GroupDigest;
+use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar, Sec1Point, Secp256k1};
 use rand_core::CryptoRngCore;
-use sha2::Sha256;
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -79,7 +78,7 @@ impl GoldenScalar for K256Scalar {
     }
 
     fn random(rng: &mut impl CryptoRngCore) -> Self {
-        Self(Scalar::random(rng))
+        Self(Scalar::random(&mut crate::rng::RngCompat(rng)))
     }
 
     fn from_u64(value: u64) -> Result<Self> {
@@ -212,7 +211,7 @@ impl GoldenGroup for K256Backend {
             return [0u8; 33];
         }
         let affine = AffinePoint::from(point.0);
-        let encoded = affine.to_encoded_point(true);
+        let encoded = affine.to_sec1_point(true);
         let mut out = [0u8; 33];
         out.copy_from_slice(encoded.as_bytes());
         out
@@ -226,8 +225,8 @@ impl GoldenGroup for K256Backend {
         if repr == &[0u8; 33] {
             return Ok(Self::identity());
         }
-        let encoded = EncodedPoint::from_bytes(repr).map_err(|_| Error::InvalidEncoding)?;
-        let affine = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&encoded))
+        let encoded = Sec1Point::from_bytes(repr).map_err(|_| Error::InvalidEncoding)?;
+        let affine = Option::<AffinePoint>::from(AffinePoint::from_sec1_point(&encoded))
             .ok_or(Error::InvalidEncoding)?;
         Ok(K256Element(ProjectivePoint::from(affine)))
     }
@@ -235,7 +234,7 @@ impl GoldenGroup for K256Backend {
 
 impl GoldenHashToGroup for K256Backend {
     fn hash_to_group(domain: &[u8], message: &[u8]) -> Result<Self::Element> {
-        let point = Secp256k1::hash_from_bytes::<ExpandMsgXmd<Sha256>>(&[message], &[domain])
+        let point = Secp256k1::hash_from_bytes(&[message], &[domain])
             .map_err(|_| Error::InvalidEncoding)?;
         let element = K256Element(point);
         if bool::from(Self::is_identity(&element)) {
@@ -343,6 +342,18 @@ mod tests {
         assert_eq!(
             K256Backend::decode_element(&repr).unwrap(),
             K256Backend::identity()
+        );
+    }
+
+    #[test]
+    fn k256_hash_to_group_preserves_v013_encoding() {
+        // Captured with RustCrypto 0.13 before the security update.
+        let point =
+            K256Backend::hash_to_group(b"golden-rustcrypto-migration-v1", b"wire compatibility")
+                .unwrap();
+        assert_eq!(
+            hex::encode(K256Backend::encode_element(&point)),
+            "03b4dbf48c7949014ceffea634986566001ab59d7d58ee1d88c765ebef2ec8ada6"
         );
     }
 

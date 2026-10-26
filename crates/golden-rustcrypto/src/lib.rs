@@ -19,6 +19,9 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+#[cfg(any(feature = "p256", feature = "k256"))]
+mod rng;
+
 #[cfg(feature = "p256")]
 pub mod p256_backend;
 

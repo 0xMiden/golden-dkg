@@ -4,13 +4,12 @@ use core::fmt;
 
 use golden_core::{Error, FieldByteOrder, GoldenGroup, GoldenHashToGroup, GoldenScalar, Result};
 use p256::elliptic_curve::ff::Field;
-use p256::elliptic_curve::hash2curve::{ExpandMsgXmd, GroupDigest};
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
 use p256::elliptic_curve::Group;
 use p256::elliptic_curve::PrimeField;
-use p256::{AffinePoint, EncodedPoint, FieldBytes, NistP256, ProjectivePoint, Scalar};
+use p256::hash2curve::GroupDigest;
+use p256::{AffinePoint, FieldBytes, NistP256, ProjectivePoint, Scalar, Sec1Point};
 use rand_core::CryptoRngCore;
-use sha2::Sha256;
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -81,7 +80,7 @@ impl GoldenScalar for P256Scalar {
     }
 
     fn random(rng: &mut impl CryptoRngCore) -> Self {
-        Self(Scalar::random(rng))
+        Self(Scalar::random(&mut crate::rng::RngCompat(rng)))
     }
 
     fn from_u64(value: u64) -> Result<Self> {
@@ -219,7 +218,7 @@ impl GoldenGroup for P256Backend {
             return [0u8; 33];
         }
         let affine = AffinePoint::from(point.0);
-        let encoded = affine.to_encoded_point(true);
+        let encoded = affine.to_sec1_point(true);
         let mut out = [0u8; 33];
         out.copy_from_slice(encoded.as_bytes());
         out
@@ -235,8 +234,8 @@ impl GoldenGroup for P256Backend {
         if repr == &[0u8; 33] {
             return Ok(Self::identity());
         }
-        let encoded = EncodedPoint::from_bytes(repr).map_err(|_| Error::InvalidEncoding)?;
-        let affine = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&encoded))
+        let encoded = Sec1Point::from_bytes(repr).map_err(|_| Error::InvalidEncoding)?;
+        let affine = Option::<AffinePoint>::from(AffinePoint::from_sec1_point(&encoded))
             .ok_or(Error::InvalidEncoding)?;
         Ok(P256Element(ProjectivePoint::from(affine)))
     }
@@ -244,8 +243,8 @@ impl GoldenGroup for P256Backend {
 
 impl GoldenHashToGroup for P256Backend {
     fn hash_to_group(domain: &[u8], message: &[u8]) -> Result<Self::Element> {
-        let point = NistP256::hash_from_bytes::<ExpandMsgXmd<Sha256>>(&[message], &[domain])
-            .map_err(|_| Error::InvalidEncoding)?;
+        let point =
+            NistP256::hash_from_bytes(&[message], &[domain]).map_err(|_| Error::InvalidEncoding)?;
         let element = P256Element(point);
         if bool::from(Self::is_identity(&element)) {
             return Err(Error::InvalidEncoding);
@@ -312,6 +311,18 @@ mod tests {
         assert_eq!(
             P256Backend::decode_element(&repr).unwrap(),
             P256Backend::identity()
+        );
+    }
+
+    #[test]
+    fn p256_hash_to_group_preserves_v013_encoding() {
+        // Captured with RustCrypto 0.13 before the security update.
+        let point =
+            P256Backend::hash_to_group(b"golden-rustcrypto-migration-v1", b"wire compatibility")
+                .unwrap();
+        assert_eq!(
+            hex::encode(P256Backend::encode_element(&point)),
+            "02b59e215438895030a601884a8facf273dbc567dcecd65541dd1b2c8458bd14c9"
         );
     }
 
