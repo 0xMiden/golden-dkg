@@ -22,7 +22,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 ff = { workspace = true, features = ["derive"] }
-golden-curves = { workspace = true, features = ["secp256k1", "jubjub"] }
+# Keep this test-only edge out of the packaged dependency graph.
+golden-curves = { path = "../golden-curves", default-features = false, features = ["secp256k1", "jubjub"] }
 rand_chacha = { workspace = true }
 postcard = { workspace = true }
 
