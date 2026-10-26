@@ -946,6 +946,7 @@ impl Backend for SecqCycle {
     type Dkg = Secp256k1Group;
     const PROOF_ID: &'static [u8] = b"golden-dkg/main-golden/secp-secq-bp/v1";
     const CYCLE_ID: &'static str = "secq256k1";
+    const MULTIPLIER_COUNTS: [usize; 3] = [1_227, 5_247, 9_268];
     fn build<CS: ConstraintSystem<Self>>(
         cs: &mut CS,
         pk: &Gin,

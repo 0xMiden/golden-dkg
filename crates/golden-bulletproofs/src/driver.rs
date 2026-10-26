@@ -13,6 +13,8 @@ pub(crate) trait Backend: Cycle {
     type Dkg: DkgGroup<BaseField = Self::Scalar>;
     const PROOF_ID: &'static [u8];
     const CYCLE_ID: &'static str;
+    /// Multiplier counts for zero, one and two slots; allocation parity repeats thereafter.
+    const MULTIPLIER_COUNTS: [usize; 3];
     fn build<CS: ConstraintSystem<Self>>(
         cs: &mut CS,
         pk: &<Self::Dkg as DkgGroup>::Point,

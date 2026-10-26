@@ -952,6 +952,7 @@ impl Backend for Bls12_381G1Cycle {
     type Dkg = JubjubGroup;
     const PROOF_ID: &'static [u8] = b"golden-dkg/main-golden/jubjub-bls12-381-bp/v1";
     const CYCLE_ID: &'static str = "bls12-381-g1";
+    const MULTIPLIER_COUNTS: [usize; 3] = [1_412, 6_185, 10_959];
     fn build<CS: ConstraintSystem<Self>>(
         cs: &mut CS,
         pk: &Gin,
