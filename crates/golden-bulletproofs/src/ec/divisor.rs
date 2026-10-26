@@ -7,7 +7,7 @@
 //!
 //! The native constructor multiplies chord functions and cancels their known
 //! vertical factors, keeping a polynomial throughout. This is the incremental
-//! divisor construction of Eagen, §3.1.1 (https://eprint.iacr.org/2022/596),
+//! divisor construction of Eagen, §3.1.1 (<https://eprint.iacr.org/2022/596>),
 //! specialized to adding one point at a time. It takes quadratic field work
 //! and linear storage; a Gaussian implementation remains a test oracle.
 
