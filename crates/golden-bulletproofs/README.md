@@ -17,12 +17,17 @@ correct generation; an arbitrary producer's signature or a digest of received by
 does not establish that provenance. Restoration deliberately does not regenerate
 bases. Applications own authentication, approval, storage, and deployment admission.
 
-Both circuits share the dealer-secret prefix once, repeat DH constraints per slot,
-constrain canonical nonzero reduced DH exponents, and bind one transcript through
-one R1CS proof and every Random constant-opening proof. The integer quotient bounds
-exclude circuit-field wrapping. Secp chord denominators have explicit inverse
-constraints. Native policy and exact witness checking remain in `golden-core`.
+Both circuits use the internal deferred EC engine: one dealer-secret decomposition,
+one certified DH point and nonzero reduced exponent per receiver across sharings,
+shared scalar selectors, and separate windowed divisor certificates for the anchor,
+DH, hash-base and terminal pad relations. Native policy remains in
+`golden-core`; the circuits retain #71's exact canonical integer reductions. Witness data is committed before ECIP challenges;
+Jubjub's native Edwards `u` coordinate is constrained to its Weierstrass certificate.
+Terminal folding is disabled. Proof/prepared families are `/v2`; old proofs and
+prepared artifacts must be regenerated. The singleton empty-proof path is unchanged.
 
+See [the construction and transcript review](../../docs/issue-72.md) and
+[actual ladder comparisons](../../docs/measurements/issue-72.md).
 Engineering checks are distinct from the independently owned final composition and
 security approval required before release of both concrete backends.
 

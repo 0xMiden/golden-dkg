@@ -1,9 +1,12 @@
 //! Private Jubjub Edwards circuit; policy/native evaluation remains in core.
 use crate::{
     driver::{Backend, Slot},
+    ec::{Affine, EcCurve, Engine, ScalarRef},
     outer::cycle::Bls12_381G1Cycle,
 };
-use bulletproofs_cycle::{ConstraintSystem, LinearCombination, R1CSError, Variable};
+use bulletproofs_cycle::{
+    ConstraintSystem, LinearCombination, R1CSError, RandomizableConstraintSystem, Variable,
+};
 use ff::{Field, PrimeField};
 use golden_core::{DkgGroup, Error, Result};
 use golden_curves::jubjub::JubjubGroup;
@@ -40,12 +43,8 @@ fn batch_affine(points: &[Gin]) -> Result<Vec<(R1csField, R1csField)>> {
 // Field constants.
 // ------------------------------------------------------------------
 
-/// Bit length used for the `k = int(S.u)` decomposition, matching the
-/// paper's security parameter `lambda = 256` (a security-parameter choice,
-/// not tied to any specific field's bit length; BLS12-381's scalar field
-/// needs only 255 bits, so the top bit is always forced to zero by the
-/// range check in [`bit_decompose_bounded_n`], the same guard-bit mechanism
-/// `secp_secq` relies on).
+/// Scalar decompositions use a fixed 257-bit envelope. The strict modulus
+/// check in [`bit_decompose_bounded_n`] forces every unused high bit to zero.
 const K_BITS: usize = 256;
 
 /// Jubjub scalar-field modulus `q` (`G_in`'s own scalar field `Fr`), encoded
@@ -88,9 +87,7 @@ fn edwards_a() -> R1csField {
 /// Jubjub curve coefficient `d = -(10240/10241)`, reconstructed from the
 /// same raw limbs `jubjub`'s own (private) `EDWARDS_D` constant uses —
 /// `jubjub::Fq` is `bls12_381::Scalar`, so `Scalar::from_raw` on those limbs
-/// reproduces the exact same field element. Cross-checked independently
-/// against the `-(10240/10241)` definition in
-/// `edwards_d_matches_its_defining_fraction`.
+/// reproduces the exact same field element.
 fn edwards_d() -> R1csField {
     R1csField::from_raw([
         0x0106_5fd6_d634_3eb1,
@@ -289,365 +286,6 @@ fn constrain_bits_lt_bound_when<CS: ConstraintSystem<R1csCycle>>(
     Ok(())
 }
 
-/// Core unified twisted-Edwards addition step: given the running
-/// accumulator's coordinates `(acc_u, acc_v)` and a step point's coordinates
-/// `(u_step, v_step)`, both as linear combinations, constrains
-/// `(u_out, v_out) = (acc_u, acc_v) + (u_step, v_step)` using the complete
-/// (unified) law
-/// `u3 = (u1*v2 + v1*u2) / (1 + d*u1*u2*v1*v2)`,
-/// `v3 = (v1*v2 - a*u1*u2) / (1 - d*u1*u2*v1*v2)`.
-/// The `u3` numerator is folded into one cross multiply,
-/// `(u1+v1)*(u2+v2) - u1*u2 - v1*v2`, rather than the two multiplies
-/// `u1*v2` and `v1*u2` a direct reading of the formula suggests.
-///
-/// `u_out`/`v_out` are each allocated via [`ConstraintSystem::allocate_multiplier`]
-/// directly against their own divisor, `(1+t)`/`(1-t)`, instead of a plain
-/// `allocate` followed by a separate `multiply` check:
-/// `allocate_multiplier((u3, 1+t))` gives `u_out * u_out_right = u_out_check`
-/// as one gate, and `u_out_right = 1+t` / `u_out_check = u_out_num` bind the
-/// other two wires via free linear constraints, enforcing exactly the same
-/// relation `u_out*(1+t) = u_out_num` as `allocate` + `multiply` did, in one
-/// fewer gate. Total: 6 multiplier gates (4 explicit `cs.multiply` calls
-/// plus the two `allocate_multiplier` calls), regardless of how many bits
-/// `(u_step, v_step)` encodes (a single bit via
-/// [`edwards_conditional_add_r1cs`], or several via
-/// [`edwards_exponentiate_windowed_r1cs`]'s windowed selection).
-///
-/// `result` is the prover's witness value of the sum (computed off-circuit
-/// via real Jubjub arithmetic); `witness_coords` is the concrete
-/// `(acc_u, acc_v, u_step, v_step)` values needed to compute `t`'s own
-/// witness value for the `allocate_multiplier` calls above. Both are `None`
-/// on the verifier side.
-fn edwards_add_r1cs<CS: ConstraintSystem<R1csCycle>>(
-    cs: &mut CS,
-    acc_u: LinearCombination<R1csField>,
-    acc_v: LinearCombination<R1csField>,
-    u_step: LinearCombination<R1csField>,
-    v_step: LinearCombination<R1csField>,
-    result: Option<(R1csField, R1csField)>,
-    witness_coords: Option<(R1csField, R1csField, R1csField, R1csField)>,
-) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
-    let a = edwards_a();
-    let d = edwards_d();
-
-    let (_, _, m1) = cs.multiply(acc_u.clone(), u_step.clone());
-    let (_, _, m2) = cs.multiply(acc_v.clone(), v_step.clone());
-    let (_, _, t) = cs.multiply(LinearCombination::from(m1) * d, m2.into());
-    // u3's numerator u1*v2 + v1*u2 via one cross multiply instead of two:
-    // (u1+v1)*(u2+v2) = u1*u2 + u1*v2 + v1*u2 + v1*v2, so
-    // u1*v2 + v1*u2 = cross - m1 - m2.
-    let (_, _, cross) = cs.multiply(acc_u + acc_v, u_step + v_step);
-
-    let u_out_num = LinearCombination::from(cross) - m1 - m2;
-    let v_out_num = LinearCombination::from(m2) - LinearCombination::from(m1) * a;
-
-    let t_value = witness_coords.map(|(au, av, us, vs)| d * (au * us) * (av * vs));
-
-    let u3 = result.map(|(u, _)| u);
-    let (u_out, u_out_right, u_out_check) =
-        cs.allocate_multiplier(u3.zip(t_value.map(|t| R1csField::ONE + t)))?;
-    cs.constrain(
-        LinearCombination::from(u_out_right) - (LinearCombination::from(R1csField::ONE) + t),
-    );
-    cs.constrain(LinearCombination::from(u_out_check) - u_out_num);
-
-    let v3 = result.map(|(_, v)| v);
-    let (v_out, v_out_right, v_out_check) =
-        cs.allocate_multiplier(v3.zip(t_value.map(|t| R1csField::ONE - t)))?;
-    cs.constrain(
-        LinearCombination::from(v_out_right) - (LinearCombination::from(R1csField::ONE) - t),
-    );
-    cs.constrain(LinearCombination::from(v_out_check) - v_out_num);
-
-    Ok((u_out, v_out))
-}
-
-/// One single-bit step of the additive ladder: given the running
-/// accumulator and a public per-bit candidate point
-/// `(base_u, base_v) = 2^j * X`, constrains
-/// `L_j = L_{j-1} + (bit ? (base_u, base_v) : identity)`.
-///
-/// Since `(base_u, base_v)` are public constants, the selected step point
-/// `(bit*base_u, 1 + bit*(base_v-1))` is linear in `bit` — no extra
-/// multiplier is needed to materialize it before handing it to
-/// [`edwards_add_r1cs`]. `bit=0` reduces the addition formula algebraically
-/// to `(u_out, v_out) = (acc_u, acc_v)` (adding the identity `(0,1)` is a
-/// no-op under the complete law, no special base case needed); `bit=1`
-/// reduces it to the direct sum of the accumulator and the base point. Both
-/// are checked in `edwards_conditional_add_reduces_correctly_for_both_bits`.
-///
-/// Used only for bit 0 of the exponent (the base case) —
-/// [`edwards_exponentiate_windowed_r1cs`] windows every other bit two at a
-/// time via [`edwards_window_step_r1cs`].
-#[allow(clippy::too_many_arguments)]
-fn edwards_conditional_add_r1cs<CS: ConstraintSystem<R1csCycle>>(
-    cs: &mut CS,
-    acc_u: LinearCombination<R1csField>,
-    acc_v: LinearCombination<R1csField>,
-    bit: Variable<R1csField>,
-    base_u: R1csField,
-    base_v: R1csField,
-    result: Option<(R1csField, R1csField)>,
-    step_witness: Option<(R1csField, R1csField)>,
-) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
-    let u_step = LinearCombination::from(bit) * base_u;
-    let v_step = LinearCombination::from(R1csField::ONE)
-        + LinearCombination::from(bit) * (base_v - R1csField::ONE);
-    // The accumulator entering the bit-0 base case is always the identity
-    // `(0, 1)`, a fixed constant — no witness lookup needed for it.
-    let witness_coords = step_witness.map(|(su, sv)| (R1csField::ZERO, R1csField::ONE, su, sv));
-    edwards_add_r1cs(cs, acc_u, acc_v, u_step, v_step, result, witness_coords)
-}
-
-/// One 2-bit-windowed step of the additive ladder, mirroring `secp_secq`'s
-/// chord-rule windowing (see the module doc): given window bits
-/// `(b0, b1) = (bit_{2w-1}, bit_{2w})`, their product `prod` (computed once
-/// per window and shared across every exponentiation using the same bit
-/// vector — see [`edwards_window_products`]), and the window's three
-/// non-identity candidate points `Q10 = 2^{2w-1}*X`, `Q01 = 2^{2w}*X`,
-/// `Q11 = Q10 + Q01` (affine; `Q00`, selected when `b0=b1=0`, is always the
-/// identity `(0,1)` and so is never stored), constrains
-/// `L_w = L_{w-1} + Q_{b0,b1}` via the standard multilinear selection
-/// `Q_{b0,b1} = Q00 + (Q10-Q00)*b0 + (Q01-Q00)*b1 + (Q11-Q10-Q01+Q00)*prod`
-/// (with `Q00 = (0,1)`), which is linear in `b0`, `b1`, `prod` and so needs
-/// no extra multiplier beyond `prod` itself before handing the selected
-/// step point to [`edwards_add_r1cs`]. `acc_witness`/`step_witness` are that
-/// call's `witness_coords` split into the accumulator-entering and
-/// selected-candidate halves; both `None` on the verifier side.
-#[allow(clippy::too_many_arguments)]
-fn edwards_window_step_r1cs<CS: ConstraintSystem<R1csCycle>>(
-    cs: &mut CS,
-    acc_u: LinearCombination<R1csField>,
-    acc_v: LinearCombination<R1csField>,
-    b0: Variable<R1csField>,
-    b1: Variable<R1csField>,
-    prod: Variable<R1csField>,
-    candidates: [(R1csField, R1csField); 3],
-    result: Option<(R1csField, R1csField)>,
-    acc_witness: Option<(R1csField, R1csField)>,
-    step_witness: Option<(R1csField, R1csField)>,
-) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
-    let [q10, q01, q11] = candidates;
-
-    let u_step = LinearCombination::from(b0) * q10.0
-        + LinearCombination::from(b1) * q01.0
-        + LinearCombination::from(prod) * (q11.0 - q10.0 - q01.0);
-    let v_step = LinearCombination::from(R1csField::ONE)
-        + LinearCombination::from(b0) * (q10.1 - R1csField::ONE)
-        + LinearCombination::from(b1) * (q01.1 - R1csField::ONE)
-        + LinearCombination::from(prod) * (q11.1 - q10.1 - q01.1 + R1csField::ONE);
-
-    let witness_coords = acc_witness
-        .zip(step_witness)
-        .map(|((au, av), (su, sv))| (au, av, su, sv));
-    edwards_add_r1cs(cs, acc_u, acc_v, u_step, v_step, result, witness_coords)
-}
-
-/// Compute the shared window AND products `bit_vars[2w-1] * bit_vars[2w]`
-/// for `w = 1..=K_BITS/2`, one multiplier gate per window. Bit 0 (the base
-/// case, handled by [`edwards_conditional_add_r1cs`]) is not included.
-/// Reused across every exponentiation over the same bit vector — mirrors
-/// `secp_secq`'s `chord_window_products` sharing (e.g. `T_1`/`T_2` in the
-/// one-receiver relation both reuse `k`'s window products).
-fn edwards_window_products<CS: ConstraintSystem<R1csCycle>>(
-    cs: &mut CS,
-    bit_vars: &[Variable<R1csField>],
-) -> core::result::Result<Vec<Variable<R1csField>>, R1CSError> {
-    if bit_vars.len() != K_BITS + 1 {
-        return Err(R1CSError::FormatError);
-    }
-    let num_windows = K_BITS / 2;
-    let mut products = Vec::with_capacity(num_windows);
-    for w in 1..=num_windows {
-        let (_, _, prod) = cs.multiply(bit_vars[2 * w - 1].into(), bit_vars[2 * w].into());
-        products.push(prod);
-    }
-    Ok(products)
-}
-
-/// Precomputed windowed candidate points for one Edwards exponentiation
-/// base `X`, for use with [`edwards_exponentiate_windowed_r1cs`].
-#[derive(Clone, Debug)]
-struct EdwardsWindowPrecomp {
-    /// Public doubling chain reused by native witness generation.
-    powers: Vec<Gin>,
-    /// Affine coords of `P_0 = X`, bit 0's candidate point.
-    bit0: (R1csField, R1csField),
-    /// For `w = 1..=K_BITS/2` (window `w` covers bits `2w-1, 2w`):
-    /// `[Q10, Q01, Q11]` affine coordinates (`Q00` is always the identity
-    /// `(0,1)`, so it is never stored — see [`edwards_window_step_r1cs`]).
-    windows: Vec<[(R1csField, R1csField); 3]>,
-}
-
-/// Multiply a public base point `X` by a witness-controlled scalar via its
-/// `K_BITS + 1`-bit decomposition: bit 0 via [`edwards_conditional_add_r1cs`]
-/// (the base case), then bits `1..=K_BITS` two at a time via
-/// [`edwards_window_step_r1cs`] (`K_BITS / 2` windows). No correction
-/// generator, unlike `secp_secq`'s chord-rule gadget (see the module doc) —
-/// Edwards addition has no exceptional case to dodge in the first place.
-///
-/// `precomp` must be [`precompute_windowed_base_powers`]'s output for `X`.
-/// `window_products` must be [`edwards_window_products`]'s output for the
-/// same bit vector (reused across every exponentiation sharing that vector).
-/// `witness`, when `Some`, must be [`edwards_windowed_ladder_witness`]'s
-/// output (prover only). If `result` is `Some`, constrains the final
-/// accumulator to equal it (used when the target point is already public,
-/// e.g. `PK_1 = g_in^sk_1`); when `None`, the caller reads back the
-/// returned variables instead (used when the target, e.g.
-/// `T_1 = H1(msg)^k`, is itself committed to and observed as a public
-/// statement field, so the gadget need not independently re-derive it).
-#[allow(clippy::too_many_arguments)]
-fn edwards_exponentiate_windowed_r1cs<CS: ConstraintSystem<R1csCycle>>(
-    cs: &mut CS,
-    bit_vars: &[Variable<R1csField>],
-    window_products: &[Variable<R1csField>],
-    precomp: &EdwardsWindowPrecomp,
-    result: Option<(R1csField, R1csField)>,
-    witness: Option<&EdwardsWindowWitness>,
-) -> core::result::Result<(Variable<R1csField>, Variable<R1csField>), R1CSError> {
-    let num_windows = K_BITS / 2;
-    if bit_vars.len() != K_BITS + 1
-        || window_products.len() != num_windows
-        || precomp.windows.len() != num_windows
-    {
-        return Err(R1CSError::FormatError);
-    }
-    if let Some(witness) = witness {
-        if witness.window_results.len() != num_windows || witness.window_steps.len() != num_windows
-        {
-            return Err(R1CSError::FormatError);
-        }
-    }
-
-    let (mut acc_u, mut acc_v) = edwards_conditional_add_r1cs(
-        cs,
-        LinearCombination::from(R1csField::ZERO),
-        LinearCombination::from(R1csField::ONE),
-        bit_vars[0],
-        precomp.bit0.0,
-        precomp.bit0.1,
-        witness.map(|w| w.bit0_result),
-        witness.map(|w| w.bit0_step),
-    )?;
-    // Tracks the accumulator's concrete value alongside its wire, so each
-    // window step below can derive its own `edwards_add_r1cs`
-    // multiplier-fold witness without re-deriving it from scratch.
-    let mut acc_value = witness.map(|w| w.bit0_result);
-
-    for w in 1..=num_windows {
-        let step_result = witness.map(|w_| w_.window_results[w - 1]);
-        let step_point = witness.map(|w_| w_.window_steps[w - 1]);
-        let (u_var, v_var) = edwards_window_step_r1cs(
-            cs,
-            acc_u.into(),
-            acc_v.into(),
-            bit_vars[2 * w - 1],
-            bit_vars[2 * w],
-            window_products[w - 1],
-            precomp.windows[w - 1],
-            step_result,
-            acc_value,
-            step_point,
-        )?;
-        acc_u = u_var;
-        acc_v = v_var;
-        acc_value = step_result;
-    }
-
-    if let Some((rx, ry)) = result {
-        cs.constrain(LinearCombination::from(acc_u) - rx);
-        cs.constrain(LinearCombination::from(acc_v) - ry);
-    }
-    Ok((acc_u, acc_v))
-}
-
-/// Precompute `2^j * X` for `j = 0..=K_BITS`, as raw `G_in` points (for
-/// [`edwards_windowed_ladder_witness`]).
-fn base_power_points(x: &Gin) -> Vec<Gin> {
-    let mut powers = Vec::with_capacity(K_BITS + 1);
-    let mut p = *x;
-    for _ in 0..=K_BITS {
-        powers.push(p);
-        p = p.double();
-    }
-    powers
-}
-
-/// Precompute [`EdwardsWindowPrecomp`] for base `X`, for use with
-/// [`edwards_exponentiate_windowed_r1cs`].
-fn precompute_windowed_base_powers(x: &Gin) -> Result<EdwardsWindowPrecomp> {
-    let powers = base_power_points(x);
-    let num_windows = K_BITS / 2;
-
-    let mut points = Vec::with_capacity(1 + 3 * num_windows);
-    points.push(powers[0]);
-    for w in 1..=num_windows {
-        let (j1, j2) = (2 * w - 1, 2 * w);
-        points.push(powers[j1]);
-        points.push(powers[j2]);
-        points.push(powers[j1] + powers[j2]);
-    }
-
-    let affines = batch_affine(&points)?;
-    let bit0 = affines[0];
-    let windows = affines[1..].as_chunks::<3>().0.to_vec();
-    Ok(EdwardsWindowPrecomp {
-        powers,
-        bit0,
-        windows,
-    })
-}
-
-struct EdwardsWindowWitness {
-    bit0_result: (R1csField, R1csField),
-    bit0_step: (R1csField, R1csField),
-    window_results: Vec<(R1csField, R1csField)>,
-    window_steps: Vec<(R1csField, R1csField)>,
-}
-
-fn edwards_windowed_ladder_witness(
-    bits: &[bool],
-    base_powers: &[Gin],
-) -> Result<EdwardsWindowWitness> {
-    if bits.len() != K_BITS + 1 || base_powers.len() != K_BITS + 1 {
-        return Err(Error::InvalidProof);
-    }
-    let num_windows = K_BITS / 2;
-
-    let bit0_step_point = if bits[0] {
-        base_powers[0]
-    } else {
-        Gin::identity()
-    };
-    let mut acc = bit0_step_point;
-    let mut running = Vec::with_capacity(1 + num_windows);
-    let mut steps = Vec::with_capacity(1 + num_windows);
-    running.push(acc);
-    steps.push(bit0_step_point);
-    for w in 1..=num_windows {
-        let (j1, j2) = (2 * w - 1, 2 * w);
-        let mut step_point = Gin::identity();
-        if bits[j1] {
-            step_point += base_powers[j1];
-        }
-        if bits[j2] {
-            step_point += base_powers[j2];
-        }
-        acc += step_point;
-        running.push(acc);
-        steps.push(step_point);
-    }
-
-    let result_affines = batch_affine(&running)?;
-    let step_affines = batch_affine(&steps)?;
-    Ok(EdwardsWindowWitness {
-        bit0_result: result_affines[0],
-        bit0_step: step_affines[0],
-        window_results: result_affines[1..].to_vec(),
-        window_steps: step_affines[1..].to_vec(),
-    })
-}
-
 /// Decompose an `R1csField` element into little-endian bits via its
 /// canonical byte representation. Produces exactly `K_BITS + 1` bits (the
 /// extra bit is the guard bit described at [`K_BITS`]).
@@ -708,9 +346,8 @@ fn fp_canonical_ge(a: &R1csField, b: &R1csField) -> bool {
 /// `m in {0,...,8}`, with `pad_var < q` (`Gin`'s own scalar modulus), so
 /// `pad_var` is safe to use as a `Gin` exponent (e.g. `g_in^pad`). Returns
 /// `pad_var` and its canonical `K_BITS + 1`-bit decomposition (already
-/// produced internally to enforce the `pad_var < q` bound), so a caller
-/// that also needs `pad_var`'s bits (e.g. for a windowed exponentiation)
-/// does not have to decompose it a second time.
+/// produced internally to enforce the `pad_var < q` bound), so the deferred
+/// EC engine can reuse the decomposition.
 ///
 /// `m` needs 4 bits (`m <= 8 < 16`), range-checked to `m < 9` via
 /// [`bit_decompose_bounded_n`]. The generic `pad < q` check alone is
@@ -719,9 +356,8 @@ fn fp_canonical_ge(a: &R1csField, b: &R1csField) -> bool {
 /// `pad' = r - 8*q` (computed mod `p`) would wrap around to
 /// `p - (8*q - r)`, which can alias into `[0, q)` for `r` close to `p`
 /// unless ruled out separately (`p` is only barely above `8q`, so this
-/// wraparound is a real risk, unlike `secp_secq`'s near-equal `p`/`q`
-/// pair). The fix mirrors `secp_secq`'s own single-bit `reduce_q` case: an
-/// *additional*, tighter bound `pad < p - 8q` applies whenever `m = 8`
+/// wraparound is a real risk). An additional, tighter bound
+/// `pad < p - 8q` applies whenever `m = 8`
 /// (`m`'s top bit, `m_bit_vars[3]`, which the `m < 9` range check already
 /// forces to imply `m = 8` exactly whenever it is set). Every other
 /// `m in {0,...,7}` is safe under the generic `pad < q` bound alone,
@@ -784,210 +420,227 @@ fn bit_options_or_none(value: Option<R1csField>) -> Vec<Option<R1csField>> {
         None => vec![None; K_BITS + 1],
     }
 }
-/// Process-wide cache for `g_in`'s windowed additive-ladder precompute.
-fn shared_g_in_window_precomp() -> &'static EdwardsWindowPrecomp {
-    static PRECOMP: std::sync::OnceLock<EdwardsWindowPrecomp> = std::sync::OnceLock::new();
-    PRECOMP.get_or_init(|| {
-        precompute_windowed_base_powers(&Gin::generator())
-            .expect("the generator is not the identity")
+/// Native values for a receiver are independent of the sharing's message.
+struct ReceiverWitness {
+    k: R1csField,
+    quotient: u8,
+    inverse: R1csField,
+}
+
+fn receiver_witness(secret: &Fr, peer: &Gin) -> Result<ReceiverWitness> {
+    let (u, _) = affine(&(*peer * *secret))?;
+    let (k, quotient) = reduce_pad_witness(&u);
+    let inverse = Option::<R1csField>::from(k.invert()).ok_or(Error::InvalidProof)?;
+    Ok(ReceiverWitness {
+        k,
+        quotient,
+        inverse,
     })
 }
 
-struct SecretPrefix {
-    bits: Vec<Variable<R1csField>>,
-    products: Vec<Variable<R1csField>>,
-}
-fn prefix<CS: ConstraintSystem<R1csCycle>>(
+fn enforce_nonzero<CS: ConstraintSystem<R1csCycle>>(
     cs: &mut CS,
-    pk: &Gin,
-    secret: Option<&Fr>,
-) -> Result<SecretPrefix> {
-    let value = secret.map(fr_to_fp);
-    let assignments = bit_options_or_none(value);
-    let variable = cs.allocate(value).map_err(|_| Error::InvalidProof)?;
-    let bits = bit_decompose_q(cs, variable, &assignments).map_err(|_| Error::InvalidProof)?;
-    let products = edwards_window_products(cs, &bits).map_err(|_| Error::InvalidProof)?;
-    let table = shared_g_in_window_precomp();
-    let mut bools = [false; K_BITS + 1];
-    if let Some(value) = value {
-        decompose_k_fp(&value, &mut bools);
-    }
-    let witness = secret
-        .map(|_| edwards_windowed_ladder_witness(&bools, &table.powers))
-        .transpose()?;
-    edwards_exponentiate_windowed_r1cs(
-        cs,
-        &bits,
-        &products,
-        table,
-        Some(affine(pk)?),
-        witness.as_ref(),
-    )
-    .map_err(|_| Error::InvalidProof)?;
-    Ok(SecretPrefix { bits, products })
+    value: Variable<R1csField>,
+    inverse: Option<R1csField>,
+) -> Result<()> {
+    let inverse = cs.allocate(inverse).map_err(|_| Error::InvalidProof)?;
+    let (_, _, product) = cs.multiply(value.into(), inverse.into());
+    cs.constrain(product - R1csField::ONE);
+    Ok(())
 }
-struct SlotWitness {
-    dh: EdwardsWindowWitness,
-    k: R1csField,
-    k_quotient: u8,
-    k_inverse: R1csField,
-    t1: EdwardsWindowWitness,
-    t2: EdwardsWindowWitness,
-    pad: R1csField,
-    pad_quotient: u8,
-    pad_point: EdwardsWindowWitness,
+
+struct WeierstrassParameters {
+    a_over_three: R1csField,
+    b: R1csField,
+    b_inverse: R1csField,
+    curve_a: R1csField,
+    curve_b: R1csField,
 }
-fn slot_witness(
-    secret: &Fr,
-    slot: &Slot<JubjubGroup>,
-    beta: R1csField,
-    peer: &EdwardsWindowPrecomp,
-    h1: &EdwardsWindowPrecomp,
-    h2: &EdwardsWindowPrecomp,
-) -> Result<SlotWitness> {
-    let (dh_u, _) = affine(&(slot.peer * *secret))?;
-    let (k, k_quotient) = reduce_pad_witness(&dh_u);
-    let k_inverse = Option::<R1csField>::from(k.invert()).ok_or(Error::InvalidProof)?;
-    let mut k_bits = [false; K_BITS + 1];
-    decompose_k_fp(&k, &mut k_bits);
-    let t1 = edwards_windowed_ladder_witness(&k_bits, &h1.powers)?;
-    let t2 = edwards_windowed_ladder_witness(&k_bits, &h2.powers)?;
-    let t1_u = t1.window_results.last().ok_or(Error::InvalidProof)?.0;
-    let t2_u = t2.window_results.last().ok_or(Error::InvalidProof)?.0;
-    let (pad, pad_quotient) = reduce_pad_witness(&(beta * t1_u + t2_u));
-    let mut secret_bits = [false; K_BITS + 1];
-    decompose_k_fp(&fr_to_fp(secret), &mut secret_bits);
-    let mut pad_bits = [false; K_BITS + 1];
-    decompose_k_fp(&pad, &mut pad_bits);
-    Ok(SlotWitness {
-        dh: edwards_windowed_ladder_witness(&secret_bits, &peer.powers)?,
-        k,
-        k_quotient,
-        k_inverse,
-        t1,
-        t2,
-        pad,
-        pad_quotient,
-        pad_point: edwards_windowed_ladder_witness(
-            &pad_bits,
-            &shared_g_in_window_precomp().powers,
-        )?,
+
+/// Cache the fixed Edwards -> Montgomery -> short-Weierstrass map constants.
+/// The fixed denominators are nonzero, as checked independently by the map
+/// test. Witness-dependent exceptional points fail closed in the adapter.
+fn weierstrass_parameters() -> &'static WeierstrassParameters {
+    static PARAMETERS: std::sync::OnceLock<WeierstrassParameters> = std::sync::OnceLock::new();
+    PARAMETERS.get_or_init(|| {
+        let denominator = edwards_a() - edwards_d();
+        let inverse = denominator.invert().unwrap_or(R1csField::ZERO);
+        let a = R1csField::from(2) * (edwards_a() + edwards_d()) * inverse;
+        let b = R1csField::from(4) * inverse;
+        let b_inverse = b.invert().unwrap_or(R1csField::ZERO);
+        let third = R1csField::from(3).invert().unwrap_or(R1csField::ZERO);
+        WeierstrassParameters {
+            a_over_three: a * third,
+            b,
+            b_inverse,
+            curve_a: (R1csField::ONE - a.square() * third) * b_inverse.square(),
+            curve_b: (R1csField::from(2) * a.square() * a * third.square() * third - a * third)
+                * b_inverse.square()
+                * b_inverse,
+        }
     })
 }
-#[allow(clippy::too_many_arguments)]
-fn receiver_slot<CS: ConstraintSystem<R1csCycle>>(
+
+impl EcCurve for Bls12_381G1Cycle {
+    fn a() -> R1csField {
+        weierstrass_parameters().curve_a
+    }
+
+    fn b() -> R1csField {
+        weierstrass_parameters().curve_b
+    }
+
+    fn affine(point: &Gin) -> Result<Affine<R1csField>> {
+        let (u, v) = affine(point)?;
+        let parameters = weierstrass_parameters();
+        let v_denominator =
+            Option::<R1csField>::from((R1csField::ONE - v).invert()).ok_or(Error::InvalidProof)?;
+        let u_denominator = Option::<R1csField>::from(u.invert()).ok_or(Error::InvalidProof)?;
+        let x_montgomery = (R1csField::ONE + v) * v_denominator;
+        Ok(Affine {
+            x: (x_montgomery + parameters.a_over_three) * parameters.b_inverse,
+            y: x_montgomery * u_denominator * parameters.b_inverse,
+        })
+    }
+
+    fn batch_affine(points: &[Gin]) -> Result<Vec<Affine<R1csField>>> {
+        if points.iter().any(is_identity) {
+            return Err(Error::InvalidProof);
+        }
+        let coordinates = batch_affine(points)?;
+        let mut denominators = Vec::new();
+        for &(u, v) in &coordinates {
+            denominators.extend([R1csField::ONE - v, u]);
+        }
+        if denominators.iter().any(|value| bool::from(value.is_zero())) {
+            return Err(Error::InvalidProof);
+        }
+        <Self as bulletproofs_cycle::Cycle>::scalar_batch_invert(&mut denominators);
+        let parameters = weierstrass_parameters();
+        Ok(coordinates
+            .into_iter()
+            .zip(denominators.as_chunks::<2>().0)
+            .map(|((_, v), inverse)| {
+                let x_montgomery = (R1csField::ONE + v) * inverse[0];
+                Affine {
+                    x: (x_montgomery + parameters.a_over_three) * parameters.b_inverse,
+                    y: x_montgomery * inverse[1] * parameters.b_inverse,
+                }
+            })
+            .collect())
+    }
+
+    fn native_x<CS: ConstraintSystem<Self>>(
+        cs: &mut CS,
+        point: (Variable<R1csField>, Variable<R1csField>),
+        witness: Option<&Gin>,
+    ) -> Result<Variable<R1csField>> {
+        let parameters = weierstrass_parameters();
+        let value = witness.map(affine).transpose()?.map(|(u, _)| u);
+        let inverse = witness
+            .map(Self::affine)
+            .transpose()?
+            .map(|point| Option::<R1csField>::from(point.y.invert()).ok_or(Error::InvalidProof))
+            .transpose()?;
+        // A finite point of order two has Y=0 and does not correspond to a
+        // nonidentity Jubjub subgroup point. Guard division before binding u.
+        enforce_nonzero(cs, point.1, inverse)?;
+        let u = cs.allocate(value).map_err(|_| Error::InvalidProof)?;
+        let (_, _, product) = cs.multiply(u.into(), point.1 * parameters.b);
+        cs.constrain(
+            LinearCombination::from(product) - point.0 * parameters.b + parameters.a_over_three,
+        );
+        Ok(u)
+    }
+}
+
+fn boolean_bits(value: Option<R1csField>) -> Option<Vec<bool>> {
+    value.map(|value| {
+        let mut bits = vec![false; K_BITS + 1];
+        decompose_k_fp(&value, &mut bits);
+        bits
+    })
+}
+
+fn deferred_build<CS: RandomizableConstraintSystem<R1csCycle>>(
     cs: &mut CS,
-    slot: &Slot<JubjubGroup>,
-    prefix: &SecretPrefix,
+    pk: &Gin,
+    slots: &[Slot<JubjubGroup>],
     secret: Option<&Fr>,
     beta: R1csField,
-    peer: &EdwardsWindowPrecomp,
-    h1: &EdwardsWindowPrecomp,
-    h2: &EdwardsWindowPrecomp,
 ) -> Result<()> {
-    let witness = secret
-        .map(|secret| slot_witness(secret, slot, beta, peer, h1, h2))
-        .transpose()?;
-    let (dh_u, _) = edwards_exponentiate_windowed_r1cs(
-        cs,
-        &prefix.bits,
-        &prefix.products,
-        peer,
-        None,
-        witness.as_ref().map(|w| &w.dh),
-    )
-    .map_err(|_| Error::InvalidProof)?;
-    // The bounded quotient 0..8 and the tighter remainder bound for quotient
-    // eight force quotient*q+k < p. This is exact integer reduction of DH.u.
-    let (k, k_bits) = reduce_pad_r1cs(
-        cs,
-        dh_u.into(),
-        witness.as_ref().map(|w| (w.k, w.k_quotient)),
-    )
-    .map_err(|_| Error::InvalidProof)?;
-    let inverse = cs
-        .allocate(witness.as_ref().map(|w| w.k_inverse))
+    let mut engine = Engine::<R1csCycle>::new();
+    let secret_value = secret.map(fr_to_fp);
+    let secret_variable = cs.allocate(secret_value).map_err(|_| Error::InvalidProof)?;
+    let bits = bit_decompose_q(cs, secret_variable, &bit_options_or_none(secret_value))
         .map_err(|_| Error::InvalidProof)?;
-    let (_, _, product) = cs.multiply(k.into(), inverse.into());
-    cs.constrain(product - R1csField::ONE);
-    let products = edwards_window_products(cs, &k_bits).map_err(|_| Error::InvalidProof)?;
-    let (t1_u, _) = edwards_exponentiate_windowed_r1cs(
-        cs,
-        &k_bits,
-        &products,
-        h1,
-        None,
-        witness.as_ref().map(|w| &w.t1),
-    )
-    .map_err(|_| Error::InvalidProof)?;
-    let (t2_u, _) = edwards_exponentiate_windowed_r1cs(
-        cs,
-        &k_bits,
-        &products,
-        h2,
-        None,
-        witness.as_ref().map(|w| &w.t2),
-    )
-    .map_err(|_| Error::InvalidProof)?;
-    let (_, pad_bits) = reduce_pad_r1cs(
-        cs,
-        t1_u * beta + t2_u,
-        witness.as_ref().map(|w| (w.pad, w.pad_quotient)),
-    )
-    .map_err(|_| Error::InvalidProof)?;
-    let products = edwards_window_products(cs, &pad_bits).map_err(|_| Error::InvalidProof)?;
-    edwards_exponentiate_windowed_r1cs(
-        cs,
-        &pad_bits,
-        &products,
-        shared_g_in_window_precomp(),
-        Some(affine(&slot.pad)?),
-        witness.as_ref().map(|w| &w.pad_point),
-    )
-    .map_err(|_| Error::InvalidProof)?;
-    Ok(())
+    let secret_scalar = engine.scalar(bits, boolean_bits(secret_value))?;
+    let anchor = engine.mul(cs, &Gin::generator(), secret_scalar)?;
+    engine.assert_equal(anchor, pk)?;
+    let mut receivers =
+        std::collections::BTreeMap::<Vec<u8>, (ScalarRef, Option<R1csField>)>::new();
+    for slot in slots {
+        for point in [&slot.peer, &slot.h1, &slot.h2, &slot.pad] {
+            if is_identity(point) {
+                return Err(Error::InvalidProof);
+            }
+        }
+        let key = JubjubGroup::encode_point(&slot.peer);
+        if let std::collections::btree_map::Entry::Vacant(entry) = receivers.entry(key.clone()) {
+            let witness = secret
+                .map(|secret| receiver_witness(secret, &slot.peer))
+                .transpose()?;
+            let dh = engine.mul(cs, &slot.peer, secret_scalar)?;
+            let dh_u = engine.point_x(cs, dh)?;
+            let (k, bits) =
+                reduce_pad_r1cs(cs, dh_u.into(), witness.as_ref().map(|w| (w.k, w.quotient)))
+                    .map_err(|_| Error::InvalidProof)?;
+            enforce_nonzero(cs, k, witness.as_ref().map(|w| w.inverse))?;
+            let value = witness.map(|w| w.k);
+            let scalar = engine.scalar(bits, boolean_bits(value))?;
+            entry.insert((scalar, value));
+        }
+        let &(k_scalar, k_value) = receivers.get(&key).ok_or(Error::ProofOperationFailed)?;
+        let t1 = engine.mul(cs, &slot.h1, k_scalar)?;
+        let t2 = engine.mul(cs, &slot.h2, k_scalar)?;
+        let t1_u = engine.point_x(cs, t1)?;
+        let t2_u = engine.point_x(cs, t2)?;
+        let pad_witness = k_value
+            .map(|k| -> Result<_> {
+                let k = JubjubGroup::reduce_base_field(&k);
+                let (u1, _) = affine(&(slot.h1 * k))?;
+                let (u2, _) = affine(&(slot.h2 * k))?;
+                Ok(reduce_pad_witness(&(beta * u1 + u2)))
+            })
+            .transpose()?;
+        let (_, bits) = reduce_pad_r1cs(cs, t1_u * beta + t2_u, pad_witness)
+            .map_err(|_| Error::InvalidProof)?;
+        let scalar = engine.scalar(bits, boolean_bits(pad_witness.map(|(pad, _)| pad)))?;
+        let point = engine.mul(cs, &Gin::generator(), scalar)?;
+        engine.assert_equal(point, &slot.pad)?;
+    }
+    engine.finalize(cs)
 }
 
 impl Backend for Bls12_381G1Cycle {
     type Dkg = JubjubGroup;
-    const PROOF_ID: &'static [u8] = b"golden-dkg/main-golden/jubjub-bls12-381-bp/v1";
+    const PROOF_ID: &'static [u8] = b"golden-dkg/main-golden/jubjub-bls12-381-bp/v2";
+    const CIRCUIT_COSTS: crate::shape::CircuitCosts = crate::shape::CircuitCosts {
+        secret_multipliers: 509,
+        reduction_multipliers: 709,
+        reduction_allocations: 2,
+        native_x_multipliers: 2,
+        native_x_allocations: 2,
+    };
     const CYCLE_ID: &'static str = "bls12-381-g1";
-    const MULTIPLIER_COUNTS: [usize; 3] = [1_412, 6_185, 10_959];
-    fn build<CS: ConstraintSystem<Self>>(
+    fn build<CS: RandomizableConstraintSystem<Self>>(
         cs: &mut CS,
         pk: &Gin,
         slots: &[Slot<JubjubGroup>],
         secret: Option<&Fr>,
         beta: R1csField,
     ) -> Result<()> {
-        let mut tables = std::collections::BTreeMap::new();
-        for slot in slots {
-            for point in [&slot.peer, &slot.h1, &slot.h2, &slot.pad] {
-                if bool::from(point.is_identity()) {
-                    return Err(Error::InvalidProof);
-                }
-            }
-            for point in [&slot.peer, &slot.h1, &slot.h2] {
-                let key = JubjubGroup::encode_point(point);
-                if let std::collections::btree_map::Entry::Vacant(entry) = tables.entry(key) {
-                    entry.insert(precompute_windowed_base_powers(point)?);
-                }
-            }
-        }
-        let shared = prefix(cs, pk, secret)?;
-        for slot in slots {
-            let peer = tables
-                .get(&JubjubGroup::encode_point(&slot.peer))
-                .ok_or(Error::ProofOperationFailed)?;
-            let h1 = tables
-                .get(&JubjubGroup::encode_point(&slot.h1))
-                .ok_or(Error::ProofOperationFailed)?;
-            let h2 = tables
-                .get(&JubjubGroup::encode_point(&slot.h2))
-                .ok_or(Error::ProofOperationFailed)?;
-            receiver_slot(cs, slot, &shared, secret, beta, peer, h1, h2)?;
-        }
-        Ok(())
+        deferred_build(cs, pk, slots, secret, beta)
     }
 }
 crate::prepared::concrete_system!(
@@ -1010,6 +663,102 @@ mod tests {
     fn shared_prefix_capacity_matches_real_layout() {
         crate::shape::check_counted_layout::<Bls12_381G1Cycle>();
     }
+    #[test]
+    fn weierstrass_map_preserves_curve_negation_and_native_coordinate() {
+        assert!(<R1csCycle as EcCurve>::affine(&Gin::identity()).is_err());
+        let parameters = weierstrass_parameters();
+        assert_eq!(
+            (edwards_a() - edwards_d()) * parameters.b,
+            R1csField::from(4)
+        );
+        assert_eq!(parameters.b * parameters.b_inverse, R1csField::ONE);
+        assert_eq!(
+            parameters.a_over_three * R1csField::from(3) * (edwards_a() - edwards_d()),
+            R1csField::from(2) * (edwards_a() + edwards_d()),
+        );
+        for scalar in [Fr::ONE, Fr::from(2), Fr::from(11), -Fr::ONE] {
+            let point = Gin::generator() * scalar;
+            let mapped = <R1csCycle as EcCurve>::affine(&point).unwrap();
+            assert_eq!(
+                mapped.y.square(),
+                mapped.x.square() * mapped.x + mapped.x * R1csCycle::a() + R1csCycle::b(),
+            );
+            let (u, v) = affine(&point).unwrap();
+            let x_montgomery = parameters.b * mapped.x - parameters.a_over_three;
+            assert_eq!(u * parameters.b * mapped.y, x_montgomery);
+            assert_eq!(
+                v * (x_montgomery + R1csField::ONE),
+                x_montgomery - R1csField::ONE
+            );
+            let negated = <R1csCycle as EcCurve>::affine(&-point).unwrap();
+            assert_eq!(negated.x, mapped.x);
+            assert_eq!(negated.y, -mapped.y);
+        }
+    }
+
+    fn bind_native_coordinate<CS: ConstraintSystem<R1csCycle>>(
+        cs: &mut CS,
+        coordinates: Affine<R1csField>,
+        native: R1csField,
+        witness: Option<&Gin>,
+    ) {
+        let x = cs.allocate(witness.map(|_| coordinates.x)).unwrap();
+        let y = cs.allocate(witness.map(|_| coordinates.y)).unwrap();
+        cs.constrain(x - coordinates.x);
+        cs.constrain(y - coordinates.y);
+        let u = R1csCycle::native_x(cs, (x, y), witness).unwrap();
+        cs.constrain(u - native);
+    }
+
+    #[test]
+    fn native_coordinate_link_rejects_substitutions_and_zero_denominator() {
+        let pc = PedersenGens::<R1csCycle>::default();
+        let bp = BulletproofGens::<R1csCycle>::new(8, 1);
+        let point = Gin::generator() * Fr::from(11);
+        let mapped = <R1csCycle as EcCurve>::affine(&point).unwrap();
+        let native = affine(&point).unwrap().0;
+        let cases = [
+            (mapped, native, true),
+            (mapped, mapped.x, false),
+            (
+                Affine {
+                    x: mapped.x + R1csField::ONE,
+                    y: mapped.y,
+                },
+                native,
+                false,
+            ),
+            (
+                Affine {
+                    x: mapped.x,
+                    y: mapped.y + R1csField::ONE,
+                },
+                native,
+                false,
+            ),
+            (
+                Affine {
+                    x: mapped.x,
+                    y: R1csField::ZERO,
+                },
+                native,
+                false,
+            ),
+        ];
+        let mut rng = ChaCha20Rng::from_seed([72; 32]);
+        for (coordinates, expected, accepted) in cases {
+            let mut prover = Prover::<R1csCycle, _>::new(&pc, Transcript::new(b"native-u-link"));
+            bind_native_coordinate(&mut prover, coordinates, expected, Some(&point));
+            let proof = prover.prove(&bp, &mut rng).unwrap();
+            let mut verifier = Verifier::<R1csCycle, _>::new(Transcript::new(b"native-u-link"));
+            bind_native_coordinate(&mut verifier, coordinates, expected, None);
+            let verdict = verifier
+                .verification_equation(&proof, &pc, &bp, &mut rng)
+                .and_then(|equation| equation.verify());
+            assert_eq!(verdict.is_ok(), accepted);
+        }
+    }
+
     #[test]
     fn integer_reduction_rejects_field_wrap_alias() {
         let pc = PedersenGens::<Bls12_381G1Cycle>::default();

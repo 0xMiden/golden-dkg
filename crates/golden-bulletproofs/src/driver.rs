@@ -1,5 +1,5 @@
 //! Shared immutable preparation, framing and proof composition.
-use bulletproofs_cycle::{ConstraintSystem, Cycle};
+use bulletproofs_cycle::{r1cs::RandomizableConstraintSystem, ConstraintSystem, Cycle};
 use golden_core::{DkgGroup, Result};
 
 pub(crate) struct Slot<G: DkgGroup> {
@@ -12,10 +12,9 @@ pub(crate) struct Slot<G: DkgGroup> {
 pub(crate) trait Backend: Cycle {
     type Dkg: DkgGroup<BaseField = Self::Scalar>;
     const PROOF_ID: &'static [u8];
+    const CIRCUIT_COSTS: crate::shape::CircuitCosts;
     const CYCLE_ID: &'static str;
-    /// Multiplier counts for zero, one and two slots; allocation parity repeats thereafter.
-    const MULTIPLIER_COUNTS: [usize; 3];
-    fn build<CS: ConstraintSystem<Self>>(
+    fn build<CS: RandomizableConstraintSystem<Self>>(
         cs: &mut CS,
         pk: &<Self::Dkg as DkgGroup>::Point,
         slots: &[Slot<Self::Dkg>],
@@ -24,7 +23,7 @@ pub(crate) trait Backend: Cycle {
     ) -> Result<()>;
 }
 
-use crate::{prepared::Prepared, shape};
+use crate::prepared::Prepared;
 use bulletproofs_cycle::{
     r1cs::{Prover, Verifier},
     R1CSError, R1CSProof, VerificationEquation,
@@ -201,7 +200,7 @@ pub(crate) fn prove<C: Backend>(
     witness: &DealerProofWitness<C::Dkg>,
     rng: &mut impl CryptoRngCore,
 ) -> Result<Vec<u8>> {
-    prepared.check_capacity(config)?;
+    let layout = prepared.check_capacity(config)?;
     main_golden::check_dealer_relation(config, statement, witness)
         .map_err(|_| Error::ProofGenerationFailed)?;
     if config.registry().len() == 1 {
@@ -222,7 +221,7 @@ pub(crate) fn prove<C: Backend>(
         main_golden::beta::<C::Dkg>()?,
     )
     .map_err(|_| Error::ProofGenerationFailed)?;
-    if prover.metrics().multipliers != shape::multiplier_count::<C>(slots.len())? {
+    if prover.metrics().multipliers != layout.phase_one {
         return Err(Error::ProofOperationFailed);
     }
     let r1cs = prover
@@ -243,12 +242,13 @@ fn prepare_equation<C: Backend>(
     proof: &[u8],
     rng: &mut impl CryptoRngCore,
 ) -> Result<VerificationEquation<C>> {
+    let layout = prepared.check_capacity(config)?;
     let mut reader = Reader::new(proof);
     if reader.framed().map_err(|_| Error::InvalidProof)? != C::PROOF_ID {
         return Err(Error::InvalidProof);
     }
     let payload = reader.framed().map_err(|_| Error::InvalidProof)?;
-    if payload.first() != Some(&0) {
+    if payload.first() != Some(&1) {
         return Err(Error::InvalidProof);
     }
     let parsed = R1CSProof::<C>::from_bytes(payload).map_err(|_| Error::InvalidProof)?;
@@ -269,7 +269,7 @@ fn prepare_equation<C: Backend>(
         None,
         main_golden::beta::<C::Dkg>()?,
     )?;
-    if verifier.metrics().multipliers != shape::multiplier_count::<C>(slots.len())? {
+    if verifier.metrics().multipliers != layout.phase_one {
         return Err(Error::ProofOperationFailed);
     }
     let equation = verifier
@@ -415,3 +415,7 @@ pub(crate) fn verify_batch<C: Backend>(
     }
     verdict.map_err(|_| Error::InvalidProof)
 }
+
+#[cfg(test)]
+#[path = "profile.rs"]
+mod profile;

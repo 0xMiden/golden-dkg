@@ -380,6 +380,7 @@ fn malformed_artifact<C: crate::driver::Backend>() {
     let pc = bulletproofs_cycle::generators::PedersenGens::<C>::default();
     let bp = bulletproofs_cycle::generators::BulletproofGens::<C>::new(4, 1);
     let prefix = Prepared::<C> {
+        layout: Default::default(),
         capacity: 2,
         generators: Some((pc, bp)),
     };

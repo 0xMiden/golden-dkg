@@ -36,7 +36,7 @@ postcard = { workspace = true }
 default = []
 secp-secq = ["golden-curves/secp256k1", "dep:halo2curves"]
 jubjub-bls12-381 = ["golden-curves/jubjub", "dep:bls12_381", "dep:blst", "dep:blstrs", "dep:jubjub"]
-parallel = ["bulletproofs-cycle/parallel", "p3-maybe-rayon/parallel"]
+parallel = ["golden-core/parallel", "bulletproofs-cycle/parallel", "p3-maybe-rayon/parallel"]
 serde = ["dep:serde"]
 
 [lints.rust]

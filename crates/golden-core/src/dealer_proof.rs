@@ -1,11 +1,13 @@
 //! Immutable core-constructed inputs for the fixed Main Golden proof relation.
-use crate::error::normalize_validation_error;
 use crate::secret::Secret;
+use crate::wire::{count, reserve};
 use crate::{
     DealerMessageNonce, DkgConfig, DkgGroup, DkgInstanceKind, Error, EvrfMessage, ParticipantIndex,
     Result, TranscriptRoot,
 };
 use core::fmt;
+use ff::PrimeField;
+use group::Group;
 use rand_core::CryptoRngCore;
 
 /// One immutable statement and opaque proof in canonical dealer order.
@@ -43,34 +45,141 @@ pub trait DealerProofSystem<G: DkgGroup>: Send + Sync {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct DealerProofReceiver<G: DkgGroup> {
-    pub(crate) participant: ParticipantIndex,
-    pub(crate) public_key: G::Point,
-    pub(crate) share_commitment: G::Point,
+/// Unvalidated public fields supplied by either native dealing or strict decoding.
+/// Participant identity and Feldman shares are derived by the statement constructor.
+pub(crate) struct ReceiverInput<G: DkgGroup> {
     pub(crate) pad_commitment: G::Point,
     pub(crate) encrypted_share: G::Scalar,
 }
-#[derive(Clone, Debug)]
-pub(crate) struct DealerProofInstance<G: DkgGroup> {
-    pub(crate) kind: DkgInstanceKind,
+pub(crate) struct InstanceInput<G: DkgGroup> {
     pub(crate) nonce: DealerMessageNonce,
-    pub(crate) effective_message: EvrfMessage,
     pub(crate) coefficients: Vec<G::Point>,
-    pub(crate) receivers: Vec<DealerProofReceiver<G>>,
+    pub(crate) receivers: Vec<ReceiverInput<G>>,
+}
+
+#[derive(Clone, Debug)]
+struct DealerProofReceiver<G: DkgGroup> {
+    participant: ParticipantIndex,
+    public_key: G::Point,
+    share_commitment: G::Point,
+    pad_commitment: G::Point,
+    encrypted_share: G::Scalar,
+}
+#[derive(Clone, Debug)]
+struct DealerProofInstance<G: DkgGroup> {
+    kind: DkgInstanceKind,
+    nonce: DealerMessageNonce,
+    effective_message: EvrfMessage,
+    coefficients: Vec<G::Point>,
+    receivers: Vec<DealerProofReceiver<G>>,
 }
 
 /// Immutable public statement. Only core constructs it after public validation.
 #[derive(Clone, Debug)]
 pub struct DealerProofStatement<G: DkgGroup> {
-    pub(crate) config_root: TranscriptRoot,
-    pub(crate) dealer: ParticipantIndex,
-    pub(crate) dealer_public_key: G::Point,
-    pub(crate) instances: Vec<DealerProofInstance<G>>,
-    pub(crate) logical: Vec<u8>,
-    pub(crate) root: TranscriptRoot,
+    config_root: TranscriptRoot,
+    dealer: ParticipantIndex,
+    dealer_public_key: G::Point,
+    instances: Vec<DealerProofInstance<G>>,
+    logical: Vec<u8>,
+    root: TranscriptRoot,
 }
 impl<G: DkgGroup> DealerProofStatement<G> {
+    /// The sole construction path: raw fields become immutable, fully validated
+    /// public inputs before any proof backend can observe them.
+    pub(crate) fn new(
+        config: &DkgConfig<G>,
+        dealer: ParticipantIndex,
+        inputs: Vec<InstanceInput<G>>,
+    ) -> Result<Self> {
+        let key = *config.registry().public_key(dealer)?;
+        if inputs.len() != config.instances().len() {
+            return Err(Error::InvalidEncoding);
+        }
+        let mut instances = reserve(inputs.len())?;
+        for (position, input) in inputs.into_iter().enumerate() {
+            let kind = config.instances()[position];
+            if input.coefficients.len() != config.threshold() {
+                return Err(Error::InvalidEncoding);
+            }
+            let effective_message = crate::main_golden::effective_message(
+                config.root(),
+                dealer,
+                position,
+                kind,
+                input.nonce,
+            )?;
+            if input.receivers.len() != config.registry().len() - 1
+                || (kind == DkgInstanceKind::Zero
+                    && !bool::from(input.coefficients[0].is_identity()))
+            {
+                return Err(Error::InvalidEncoding);
+            }
+            let mut receivers = reserve(input.receivers.len())?;
+            for (receiver, (participant, public_key)) in input.receivers.into_iter().zip(
+                config
+                    .registry()
+                    .entries()
+                    .filter(|(index, _)| *index != dealer),
+            ) {
+                let share_commitment =
+                    crate::feldman::evaluate::<G>(&input.coefficients, participant);
+                if bool::from(receiver.pad_commitment.is_identity())
+                    || G::mul_generator(&receiver.encrypted_share)
+                        != share_commitment + receiver.pad_commitment
+                {
+                    return Err(Error::InvalidEncoding);
+                }
+                receivers.push(DealerProofReceiver {
+                    participant,
+                    public_key: *public_key,
+                    share_commitment,
+                    pad_commitment: receiver.pad_commitment,
+                    encrypted_share: receiver.encrypted_share,
+                });
+            }
+            instances.push(DealerProofInstance {
+                kind,
+                nonce: input.nonce,
+                effective_message,
+                coefficients: input.coefficients,
+                receivers,
+            });
+        }
+        let mut logical = Vec::new();
+        logical.extend_from_slice(&config.root());
+        logical.extend_from_slice(&dealer.get().to_be_bytes());
+        logical.extend_from_slice(&G::encode_point(&key));
+        logical.extend_from_slice(crate::main_golden::beta::<G>()?.to_repr().as_ref());
+        count(&mut logical, instances.len())?;
+        for (position, instance) in instances.iter().enumerate() {
+            count(&mut logical, position)?;
+            logical.push(instance.kind.tag());
+            logical.extend_from_slice(&instance.nonce.0);
+            logical.extend_from_slice(&instance.effective_message.0);
+            count(&mut logical, instance.coefficients.len())?;
+            for coefficient in &instance.coefficients {
+                logical.extend_from_slice(&G::encode_point(coefficient));
+            }
+            count(&mut logical, instance.receivers.len())?;
+            for receiver in &instance.receivers {
+                logical.extend_from_slice(&receiver.participant.get().to_be_bytes());
+                logical.extend_from_slice(&G::encode_point(&receiver.public_key));
+                logical.extend_from_slice(&G::encode_point(&receiver.share_commitment));
+                logical.extend_from_slice(&G::encode_point(&receiver.pad_commitment));
+                logical.extend_from_slice(&G::encode_scalar(&receiver.encrypted_share));
+            }
+        }
+        let root = crate::transcript::hash_payload(b"golden-dkg/dealer-root/v3", &logical)?;
+        Ok(Self {
+            config_root: config.root(),
+            dealer,
+            dealer_public_key: key,
+            instances,
+            logical,
+            root,
+        })
+    }
     /// Configuration identity.
     pub fn config_root(&self) -> TranscriptRoot {
         self.config_root
@@ -114,8 +223,9 @@ impl<G: DkgGroup> DealerProofStatement<G> {
         {
             return Err(Error::InvalidProof);
         }
-        crate::dealer_message::validate_instances(config, self.dealer, &self.instances)
-            .map_err(|error| normalize_validation_error(error, Error::InvalidProof))
+        // The private fields and sole constructor preserve every public relation.
+        // A different configuration must still fail before a backend uses them.
+        Ok(())
     }
 }
 

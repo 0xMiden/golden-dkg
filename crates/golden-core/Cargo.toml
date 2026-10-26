@@ -14,6 +14,7 @@ publish = ["crates-io"]
 ff = { workspace = true }
 group = { workspace = true }
 miden-serde-utils = { workspace = true, optional = true }
+p3-maybe-rayon = { workspace = true }
 rand_core = { workspace = true }
 serde = { workspace = true, optional = true }
 sha2 = { workspace = true }
@@ -29,6 +30,7 @@ postcard = { workspace = true }
 
 [features]
 default = []
+parallel = ["p3-maybe-rayon/parallel"]
 insecure-revealed-witness = []
 miden-serde = ["dep:miden-serde-utils"]
 serde = ["dep:serde"]
