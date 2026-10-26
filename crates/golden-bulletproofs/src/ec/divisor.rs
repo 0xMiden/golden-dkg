@@ -67,65 +67,6 @@ pub(super) fn basis<F: PrimeField>(
     Ok((values, derivatives))
 }
 
-/// Expand the basis in the local parameter `t = x - point.x`.
-///
-/// Coefficients of `t^j` impose order of vanishing without dividing by j!,
-/// so repeated roots retain their full multiplicity.
-#[cfg(test)]
-fn local_rows<F: PrimeField>(
-    point: Affine<F>,
-    multiplicity: usize,
-    degree: usize,
-    a: F,
-) -> Result<Vec<Vec<F>>> {
-    let inverse_2y = Option::<F>::from(point.y.double().invert()).ok_or(Error::InvalidProof)?;
-    let mut ys = vec![F::ZERO; multiplicity];
-    ys[0] = point.y;
-    for order in 1..multiplicity {
-        let curve_coefficient = match order {
-            1 => F::from(3) * point.x.square() + a,
-            2 => F::from(3) * point.x,
-            3 => F::ONE,
-            _ => F::ZERO,
-        };
-        let cross = (1..order)
-            .map(|j| ys[j] * ys[order - j])
-            .fold(F::ZERO, |sum, term| sum + term);
-        ys[order] = (curve_coefficient - cross) * inverse_2y;
-    }
-    let mut powers = vec![vec![F::ZERO; multiplicity]; degree / 2 + 1];
-    powers[0][0] = F::ONE;
-    for power in 1..powers.len() {
-        for order in 0..multiplicity {
-            powers[power][order] = powers[power - 1][order] * point.x
-                + if order == 0 {
-                    F::ZERO
-                } else {
-                    powers[power - 1][order - 1]
-                };
-        }
-    }
-    let mut rows = Vec::with_capacity(multiplicity);
-    for order in 0..multiplicity {
-        let mut row = Vec::with_capacity(degree);
-        row.push(if order == 0 { F::ONE } else { F::ZERO });
-        for weight in 2..=degree {
-            if weight % 2 == 0 {
-                row.push(powers[weight / 2][order]);
-            } else {
-                let power = (weight - 3) / 2;
-                row.push(
-                    -(0..=order)
-                        .map(|j| ys[j] * powers[power][order - j])
-                        .fold(F::ZERO, |sum, term| sum + term),
-                );
-            }
-        }
-        rows.push(row);
-    }
-    Ok(rows)
-}
-
 fn curve_b<F: PrimeField>(roots: &[Affine<F>], a: F) -> Result<F> {
     let degree = roots.len();
     if degree < 3 || !valid_degree::<F>(degree) || F::from(6) == F::ZERO {
@@ -283,74 +224,131 @@ pub(super) fn interpolate<F: PrimeField>(roots: &[Affine<F>], a: F) -> Result<Ve
     Ok(coefficients)
 }
 
-/// Independent Hermite interpolation oracle for native constructor tests.
-#[cfg(test)]
-fn interpolate_gaussian<F: PrimeField>(roots: &[Affine<F>], a: F) -> Result<Vec<F>> {
-    curve_b(roots, a)?;
-    let degree = roots.len();
-    let mut groups: Vec<(Affine<F>, usize)> = Vec::with_capacity(degree);
-    for &root in roots {
-        if let Some((_, count)) = groups.iter_mut().find(|(point, _)| *point == root) {
-            *count += 1;
-        } else {
-            groups.push((root, 1));
-        }
-    }
-    let unknowns = degree - 1;
-    let mut matrix = Vec::with_capacity(degree);
-    for (root, multiplicity) in groups {
-        for mut row in local_rows(root, multiplicity, degree, a)? {
-            // Move the monic leading term to the right-hand side.
-            row[unknowns] = -row[unknowns];
-            matrix.push(row);
-        }
-    }
-    // Forward elimination keeps work below each pivot; back substitution
-    // avoids the redundant eliminations of Gauss-Jordan interpolation.
-    for column in 0..unknowns {
-        let pivot = (column..degree)
-            .find(|&row| matrix[row][column] != F::ZERO)
-            .ok_or(Error::InvalidProof)?;
-        matrix.swap(column, pivot);
-        let inverse =
-            Option::<F>::from(matrix[column][column].invert()).ok_or(Error::InvalidProof)?;
-        for value in &mut matrix[column][column..] {
-            *value *= inverse;
-        }
-        let (processed, remaining) = matrix.split_at_mut(column + 1);
-        let pivot_values = &processed[column][column..];
-        for row in remaining {
-            let factor = row[column];
-            for (value, pivot_value) in row[column..].iter_mut().zip(pivot_values) {
-                *value -= factor * pivot_value;
-            }
-        }
-    }
-    if matrix[unknowns..]
-        .iter()
-        .flatten()
-        .any(|value| *value != F::ZERO)
-    {
-        return Err(Error::InvalidProof);
-    }
-    let mut coefficients = vec![F::ZERO; degree];
-    coefficients[unknowns] = F::ONE;
-    for row in (0..unknowns).rev() {
-        let mut value = matrix[row][unknowns];
-        for (coefficient, entry) in coefficients[row + 1..unknowns]
-            .iter()
-            .zip(&matrix[row][row + 1..unknowns])
-        {
-            value -= *coefficient * entry;
-        }
-        coefficients[row] = value;
-    }
-    Ok(coefficients)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Expand the basis in the local parameter `t = x - point.x`.
+    ///
+    /// Coefficients of `t^j` impose order of vanishing without dividing by j!,
+    /// so repeated roots retain their full multiplicity.
+    fn local_rows<F: PrimeField>(
+        point: Affine<F>,
+        multiplicity: usize,
+        degree: usize,
+        a: F,
+    ) -> Result<Vec<Vec<F>>> {
+        let inverse_2y = Option::<F>::from(point.y.double().invert()).ok_or(Error::InvalidProof)?;
+        let mut ys = vec![F::ZERO; multiplicity];
+        ys[0] = point.y;
+        for order in 1..multiplicity {
+            let curve_coefficient = match order {
+                1 => F::from(3) * point.x.square() + a,
+                2 => F::from(3) * point.x,
+                3 => F::ONE,
+                _ => F::ZERO,
+            };
+            let cross = (1..order)
+                .map(|j| ys[j] * ys[order - j])
+                .fold(F::ZERO, |sum, term| sum + term);
+            ys[order] = (curve_coefficient - cross) * inverse_2y;
+        }
+        let mut powers = vec![vec![F::ZERO; multiplicity]; degree / 2 + 1];
+        powers[0][0] = F::ONE;
+        for power in 1..powers.len() {
+            for order in 0..multiplicity {
+                powers[power][order] = powers[power - 1][order] * point.x
+                    + if order == 0 {
+                        F::ZERO
+                    } else {
+                        powers[power - 1][order - 1]
+                    };
+            }
+        }
+        let mut rows = Vec::with_capacity(multiplicity);
+        for order in 0..multiplicity {
+            let mut row = Vec::with_capacity(degree);
+            row.push(if order == 0 { F::ONE } else { F::ZERO });
+            for weight in 2..=degree {
+                if weight % 2 == 0 {
+                    row.push(powers[weight / 2][order]);
+                } else {
+                    let power = (weight - 3) / 2;
+                    row.push(
+                        -(0..=order)
+                            .map(|j| ys[j] * powers[power][order - j])
+                            .fold(F::ZERO, |sum, term| sum + term),
+                    );
+                }
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// Independent Hermite interpolation oracle for native constructor tests.
+    fn interpolate_gaussian<F: PrimeField>(roots: &[Affine<F>], a: F) -> Result<Vec<F>> {
+        curve_b(roots, a)?;
+        let degree = roots.len();
+        let mut groups: Vec<(Affine<F>, usize)> = Vec::with_capacity(degree);
+        for &root in roots {
+            if let Some((_, count)) = groups.iter_mut().find(|(point, _)| *point == root) {
+                *count += 1;
+            } else {
+                groups.push((root, 1));
+            }
+        }
+        let unknowns = degree - 1;
+        let mut matrix = Vec::with_capacity(degree);
+        for (root, multiplicity) in groups {
+            for mut row in local_rows(root, multiplicity, degree, a)? {
+                // Move the monic leading term to the right-hand side.
+                row[unknowns] = -row[unknowns];
+                matrix.push(row);
+            }
+        }
+        // Forward elimination keeps work below each pivot; back substitution
+        // avoids the redundant eliminations of Gauss-Jordan interpolation.
+        for column in 0..unknowns {
+            let pivot = (column..degree)
+                .find(|&row| matrix[row][column] != F::ZERO)
+                .ok_or(Error::InvalidProof)?;
+            matrix.swap(column, pivot);
+            let inverse =
+                Option::<F>::from(matrix[column][column].invert()).ok_or(Error::InvalidProof)?;
+            for value in &mut matrix[column][column..] {
+                *value *= inverse;
+            }
+            let (processed, remaining) = matrix.split_at_mut(column + 1);
+            let pivot_values = &processed[column][column..];
+            for row in remaining {
+                let factor = row[column];
+                for (value, pivot_value) in row[column..].iter_mut().zip(pivot_values) {
+                    *value -= factor * pivot_value;
+                }
+            }
+        }
+        if matrix[unknowns..]
+            .iter()
+            .flatten()
+            .any(|value| *value != F::ZERO)
+        {
+            return Err(Error::InvalidProof);
+        }
+        let mut coefficients = vec![F::ZERO; degree];
+        coefficients[unknowns] = F::ONE;
+        for row in (0..unknowns).rev() {
+            let mut value = matrix[row][unknowns];
+            for (coefficient, entry) in coefficients[row + 1..unknowns]
+                .iter()
+                .zip(&matrix[row][row + 1..unknowns])
+            {
+                value -= *coefficient * entry;
+            }
+            coefficients[row] = value;
+        }
+        Ok(coefficients)
+    }
 
     fn with_oracle<F: PrimeField>(roots: &[Affine<F>], a: F) -> Result<Vec<F>> {
         let result = interpolate(roots, a);

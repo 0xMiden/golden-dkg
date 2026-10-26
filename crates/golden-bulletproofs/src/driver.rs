@@ -21,19 +21,9 @@ pub(crate) trait Backend: Cycle {
         secret: Option<&<Self::Dkg as DkgGroup>::Scalar>,
         beta: Self::Scalar,
     ) -> Result<()>;
-    #[cfg(test)]
-    fn build_ladder<CS: ConstraintSystem<Self>>(
-        cs: &mut CS,
-        pk: &<Self::Dkg as DkgGroup>::Point,
-        slots: &[Slot<Self::Dkg>],
-        secret: Option<&<Self::Dkg as DkgGroup>::Scalar>,
-        beta: Self::Scalar,
-    ) -> Result<()>;
 }
 
 use crate::prepared::Prepared;
-#[cfg(test)]
-use crate::shape;
 use bulletproofs_cycle::{
     r1cs::{Prover, Verifier},
     R1CSError, R1CSProof, VerificationEquation,

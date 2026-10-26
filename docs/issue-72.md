@@ -34,9 +34,13 @@ direct table check; zero is excluded because these point references represent
 nonidentity points. Production scalars retain the existing 257-bit canonical
 representation. Singleton configurations retain #71's empty proof path.
 
-The ladder circuits remain available to tests as a comparison baseline. They
-retain their original formulas and now also reuse receiver DH and reduction
-across sharings, as required for comparison with the issue's projections.
+The measured ladder baseline is preserved in signed snapshot
+`c7c6795ae7b684a3f4f637546c09e3e89a171090`. It retains the original formulas and
+also reuses receiver DH and reduction across sharings, as required for comparison
+with the issue's projections. After measuring, the old circuits and comparison
+branches were removed from the active source. The current profiler measures the
+production ECIP implementation. The independent native divisor oracle remains
+inside its test module.
 
 ## Certificate and scalar linkage
 

@@ -1149,7 +1149,7 @@
     "features": "secp-secq,jubjub-bls12-381,parallel,serde",
     "profile": "release",
     "dependency_base": "f338f38b5c6b153fcba101ef4ca6bee81c2580e9",
-    "source_commit": "PENDING_SOURCE_COMMIT",
+    "source_commit": "c7c6795ae7b684a3f4f637546c09e3e89a171090",
     "sampling": "three fresh processes per case; timing medians, maximum peak RSS"
   }
 }

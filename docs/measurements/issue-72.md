@@ -2,7 +2,7 @@
 
 Observed 2026-10-26 on Apple M5 Max (18 logical CPUs, 64 GiB), macOS/aarch64,
 Rust 1.99.0, release profile, both backends with `parallel,serde` enabled. Source:
-`PENDING_SOURCE_COMMIT`, based on post-#71 `f338f38`.
+`c7c6795ae7b684a3f4f637546c09e3e89a171090`, based on post-#71 `f338f38`.
 
 Each row is the median of three fresh processes. Peak RSS is the maximum of
 those processes, measured with macOS `/usr/bin/time -l` (bytes converted to MiB).
@@ -89,6 +89,16 @@ final tables.
 
 ## Reproduction
 
+Both engines are preserved at signed snapshot
+`c7c6795ae7b684a3f4f637546c09e3e89a171090`. The active source removes the old
+ladders; its profiler measures ECIP only. To reproduce the comparisons below,
+check out that snapshot in a separate worktree first:
+
+```sh
+git worktree add --detach ../golden-issue72-comparison c7c6795ae7b684a3f4f637546c09e3e89a171090
+cd ../golden-issue72-comparison
+```
+
 On AC power, build the ignored profiling tests:
 
 ```sh
@@ -106,7 +116,8 @@ GOLDEN_PROFILE_N=3 GOLDEN_PROFILE_T=2 GOLDEN_PROFILE_ENGINE=ecip \
 
 Use `GOLDEN_PROFILE_ENGINE=ladder` for the baseline, `profile_jubjub` for the other
 curve, and `(N,T)=(3,2),(3,3),(5,3),(10,5)` for the cases above. Repeat each
-combination in three fresh processes. No other compilation/testing ran during
+combination in three fresh processes. On the active branch, omit
+`GOLDEN_PROFILE_ENGINE`; only ECIP is retained. No other compilation/testing ran during
 measurement. The macOS meter reports RSS bytes; Linux meter units differ.
 
 Terminal folding remains disabled. No field-sum proxy, unchecked integer carry

@@ -1,7 +1,6 @@
-//! Reproducible, opt-in full dealer proof comparison. Run each case in its own
+//! Reproducible, opt-in full dealer proof measurements. Run each case in its own
 //! process under the platform's peak-RSS meter; timings are single observations.
 use super::*;
-use bulletproofs_cycle::generators::{BulletproofGens, PedersenGens};
 use golden_core::{
     deal, DealerProofSystem, DkgInstanceKind, ParticipantIndex, ParticipantRegistry, SessionId,
 };
@@ -20,33 +19,7 @@ struct Sample {
 }
 struct Profile<C: Backend> {
     prepared: Prepared<C>,
-    ladder: bool,
     sample: Mutex<Option<Sample>>,
-}
-fn build<C: Backend, CS: RandomizableConstraintSystem<C>>(
-    cs: &mut CS,
-    statement: &DealerProofStatement<C::Dkg>,
-    slots: &[Slot<C::Dkg>],
-    secret: Option<&<C::Dkg as DkgGroup>::Scalar>,
-    ladder: bool,
-) -> Result<()> {
-    if ladder {
-        C::build_ladder(
-            cs,
-            statement.dealer_public_key(),
-            slots,
-            secret,
-            main_golden::beta::<C::Dkg>()?,
-        )
-    } else {
-        C::build(
-            cs,
-            statement.dealer_public_key(),
-            slots,
-            secret,
-            main_golden::beta::<C::Dkg>()?,
-        )
-    }
 }
 impl<C: Backend> DealerProofSystem<C::Dkg> for Profile<C> {
     fn prove(
@@ -67,12 +40,12 @@ impl<C: Backend> DealerProofSystem<C::Dkg> for Profile<C> {
             .ok_or(Error::ProofOperationFailed)?;
         let mut transcript = transcript::<C>(config, statement);
         let mut prover = Prover::<C, _>::new(pc, &mut transcript);
-        build::<C, _>(
+        C::build(
             &mut prover,
-            statement,
+            statement.dealer_public_key(),
             &slots,
             Some(witness.identity_secret()),
-            self.ladder,
+            main_golden::beta::<C::Dkg>()?,
         )?;
         if prover.metrics().multipliers != layout.phase_one {
             return Err(Error::ProofOperationFailed);
@@ -119,7 +92,7 @@ impl<C: Backend> DealerProofSystem<C::Dkg> for Profile<C> {
             return Err(Error::InvalidProof);
         }
         let payload = reader.framed()?;
-        if payload.first() != Some(&u8::from(!self.ladder)) {
+        if payload.first() != Some(&1) {
             return Err(Error::InvalidProof);
         }
         let proof = R1CSProof::<C>::from_bytes(payload).map_err(|_| Error::InvalidProof)?;
@@ -131,7 +104,13 @@ impl<C: Backend> DealerProofSystem<C::Dkg> for Profile<C> {
             .ok_or(Error::ProofOperationFailed)?;
         let mut transcript = transcript::<C>(config, statement);
         let mut verifier = Verifier::<C, _>::new(&mut transcript);
-        build::<C, _>(&mut verifier, statement, &slots, None, self.ladder)?;
+        C::build(
+            &mut verifier,
+            statement.dealer_public_key(),
+            &slots,
+            None,
+            main_golden::beta::<C::Dkg>()?,
+        )?;
         if verifier.metrics().multipliers != layout.phase_one || proof.to_bytes() != payload {
             return Err(Error::ProofOperationFailed);
         }
@@ -154,7 +133,6 @@ fn profile<C: Backend>() {
         .map(|v| v.parse().unwrap())
         .unwrap_or(n.min(2) as usize);
     assert!((2..=10).contains(&n));
-    let ladder = std::env::var("GOLDEN_PROFILE_ENGINE").is_ok_and(|v| v == "ladder");
     let entries = (1..=n)
         .map(|i| {
             (
@@ -173,38 +151,13 @@ fn profile<C: Backend>() {
     )
     .unwrap();
     let start = Instant::now();
-    let layout = if ladder {
-        let generator = <C::Dkg as DkgGroup>::Point::generator();
-        let data = (0..2)
-            .flat_map(|_| {
-                (0..n - 1).map(|i| Slot::<C::Dkg> {
-                    peer: generator * <C::Dkg as DkgGroup>::Scalar::from(u64::from(i) + 2),
-                    h1: generator,
-                    h2: generator,
-                    pad: generator,
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut verifier = Verifier::<C, _>::new(Transcript::new(b"profile-layout"));
-        C::build_ladder(&mut verifier, &generator, &data, None, C::Scalar::ONE).unwrap();
-        shape::Layout {
-            phase_one: verifier.metrics().multipliers,
-            total: verifier.metrics().multipliers,
-        }
-    } else {
-        shape::layout::<C>((n - 1) as usize, 2).unwrap()
-    };
-    let total = layout.total;
-    let capacity = total.next_power_of_two();
-    let prepared = Prepared {
-        capacity,
-        layout: std::sync::OnceLock::from((shape::Shape::of(&config), layout)),
-        generators: Some((PedersenGens::default(), BulletproofGens::new(capacity, 1))),
-    };
+    let prepared = Prepared::<C>::prepare_for(&config).unwrap();
     let preparation = start.elapsed();
+    let layout = prepared.check_capacity(&config).unwrap();
+    let total = layout.total;
+    let capacity = prepared.capacity;
     let proofs = Profile::<C> {
         prepared,
-        ladder,
         sample: Mutex::new(None),
     };
     let mut rng = ChaCha20Rng::from_seed([73; 32]);
@@ -225,8 +178,8 @@ fn profile<C: Backend>() {
         proof_bytes,
         phase_one,
     } = proofs.sample.lock().unwrap().unwrap();
-    println!("PROFILE,curve={},engine={},n={},t={},slots={},phase_one={},capacity={},proof_bytes={},preparation_ms={:.3},witness_build_ms={:.3},proving_ms={:.3},verification_ms={:.3},deal_and_check_ms={:.3},broadcast_bytes={}",
-        C::CYCLE_ID, if ladder { "ladder" } else { "ecip" }, n, threshold, total, phase_one, capacity, proof_bytes,
+    println!("PROFILE,curve={},engine=ecip,n={},t={},slots={},phase_one={},capacity={},proof_bytes={},preparation_ms={:.3},witness_build_ms={:.3},proving_ms={:.3},verification_ms={:.3},deal_and_check_ms={:.3},broadcast_bytes={}",
+        C::CYCLE_ID, n, threshold, total, phase_one, capacity, proof_bytes,
         preparation.as_secs_f64()*1000., witness.as_secs_f64()*1000., proving.as_secs_f64()*1000., verification.as_secs_f64()*1000., deal_and_check.as_secs_f64()*1000., dealing.broadcast_bytes().len());
 }
 #[cfg(feature = "secp-secq")]
