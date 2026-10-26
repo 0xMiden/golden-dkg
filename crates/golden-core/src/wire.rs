@@ -1218,6 +1218,76 @@ mod tests {
         )
     }
 
+    // Fixed fields, including valid proofs for identity secrets 11 and 12.
+    // Do not regenerate these with the prover or wire encoder: these fixtures
+    // must catch matching changes to the encoder and decoder.
+    fn fixed_registry() -> ParticipantRegistry<TinyGroup> {
+        ParticipantRegistry::new(
+            [(1, 11, 9, 25), (0x0102_0304, 12, 62, 95)]
+                .into_iter()
+                .map(|(participant, public_key, nonce_point, response)| {
+                    (
+                        idx(participant),
+                        TinyScalar::from_u64(public_key).unwrap(),
+                        IdentityKeyProof {
+                            nonce_point: TinyScalar::from_u64(nonce_point).unwrap(),
+                            response: TinyScalar::from_u64(response).unwrap(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn participant_registry_v2_fixed_wire_vector() {
+        let bytes = concat!(
+            "golden-dkg-wire-v3\x05", // Magic and registry tag.
+            "\x00\x00\x00\x00\x00\x00\x00\x17participant-registry-v2",
+            "\x00\x00\x00\x00\x00\x00\x00\x13golden-test-tiny-v1",
+            "\x00\x00\x00\x00\x00\x00\x00\x02", // Entry count.
+            "\x00\x00\x00\x01\x0b\x09\x19",     // Index, key, nonce point, response.
+            "\x01\x02\x03\x04\x0c\x3e\x5f",
+        )
+        .as_bytes();
+        let expected = fixed_registry();
+
+        let decoded = from_wire_bytes::<ParticipantRegistry<TinyGroup>>(bytes).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(to_wire_bytes(&expected), bytes);
+    }
+
+    #[test]
+    fn dkg_config_v2_fixed_wire_vector() {
+        let bytes = concat!(
+            "golden-dkg-wire-v3\x06", // Magic and config tag.
+            "\x00\x00\x00\x00\x00\x00\x00\x0ddkg-config-v2",
+            "\x00\x00\x00\x00\x00\x00\x00\x13golden-test-tiny-v1",
+            "\x00\x00\x00\x00\x00\x00\x00\x01", // Threshold.
+            "0123456789abcdef0123456789abcdef", // Session ID.
+            "\x07",                             // Beta.
+            "\x00\x00\x00\x00\x00\x00\x00\x02", // Nested registry entry count.
+            "\x00\x00\x00\x01\x0b\x09\x19",     // Index, key, nonce point, response.
+            "\x01\x02\x03\x04\x0c\x3e\x5f",
+        )
+        .as_bytes();
+        let expected = DkgConfig::new(
+            1,
+            SessionId(*b"0123456789abcdef0123456789abcdef"),
+            TinyScalar::from_u64(7).unwrap(),
+            fixed_registry(),
+        )
+        .unwrap();
+
+        let decoded = from_wire_bytes::<DkgConfig<TinyGroup>>(bytes).unwrap();
+        assert_eq!(decoded.threshold, expected.threshold);
+        assert_eq!(decoded.session_id, expected.session_id);
+        assert_eq!(decoded.beta, expected.beta);
+        assert_eq!(decoded.registry, expected.registry);
+        assert_eq!(to_wire_bytes(&expected), bytes);
+    }
+
     #[test]
     fn identity_key_proof_round_trips() {
         let (_, _, proof) = registry_entry(idx(1), 11);
