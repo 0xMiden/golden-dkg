@@ -1,10 +1,10 @@
 //! Benchmark-only [`Cycle`] impls over the upstream `halo2curves` secp256k1 /
 //! secq256k1 curves (privacy-ethereum/halo2curves).
 //!
-//! These live in the bench harness — not in `golden-halo2curves` — so that
+//! These live in the bench harness — not in `golden-bulletproofs` — so that
 //! `bulletproofs-cycle` can be benchmarked against `halo2curves` directly,
 //! with no dependency on the golden project. The impls mirror the production
-//! adapters in `golden-halo2curves` (same `msm_best` Pippenger MSM, same
+//! adapters in `golden-bulletproofs` (same `msm_best` Pippenger MSM, same
 //! `hash_to_curve` domain separators) so the numbers reflect the real curve
 //! backend.
 //!

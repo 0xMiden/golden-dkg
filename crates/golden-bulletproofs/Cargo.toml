@@ -1,0 +1,52 @@
+[package]
+name = "golden-bulletproofs"
+version.workspace = true
+description = "Explicitly prepared Bulletproofs for the fixed Main Golden DKG relation"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+golden-core = { workspace = true }
+golden-curves = { workspace = true }
+bulletproofs-cycle = { workspace = true }
+ff = { workspace = true }
+group = { workspace = true }
+merlin = { workspace = true }
+p3-maybe-rayon = { workspace = true }
+rand_core = { workspace = true }
+rand_chacha = { workspace = true }
+serde = { workspace = true, optional = true }
+subtle = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+halo2curves = { workspace = true, optional = true, features = ["std"] }
+bls12_381 = { workspace = true, optional = true }
+blst = { workspace = true, optional = true }
+blstrs = { workspace = true, optional = true }
+jubjub = { workspace = true, optional = true }
+
+[dev-dependencies]
+codspeed-criterion-compat = "5.0.1"
+postcard = { workspace = true }
+
+[features]
+default = []
+secp-secq = ["golden-curves/secp256k1", "dep:halo2curves"]
+jubjub-bls12-381 = ["golden-curves/jubjub", "dep:bls12_381", "dep:blst", "dep:blstrs", "dep:jubjub"]
+parallel = ["bulletproofs-cycle/parallel", "p3-maybe-rayon/parallel"]
+serde = ["dep:serde"]
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+panic = "deny"
+
+[[bench]]
+name = "joint_dkg"
+harness = false

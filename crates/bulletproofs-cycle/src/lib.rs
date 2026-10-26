@@ -2,8 +2,8 @@
 //!
 //! This is a fork of `zkcrypto/bulletproofs` 5.0.1 with the range proof, MPC,
 //! and serialization paths removed, and the hard-coded Ristretto backend
-//! replaced by the [`Cycle`] trait. The first milestone targets the
-//! `halo2curves` Secp/Secq cycle via the `golden-halo2curves` adapters.
+//! replaced by the [`Cycle`] trait. Concrete Secp/Secq and Jubjub/BLS12-381
+//! commitment-cycle adapters live privately in `golden-bulletproofs`.
 //!
 //! ## Pedersen blinding base: two domain separations
 //!

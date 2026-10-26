@@ -8,7 +8,7 @@
 //! As in the ancestor, the `ShuffleProof` gadget is copied into the bench
 //! harness rather than shared with the test code (criterion requires a separate
 //! `harness = false` binary). The gadget body matches the cycle-abstracted port
-//! in `golden-halo2curves/tests/r1cs.rs`.
+//! in `the concrete Secp/Secq R1CS proof flow`.
 
 #![allow(non_snake_case)]
 #![allow(missing_docs)]

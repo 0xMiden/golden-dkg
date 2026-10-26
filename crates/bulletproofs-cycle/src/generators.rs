@@ -5,9 +5,6 @@
 extern crate alloc;
 
 use alloc::{sync::Arc, vec::Vec};
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 use digest::{ExtendableOutput, Update, XofReader};
 #[cfg(all(feature = "cycle-pedersen", not(feature = "bulletproofs-compat")))]
@@ -16,6 +13,7 @@ use p3_maybe_rayon::prelude::*;
 use sha3::Shake256;
 
 use crate::cycle::Cycle;
+use crate::ProofError;
 
 /// A pair of base points for Pedersen commitments.
 #[derive(Copy, Clone)]
@@ -83,14 +81,6 @@ impl GeneratorsChain {
             reader: shake.finalize_xof(),
         }
     }
-
-    fn fast_forward(mut self, n: usize) -> Self {
-        let mut buf = [0u8; 64];
-        for _ in 0..n {
-            self.reader.read(&mut buf);
-        }
-        self
-    }
 }
 
 impl Iterator for GeneratorsChain {
@@ -138,11 +128,37 @@ where
     where
         S: serde::Serializer,
     {
-        BulletproofGensRepr {
+        #[derive(serde::Serialize)]
+        struct Prefixes<'a, A> {
+            gens_capacity: usize,
+            party_capacity: usize,
+            g_vec: Vec<&'a [A]>,
+            h_vec: Vec<&'a [A]>,
+        }
+
+        fn prefixes<A, E: serde::ser::Error>(
+            parties: &[Arc<Vec<A>>],
+            capacity: usize,
+            party_capacity: usize,
+        ) -> Result<Vec<&[A]>, E> {
+            if parties.len() != party_capacity {
+                return Err(E::custom("generator dimensions do not match capacities"));
+            }
+            parties
+                .iter()
+                .map(|party| {
+                    party
+                        .get(..capacity)
+                        .ok_or_else(|| E::custom("generator prefix exceeds storage"))
+                })
+                .collect()
+        }
+
+        Prefixes {
             gens_capacity: self.gens_capacity,
             party_capacity: self.party_capacity,
-            g_vec: self.G_vec.clone(),
-            h_vec: self.H_vec.clone(),
+            g_vec: prefixes::<_, S::Error>(&self.G_vec, self.gens_capacity, self.party_capacity)?,
+            h_vec: prefixes::<_, S::Error>(&self.H_vec, self.gens_capacity, self.party_capacity)?,
         }
         .serialize(serializer)
     }
@@ -158,36 +174,20 @@ where
     where
         D: serde::Deserializer<'de>,
     {
-        fn validate<C: Cycle, E: serde::de::Error>(
-            parties: &[Arc<Vec<C::Affine>>],
-            gens_capacity: usize,
-            party_capacity: usize,
-        ) -> Result<(), E> {
-            gens_capacity
-                .checked_mul(party_capacity)
-                .ok_or_else(|| E::custom("generator count overflow"))?;
-            if parties.len() != party_capacity
-                || parties.iter().any(|party| party.len() != gens_capacity)
-            {
-                return Err(E::custom("generator dimensions do not match capacities"));
-            }
-            for point in parties.iter().flat_map(|party| party.iter()) {
-                if C::compressed_is_identity(&C::affine_compress(point)) {
-                    return Err(E::custom("generator must not be the identity"));
-                }
-            }
-            Ok(())
-        }
-
         let repr = BulletproofGensRepr::<C::Affine>::deserialize(deserializer)?;
-        validate::<C, D::Error>(&repr.g_vec, repr.gens_capacity, repr.party_capacity)?;
-        validate::<C, D::Error>(&repr.h_vec, repr.gens_capacity, repr.party_capacity)?;
-        Ok(Self {
-            gens_capacity: repr.gens_capacity,
-            party_capacity: repr.party_capacity,
-            G_vec: repr.g_vec,
-            H_vec: repr.h_vec,
-        })
+        Self::from_prefixes(
+            repr.gens_capacity,
+            repr.party_capacity,
+            repr.g_vec
+                .into_iter()
+                .map(|party| (*party).clone())
+                .collect(),
+            repr.h_vec
+                .into_iter()
+                .map(|party| (*party).clone())
+                .collect(),
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -205,73 +205,51 @@ fn hash_chunk_size(count: usize) -> usize {
     count.div_ceil(4 * threads).clamp(1, MAX_HASH_CHUNK_SIZE)
 }
 
-/// Process-wide cache of derived generator prefixes, keyed by [`Cycle`] type
-/// and chain label. A label's generators are a fixed function of position
-/// (`GeneratorsChain` + `fast_forward`), so different shapes sharing the same
-/// labels (e.g. all `party_capacity = 1` circuits) reuse each other's prefix
-/// instead of re-deriving it. Grows monotonically, never shrinks.
-type GeneratorCache = HashMap<(TypeId, Vec<u8>), Box<dyn Any + Send + Sync>>;
-
-fn generator_cache() -> &'static Mutex<GeneratorCache> {
-    static CACHE: OnceLock<Mutex<GeneratorCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Test/benchmark-only: clears the cache so the next derivation is cold.
-/// Production code should let it grow monotonically.
-#[doc(hidden)]
-pub fn clear_generator_cache() {
-    generator_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
-}
-
 impl<C: Cycle> BulletproofGens<C> {
     fn derive(label: &[u8], capacity: usize) -> Arc<Vec<C::Affine>> {
-        let key = (TypeId::of::<C>(), label.to_vec());
+        let uniforms: Vec<[u8; 64]> = GeneratorsChain::new(label).take(capacity).collect();
+        let points: Vec<C::Point> = uniforms
+            .par_chunks(hash_chunk_size(uniforms.len()))
+            .flat_map(C::points_hash_from_uniform)
+            .collect();
+        Arc::new(C::batch_normalize(&points))
+    }
 
-        loop {
-            let have = {
-                let cache = generator_cache()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match cache.get(&key) {
-                    Some(entry) => Arc::clone(
-                        entry
-                            .downcast_ref::<Arc<Vec<C::Affine>>>()
-                            .expect("cache entry type matches C::Affine"),
-                    ),
-                    None => Arc::new(Vec::new()),
-                }
-            };
-            if have.len() >= capacity {
-                return have;
+    /// Restore exact generator prefixes without deriving any generators.
+    ///
+    /// Callers must supply canonically decoded, subgroup-checked points from
+    /// authenticated storage with approved generation provenance. Dimensions
+    /// and identity points are checked here; those checks cannot establish
+    /// that the generators were generated correctly.
+    pub fn from_prefixes(
+        gens_capacity: usize,
+        party_capacity: usize,
+        g_points: Vec<Vec<C::Affine>>,
+        h_points: Vec<Vec<C::Affine>>,
+    ) -> Result<Self, ProofError> {
+        gens_capacity
+            .checked_mul(party_capacity)
+            .ok_or(ProofError::InvalidGeneratorsLength)?;
+        for parties in [&g_points, &h_points] {
+            if parties.len() != party_capacity
+                || parties.iter().any(|party| party.len() != gens_capacity)
+            {
+                return Err(ProofError::InvalidGeneratorsLength);
             }
-
-            let uniforms: Vec<[u8; 64]> = GeneratorsChain::new(label)
-                .fast_forward(have.len())
-                .take(capacity - have.len())
-                .collect();
-            let points: Vec<C::Point> = uniforms
-                .par_chunks(hash_chunk_size(uniforms.len()))
-                .flat_map(C::points_hash_from_uniform)
-                .collect();
-            let mut extended = (*have).clone();
-            extended.extend(C::batch_normalize(&points));
-
-            let mut cache = generator_cache()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let slot: &mut Arc<Vec<C::Affine>> = cache
-                .entry(key.clone())
-                .or_insert_with(|| Box::new(Arc::new(Vec::<C::Affine>::new())))
-                .downcast_mut()
-                .expect("cache entry type matches C::Affine");
-            if slot.len() == have.len() {
-                *slot = Arc::new(extended);
+            if parties
+                .iter()
+                .flatten()
+                .any(|point| C::compressed_is_identity(&C::affine_compress(point)))
+            {
+                return Err(ProofError::FormatError);
             }
         }
+        Ok(Self {
+            gens_capacity,
+            party_capacity,
+            G_vec: g_points.into_iter().map(Arc::new).collect(),
+            H_vec: h_points.into_iter().map(Arc::new).collect(),
+        })
     }
 
     /// Create a new generator set with the given capacities.
@@ -361,10 +339,8 @@ mod tests {
     }
 
     #[test]
-    fn smaller_instance_is_a_prefix_of_a_larger_one_sharing_the_cache() {
+    fn independently_owned_instances_have_identical_generator_prefixes() {
         type C = RistrettoCycle;
-
-        clear_generator_cache();
 
         let small = BulletproofGens::<C>::new(8, 1);
         let large = BulletproofGens::<C>::new(96, 1);

@@ -1,6 +1,6 @@
 [package]
 name = "golden-core"
-version = "0.5.0"
+version.workspace = true
 description = "Core traits and protocols for Golden distributed key generation"
 edition.workspace = true
 homepage.workspace = true
@@ -11,23 +11,26 @@ rust-version.workspace = true
 publish = ["crates-io"]
 
 [dependencies]
+ff = { workspace = true }
+group = { workspace = true }
 miden-serde-utils = { workspace = true, optional = true }
-p3-maybe-rayon = { workspace = true }
 rand_core = { workspace = true }
 serde = { workspace = true, optional = true }
 sha2 = { workspace = true }
-subtle = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+ff = { workspace = true, features = ["derive"] }
+# Keep this test-only edge out of the packaged dependency graph.
+golden-curves = { path = "../golden-curves", default-features = false, features = ["secp256k1", "jubjub"] }
 rand_chacha = { workspace = true }
-serde_test = { workspace = true }
+postcard = { workspace = true }
 
 [features]
 default = []
+insecure-revealed-witness = []
 miden-serde = ["dep:miden-serde-utils"]
-parallel = ["p3-maybe-rayon/parallel"]
 serde = ["dep:serde"]
 
 [lints]

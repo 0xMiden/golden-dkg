@@ -30,9 +30,11 @@ jobs:
       - uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
         with:
           tool: cargo-nextest
-      - name: Run ignored golden-evrf Secp/Secq tests
-        run: cargo nextest run -p golden-evrf --features halo2curves-secp256k1 --run-ignored only
-      - name: Run ignored golden-ehtdh1 Secp/Secq bridge test
-        run: cargo nextest run -p golden-ehtdh1 --features halo2curves-secp256k1 --run-ignored only
+      - name: Run ignored joint proof tests (Secp/Secq)
+        run: cargo nextest run -p golden-bulletproofs --features secp-secq,parallel --run-ignored only
+      - name: Run ignored joint proof tests (Jubjub/BLS12-381)
+        run: cargo nextest run -p golden-bulletproofs --features jubjub-bls12-381,parallel --run-ignored only
+      - name: Run ignored EHTDH1 production bridges (both groups)
+        run: cargo nextest run -p golden-ehtdh1 --run-ignored only
       - name: Run EHTDH1 threshold record example
-        run: cargo run -p golden-ehtdh1 --example threshold_records --features prototype-bridge
+        run: cargo run -p golden-ehtdh1 --example threshold_records

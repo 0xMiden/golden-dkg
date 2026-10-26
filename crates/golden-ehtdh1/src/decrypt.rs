@@ -1,13 +1,12 @@
 //! Validator decryption shares and combiners.
 //!
-//! See crate root for the paper-to-crate symbol map.
+//! Online equations use the native inner group and the approved batch context.
 
+use group::Group;
 use std::collections::BTreeSet;
 use std::fmt;
 
-use golden_core::{
-    GoldenGroup, GoldenHashToGroup, GoldenScalar, ParticipantIndex, TranscriptBuilder,
-};
+use golden_core::{DkgGroup, ParticipantIndex, TranscriptBuilder};
 use rand_core::{CryptoRng, RngCore};
 
 use crate::context::{
@@ -18,11 +17,11 @@ use crate::encrypt::{apply_payload_mask, random_nonzero_scalar, verify_ciphertex
 
 /// Validator wrapper around `sk_i = (x_i, z_i)` from paper Section 3.
 #[derive(Clone)]
-pub struct UnsealingShare<G: GoldenHashToGroup> {
+pub struct UnsealingShare<G: DkgGroup> {
     share: SecretShare<G>,
 }
 
-impl<G: GoldenHashToGroup> fmt::Debug for UnsealingShare<G> {
+impl<G: DkgGroup> fmt::Debug for UnsealingShare<G> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("UnsealingShare")
@@ -32,7 +31,7 @@ impl<G: GoldenHashToGroup> fmt::Debug for UnsealingShare<G> {
     }
 }
 
-impl<G: GoldenHashToGroup> UnsealingShare<G> {
+impl<G: DkgGroup> UnsealingShare<G> {
     /// Construct a validator unsealing share.
     pub fn new(share: SecretShare<G>) -> Self {
         Self { share }
@@ -77,27 +76,23 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
         verify_ciphertext(message)?;
 
         // `X_i = x_i G`, `Z_i = z_i G`, and `S = Hdgd(ad, dc, ctxt)`.
-        let public_decryption_share = G::mul_generator(&self.share.decryption);
-        let public_context_share = G::mul_generator(&self.share.context);
+        let public_decryption_share = G::mul_generator(self.share.decryption());
+        let public_context_share = G::mul_generator(self.share.context());
         let decryption_group = decryption_group::<G>(setup_context, message, decryption_context)?;
 
         // `W_i = x_i R + z_i S`.
-        let share = G::add(
-            &G::mul(&message.ephemeral_public, &self.share.decryption),
-            &G::mul(&decryption_group, &self.share.context),
-        );
+        let share = message.ephemeral_public * *self.share.decryption()
+            + decryption_group * *self.share.context();
 
         // Paper nonces `x_i', z_i' in Zq`.
-        let decryption_nonce = random_nonzero_scalar::<G, _>(rng);
-        let context_nonce = random_nonzero_scalar::<G, _>(rng);
+        let decryption_nonce = crate::secret::secret(random_nonzero_scalar::<G, _>(rng));
+        let context_nonce = crate::secret::secret(random_nonzero_scalar::<G, _>(rng));
 
         // `X_i' = x_i'G`, `Z_i' = z_i'G`, and `W_i' = x_i'R + z_i'S`.
-        let public_decryption_commitment = G::mul_generator(&decryption_nonce);
-        let public_context_commitment = G::mul_generator(&context_nonce);
-        let share_commitment = G::add(
-            &G::mul(&message.ephemeral_public, &decryption_nonce),
-            &G::mul(&decryption_group, &context_nonce),
-        );
+        let public_decryption_commitment = G::mul_generator(decryption_nonce.expose());
+        let public_context_commitment = G::mul_generator(context_nonce.expose());
+        let share_commitment = message.ephemeral_public * *decryption_nonce.expose()
+            + decryption_group * *context_nonce.expose();
 
         // `e_i = Hdcd(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
         let challenge = share_challenge::<G>(ShareChallengeInputs {
@@ -112,8 +107,8 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
         })?;
 
         // `x_i'' = x_i' + e_i x_i` and `z_i'' = z_i' + e_i z_i`.
-        let decryption_response = decryption_nonce.add(&challenge.mul(&self.share.decryption));
-        let context_response = context_nonce.add(&challenge.mul(&self.share.context));
+        let decryption_response = *decryption_nonce.expose() + challenge * *self.share.decryption();
+        let context_response = *context_nonce.expose() + challenge * *self.share.context();
 
         Ok(DecryptionShare {
             participant: self.share.participant,
@@ -129,11 +124,11 @@ impl<G: GoldenHashToGroup> UnsealingShare<G> {
 ///
 /// `(e_i, x_i'', z_i'')` is a double Schnorr proof for `W_i = x_i R + z_i S`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DecryptionShare<G: GoldenHashToGroup> {
+pub struct DecryptionShare<G: DkgGroup> {
     /// Participant index.
     pub participant: ParticipantIndex,
     /// `W_i = x_i R + z_i S` (paper Section 3 Decryption).
-    pub share: G::Element,
+    pub share: G::Point,
     /// `e_i = Hdcd(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
     pub challenge: G::Scalar,
     /// `x_i'' = x_i' + e_i x_i` (paper Section 3 Decryption).
@@ -144,12 +139,12 @@ pub struct DecryptionShare<G: GoldenHashToGroup> {
 
 /// Combiner for paper `pkc`, checking shares and opening plaintext.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Combiner<G: GoldenHashToGroup> {
+pub struct Combiner<G: DkgGroup> {
     public_key_set: PublicKeySet<G>,
     setup_context: SetupContext,
 }
 
-impl<G: GoldenHashToGroup> Combiner<G> {
+impl<G: DkgGroup> Combiner<G> {
     /// Construct a combiner and run setup consistency checks not in the paper.
     pub fn new(
         public_key_set: PublicKeySet<G>,
@@ -293,7 +288,7 @@ impl<G: GoldenHashToGroup> Combiner<G> {
     fn verify_shares(
         &self,
         message: &Ciphertext<G>,
-        decryption_group: &G::Element,
+        decryption_group: &G::Point,
         shares: &[DecryptionShare<G>],
     ) -> (Vec<DecryptionShare<G>>, Vec<u32>) {
         let mut accepted = BTreeSet::new();
@@ -338,9 +333,9 @@ impl<G: GoldenHashToGroup> Combiner<G> {
         let lambdas =
             lagrange_coefficients_at_zero::<G>(&participants).map_err(CombineError::Ciphertext)?;
 
-        let mut dh_point = G::identity();
+        let mut dh_point = G::Point::identity();
         for (share, lambda) in shares.iter().zip(&lambdas) {
-            dh_point = G::add(&dh_point, &G::mul(&share.share, lambda));
+            dh_point += share.share * lambda;
         }
 
         let mut plaintext = message.encrypted_payload.clone();
@@ -350,12 +345,13 @@ impl<G: GoldenHashToGroup> Combiner<G> {
     }
 }
 
-fn validate_combiner_setup<G: GoldenHashToGroup>(
+fn validate_combiner_setup<G: DkgGroup>(
     public_key_set: &PublicKeySet<G>,
     setup_context: &SetupContext,
 ) -> Result<(), Error> {
-    if setup_context.backend_id != G::BACKEND_ID {
-        return Err(Error::InvalidBridge("setup backend mismatch"));
+    public_key_set.validate()?;
+    if setup_context.group_id != G::GROUP_ID {
+        return Err(Error::InvalidBridge("setup group mismatch"));
     }
     if setup_context.threshold != public_key_set.threshold {
         return Err(Error::InvalidBridge("setup threshold mismatch"));
@@ -368,10 +364,18 @@ fn validate_combiner_setup<G: GoldenHashToGroup>(
     if setup_context.participants != public_participants {
         return Err(Error::InvalidBridge("setup participant mismatch"));
     }
-    if setup_context.context_session_id
-        != crate::context::derive_context_session_id(setup_context.decryption_session_id)
-    {
-        return Err(Error::InvalidBridge("setup context session mismatch"));
+    let shares: Vec<_> = public_key_set
+        .public_shares
+        .iter()
+        .map(|(id, share)| (*id, share.decryption, share.context))
+        .collect();
+    let completion_root = golden_core::output::ehtdh1_completion_root::<G>(
+        setup_context.config_root,
+        &public_key_set.joint_public_key,
+        &shares,
+    )?;
+    if completion_root != setup_context.completion_root {
+        return Err(Error::InvalidBridge("setup completion mismatch"));
     }
     Ok(())
 }
@@ -381,33 +385,25 @@ fn validate_combiner_setup<G: GoldenHashToGroup>(
 /// This verifies the double Schnorr proof for `W_i = x_i R + z_i S`.
 /// `decryption_group` (`S = Hdgd(ad, dc, ctxt)`) is computed once by the
 /// caller and shared across shares instead of re-derived per share.
-fn verify_decryption_share<G: GoldenHashToGroup>(
+fn verify_decryption_share<G: DkgGroup>(
     setup_context: &SetupContext,
-    decryption_group: &G::Element,
+    decryption_group: &G::Point,
     message: &Ciphertext<G>,
     share: &DecryptionShare<G>,
     public_share: &PublicShare<G>,
 ) -> Result<(), Error> {
     // `X_i' = x_i''G - e_i X_i`.
-    let public_decryption_commitment = G::sub(
-        &G::mul_generator(&share.decryption_response),
-        &G::mul(&public_share.decryption, &share.challenge),
-    );
+    let public_decryption_commitment =
+        G::mul_generator(&share.decryption_response) - public_share.decryption * share.challenge;
 
     // `Z_i' = z_i''G - e_i Z_i`.
-    let public_context_commitment = G::sub(
-        &G::mul_generator(&share.context_response),
-        &G::mul(&public_share.context, &share.challenge),
-    );
+    let public_context_commitment =
+        G::mul_generator(&share.context_response) - public_share.context * share.challenge;
 
     // `W_i' = x_i''R + z_i''S - e_i W_i`.
-    let share_commitment = G::sub(
-        &G::add(
-            &G::mul(&message.ephemeral_public, &share.decryption_response),
-            &G::mul(decryption_group, &share.context_response),
-        ),
-        &G::mul(&share.share, &share.challenge),
-    );
+    let share_commitment = message.ephemeral_public * share.decryption_response
+        + *decryption_group * share.context_response
+        - share.share * share.challenge;
 
     // Accept only when `e_i = Hdcd(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
     let expected = share_challenge::<G>(ShareChallengeInputs {
@@ -429,13 +425,13 @@ fn verify_decryption_share<G: GoldenHashToGroup>(
 }
 
 /// `S = Hdgd(ad, dc, ctxt)`, additionally binding `SetupContext::root`.
-fn decryption_group<G: GoldenHashToGroup>(
+fn decryption_group<G: DkgGroup>(
     setup_context: &SetupContext,
     message: &Ciphertext<G>,
     decryption_context: &[u8],
-) -> Result<G::Element, Error> {
+) -> Result<G::Point, Error> {
     let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"hdgd");
-    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
+    transcript.bytes(b"backend", G::GROUP_ID.as_bytes());
     // The paper's `Hdgd` input is `(ad, dc, ctxt)`.
     // This crate also binds `SetupContext::root` into that transcript.
     transcript.bytes(b"setup-context-root", &setup_context.root());
@@ -447,29 +443,27 @@ fn decryption_group<G: GoldenHashToGroup>(
     transcript.scalar::<G>(b"e", &message.challenge);
     transcript.scalar::<G>(b"r-response", &message.response);
     transcript.bytes(b"ciphertext", &message.encrypted_payload);
-    G::hash_to_group(b"golden-ehtdh1-hdgd-v1", &transcript.root())
+    G::hash_to_point(b"golden-ehtdh1-hdgd-v1", &transcript.root())
         .map_err(|_| Error::InvalidEncoding)
 }
 
-struct ShareChallengeInputs<'a, G: GoldenGroup> {
+struct ShareChallengeInputs<'a, G: DkgGroup> {
     setup_context: &'a SetupContext,
-    decryption_group: &'a G::Element,
-    public_decryption_share: &'a G::Element,
-    public_context_share: &'a G::Element,
-    share: &'a G::Element,
-    public_decryption_commitment: &'a G::Element,
-    public_context_commitment: &'a G::Element,
-    share_commitment: &'a G::Element,
+    decryption_group: &'a G::Point,
+    public_decryption_share: &'a G::Point,
+    public_context_share: &'a G::Point,
+    share: &'a G::Point,
+    public_decryption_commitment: &'a G::Point,
+    public_context_commitment: &'a G::Point,
+    share_commitment: &'a G::Point,
 }
 
 /// `e_i = Hdcd(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
 ///
 /// Commitments are `X_i' = x_i'G`, `Z_i' = z_i'G`, and `W_i' = x_i'R + z_i'S`.
-fn share_challenge<G: GoldenGroup>(
-    inputs: ShareChallengeInputs<'_, G>,
-) -> Result<G::Scalar, Error> {
+fn share_challenge<G: DkgGroup>(inputs: ShareChallengeInputs<'_, G>) -> Result<G::Scalar, Error> {
     let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"hdcd");
-    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
+    transcript.bytes(b"backend", G::GROUP_ID.as_bytes());
     transcript.bytes(b"setup-context-root", &inputs.setup_context.root());
     // The paper's `Hdcd` input tuple is `(S, X_i, Z_i, W_i, X_i', Z_i', W_i')`.
     transcript.element::<G>(b"S", inputs.decryption_group);
@@ -484,7 +478,7 @@ fn share_challenge<G: GoldenGroup>(
 
 /// Paper coefficients `lambda_j^(J)` at 0 for every participant, computed
 /// with one batch field inversion via [`golden_core::batch_invert`].
-fn lagrange_coefficients_at_zero<G: GoldenGroup>(
+fn lagrange_coefficients_at_zero<G: DkgGroup>(
     participants: &[ParticipantIndex],
 ) -> Result<Vec<G::Scalar>, Error> {
     let xs: Vec<G::Scalar> = participants

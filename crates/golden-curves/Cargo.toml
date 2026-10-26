@@ -1,0 +1,34 @@
+[package]
+name = "golden-curves"
+version.workspace = true
+description = "Proof-free native group adapters for Golden distributed key generation"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+
+[dependencies]
+ff = { workspace = true }
+golden-core = { workspace = true }
+group = { workspace = true }
+halo2curves = { workspace = true, optional = true, features = ["std"] }
+jubjub = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+subtle = { workspace = true }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+halo2curves = { workspace = true, optional = true, features = ["asm"] }
+
+[dev-dependencies]
+rand_chacha = { workspace = true }
+
+[features]
+default = []
+secp256k1 = ["dep:halo2curves"]
+jubjub = ["dep:jubjub", "dep:sha2"]
+
+[lints]
+workspace = true

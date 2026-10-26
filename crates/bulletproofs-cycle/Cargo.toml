@@ -1,6 +1,6 @@
 [package]
 name = "bulletproofs-cycle"
-version = "0.5.0"
+version.workspace = true
 description = "Bulletproofs R1CS over configurable curve cycles"
 edition.workspace = true
 homepage.workspace = true
@@ -21,11 +21,11 @@ rand_core = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive", "rc"] }
 sha3 = { workspace = true }
 smallvec = { workspace = true }
-subtle = { workspace = true }
 thiserror = { workspace = true }
 digest = { version = "0.10", default-features = false }
 
 [dev-dependencies]
+subtle = { workspace = true }
 criterion = "0.5"
 curve25519-dalek = { workspace = true }
 halo2curves = { workspace = true, features = ["std"] }

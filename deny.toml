@@ -35,16 +35,9 @@ multiple-versions = "deny"
 skip = [
   # halo2derive still depends on syn 1.
   { name = "syn", version = "=1.0.109" },
-  # RustCrypto 0.14 uses the newer field, RNG, and digest traits. The other
-  # curve and symmetric-crypto dependencies still require these older versions.
-  { name = "block-buffer", version = "=0.10.4" },
-  { name = "cpufeatures", version = "=0.2.17" },
-  { name = "crypto-common", version = "=0.1.6" },
-  { name = "digest", version = "=0.10.7" },
-  { name = "ff", version = "=0.13.1" },
-  { name = "group", version = "=0.13.0" },
-  { name = "rand_core", version = "=0.6.4" },
-  { name = "sha2", version = "=0.10.9" },
+  # ff_derive's addition-chain generator uses 0.3 for the tiny-field tests;
+  # halo2curves and halo2derive require 0.4.
+  { name = "num-bigint", version = "=0.3.3" },
 ]
 skip-tree = []
 wildcards = "allow"

@@ -1,220 +1,278 @@
-//! Shamir secret sharing over a generic scalar field.
+//! Shamir sharing over native scalar fields.
 
+use core::fmt;
 use std::collections::BTreeSet;
 
+use ff::PrimeField;
 use rand_core::CryptoRngCore;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::{Error, GoldenScalar, ParticipantIndex, Result};
+use crate::secret::{secret, secret_vec, Secret, SecretVec, Wipeable};
+use crate::{Error, ParticipantIndex, Result};
 
-/// A Shamir share.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Share<S: GoldenScalar> {
-    /// Participant that owns this share.
-    pub participant: ParticipantIndex,
-    /// Share value `f(i)`.
-    pub value: S,
+/// An owned Shamir share with zeroizing native-field storage.
+///
+/// Diagnostics redact the scalar. Reading [`Self::value`] borrows the secret;
+/// applications remain responsible for any scalar copies they make.
+pub struct Share<F: PrimeField> {
+    participant: ParticipantIndex,
+    value: Secret<F>,
 }
 
-impl<S> Zeroize for Share<S>
-where
-    S: GoldenScalar + Zeroize,
-{
+impl<F: PrimeField> Share<F> {
+    /// Take ownership of a share for a validated participant index.
+    pub fn new(participant: ParticipantIndex, value: F) -> Self {
+        Self {
+            participant,
+            value: secret(value),
+        }
+    }
+
+    /// Participant that owns this share.
+    pub fn participant(&self) -> ParticipantIndex {
+        self.participant
+    }
+
+    /// Borrow the native share value.
+    pub fn value(&self) -> &F {
+        self.value.expose()
+    }
+}
+
+impl<F: PrimeField> fmt::Debug for Share<F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Share")
+            .field("participant", &self.participant)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<F: PrimeField> PartialEq for Share<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.participant == other.participant && self.value() == other.value()
+    }
+}
+
+impl<F: PrimeField> Eq for Share<F> {}
+
+impl<F: PrimeField> Zeroize for Share<F> {
     fn zeroize(&mut self) {
         self.value.zeroize();
     }
 }
 
-/// Polynomial over a Golden scalar field.
+impl<F: PrimeField> ZeroizeOnDrop for Share<F> {}
+
+/// An owned polynomial with coefficients in ascending degree order.
 ///
-/// The first coefficient is the shared secret. `Polynomial` implements
-/// `Zeroize` so callers can wipe the coefficients before dropping the
-/// value; drop itself does **not** call `zeroize` because `GoldenScalar`
-/// does not require `S: Zeroize`. Callers that want a guaranteed wipe on
-/// drop should wrap the polynomial in `zeroize::Zeroizing<Polynomial<S>>`
-/// or call `poly.zeroize()` explicitly at the end of the scope.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Polynomial<S: GoldenScalar> {
-    coefficients: Vec<S>,
+/// The storage is guarded before filling, and every owned coefficient is
+/// zeroized on drop. This does not erase callers' copies or every temporary
+/// produced by field arithmetic. This secret-bearing type is not cloneable.
+pub struct Polynomial<F: PrimeField> {
+    coefficients: SecretVec<F>,
 }
 
-impl<S> Zeroize for Polynomial<S>
-where
-    S: GoldenScalar + Zeroize,
-{
-    fn zeroize(&mut self) {
-        for coeff in self.coefficients.iter_mut() {
-            coeff.zeroize();
+impl<F: PrimeField> Polynomial<F> {
+    /// Sample every coefficient of a degree-at-most `threshold - 1` polynomial.
+    ///
+    /// The constant coefficient is independently uniform and may be zero.
+    pub fn random(threshold: usize, rng: &mut impl CryptoRngCore) -> Result<Self> {
+        validate_threshold(threshold)?;
+        let mut coefficients = secret_vec(threshold)?;
+        for _ in 0..threshold {
+            coefficients.push(Wipeable(F::random(&mut *rng)));
         }
+        Ok(Self { coefficients })
     }
-}
 
-impl<S: GoldenScalar> Polynomial<S> {
-    /// Create a random degree `threshold - 1` polynomial with fixed secret.
+    /// Sample higher coefficients while fixing the constant term.
     pub fn random_with_secret(
-        secret: S,
+        value: F,
         threshold: usize,
         rng: &mut impl CryptoRngCore,
     ) -> Result<Self> {
-        if threshold == 0 {
-            return Err(Error::InvalidThreshold {
-                threshold,
-                participants: 0,
-            });
-        }
-
-        let mut coefficients = Vec::with_capacity(threshold);
-        coefficients.push(secret);
+        validate_threshold(threshold)?;
+        let mut coefficients = secret_vec(threshold)?;
+        coefficients.push(Wipeable(value));
         for _ in 1..threshold {
-            coefficients.push(S::random(rng));
+            coefficients.push(Wipeable(F::random(&mut *rng)));
         }
         Ok(Self { coefficients })
     }
 
-    /// Create a polynomial from explicit coefficients in ascending degree order.
-    pub fn from_coefficients(coefficients: Vec<S>) -> Result<Self> {
-        if coefficients.is_empty() {
-            return Err(Error::InvalidThreshold {
-                threshold: 0,
-                participants: 0,
-            });
+    /// Copy explicit coefficients into guarded owned storage.
+    ///
+    /// The borrowed source remains the caller's responsibility.
+    pub fn from_coefficients(values: &[F]) -> Result<Self> {
+        validate_threshold(values.len())?;
+        let mut coefficients = secret_vec(values.len())?;
+        for value in values {
+            coefficients.push(Wipeable(*value));
         }
         Ok(Self { coefficients })
     }
 
-    /// Return polynomial coefficients in ascending degree order.
-    pub fn coefficients(&self) -> &[S] {
-        &self.coefficients
+    /// Number of coefficients, including a zero constant when present.
+    pub fn threshold(&self) -> usize {
+        self.coefficients.len()
     }
 
-    /// Evaluate this polynomial at a scalar point.
-    pub fn evaluate_at_scalar(&self, x: &S) -> S {
-        let mut result = S::zero();
-        for coeff in self.coefficients.iter().rev() {
-            result = result.mul(x).add(coeff);
+    /// Borrow coefficients in ascending degree order.
+    pub fn coefficients(&self) -> impl DoubleEndedIterator<Item = &F> + ExactSizeIterator {
+        self.coefficients.iter().map(Wipeable::expose)
+    }
+
+    /// Borrow one coefficient by its zero-based degree.
+    pub fn coefficient(&self, degree: usize) -> Option<&F> {
+        self.coefficients.get(degree).map(Wipeable::expose)
+    }
+
+    /// Evaluate the polynomial at a native field element.
+    pub fn evaluate_at_scalar(&self, x: &F) -> F {
+        let mut value = secret(F::ZERO);
+        for coefficient in self.coefficients().rev() {
+            (*value).0 = *value.expose() * x + coefficient;
         }
-        result
+        *value.expose()
     }
 
-    /// Evaluate this polynomial for a participant.
-    pub fn evaluate(&self, participant: ParticipantIndex) -> Result<Share<S>> {
-        let x = participant.to_scalar::<S>()?;
-        Ok(Share {
-            participant,
-            value: self.evaluate_at_scalar(&x),
-        })
+    /// Evaluate at the participant's nonzero integer interpolation point.
+    pub fn evaluate(&self, participant: ParticipantIndex) -> Result<Share<F>> {
+        let x = participant.to_scalar::<F>()?;
+        Ok(Share::new(participant, self.evaluate_at_scalar(&x)))
     }
 
-    /// Generate shares for the provided participant indexes.
-    pub fn shares(&self, participants: &[ParticipantIndex]) -> Result<Vec<Share<S>>> {
+    /// Evaluate at unique participant indexes in the supplied order.
+    pub fn shares(&self, participants: &[ParticipantIndex]) -> Result<Vec<Share<F>>> {
         ensure_unique_participants(participants)?;
         participants
-            .iter()
-            .copied()
-            .map(|participant| self.evaluate(participant))
-            .collect()
+            .len()
+            .checked_mul(core::mem::size_of::<Share<F>>())
+            .ok_or(Error::ArithmeticOverflow)?;
+        let mut shares = Vec::new();
+        shares
+            .try_reserve_exact(participants.len())
+            .map_err(|_| Error::AllocationFailed)?;
+        for participant in participants {
+            shares.push(self.evaluate(*participant)?);
+        }
+        Ok(shares)
     }
 }
 
-/// Reconstruct the secret `f(0)` from shares.
+impl<F: PrimeField> fmt::Debug for Polynomial<F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Polynomial")
+            .field("coefficient_count", &self.coefficients.len())
+            .field("coefficients", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<F: PrimeField> Zeroize for Polynomial<F> {
+    fn zeroize(&mut self) {
+        for coefficient in self.coefficients.iter_mut() {
+            coefficient.zeroize();
+        }
+    }
+}
+
+impl<F: PrimeField> ZeroizeOnDrop for Polynomial<F> {}
+
+/// Reconstruct `f(0)` from every supplied share after checking a minimum count.
 ///
-/// `threshold` is a minimum-count gate: this function only checks that
-/// `shares.len() >= threshold` and that `threshold != 0`. The interpolation
-/// itself uses every supplied share, not just the first `threshold`. Callers
-/// that want exactly the threshold-many shares to participate must truncate
-/// the input slice themselves; passing more shares than the threshold is
-/// safe (they are all points on the same polynomial of degree
-/// `threshold - 1`) but produces a different forgiveness set, not a
-/// different secret.
-pub fn reconstruct_secret<S: GoldenScalar>(shares: &[Share<S>], threshold: usize) -> Result<S> {
+/// This count check does not verify that the shares lie on one polynomial.
+/// Authenticate or verify shares before reconstruction; select exactly the
+/// desired participants before calling if only a threshold-sized set is wanted.
+pub fn reconstruct_secret<F: PrimeField>(shares: &[Share<F>], threshold: usize) -> Result<F> {
     if threshold == 0 || shares.len() < threshold {
         return Err(Error::InvalidThreshold {
             threshold,
             participants: shares.len(),
         });
     }
-
     lagrange_interpolate_at_zero(shares)
 }
 
-/// Interpolate the value at zero from the provided shares.
-pub fn lagrange_interpolate_at_zero<S: GoldenScalar>(shares: &[Share<S>]) -> Result<S> {
+/// Interpolate `f(0)` from shares with unique, valid participant indexes.
+pub fn lagrange_interpolate_at_zero<F: PrimeField>(shares: &[Share<F>]) -> Result<F> {
     if shares.is_empty() {
         return Err(Error::InvalidThreshold {
             threshold: 0,
             participants: 0,
         });
     }
-
-    let participants: Vec<_> = shares.iter().map(|share| share.participant).collect();
+    let participants: Vec<_> = shares.iter().map(Share::participant).collect();
     ensure_unique_participants(&participants)?;
-
-    let xs: Vec<S> = shares
+    let xs = participants
         .iter()
-        .map(|share| share.participant.to_scalar::<S>())
-        .collect::<Result<_>>()?;
-
+        .map(|participant| participant.to_scalar::<F>())
+        .collect::<Result<Vec<_>>>()?;
     let coefficients = lagrange_coefficients_at_zero(&xs)?;
-
-    let mut result = S::zero();
-    for (share, coefficient) in shares.iter().zip(coefficients.iter()) {
-        result = result.add(&share.value.mul(coefficient));
+    let mut value = secret(F::ZERO);
+    for (share, coefficient) in shares.iter().zip(coefficients) {
+        (*value).0 += *share.value() * coefficient;
     }
-
-    Ok(result)
+    Ok(*value.expose())
 }
 
-/// Lagrange coefficients `lambda_i(0)` for each `x_i` in `xs`, computed with
-/// `O(k)` scratch space and one batch field inversion via [`batch_invert`].
-pub fn lagrange_coefficients_at_zero<S: GoldenScalar>(xs: &[S]) -> Result<Vec<S>> {
+/// Lagrange coefficients at zero, in the same order as `xs`.
+///
+/// This uses `O(k)` scratch space and one field inversion. Duplicate field
+/// points fail because their interpolation denominator is zero.
+pub fn lagrange_coefficients_at_zero<F: PrimeField>(xs: &[F]) -> Result<Vec<F>> {
     let mut numerators = Vec::with_capacity(xs.len());
     let mut denominators = Vec::with_capacity(xs.len());
     for (i, xi) in xs.iter().enumerate() {
-        let mut numerator = S::one();
-        let mut denominator = S::one();
+        let mut numerator = F::ONE;
+        let mut denominator = F::ONE;
         for (j, xj) in xs.iter().enumerate() {
-            if i == j {
-                continue;
+            if i != j {
+                numerator *= -*xj;
+                denominator *= *xi - xj;
             }
-            numerator = numerator.mul(&xj.neg());
-            denominator = denominator.mul(&xi.sub(xj));
         }
         numerators.push(numerator);
         denominators.push(denominator);
     }
-
     batch_invert(&mut denominators).ok_or(Error::NonInvertibleDenominator)?;
-
     Ok(numerators
         .into_iter()
         .zip(denominators)
-        .map(|(numerator, inverse)| numerator.mul(&inverse))
+        .map(|(numerator, inverse)| numerator * inverse)
         .collect())
 }
 
-/// Batch-inverts `values` in place with one field inversion (the Montgomery
-/// trick) instead of `values.len()` individual inversions. Returns `None`
-/// if the product is zero, leaving `values` partially overwritten.
-pub fn batch_invert<S: GoldenScalar>(values: &mut [S]) -> Option<()> {
-    if values.is_empty() {
-        return Some(());
-    }
-
+/// Montgomery batch inversion, leaving `values` unchanged on a zero input.
+// This helper is shared inside core; callers needing weights use the public
+// interpolation API rather than an additional general arithmetic API.
+pub(crate) fn batch_invert<F: PrimeField>(values: &mut [F]) -> Option<()> {
     let mut prefix = Vec::with_capacity(values.len());
-    let mut acc = S::one();
+    let mut product = F::ONE;
     for value in values.iter() {
-        prefix.push(acc.clone());
-        acc = acc.mul(value);
+        prefix.push(product);
+        product *= value;
     }
-
-    let mut acc_inv = acc.invert()?;
-    for (value, prefix_product) in values.iter_mut().zip(prefix.iter()).rev() {
-        let inverse = acc_inv.mul(prefix_product);
-        acc_inv = acc_inv.mul(value);
-        *value = inverse;
+    let mut inverse = Option::<F>::from(product.invert())?;
+    for (value, prefix_product) in values.iter_mut().zip(prefix).rev() {
+        let next = inverse * *value;
+        *value = inverse * prefix_product;
+        inverse = next;
     }
-
     Some(())
+}
+
+fn validate_threshold(threshold: usize) -> Result<()> {
+    if threshold == 0 {
+        return Err(Error::InvalidThreshold {
+            threshold,
+            participants: 0,
+        });
+    }
+    Ok(())
 }
 
 fn ensure_unique_participants(participants: &[ParticipantIndex]) -> Result<()> {
@@ -229,294 +287,98 @@ fn ensure_unique_participants(participants: &[ParticipantIndex]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use rand_chacha::{
-        rand_core::{RngCore, SeedableRng},
-        ChaCha20Rng,
-    };
-
     use super::*;
-    use crate::test_support::TinyScalar;
+    use ff::Field;
+    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 
-    fn participants(values: &[u32]) -> Vec<ParticipantIndex> {
-        values
-            .iter()
-            .map(|value| ParticipantIndex::new(*value).expect("nonzero participant"))
-            .collect()
+    #[derive(ff::PrimeField)]
+    #[PrimeFieldModulus = "127"]
+    #[PrimeFieldGenerator = "3"]
+    #[PrimeFieldReprEndianness = "little"]
+    struct TestField([u64; 1]);
+
+    fn participant(value: u32) -> ParticipantIndex {
+        ParticipantIndex::new(value).unwrap()
     }
 
     #[test]
-    fn reconstructs_from_threshold_subset() {
-        let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-        let secret = TinyScalar::from_u64(42).unwrap();
-        let poly = Polynomial::random_with_secret(secret, 3, &mut rng).unwrap();
-        let shares = poly.shares(&participants(&[1, 2, 3, 4, 5])).unwrap();
-
-        assert_eq!(reconstruct_secret(&shares[0..3], 3).unwrap(), secret);
-        assert_eq!(
-            reconstruct_secret(
-                &[shares[0].clone(), shares[2].clone(), shares[4].clone()],
-                3
-            )
-            .unwrap(),
-            secret
-        );
-    }
-
-    #[test]
-    fn fewer_than_threshold_shares_are_rejected_by_reconstruction_api() {
-        let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
-        let secret = TinyScalar::from_u64(42).unwrap();
-        let poly = Polynomial::random_with_secret(secret, 3, &mut rng).unwrap();
-        let shares = poly.shares(&participants(&[1, 2, 3, 4, 5])).unwrap();
-
-        assert_eq!(
-            reconstruct_secret(&shares[0..2], 3).unwrap_err(),
-            Error::InvalidThreshold {
-                threshold: 3,
-                participants: 2
-            }
-        );
-    }
-
-    #[test]
-    fn all_threshold_subsets_reconstruct_for_small_committees() {
-        let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
-        for n in 1..=6 {
-            for threshold in 1..=n {
-                let secret = TinyScalar::from_u64((10 + n + threshold) as u64).unwrap();
-                let poly = Polynomial::random_with_secret(secret, threshold, &mut rng).unwrap();
-                let indexes: Vec<_> = (1..=n as u32)
-                    .map(|value| participants(&[value])[0])
-                    .collect();
-                let shares = poly.shares(&indexes).unwrap();
-                for subset in threshold_subsets(&shares, threshold) {
-                    assert_eq!(reconstruct_secret(&subset, threshold).unwrap(), secret);
+    fn threshold_subsets_reconstruct_zero_and_nonzero_constants() {
+        let participants: Vec<_> = (1..=5).map(participant).collect();
+        let mut rng = ChaCha20Rng::from_seed([7; 32]);
+        for threshold in [1, 2, 3] {
+            for constant in [0, 1, 42] {
+                let constant = TestField::from(constant);
+                let polynomial =
+                    Polynomial::random_with_secret(constant, threshold, &mut rng).unwrap();
+                let shares = polynomial.shares(&participants).unwrap();
+                for offset in 0..=shares.len() - threshold {
+                    assert_eq!(
+                        reconstruct_secret(&shares[offset..offset + threshold], threshold).unwrap(),
+                        constant
+                    );
                 }
+                assert_eq!(reconstruct_secret(&shares, threshold).unwrap(), constant);
             }
         }
     }
 
     #[test]
-    fn randomized_committee_sizes_reconstruct_from_threshold_subset() {
-        let mut chooser = ChaCha20Rng::from_seed([21u8; 32]);
-        let mut polynomial_rng = ChaCha20Rng::from_seed([22u8; 32]);
-
-        for case in 0..128 {
-            let n = 1 + (chooser.next_u32() as usize % 16);
-            let threshold = 1 + (chooser.next_u32() as usize % n);
-            let secret = TinyScalar::from_u64(1 + u64::from(chooser.next_u32())).unwrap();
-            let polynomial =
-                Polynomial::random_with_secret(secret, threshold, &mut polynomial_rng).unwrap();
-            let indexes: Vec<_> = (1..=n as u32)
-                .map(|value| participants(&[value])[0])
-                .collect();
-            let shares = polynomial.shares(&indexes).unwrap();
-            let subset = randomized_subset(&shares, threshold, &mut chooser);
-
-            assert_eq!(
-                reconstruct_secret(&subset, threshold).unwrap(),
-                secret,
-                "case {case}: n={n}, threshold={threshold}"
-            );
-        }
-    }
-
-    #[test]
-    fn polynomial_from_coefficients_rejects_empty() {
-        // The empty-vec branch of from_coefficients is a boundary condition
-        // that no other test exercises; pin it here so a regression that
-        // accepts an empty polynomial fails loudly.
-        assert_eq!(
-            Polynomial::<TinyScalar>::from_coefficients(Vec::new()).unwrap_err(),
-            Error::InvalidThreshold {
-                threshold: 0,
-                participants: 0
-            }
-        );
-    }
-
-    #[test]
-    fn polynomial_evaluates_known_value() {
-        // Build p(x) = 1 + 2*x + 3*x^2 (in ascending coefficient order)
-        // and check p(2) = 1 + 4 + 12 = 17 (mod 97). Pins from_coefficients
-        // + evaluate_at_scalar against a hand-computed value so a reordering
-        // of the coefficient vector (e.g. descending order) is caught.
-        let poly = Polynomial::from_coefficients(vec![
-            TinyScalar::from_u64(1).unwrap(),
-            TinyScalar::from_u64(2).unwrap(),
-            TinyScalar::from_u64(3).unwrap(),
+    fn polynomial_order_and_owned_cleanup_are_explicit() {
+        let mut polynomial = Polynomial::from_coefficients(&[
+            TestField::from(1),
+            TestField::from(2),
+            TestField::from(3),
         ])
         .unwrap();
-        let x = TinyScalar::from_u64(2).unwrap();
-        let got = poly.evaluate_at_scalar(&x);
-        let want = TinyScalar::from_u64(17).unwrap();
-        assert_eq!(got, want);
+        assert_eq!(
+            polynomial.evaluate_at_scalar(&TestField::from(2)),
+            TestField::from(17)
+        );
+        assert_eq!(polynomial.coefficient(0), Some(&TestField::ONE));
+        assert!(format!("{polynomial:?}").contains("<redacted>"));
+        polynomial.zeroize();
+        assert!(polynomial
+            .coefficients()
+            .all(|coefficient| bool::from(coefficient.is_zero())));
+        let mut share = Share::new(participant(1), TestField::from(42));
+        share.zeroize();
+        assert_eq!(*share.value(), TestField::ZERO);
     }
 
     #[test]
-    fn polynomial_zeroize_wipes_coefficients() {
-        // Polynomial's first coefficient is the shared secret; Zeroize must
-        // wipe every coefficient, not just the first. Build a polynomial
-        // with nonzero coefficients across multiple slots, zeroize, and
-        // confirm every slot is zero. Drop does NOT call zeroize
-        // automatically (GoldenScalar does not require S: Zeroize); callers
-        // must invoke it explicitly or wrap in zeroize::Zeroizing.
-        let mut poly = Polynomial::from_coefficients(vec![
-            TinyScalar::from_u64(11).unwrap(),
-            TinyScalar::from_u64(22).unwrap(),
-            TinyScalar::from_u64(33).unwrap(),
-        ])
-        .unwrap();
-        poly.zeroize();
-        for (i, coeff) in poly.coefficients().iter().enumerate() {
-            assert!(*coeff == TinyScalar::zero(), "coefficient {i} not zeroized");
-        }
-    }
-
-    #[test]
-    fn scalar_decoding_rejects_malformed_bytes() {
-        for value in 97..=u8::MAX {
+    fn participant_indexes_cannot_alias_the_secret_or_another_field_point() {
+        assert_eq!(
+            participant(126).to_scalar::<TestField>().unwrap(),
+            TestField::from(126)
+        );
+        for value in [127, 128, u32::MAX] {
             assert_eq!(
-                TinyScalar::from_repr(&[value]).unwrap_err(),
-                Error::InvalidEncoding
+                participant(value).to_scalar::<TestField>(),
+                Err(Error::InvalidEncoding)
             );
         }
-    }
-
-    fn threshold_subsets<S: GoldenScalar>(
-        shares: &[Share<S>],
-        threshold: usize,
-    ) -> Vec<Vec<Share<S>>> {
-        fn collect<S: GoldenScalar>(
-            shares: &[Share<S>],
-            threshold: usize,
-            offset: usize,
-            current: &mut Vec<Share<S>>,
-            output: &mut Vec<Vec<Share<S>>>,
-        ) {
-            if current.len() == threshold {
-                output.push(current.clone());
-                return;
-            }
-
-            for index in offset..shares.len() {
-                current.push(shares[index].clone());
-                collect(shares, threshold, index + 1, current, output);
-                current.pop();
-            }
-        }
-
-        let mut output = Vec::new();
-        collect(shares, threshold, 0, &mut Vec::new(), &mut output);
-        output
-    }
-
-    fn randomized_subset<S: GoldenScalar>(
-        shares: &[Share<S>],
-        threshold: usize,
-        rng: &mut impl RngCore,
-    ) -> Vec<Share<S>> {
-        let mut indexes: Vec<_> = (0..shares.len()).collect();
-        for index in 0..indexes.len() {
-            let swap_with = index + (rng.next_u32() as usize % (indexes.len() - index));
-            indexes.swap(index, swap_with);
-        }
-
-        indexes
-            .into_iter()
-            .take(threshold)
-            .map(|index| shares[index].clone())
-            .collect()
-    }
-
-    #[test]
-    fn interpolation_primitive_still_accepts_exact_shares() {
-        let mut rng = ChaCha20Rng::from_seed([12u8; 32]);
-        let secret = TinyScalar::from_u64(42).unwrap();
-        let poly = Polynomial::random_with_secret(secret, 3, &mut rng).unwrap();
-        let shares = poly.shares(&participants(&[1, 2, 3, 4, 5])).unwrap();
-
-        assert_eq!(
-            lagrange_interpolate_at_zero(&[
-                shares[0].clone(),
-                shares[2].clone(),
-                shares[4].clone()
-            ])
-            .unwrap(),
-            secret
-        );
-    }
-
-    #[test]
-    fn duplicate_participant_indexes_are_rejected() {
-        let shares = vec![
-            Share {
-                participant: ParticipantIndex::new(1).unwrap(),
-                value: TinyScalar::from_u64(3).unwrap(),
-            },
-            Share {
-                participant: ParticipantIndex::new(1).unwrap(),
-                value: TinyScalar::from_u64(5).unwrap(),
-            },
+        let shares = [
+            Share::new(participant(1), TestField::from(3)),
+            Share::new(participant(1), TestField::from(5)),
         ];
-
         assert_eq!(
-            lagrange_interpolate_at_zero(&shares).unwrap_err(),
-            Error::DuplicateParticipantIndex(1)
+            lagrange_interpolate_at_zero(&shares),
+            Err(Error::DuplicateParticipantIndex(1))
         );
     }
 
     #[test]
-    fn invalid_participant_zero_is_rejected() {
-        assert_eq!(
-            ParticipantIndex::new(0).unwrap_err(),
-            Error::ZeroParticipantIndex
-        );
-    }
-
-    #[test]
-    fn field_inversion_property_holds() {
-        for value in 1..96 {
-            let scalar = TinyScalar::from_u64(value).unwrap();
-            let inverse = scalar.invert().unwrap();
-            assert_eq!(scalar.mul(&inverse), TinyScalar::one());
-        }
-    }
-
-    #[test]
-    fn scalar_encoding_round_trips_and_rejects_noncanonical() {
-        let scalar = TinyScalar::from_u64(96).unwrap();
-        let repr = scalar.to_repr();
-        assert_eq!(TinyScalar::from_repr(&repr).unwrap(), scalar);
-        assert!(TinyScalar::from_repr(&[97]).is_err());
-    }
-
-    #[test]
-    fn batch_invert_matches_individual_inversions() {
-        let mut values: Vec<TinyScalar> = (1u64..12)
-            .map(|value| TinyScalar::from_u64(value).unwrap())
+    fn batch_inversion_matches_native_inversion_without_partial_zero_updates() {
+        let mut values: Vec<_> = (1..12).map(TestField::from).collect();
+        let expected: Vec<_> = values
+            .iter()
+            .map(|value| Option::<TestField>::from(value.invert()).unwrap())
             .collect();
-        let expected: Vec<TinyScalar> = values.iter().map(|v| v.invert().unwrap()).collect();
-
-        batch_invert(&mut values).unwrap();
-
-        assert_eq!(values, expected);
-    }
-
-    #[test]
-    fn batch_invert_empty_slice_is_a_noop() {
-        let mut values: Vec<TinyScalar> = Vec::new();
         assert!(batch_invert(&mut values).is_some());
-        assert!(values.is_empty());
-    }
-
-    #[test]
-    fn batch_invert_rejects_a_zero_element() {
-        let mut values = vec![
-            TinyScalar::from_u64(3).unwrap(),
-            TinyScalar::zero(),
-            TinyScalar::from_u64(5).unwrap(),
-        ];
-        assert!(batch_invert(&mut values).is_none());
+        assert_eq!(values, expected);
+        let mut with_zero = [TestField::from(3), TestField::ZERO, TestField::from(5)];
+        let original = with_zero;
+        assert!(batch_invert(&mut with_zero).is_none());
+        assert_eq!(with_zero, original);
     }
 }

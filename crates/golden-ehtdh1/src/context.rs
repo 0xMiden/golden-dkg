@@ -1,41 +1,58 @@
 //! Shared EHTDH1 setup data and transcript errors.
 //!
-//! See crate root for the paper-to-crate symbol map. The generic `G` supplies
+//! Online equations use the native inner group and the approved batch context. The generic `G` supplies
 //! the paper group `G`, scalar field order `q`, and identity `O`.
 
+use ff::Field;
+use group::Group;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use golden_core::{
-    GoldenGroup, GoldenScalar, ParticipantIndex, SessionId, TranscriptBuilder, TranscriptRoot,
-};
+use golden_core::{DkgGroup, ParticipantIndex, SessionId, TranscriptBuilder, TranscriptRoot};
 
-pub(crate) const TRANSCRIPT_PREFIX: &[u8] = b"golden-ehtdh1-v1";
+pub(crate) const TRANSCRIPT_PREFIX: &[u8] = b"golden-ehtdh1-v2";
 
 /// Public share material for one participant.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublicShare<G: GoldenGroup> {
+pub struct PublicShare<G: DkgGroup> {
     /// `X_i = x_i G` (paper Section 3 Key generation).
-    pub decryption: G::Element,
+    pub decryption: G::Point,
     /// `Z_i = z_i G` for the zero sharing (paper Section 3 Key generation).
-    pub context: G::Element,
+    pub context: G::Point,
 }
 
-/// Secret share material held by one participant.
+/// Participant-local native scalar shares with redacted, guarded storage.
 #[derive(Clone)]
-pub struct SecretShare<G: GoldenGroup> {
-    /// Participant that owns this share.
-    pub participant: ParticipantIndex,
-    /// `x_i`, one of `(x_1..x_N)` sharing `x` (paper Section 3 Key generation).
-    pub decryption: G::Scalar,
-    /// `z_i`, one of `(z_1..z_N)` sharing zero (paper Section 3 Key generation).
-    pub context: G::Scalar,
+pub struct SecretShare<G: DkgGroup> {
+    pub(crate) participant: ParticipantIndex,
+    pub(crate) decryption: crate::secret::Secret<G::Scalar>,
+    pub(crate) context: crate::secret::Secret<G::Scalar>,
 }
-
-impl<G: GoldenGroup> fmt::Debug for SecretShare<G> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SecretShare")
+impl<G: DkgGroup> SecretShare<G> {
+    /// Copy caller-owned scalar values into independently guarded storage.
+    pub fn new(participant: ParticipantIndex, decryption: &G::Scalar, context: &G::Scalar) -> Self {
+        Self {
+            participant,
+            decryption: crate::secret::secret(*decryption),
+            context: crate::secret::secret(*context),
+        }
+    }
+    /// Owning participant.
+    pub fn participant(&self) -> ParticipantIndex {
+        self.participant
+    }
+    /// Borrow the native decryption scalar.
+    pub fn decryption(&self) -> &G::Scalar {
+        self.decryption.expose()
+    }
+    /// Borrow the native context scalar.
+    pub fn context(&self) -> &G::Scalar {
+        self.context.expose()
+    }
+}
+impl<G: DkgGroup> fmt::Debug for SecretShare<G> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretShare")
             .field("participant", &self.participant)
             .field("decryption", &"<redacted>")
             .field("context", &"<redacted>")
@@ -45,34 +62,39 @@ impl<G: GoldenGroup> fmt::Debug for SecretShare<G> {
 
 /// Paper `pkc = (X; [(X_i, Z_i)]_i)` plus the reconstruction threshold.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublicKeySet<G: GoldenGroup> {
+pub struct PublicKeySet<G: DkgGroup> {
     /// Number of shares required to decrypt.
     pub threshold: usize,
     /// `X = xG`, the joint public key (paper Section 3 Key generation).
-    pub joint_public_key: G::Element,
+    pub joint_public_key: G::Point,
     /// Pairs `(X_i, Z_i) = (x_i G, z_i G)`, keyed by participant.
     pub public_shares: BTreeMap<ParticipantIndex, PublicShare<G>>,
 }
 
-impl<G: GoldenGroup> PublicKeySet<G> {
+impl<G: DkgGroup> PublicKeySet<G> {
     /// Build and validate a public key set.
     pub fn new(
         threshold: usize,
-        joint_public_key: G::Element,
+        joint_public_key: G::Point,
         public_shares: BTreeMap<ParticipantIndex, PublicShare<G>>,
     ) -> Result<Self, Error> {
-        if threshold == 0 || public_shares.len() < threshold {
-            return Err(Error::InvalidThreshold);
-        }
-        if bool::from(G::is_identity(&joint_public_key)) {
-            return Err(Error::InvalidJointPublicKey);
-        }
-        validate_public_shares(threshold, &joint_public_key, &public_shares)?;
-        Ok(Self {
+        let key_set = Self {
             threshold,
             joint_public_key,
             public_shares,
-        })
+        };
+        key_set.validate()?;
+        Ok(key_set)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        if self.threshold == 0 || self.public_shares.len() < self.threshold {
+            return Err(Error::InvalidThreshold);
+        }
+        if bool::from(self.joint_public_key.is_identity()) {
+            return Err(Error::InvalidJointPublicKey);
+        }
+        validate_public_shares(self.threshold, &self.joint_public_key, &self.public_shares)
     }
 
     /// Public share for a participant.
@@ -81,63 +103,44 @@ impl<G: GoldenGroup> PublicKeySet<G> {
     }
 }
 
-/// Golden setup context bound into `Hdgd` and `Hdcd`.
+/// Trusted setup identity bound into decryption transcripts.
 ///
-/// This is the crate's addition to paper Section 3: Golden DKG transcript
-/// roots, registry root, session ids, and epoch are bound through
-/// [`SetupContext::root`]. The zero sharing session id is derived by
-/// [`derive_context_session_id`].
+/// This metadata accompanies the approved `[Random, Zero]` public result.
+/// Its authenticity and agreement are application responsibilities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupContext {
-    /// Stable Golden backend id.
-    pub backend_id: String,
-    /// Threshold.
+    /// Stable protocol group identifier.
+    pub group_id: String,
+    /// Reconstruction threshold.
     pub threshold: usize,
-    /// Golden participant registry root.
-    pub registry_root: TranscriptRoot,
-    /// Participants in canonical order.
+    /// Canonical registered participant indexes.
     pub participants: Vec<ParticipantIndex>,
-    /// Session id for the `x` sharing.
-    pub decryption_session_id: SessionId,
-    /// Session id for the zero sharing run.
-    pub context_session_id: SessionId,
-    /// Completion transcript root from the `x` sharing.
-    pub decryption_transcript_root: TranscriptRoot,
-    /// Completion transcript root from the zero sharing run.
-    pub context_transcript_root: TranscriptRoot,
-    /// Caller provided epoch or setup label.
+    /// Single batch session identifier.
+    pub session_id: SessionId,
+    /// Configuration identity.
+    pub config_root: TranscriptRoot,
+    /// Public result identity.
+    pub completion_root: TranscriptRoot,
+    /// Application epoch.
     pub epoch: [u8; 32],
 }
 
 impl SetupContext {
-    /// Compute the root used in EHTDH1 decryption transcripts.
+    /// Derive the context used by EHTDH1 decryption proofs.
     pub fn root(&self) -> TranscriptRoot {
         let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"setup-context");
-        transcript.bytes(b"backend", self.backend_id.as_bytes());
+        transcript.bytes(b"group", self.group_id.as_bytes());
         transcript.usize(b"threshold", self.threshold);
-        transcript.bytes(b"registry-root", &self.registry_root);
         transcript.usize(b"participants-len", self.participants.len());
         for participant in &self.participants {
             transcript.participant(b"participant", *participant);
         }
-        transcript.bytes(b"decryption-session", &self.decryption_session_id.0);
-        transcript.bytes(b"context-session", &self.context_session_id.0);
-        transcript.bytes(
-            b"decryption-transcript-root",
-            &self.decryption_transcript_root,
-        );
-        transcript.bytes(b"context-transcript-root", &self.context_transcript_root);
+        transcript.bytes(b"session", &self.session_id.0);
+        transcript.bytes(b"config-root", &self.config_root);
+        transcript.bytes(b"completion-root", &self.completion_root);
         transcript.bytes(b"epoch", &self.epoch);
         transcript.root()
     }
-}
-
-/// Golden setup derivation for the zero sharing session id, not in the paper.
-pub fn derive_context_session_id(decryption_session_id: SessionId) -> SessionId {
-    let mut transcript = TranscriptBuilder::with_prefix(TRANSCRIPT_PREFIX, b"context-session");
-    transcript.bytes(b"label", b"zero-sharing");
-    transcript.bytes(b"decryption-session", &decryption_session_id.0);
-    SessionId(transcript.root())
 }
 
 /// Errors returned by the EHTDH1 core.
@@ -201,16 +204,40 @@ pub enum CombineError {
 }
 
 /// `Hecd`/`Hdcd` reduction to `Zq`; the paper models this as a random oracle.
-pub(crate) fn hash_to_nonzero_scalar<G: GoldenGroup>(
+pub(crate) fn hash_to_nonzero_scalar<G: DkgGroup>(
     domain: &[u8],
     message: &[u8],
 ) -> Result<G::Scalar, Error> {
-    G::Scalar::hash_to_scalar(domain, message).map_err(|_| Error::ScalarDerivationFailed)
+    use sha2::{Digest, Sha256};
+    for counter in 0..u32::MAX {
+        let mut hash = Sha256::new();
+        hash.update(b"golden-scalar-v1");
+        hash.update(
+            u64::try_from(domain.len())
+                .map_err(|_| Error::ScalarDerivationFailed)?
+                .to_be_bytes(),
+        );
+        hash.update(domain);
+        hash.update(
+            u64::try_from(message.len())
+                .map_err(|_| Error::ScalarDerivationFailed)?
+                .to_be_bytes(),
+        );
+        hash.update(message);
+        hash.update(counter.to_be_bytes());
+        hash.update(0u32.to_be_bytes());
+        if let Ok(scalar) = G::decode_scalar(&hash.finalize()) {
+            if !bool::from(scalar.is_zero()) {
+                return Ok(scalar);
+            }
+        }
+    }
+    Err(Error::ScalarDerivationFailed)
 }
 
-fn validate_public_shares<G: GoldenGroup>(
+fn validate_public_shares<G: DkgGroup>(
     threshold: usize,
-    joint_public_key: &G::Element,
+    joint_public_key: &G::Point,
     public_shares: &BTreeMap<ParticipantIndex, PublicShare<G>>,
 ) -> Result<(), Error> {
     let participants = public_shares.keys().copied().collect::<Vec<_>>();
@@ -219,7 +246,7 @@ fn validate_public_shares<G: GoldenGroup>(
     // Interpolate `X_i` shares at 0 and check that they recover `X`.
     let decryption = interpolate_public_key_share::<G>(
         basis,
-        G::Scalar::zero(),
+        G::Scalar::ZERO,
         |share| &share.decryption,
         public_shares,
     )?;
@@ -230,23 +257,19 @@ fn validate_public_shares<G: GoldenGroup>(
     // Interpolate `Z_i` shares at 0 and check that they recover the identity.
     let context = interpolate_public_key_share::<G>(
         basis,
-        G::Scalar::zero(),
+        G::Scalar::ZERO,
         |share| &share.context,
         public_shares,
     )?;
-    if !bool::from(G::is_identity(&context)) {
+    if !bool::from(context.is_identity()) {
         return Err(Error::InvalidPublicKeySet);
     }
 
     for participant in participants.iter().skip(threshold) {
         let x = participant.to_scalar::<G::Scalar>()?;
         // Check that each remaining `(X_i, Z_i)` lies on the same polynomials.
-        let expected_decryption = interpolate_public_key_share::<G>(
-            basis,
-            x.clone(),
-            |share| &share.decryption,
-            public_shares,
-        )?;
+        let expected_decryption =
+            interpolate_public_key_share::<G>(basis, x, |share| &share.decryption, public_shares)?;
         let expected_context =
             interpolate_public_key_share::<G>(basis, x, |share| &share.context, public_shares)?;
         let public_share = public_shares
@@ -262,31 +285,31 @@ fn validate_public_shares<G: GoldenGroup>(
     Ok(())
 }
 
-fn interpolate_public_key_share<'a, G: GoldenGroup>(
+fn interpolate_public_key_share<'a, G: DkgGroup>(
     participants: &[ParticipantIndex],
     x: G::Scalar,
-    select: impl Fn(&'a PublicShare<G>) -> &'a G::Element,
+    select: impl Fn(&'a PublicShare<G>) -> &'a G::Point,
     public_shares: &'a BTreeMap<ParticipantIndex, PublicShare<G>>,
-) -> Result<G::Element, Error> {
-    let mut point = G::identity();
+) -> Result<G::Point, Error> {
+    let mut point = G::Point::identity();
     for participant in participants {
         let lambda = lagrange_at::<G>(*participant, participants.iter().copied(), &x)?;
         let public_share = public_shares
             .get(participant)
             .ok_or(Error::UnknownParticipant(participant.get()))?;
-        point = G::add(&point, &G::mul(select(public_share), &lambda));
+        point += *select(public_share) * lambda;
     }
     Ok(point)
 }
 
-fn lagrange_at<G: GoldenGroup>(
+fn lagrange_at<G: DkgGroup>(
     participant: ParticipantIndex,
     participants: impl IntoIterator<Item = ParticipantIndex>,
     x: &G::Scalar,
 ) -> Result<G::Scalar, Error> {
     let i = participant.to_scalar::<G::Scalar>()?;
-    let mut numerator = G::Scalar::one();
-    let mut denominator = G::Scalar::one();
+    let mut numerator = G::Scalar::ONE;
+    let mut denominator = G::Scalar::ONE;
 
     // Lagrange basis value at `x`: product_j (x - j) / product_j (i - j).
     for other in participants {
@@ -294,10 +317,10 @@ fn lagrange_at<G: GoldenGroup>(
             continue;
         }
         let j = other.to_scalar::<G::Scalar>()?;
-        numerator = numerator.mul(&x.sub(&j));
-        denominator = denominator.mul(&i.sub(&j));
+        numerator *= *x - j;
+        denominator *= i - j;
     }
 
-    let inverse = denominator.invert().ok_or(Error::InvalidThreshold)?;
-    Ok(numerator.mul(&inverse))
+    let inverse = Option::<G::Scalar>::from(denominator.invert()).ok_or(Error::InvalidThreshold)?;
+    Ok(numerator * inverse)
 }

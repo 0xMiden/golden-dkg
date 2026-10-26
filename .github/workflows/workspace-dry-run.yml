@@ -11,7 +11,6 @@ on:
       - "crates/*/LICENSE-*"
       - "crates/*/README.md"
       - .github/workflows/workspace-dry-run.yml
-      - .github/workflows/workspace-publish.yml
   workflow_dispatch:
     inputs:
       packages:
@@ -167,7 +166,7 @@ jobs:
             exit 0
           fi
 
-          publish_cmd=(cargo publish --workspace --locked --dry-run)
+          publish_cmd=(cargo publish --workspace --registry crates-io --locked --dry-run)
 
           while IFS= read -r package; do
             if ! is_release_package "$package"; then
