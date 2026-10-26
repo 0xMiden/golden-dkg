@@ -2,7 +2,7 @@
 
 The workspace implements the fixed Main Golden relation over native Secp256k1
 and Jubjub groups. The issue 71 contract is in [docs/issue-71.md](docs/issue-71.md).
-All previous state, formats and APIs are retired in the 0.5 compatibility cut.
+All previous state, formats and APIs are retired in the 2.0 compatibility cut.
 
 Keep the dependency boundary explicit:
 

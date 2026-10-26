@@ -3,7 +3,7 @@
 [![CI](https://github.com/0xMiden/golden-dkg/actions/workflows/ci.yml/badge.svg)](https://github.com/0xMiden/golden-dkg/actions/workflows/ci.yml)
 
 Native Golden distributed key generation and context-bound threshold encryption
-over Secp256k1 and Jubjub. Version 0.5 is a hard compatibility cut: configurations,
+over Secp256k1 and Jubjub. Version 2.0 is a hard compatibility cut: configurations,
 keys, broadcasts, ciphertexts, snapshots and prepared artifacts from earlier
 versions require fresh setup. The full refactor contract is in
 [docs/issue-71.md](docs/issue-71.md).

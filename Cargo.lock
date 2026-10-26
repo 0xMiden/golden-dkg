@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "bulletproofs-cycle"
-version = "0.5.0"
+version = "2.0.0"
 dependencies = [
  "bulletproofs",
  "criterion",
@@ -635,7 +635,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "golden-bulletproofs"
-version = "0.5.0"
+version = "2.0.0"
 dependencies = [
  "bls12_381",
  "blst",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "golden-core"
-version = "0.5.0"
+version = "2.0.0"
 dependencies = [
  "ff",
  "golden-curves",
@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "golden-curves"
-version = "0.5.0"
+version = "2.0.0"
 dependencies = [
  "ff",
  "golden-core",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "golden-ehtdh1"
-version = "0.5.0"
+version = "2.0.0"
 dependencies = [
  "chacha20",
  "chacha20poly1305",

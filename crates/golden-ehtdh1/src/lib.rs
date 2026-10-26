@@ -150,6 +150,34 @@ mod tests {
             ),
             &[1],
         );
+        let mut invalid = shares[0].clone();
+        invalid.share += G::Point::generator();
+        let candidates = [invalid, shares[0].clone(), shares[1].clone()];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let arrived: Vec<_> = order.iter().map(|&i| candidates[i].clone()).collect();
+            assert_eq!(
+                combiner
+                    .combine_quorum(&message, b"context", &arrived)
+                    .unwrap(),
+                b"payload",
+                "arrival order {order:?}"
+            );
+        }
+        malformed(
+            combiner.combine_quorum(
+                &message,
+                b"context",
+                &[shares[0].clone(), shares[0].clone()],
+            ),
+            &[1],
+        );
         let mut altered = shares.clone();
         altered[2].share += G::Point::generator();
         assert_eq!(
