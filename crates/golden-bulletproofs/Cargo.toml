@@ -15,6 +15,7 @@ bulletproofs-cycle = { workspace = true }
 ff = { workspace = true }
 group = { workspace = true }
 merlin = { workspace = true }
+p3-maybe-rayon = { workspace = true }
 rand_core = { workspace = true }
 rand_chacha = { workspace = true }
 serde = { workspace = true, optional = true }
@@ -35,7 +36,7 @@ postcard = { workspace = true }
 default = []
 secp-secq = ["golden-curves/secp256k1", "dep:halo2curves"]
 jubjub-bls12-381 = ["golden-curves/jubjub", "dep:bls12_381", "dep:blst", "dep:blstrs", "dep:jubjub"]
-parallel = ["bulletproofs-cycle/parallel"]
+parallel = ["bulletproofs-cycle/parallel", "p3-maybe-rayon/parallel"]
 serde = ["dep:serde"]
 
 [lints.rust]

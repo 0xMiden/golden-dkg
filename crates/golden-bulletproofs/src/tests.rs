@@ -40,7 +40,7 @@ impl RngCore for FirstFieldZero {
 impl CryptoRng for FirstFieldZero {}
 struct Capture<G: DkgGroup, P> {
     inner: P,
-    statement: Mutex<Option<DealerProofStatement<G>>>,
+    proofs: Mutex<Vec<(DealerProofStatement<G>, Vec<u8>)>>,
 }
 impl<G: DkgGroup, P: DealerProofSystem<G>> DealerProofSystem<G> for Capture<G, P> {
     fn prove(
@@ -50,8 +50,12 @@ impl<G: DkgGroup, P: DealerProofSystem<G>> DealerProofSystem<G> for Capture<G, P
         witness: &DealerProofWitness<G>,
         rng: &mut impl rand_core::CryptoRngCore,
     ) -> Result<Vec<u8>> {
-        *self.statement.lock().unwrap() = Some(statement.clone());
-        self.inner.prove(config, statement, witness, rng)
+        let proof = self.inner.prove(config, statement, witness, rng)?;
+        self.proofs
+            .lock()
+            .unwrap()
+            .push((statement.clone(), proof.clone()));
+        Ok(proof)
     }
     fn verify(
         &self,
@@ -95,7 +99,7 @@ fn real_workflow<G: DkgGroup, P: DealerProofSystem<G>>(
     assert_eq!(capacity, restored_capacity);
     let capture = Capture {
         inner: proofs,
-        statement: Mutex::new(None),
+        proofs: Mutex::new(Vec::new()),
     };
     let one = ParticipantIndex::new(1).unwrap();
     let two = ParticipantIndex::new(2).unwrap();
@@ -109,6 +113,23 @@ fn real_workflow<G: DkgGroup, P: DealerProofSystem<G>>(
     };
     let own = deal(&capture, &config, one, &G::Scalar::ONE, &mut rng1).unwrap();
     let peer = deal(&capture, &config, two, &G::Scalar::from(2), &mut rng2).unwrap();
+    {
+        let captured = capture.proofs.lock().unwrap();
+        // The proof-system seam permits repeated proofs; board uniqueness is
+        // enforced by core. Reuse the fixture to cross a worker-sized chunk.
+        let mut batch = (0..=p3_maybe_rayon::prelude::current_num_threads())
+            .map(|index| {
+                let (statement, proof) = &captured[index % captured.len()];
+                DealerProofRef { statement, proof }
+            })
+            .collect::<Vec<_>>();
+        capture.verify_batch(&config, &batch).unwrap();
+        batch.last_mut().unwrap().proof = b"malformed";
+        assert_eq!(
+            capture.verify_batch(&config, &batch),
+            Err(Error::InvalidProof)
+        );
+    }
     let board = [
         DealerMessageRef {
             expected_dealer: one,
@@ -134,9 +155,9 @@ fn real_workflow<G: DkgGroup, P: DealerProofSystem<G>>(
     assert_eq!(zero_capacity, 0);
     assert!(zero_bytes.len() < 256);
     {
-        let statement = capture.statement.lock().unwrap();
+        let captured = capture.proofs.lock().unwrap();
         assert!(matches!(
-            zero.verify(&config, statement.as_ref().unwrap(), b"malformed"),
+            zero.verify(&config, &captured.last().unwrap().0, b"malformed"),
             Err(Error::InsufficientProofCapacity { available: 0, .. })
         ));
     }

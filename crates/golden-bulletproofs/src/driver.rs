@@ -37,6 +37,7 @@ use golden_core::{
 };
 use group::Group;
 use merlin::Transcript;
+use p3_maybe_rayon::prelude::*;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use rand_core::CryptoRngCore;
 
@@ -374,20 +375,38 @@ pub(crate) fn verify_batch<C: Backend>(
     }
     let seed = batch_seed::<C>(config, proofs)?;
     let mut rng = ChaCha20Rng::from_seed(seed);
-    let mut operational = None;
-    // Fold each equation immediately: shared generators and optimized mixed MSM
-    // are preserved without retaining every dealer's generator-scalar vectors.
-    let equations = proofs.iter().enumerate().map(|(index, item)| {
-        let result = per_proof_rng(&seed, index).and_then(|mut rng| {
-            prepare_equation::<C>(prepared, config, item.statement, item.proof, &mut rng)
+    // Prepare at most one equation per worker before folding shared generator
+    // scalars. The complete ordered batch is already bound above; absolute
+    // indices keep each proof's entropy independent of worker scheduling.
+    let chunk_size = current_num_threads().max(1);
+    let results = proofs
+        .chunks(chunk_size)
+        .enumerate()
+        .flat_map(|(chunk_index, chunk)| {
+            chunk
+                .par_iter()
+                .enumerate()
+                .map(|(offset, item)| {
+                    let index = chunk_index * chunk_size + offset;
+                    per_proof_rng(&seed, index).and_then(|mut rng| {
+                        prepare_equation::<C>(
+                            prepared,
+                            config,
+                            item.statement,
+                            item.proof,
+                            &mut rng,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
         });
-        match result {
-            Ok(equation) => Ok(equation),
-            Err(Error::InvalidProof) => Err(R1CSError::VerificationError),
-            Err(error) => {
-                operational = Some(error);
-                Err(R1CSError::VerificationError)
-            }
+    let mut operational = None;
+    let equations = results.map(|result| match result {
+        Ok(equation) => Ok(equation),
+        Err(Error::InvalidProof) => Err(R1CSError::VerificationError),
+        Err(error) => {
+            operational = Some(error);
+            Err(R1CSError::VerificationError)
         }
     });
     let verdict = VerificationEquation::<C>::verify_batch_iter(equations, &mut rng);
