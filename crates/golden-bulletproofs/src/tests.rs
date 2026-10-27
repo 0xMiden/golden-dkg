@@ -211,6 +211,7 @@ fn real_workflow<G: DkgGroup, P: DealerProofSystem<G>>(
             reject_publicly_valid_mutations(&capture, &case, one, own.broadcast_bytes());
         }
     }
+    reshare::reshare_cases(capture.inner, restored_capacity, prepare);
 }
 
 fn assert_invalid_proof<G: DkgGroup, P: DealerProofSystem<G>>(
@@ -229,18 +230,38 @@ fn assert_invalid_proof<G: DkgGroup, P: DealerProofSystem<G>>(
     );
 }
 
+/// Broadcast bytes before the first instance block: framed magic, configuration root and dealer.
+const WIRE_HEADER: usize = 8 + b"golden-dkg-wire-v4".len() + 32 + 4;
+
+/// Whether the wire omits this kind's constant commitment.
+fn pinned_constant(kind: DkgInstanceKind) -> bool {
+    matches!(kind, DkgInstanceKind::Zero | DkgInstanceKind::Reshare)
+}
+
+/// Encoded coefficients of one instance; pinned Zero and Reshare constants are omitted.
+fn wire_coefficients<G: DkgGroup>(config: &DkgConfig<G>, kind: DkgInstanceKind) -> usize {
+    config.threshold() - usize::from(pinned_constant(kind))
+}
+
+/// Encoded instance block: nonce, coefficients and one pad/ciphertext slot per receiver.
+fn block_bytes<G: DkgGroup>(config: &DkgConfig<G>, kind: DkgInstanceKind) -> usize {
+    32 + wire_coefficients(config, kind) * G::POINT_BYTES
+        + config.receiver_count() * (G::POINT_BYTES + 32)
+}
+
 fn reject_publicly_valid_mutations<G: DkgGroup, P: DealerProofSystem<G>>(
     proofs: &P,
     config: &DkgConfig<G>,
     dealer: ParticipantIndex,
     message: &[u8],
 ) {
-    let header = 8 + b"golden-dkg-wire-v4".len() + 32 + 4;
-    let receivers = config.registry().len() - 1;
+    let header = WIRE_HEADER;
     let slot_bytes = G::POINT_BYTES + 32;
-    let block_bytes = 32 + config.threshold() * G::POINT_BYTES + receivers * slot_bytes;
-    let first_constant = header + 32;
-    let first_pad = first_constant + config.threshold() * G::POINT_BYTES;
+    let first_kind = config.instance(0).unwrap();
+    let first_block = block_bytes(config, first_kind);
+    let first_coefficients = wire_coefficients(config, first_kind);
+    let first_coefficient = header + 32;
+    let first_pad = first_coefficient + first_coefficients * G::POINT_BYTES;
     let first_cipher = first_pad + G::POINT_BYTES;
     let mut mutations = Vec::new();
 
@@ -260,40 +281,65 @@ fn reject_publicly_valid_mutations<G: DkgGroup, P: DealerProofSystem<G>>(
     paired[first_cipher..first_cipher + 32].copy_from_slice(&G::encode_scalar(&(cipher + delta)));
     mutations.push(("paired pad/ciphertext", paired));
 
-    let constant =
-        G::decode_point(&message[first_constant..first_constant + G::POINT_BYTES]).unwrap();
-    let mut shifted = message.to_vec();
-    shifted[first_constant..first_constant + G::POINT_BYTES].copy_from_slice(&G::encode_point(
-        &(constant + G::mul_generator(&G::Scalar::ONE)),
-    ));
-    // Adding one to A_0 adds one to every receiver's Feldman evaluation;
-    // shift each ciphertext by the same amount to retain the public equation.
-    for receiver in 0..receivers {
-        let offset = first_cipher + receiver * slot_bytes;
-        let value = G::decode_scalar(&message[offset..offset + 32]).unwrap();
-        shifted[offset..offset + 32].copy_from_slice(&G::encode_scalar(&(value + G::Scalar::ONE)));
+    // The first encoded coefficient is A_0, or A_1 when the constant is pinned;
+    // a pinned threshold-one block encodes none. Adding one to A_k adds j^k to
+    // receiver j's Feldman evaluation; shift each ciphertext by the same amount
+    // to retain the public equation.
+    if first_coefficients > 0 {
+        let degree = u64::from(pinned_constant(first_kind));
+        let coefficient =
+            G::decode_point(&message[first_coefficient..first_coefficient + G::POINT_BYTES])
+                .unwrap();
+        let mut shifted = message.to_vec();
+        shifted[first_coefficient..first_coefficient + G::POINT_BYTES].copy_from_slice(
+            &G::encode_point(&(coefficient + G::mul_generator(&G::Scalar::ONE))),
+        );
+        for (slot, (receiver, _)) in config.receivers(dealer).enumerate() {
+            let offset = first_cipher + slot * slot_bytes;
+            let value = G::decode_scalar(&message[offset..offset + 32]).unwrap();
+            let step = receiver
+                .to_scalar::<G::Scalar>()
+                .unwrap()
+                .pow_vartime([degree]);
+            shifted[offset..offset + 32].copy_from_slice(&G::encode_scalar(&(value + step)));
+        }
+        mutations.push(("first coefficient/ciphertexts", shifted));
     }
-    mutations.push(("constant/ciphertexts", shifted));
 
-    let mut reordered = message.to_vec();
-    let (first, rest) = reordered.split_at_mut(header + block_bytes);
-    first[header..].swap_with_slice(&mut rest[..block_bytes]);
-    mutations.push(("instance block order", reordered));
+    // Only blocks of one kind share a size and a constant policy.
+    if config.instance(1) == Some(first_kind) {
+        let mut reordered = message.to_vec();
+        let (first, rest) = reordered.split_at_mut(header + first_block);
+        first[header..].swap_with_slice(&mut rest[..first_block]);
+        mutations.push(("instance block order", reordered));
+    }
 
     // Constant proof widths are fixed by the inner protocol codec; their
     // positions are omitted from bytes and must remain transcript-bound.
-    let proof_frame = header + config.instances().len() * block_bytes;
+    let proof_frame = header
+        + config
+            .instances()
+            .iter()
+            .map(|kind| block_bytes(config, *kind))
+            .sum::<usize>();
     let proof_start = proof_frame + 8;
     let mut reader = golden_core::wire::Reader::new(&message[proof_start..]);
     reader.framed().unwrap(); // expected concrete proof-family identifier
     reader.framed().unwrap(); // canonical nested R1CS payload
     let constant_bytes = G::POINT_BYTES + 32;
-    assert_eq!(reader.remaining(), 2 * constant_bytes);
-    let constant_start = message.len() - reader.remaining();
-    let mut swapped = message.to_vec();
-    let (first, second) = swapped[constant_start..].split_at_mut(constant_bytes);
-    first.swap_with_slice(second);
-    mutations.push(("Random constant proof order", swapped));
+    let randoms = config
+        .instances()
+        .iter()
+        .filter(|kind| **kind == DkgInstanceKind::Random)
+        .count();
+    assert_eq!(reader.remaining(), randoms * constant_bytes);
+    if randoms > 1 {
+        let constant_start = message.len() - reader.remaining();
+        let mut swapped = message.to_vec();
+        let (first, second) = swapped[constant_start..].split_at_mut(constant_bytes);
+        first.swap_with_slice(&mut second[..constant_bytes]);
+        mutations.push(("Random constant proof order", swapped));
+    }
 
     for (name, bytes) in mutations {
         assert_invalid_proof(proofs, config, dealer, &bytes, name);
@@ -429,3 +475,5 @@ fn jubjub_serde_uses_the_same_validated_artifact_bytes() {
     let restored: crate::BlsJubjubPrepared = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(prepared.to_bytes().unwrap(), restored.to_bytes().unwrap());
 }
+
+mod reshare;
