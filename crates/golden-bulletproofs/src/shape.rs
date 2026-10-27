@@ -23,11 +23,7 @@ pub(crate) fn multiplier_count<C: Backend>(slot_count: usize) -> Result<usize> {
 }
 
 pub(crate) fn required_capacity<C: Backend>(config: &DkgConfig<C::Dkg>) -> Result<usize> {
-    let receivers = config
-        .registry()
-        .len()
-        .checked_sub(1)
-        .ok_or(Error::ProofOperationFailed)?;
+    let receivers = config.receiver_count();
     if receivers == 0 {
         return Ok(0);
     }

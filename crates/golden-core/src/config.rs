@@ -190,6 +190,27 @@ impl<G: DkgGroup> DkgConfig<G> {
     pub fn identity_public_key(&self, participant: ParticipantIndex) -> Option<&G::Point> {
         self.registry.participants.get(&participant)
     }
+    /// Canonical dealer registry.
+    pub fn dealers(&self) -> &ParticipantRegistry<G> {
+        &self.registry
+    }
+    /// Registered dealer identity key, if present.
+    pub fn dealer_public_key(&self, dealer: ParticipantIndex) -> Option<&G::Point> {
+        self.registry.participants.get(&dealer)
+    }
+    /// Canonical receivers of one dealer's sharings, excluding that dealer.
+    pub fn receivers(
+        &self,
+        dealer: ParticipantIndex,
+    ) -> impl Iterator<Item = (ParticipantIndex, &G::Point)> + '_ {
+        self.registry
+            .entries()
+            .filter(move |(participant, _)| *participant != dealer)
+    }
+    /// Receiver count of every dealer's sharings.
+    pub fn receiver_count(&self) -> usize {
+        self.registry.len() - 1
+    }
     /// Instance kinds in configuration order.
     pub fn instances(&self) -> &[DkgInstanceKind] {
         &self.instances
@@ -221,7 +242,7 @@ pub(crate) fn associate<'a, G: DkgGroup>(
     let mut duplicate = BTreeSet::new();
     for candidate in candidates {
         let dealer = candidate.expected_dealer;
-        if config.identity_public_key(dealer).is_none() {
+        if config.dealer_public_key(dealer).is_none() {
             unexpected.insert(dealer);
         }
         if board.insert(dealer, candidate.bytes).is_some() {
@@ -235,7 +256,7 @@ pub(crate) fn associate<'a, G: DkgGroup>(
         return Err(Error::DuplicateDealer { dealer: *dealer });
     }
     if full {
-        for dealer in config.registry.indexes() {
+        for dealer in config.dealers().indexes() {
             if !board.contains_key(&dealer) {
                 return Err(Error::MissingDealer { dealer });
             }

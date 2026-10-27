@@ -155,7 +155,7 @@ fn restore_own<G: DkgGroup>(
     if reader.array::<32>()? != config.root() || reader.u32()? != expected.get() {
         return Err(Error::InvalidPersistedState);
     }
-    config.registry().public_key(expected)?;
+    config.dealers().public_key(expected)?;
     let broadcast = reader.framed()?;
     let message = crate::dealer_message::parse(config, expected, broadcast)?;
     let count = reader.count()?;

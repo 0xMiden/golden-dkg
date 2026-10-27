@@ -17,12 +17,8 @@ pub(crate) struct ParsedDealerMessage<'a, G: DkgGroup> {
 }
 
 pub(crate) fn encoded_prefix_len<G: DkgGroup>(config: &DkgConfig<G>) -> Result<usize> {
-    let receiver_count = config
-        .registry()
-        .len()
-        .checked_sub(1)
-        .ok_or(Error::ArithmeticOverflow)?;
-    let receiver_bytes = receiver_count
+    let receiver_bytes = config
+        .receiver_count()
         .checked_mul(
             G::POINT_BYTES
                 .checked_add(32)
@@ -57,7 +53,7 @@ pub(crate) fn validate_instances<G: DkgGroup>(
     dealer: ParticipantIndex,
     instances: &[DealerProofInstance<G>],
 ) -> Result<()> {
-    config.registry().public_key(dealer)?;
+    config.dealers().public_key(dealer)?;
     if instances.len() != config.instances().len() {
         return Err(Error::InvalidEncoding);
     }
@@ -73,18 +69,15 @@ pub(crate) fn validate_instances<G: DkgGroup>(
                     kind,
                     instance.nonce,
                 )?
-            || instance.receivers.len() != config.registry().len() - 1
+            || instance.receivers.len() != config.receiver_count()
             || (kind == DkgInstanceKind::Zero
                 && !bool::from(instance.coefficients[0].is_identity()))
         {
             return Err(Error::InvalidEncoding);
         }
-        for (receiver, (participant, key)) in instance.receivers.iter().zip(
-            config
-                .registry()
-                .entries()
-                .filter(|(index, _)| *index != dealer),
-        ) {
+        for (receiver, (participant, key)) in
+            instance.receivers.iter().zip(config.receivers(dealer))
+        {
             if receiver.participant != participant
                 || receiver.public_key != *key
                 || receiver.share_commitment != evaluate::<G>(&instance.coefficients, participant)
@@ -105,7 +98,7 @@ pub(crate) fn statement<G: DkgGroup>(
     instances: Vec<DealerProofInstance<G>>,
 ) -> Result<DealerProofStatement<G>> {
     validate_instances(config, dealer, &instances)?;
-    let key = *config.registry().public_key(dealer)?;
+    let key = *config.dealers().public_key(dealer)?;
     let mut logical = Vec::new();
     logical.extend_from_slice(&config.root());
     logical.extend_from_slice(&dealer.get().to_be_bytes());
@@ -147,7 +140,7 @@ pub(crate) fn encode<G: DkgGroup>(
     proof: &[u8],
 ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     statement.validate_against(config)?;
-    if config.registry().len() == 1 && !proof.is_empty() {
+    if config.receiver_count() == 0 && !proof.is_empty() {
         return Err(Error::InvalidProof);
     }
     let length = encoded_prefix_len(config)?
@@ -197,7 +190,7 @@ pub(crate) fn parse<'a, G: DkgGroup>(
     {
         return Err(Error::InvalidEncoding);
     }
-    config.registry().public_key(expected_dealer)?;
+    config.dealers().public_key(expected_dealer)?;
     let mut instances = reserve(config.instances().len())?;
     for (position, kind) in config.instances().iter().copied().enumerate() {
         let nonce = DealerMessageNonce(reader.array()?);
@@ -215,12 +208,8 @@ pub(crate) fn parse<'a, G: DkgGroup>(
         for _ in coefficients.len()..config.threshold() {
             coefficients.push(G::decode_point(reader.take(G::POINT_BYTES)?)?);
         }
-        let mut receivers = reserve(config.registry().len() - 1)?;
-        for (participant, key) in config
-            .registry()
-            .entries()
-            .filter(|(index, _)| *index != expected_dealer)
-        {
+        let mut receivers = reserve(config.receiver_count())?;
+        for (participant, key) in config.receivers(expected_dealer) {
             let pad_commitment = G::decode_point(reader.take(G::POINT_BYTES)?)?;
             let encrypted_share = G::decode_scalar(reader.take(32)?)?;
             receivers.push(DealerProofReceiver {
@@ -241,7 +230,7 @@ pub(crate) fn parse<'a, G: DkgGroup>(
     }
     let proof = reader.framed()?;
     reader.finish()?;
-    if config.registry().len() == 1 && !proof.is_empty() {
+    if config.receiver_count() == 0 && !proof.is_empty() {
         return Err(Error::InvalidEncoding);
     }
     Ok(ParsedDealerMessage {

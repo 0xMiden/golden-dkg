@@ -87,11 +87,11 @@ where
     G: DkgGroup,
     P: DealerProofSystem<G>,
 {
-    if G::mul_generator(identity_secret) != *config.registry().public_key(dealer)? {
+    if G::mul_generator(identity_secret) != *config.dealers().public_key(dealer)? {
         return Err(Error::IdentityKeyMismatch);
     }
     dealer_message::encoded_prefix_len(config)?;
-    let receiver_count = config.registry().len() - 1;
+    let receiver_count = config.receiver_count();
     let mut instances = reserve(config.instances().len())?;
     let mut private_instances = reserve(config.instances().len())?;
     let mut private_shares = secret_vec(config.instances().len())?;
@@ -122,11 +122,7 @@ where
             crate::main_golden::effective_message(config.root(), dealer, position, kind, nonce)?;
         let mut receivers = reserve(receiver_count)?;
         let mut openings = reserve(receiver_count)?;
-        for (participant, key) in config
-            .registry()
-            .entries()
-            .filter(|(participant, _)| *participant != dealer)
-        {
+        for (participant, key) in config.receivers(dealer) {
             let share = polynomial.evaluate(participant)?;
             let pad = secret(crate::main_golden::receiver_pad::<G>(
                 effective_message,
@@ -346,7 +342,7 @@ where
     G: DkgGroup,
     P: DealerProofSystem<G>,
 {
-    if config.registry().len() == 1 {
+    if config.receiver_count() == 0 {
         return Ok(());
     }
     let mut refs = reserve(messages.len())?;

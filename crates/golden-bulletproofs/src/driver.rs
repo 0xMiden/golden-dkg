@@ -46,20 +46,14 @@ fn slots<C: Backend>(
     statement: &DealerProofStatement<C::Dkg>,
 ) -> Result<Vec<Slot<C::Dkg>>> {
     if statement.config_root() != config.root()
-        || config.identity_public_key(statement.dealer()) != Some(statement.dealer_public_key())
+        || config.dealer_public_key(statement.dealer()) != Some(statement.dealer_public_key())
         || statement.instance_count() != config.instances().len()
     {
         return Err(Error::InvalidProof);
     }
     let count = statement
         .instance_count()
-        .checked_mul(
-            config
-                .registry()
-                .len()
-                .checked_sub(1)
-                .ok_or(Error::InvalidProof)?,
-        )
+        .checked_mul(config.receiver_count())
         .ok_or(Error::ProofOperationFailed)?;
     let mut slots = Vec::new();
     slots
@@ -67,7 +61,7 @@ fn slots<C: Backend>(
         .map_err(|_| Error::ProofOperationFailed)?;
     for instance in statement.instances() {
         if config.instance(instance.position()) != Some(instance.kind())
-            || instance.receiver_count() != config.registry().len() - 1
+            || instance.receiver_count() != config.receiver_count()
         {
             return Err(Error::InvalidProof);
         }
@@ -204,7 +198,7 @@ pub(crate) fn prove<C: Backend>(
     prepared.check_capacity(config)?;
     main_golden::check_dealer_relation(config, statement, witness)
         .map_err(|_| Error::ProofGenerationFailed)?;
-    if config.registry().len() == 1 {
+    if config.receiver_count() == 0 {
         return Ok(Vec::new());
     }
     let slots = slots::<C>(config, statement)?;
@@ -328,9 +322,9 @@ pub(crate) fn verify<C: Backend>(
     proof: &[u8],
 ) -> Result<()> {
     prepared.check_capacity(config)?;
-    if config.registry().len() == 1 {
+    if config.receiver_count() == 0 {
         if statement.config_root() != config.root()
-            || config.identity_public_key(statement.dealer()) != Some(statement.dealer_public_key())
+            || config.dealer_public_key(statement.dealer()) != Some(statement.dealer_public_key())
         {
             return Err(Error::InvalidProof);
         }
@@ -361,11 +355,11 @@ pub(crate) fn verify_batch<C: Backend>(
     if proofs.is_empty() {
         return Ok(());
     }
-    if config.registry().len() == 1 {
+    if config.receiver_count() == 0 {
         return if proofs.iter().all(|item| {
             item.proof.is_empty()
                 && item.statement.config_root() == config.root()
-                && config.identity_public_key(item.statement.dealer())
+                && config.dealer_public_key(item.statement.dealer())
                     == Some(item.statement.dealer_public_key())
         }) {
             Ok(())

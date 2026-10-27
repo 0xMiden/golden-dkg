@@ -28,7 +28,7 @@ impl<G: DkgGroup> DealerProofSystem<G> for InsecureRevealedWitnessProof {
         _rng: &mut impl CryptoRngCore,
     ) -> Result<Vec<u8>> {
         crate::main_golden::check_dealer_relation(config, statement, witness)?;
-        let receiver_count = config.registry().len() - 1;
+        let receiver_count = config.receiver_count();
         let constants = config
             .instances()
             .iter()
@@ -97,7 +97,7 @@ fn verify<G: DkgGroup>(
         } else {
             None
         };
-        let count = config.registry().len() - 1;
+        let count = config.receiver_count();
         reader.ensure_items(count, 64)?;
         let mut receivers = reserve(count)?;
         for _ in 0..count {

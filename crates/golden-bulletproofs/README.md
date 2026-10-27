@@ -9,7 +9,8 @@ thread pool independently of that feature.
 expand the minimally padded generator requirement. A proof system is constructed
 with `from_prepared(prepared)` and shares immutable owned state. Larger compatible
 prefixes serve smaller configurations, with no lazy growth or process-wide
-generator cache. Singleton configurations require zero capacity and no bases.
+generator cache. Configurations without receivers, which are exactly the plain
+single-participant ones, require zero capacity and no bases.
 
 Byte and serde restoration require intact authenticated storage from approved
 generation. Canonical subgroup encodings and exact dimensions do not establish

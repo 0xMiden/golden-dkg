@@ -110,7 +110,7 @@ impl<G: DkgGroup> DealerProofStatement<G> {
     }
     pub(crate) fn validate_against(&self, config: &DkgConfig<G>) -> Result<()> {
         if self.config_root != config.root()
-            || config.identity_public_key(self.dealer) != Some(&self.dealer_public_key)
+            || config.dealer_public_key(self.dealer) != Some(&self.dealer_public_key)
         {
             return Err(Error::InvalidProof);
         }

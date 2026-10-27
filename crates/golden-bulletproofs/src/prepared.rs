@@ -241,7 +241,8 @@ macro_rules! concrete_system {
         pub struct $prepared(std::sync::Arc<crate::prepared::Prepared<$cycle>>);
         impl $prepared {
             /// Expand the minimally padded generator requirement explicitly.
-            /// Singleton configurations return zero without preparing bases.
+            /// Configurations without receivers, which are exactly the plain single-participant
+            /// ones, return zero capacity without preparing bases.
             pub fn prepare_for(
                 config: &golden_core::DkgConfig<$group>,
             ) -> golden_core::Result<Self> {
