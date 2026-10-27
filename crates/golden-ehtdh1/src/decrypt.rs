@@ -6,7 +6,7 @@ use group::Group;
 use std::collections::BTreeSet;
 use std::fmt;
 
-use golden_core::{DkgGroup, ParticipantIndex, TranscriptBuilder};
+use golden_core::{DkgGroup, DkgInstanceKind, ParticipantIndex, TranscriptBuilder};
 use rand_core::{CryptoRng, RngCore};
 
 use crate::context::{
@@ -369,12 +369,17 @@ fn validate_combiner_setup<G: DkgGroup>(
         .iter()
         .map(|(id, share)| (*id, share.decryption, share.context))
         .collect();
-    let completion_root = golden_core::output::ehtdh1_completion_root::<G>(
-        setup_context.config_root,
-        &public_key_set.joint_public_key,
-        &shares,
-    )?;
-    if completion_root != setup_context.completion_root {
+    let completion_root = |decryption_kind| {
+        golden_core::output::ehtdh1_completion_root::<G>(
+            decryption_kind,
+            setup_context.config_root,
+            &public_key_set.joint_public_key,
+            &shares,
+        )
+    };
+    if completion_root(DkgInstanceKind::Random)? != setup_context.completion_root
+        && completion_root(DkgInstanceKind::Reshare)? != setup_context.completion_root
+    {
         return Err(Error::InvalidBridge("setup completion mismatch"));
     }
     Ok(())

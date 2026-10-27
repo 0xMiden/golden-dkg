@@ -164,20 +164,26 @@ fn kind_mismatch<G: DkgGroup>(
         })
 }
 
-/// Recompute the EHTDH1 `[Random, Zero]` public-result identity without creating an output.
+/// Recompute the EHTDH1 `[decryption_kind, Zero]` public-result identity for `Random` or `Reshare`.
 ///
 /// This checks canonical participant order only; it does not authenticate setup provenance.
 #[doc(hidden)]
 pub fn ehtdh1_completion_root<G: DkgGroup>(
+    decryption_kind: DkgInstanceKind,
     config_root: TranscriptRoot,
     joint_key: &G::Point,
     shares: &[(ParticipantIndex, G::Point, G::Point)],
 ) -> Result<TranscriptRoot> {
-    if shares.is_empty() || shares.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+    if !matches!(
+        decryption_kind,
+        DkgInstanceKind::Random | DkgInstanceKind::Reshare
+    ) || shares.is_empty()
+        || shares.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+    {
         return Err(Error::InvalidEncoding);
     }
     let decryption = DkgPublicInstance::<G> {
-        kind: DkgInstanceKind::Random,
+        kind: decryption_kind,
         public_key: *joint_key,
         public_key_shares: shares
             .iter()

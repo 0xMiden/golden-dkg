@@ -1,7 +1,8 @@
 # Golden DKG
 
 The workspace implements the fixed Main Golden relation over native Secp256k1
-and Jubjub groups. The issue 71 contract is in [docs/issue-71.md](docs/issue-71.md).
+and Jubjub groups. The issue 71 contract is in [docs/issue-71.md](docs/issue-71.md);
+the group-key resharing contract is in [docs/resharing.md](docs/resharing.md).
 All previous state, formats and APIs are retired in the 2.0 compatibility cut.
 
 Keep the dependency boundary explicit:
@@ -14,7 +15,7 @@ Keep the dependency boundary explicit:
   preparation, commitment-cycle adapters and optimized MSM implementations.
 * `bulletproofs-cycle` is the generic engine with explicitly owned generators.
 * `golden-ehtdh1` implements online encryption/decryption and consumes exactly one
-  completed `[Random, Zero]` batch.
+  completed `[Random, Zero]` or `[Reshare, Zero]` batch.
 
 Keep protocol parsing and circuit gadgets private. Extend the proof interface,
 not the fixed relation. Reuse native field/group operations and existing seams

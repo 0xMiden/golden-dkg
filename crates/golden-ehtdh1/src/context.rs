@@ -105,7 +105,7 @@ impl<G: DkgGroup> PublicKeySet<G> {
 
 /// Trusted setup identity bound into decryption transcripts.
 ///
-/// This metadata accompanies the approved `[Random, Zero]` public result.
+/// This metadata accompanies the approved `[Random, Zero]` or `[Reshare, Zero]` public result.
 /// Its authenticity and agreement are application responsibilities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupContext {

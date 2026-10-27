@@ -429,6 +429,7 @@ fn contextual_persistence<G: DkgGroup>() {
         })
         .collect();
     let expected_root = golden_core::output::ehtdh1_completion_root::<G>(
+        Random,
         config.root(),
         output.public().instance(0).unwrap().public_key(),
         &rows,

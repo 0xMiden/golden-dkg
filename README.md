@@ -6,7 +6,8 @@ Native Golden distributed key generation and context-bound threshold encryption
 over Secp256k1 and Jubjub. Version 2.0 is a hard compatibility cut: configurations,
 keys, broadcasts, ciphertexts, snapshots and prepared artifacts from earlier
 versions require fresh setup. The full refactor contract is in
-[docs/issue-71.md](docs/issue-71.md).
+[docs/issue-71.md](docs/issue-71.md), and the group-key resharing contract is in
+[docs/resharing.md](docs/resharing.md).
 
 The protocols follow these papers:
 
@@ -21,7 +22,7 @@ The protocols follow these papers:
 | [`golden-curves`](crates/golden-curves) | Proof-free Secp256k1 and Jubjub adapters with strict canonical codecs. |
 | [`golden-bulletproofs`](crates/golden-bulletproofs) | Joint Main Golden proofs for Secp/Secq and Jubjub/BLS12-381, explicit typed preparation and optimized MSM. |
 | [`bulletproofs-cycle`](crates/bulletproofs-cycle) | Generic Bulletproofs engine with owned generator prefixes. |
-| [`golden-ehtdh1`](crates/golden-ehtdh1) | Online encryption/decryption and one completed `[Random, Zero]` batch bridge. |
+| [`golden-ehtdh1`](crates/golden-ehtdh1) | Online encryption/decryption and one completed `[Random, Zero]` or `[Reshare, Zero]` batch bridge. |
 
 Rust 1.93 or later is required. Concrete adapters and proofs are opt-in features;
 core does not depend on either. See each package README for the public API and

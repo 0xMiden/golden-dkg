@@ -4,9 +4,12 @@ Context-bound threshold encryption for Golden distributed key generation,
 based on [EHTDH1, ePrint 2025/279](https://eprint.iacr.org/2025/279).
 
 Run Golden once with exactly `[DkgInstanceKind::Random,
-DkgInstanceKind::Zero]`, then call
-`material_from_dkg_output(&config, &output, epoch)`. The Random instance shares
-the decryption secret; the Zero instance supplies context-binding shares. The
+DkgInstanceKind::Zero]`, or reshare its key with exactly
+`[DkgInstanceKind::Reshare, DkgInstanceKind::Zero]`, then call
+`material_from_dkg_output(&config, &output, epoch)`. The Random or Reshare
+instance shares the decryption secret; the Zero instance supplies
+context-binding shares. A reshare keeps the sealing key under a new setup
+context, so records sealed before it open with the new committee. The
 bridge checks configuration binding, instance policies, public-share
 interpolation and the aggregate keys before constructing local EHTDH1 material.
 
@@ -46,11 +49,12 @@ its own versioned envelope, separate from DKG broadcasts and local snapshots.
 Legacy keys, ciphertexts and setup artifacts are not compatible with this cut.
 
 Applications own authenticated setup agreement, generator provenance, secret
-custody, request authorization, associated-data policy, replay handling and
-record AEAD. Restored DKG outputs require authenticated storage with trusted
-completion provenance. Secret diagnostics are redacted and owned storage is
-cleaned up on normal drop; caller copies and application-owned serialized bytes
-remain the caller's responsibility.
+custody, request authorization, associated-data policy, replay handling, record
+AEAD and retirement of the predecessor setup once a reshare activates. Restored
+DKG outputs require authenticated storage with trusted completion provenance.
+Secret diagnostics are redacted and owned storage is cleaned up on normal drop;
+caller copies and application-owned serialized bytes remain the caller's
+responsibility.
 
 The retained security targets do not constitute a new audit. Mixed-instance
 setup composition and both concrete proof backends require the separate

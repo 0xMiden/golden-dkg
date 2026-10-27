@@ -1,6 +1,6 @@
-//! Conversion from one completed `[Random, Zero]` batch to EHTDH1 material.
+//! Conversion from one completed `[Random, Zero]` or `[Reshare, Zero]` batch to EHTDH1 material.
 
-use golden_core::{DkgConfig, DkgGroup, DkgInstanceKind, DkgOutput};
+use golden_core::{DkgConfig, DkgGroup, DkgInstanceKind, DkgOutput, ResharePredecessor};
 use group::Group;
 use std::{collections::BTreeMap, fmt};
 
@@ -29,7 +29,8 @@ impl<G: DkgGroup> fmt::Debug for Ehtdh1Material<G> {
     }
 }
 
-/// Validate a completed batch and construct its EHTDH1 material.
+/// Validate a completed `[Random, Zero]` or `[Reshare, Zero]` batch and construct its EHTDH1
+/// material. A `[Reshare, Zero]` batch keeps its predecessor's sealing key.
 ///
 /// Restored outputs require authenticated trusted completion provenance. These
 /// algebraic and identity checks cannot establish historical proof verification.
@@ -38,8 +39,13 @@ pub fn material_from_dkg_output<G: DkgGroup>(
     output: &DkgOutput<G>,
     epoch: [u8; 32],
 ) -> Result<Ehtdh1Material<G>, Error> {
-    if config.instances() != [DkgInstanceKind::Random, DkgInstanceKind::Zero]
-        || output.config_root() != config.root()
+    if !matches!(
+        config.instances(),
+        [
+            DkgInstanceKind::Random | DkgInstanceKind::Reshare,
+            DkgInstanceKind::Zero
+        ]
+    ) || output.config_root() != config.root()
         || output.public().instance_count() != 2
     {
         return Err(Error::InvalidBridge("batch configuration mismatch"));
@@ -52,10 +58,13 @@ pub fn material_from_dkg_output<G: DkgGroup>(
         .public()
         .instance(1)
         .ok_or(Error::InvalidBridge("missing context instance"))?;
-    if decryption.kind() != DkgInstanceKind::Random
+    if Some(decryption.kind()) != config.instance(0)
         || context.kind() != DkgInstanceKind::Zero
         || bool::from(decryption.public_key().is_identity())
         || !bool::from(context.public_key().is_identity())
+        || (decryption.kind() == DkgInstanceKind::Reshare
+            && config.predecessor().map(ResharePredecessor::public_key)
+                != Some(decryption.public_key()))
     {
         return Err(Error::InvalidBridge("invalid instance keys"));
     }

@@ -1,7 +1,8 @@
 //! Context-dependent threshold encryption using Golden DKG output.
 //!
-//! Run Golden with exactly `[Random, Zero]`, then convert its completed local
-//! output with [`material_from_dkg_output`]. Clients use [`SealingKey`]; validators
+//! Run Golden with exactly `[Random, Zero]`, or reshare its key with exactly
+//! `[Reshare, Zero]`, then convert its completed local output with
+//! [`material_from_dkg_output`]. Clients use [`SealingKey`]; validators
 //! use [`UnsealingShare`]; [`Combiner`] checks and combines a threshold of shares.
 //! Setup context binds the batch session, configuration, completion and epoch.
 //!
@@ -71,9 +72,13 @@ mod tests {
             .map(|(id, share)| (*id, share.decryption, share.context))
             .collect();
         let config_root = [1; 32];
-        let completion_root =
-            golden_core::output::ehtdh1_completion_root::<G>(config_root, &joint_key, &rows)
-                .unwrap();
+        let completion_root = golden_core::output::ehtdh1_completion_root::<G>(
+            golden_core::DkgInstanceKind::Random,
+            config_root,
+            &joint_key,
+            &rows,
+        )
+        .unwrap();
         let context = SetupContext {
             group_id: G::GROUP_ID.into(),
             threshold: 2,
