@@ -18,7 +18,8 @@
 #![allow(clippy::type_complexity)]
 
 use golden_core::{
-    DkgConfig, GoldenGroup, GoldenScalar, ParticipantIndex, ParticipantRegistry, SessionId,
+    DkgConfig, GoldenGroup, GoldenScalar, IdentityKeyProof, ParticipantIndex, ParticipantRegistry,
+    SessionId,
 };
 use golden_evrf::paper::secp_secq::{
     evrf_batched_prove, evrf_batched_verify, testing, BatchedEvrfPublicParams,
@@ -102,9 +103,11 @@ pub fn build_config(n: usize, t: usize) -> DkgConfig<Secp256k1GoldenGroup> {
         participants
             .iter()
             .map(|p| {
+                let identity_secret = identity_secret(*p);
                 (
                     *p,
-                    Secp256k1GoldenGroup::mul_generator(&identity_secret(*p)),
+                    Secp256k1GoldenGroup::mul_generator(&identity_secret),
+                    IdentityKeyProof::prove(&identity_secret).unwrap(),
                 )
             })
             .collect(),

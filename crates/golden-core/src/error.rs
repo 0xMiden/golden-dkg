@@ -23,6 +23,19 @@ pub enum Error {
         second: u32,
     },
 
+    /// A participant identity public key was the negation of another one.
+    #[error("negated participant public key for participants {first} and {second}")]
+    NegatedParticipantPublicKey {
+        /// Participant index registered first.
+        first: u32,
+        /// Participant index whose key negates the first one.
+        second: u32,
+    },
+
+    /// A participant identity key proof did not verify against its key.
+    #[error("invalid identity key proof for participant {0}")]
+    InvalidIdentityKeyProof(u32),
+
     /// The threshold was invalid for the requested operation.
     #[error("invalid threshold: threshold={threshold}, participants={participants}")]
     InvalidThreshold {
