@@ -49,6 +49,10 @@ All functions borrow an injected `P: DealerProofSystem<G>` and configuration.
 * `complete(proofs, config, &identity_secret, &own, peers) -> Result<DkgOutput<G>>`:
   exactly the other dealers; retry does not consume own state.
 
+Reshare configurations (`DkgConfig::new_reshare`, `deal_reshare`, `complete_reshare`)
+are specified in [resharing.md](resharing.md); this contract describes plain
+configurations.
+
 `OwnDealing` exposes participant/config binding and `broadcast_bytes()`. It is
 cloneable, with no production identity secret. `DkgOutput` and proof witnesses
 are not Clone or Copy. Public configurations/outputs may be Clone.
