@@ -144,6 +144,31 @@ pub enum Error {
     /// Decryption failed.
     #[error("decryption failed")]
     DecryptionFailed,
+    /// Invalid reshare dealer set or instance kinds.
+    #[error("invalid reshare configuration")]
+    InvalidReshareConfiguration,
+    /// Duplicate or negated identity keys across reshare registries.
+    #[error("reshare identity keys collide")]
+    ReshareKeyCollision,
+    /// Reshare threshold does not exceed the declared corrupt-receiver bound.
+    #[error(
+        "insecure reshare threshold: {threshold} for {max_corrupt_receivers} corrupt receivers"
+    )]
+    InsecureReshareThreshold {
+        /// Requested threshold.
+        threshold: usize,
+        /// Declared corrupt-receiver bound.
+        max_corrupt_receivers: usize,
+    },
+    /// Inconsistent predecessor key set.
+    #[error("invalid reshare predecessor")]
+    InvalidPredecessor,
+    /// Operation does not apply to this configuration kind.
+    #[error("operation does not apply to this configuration kind")]
+    ConfigurationKindMismatch,
+    /// Predecessor share does not match its pinned public share.
+    #[error("predecessor share does not match its pinned public share")]
+    PredecessorShareMismatch,
 }
 
 /// Coarsen a validation verdict without disguising an operational failure.

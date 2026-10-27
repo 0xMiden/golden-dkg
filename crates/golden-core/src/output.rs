@@ -52,7 +52,7 @@ impl<G: DkgGroup> DkgPublicOutput<G> {
             || instances
                 .iter()
                 .zip(config.instances())
-                .any(|(instance, kind)| instance.kind != *kind)
+                .any(|(instance, kind)| kind_mismatch(config, instance, *kind))
         {
             return Err(Error::InvalidPersistedState);
         }
@@ -134,11 +134,13 @@ pub(crate) fn public_payload<G: DkgGroup>(
         count(&mut payload, position)?;
         payload.push(instance.kind.tag());
         payload.extend_from_slice(&G::encode_point(&instance.public_key));
-        count(&mut payload, instance.public_key_shares.len())?;
-        for (participant, point) in &instance.public_key_shares {
-            payload.extend_from_slice(&participant.get().to_be_bytes());
-            payload.extend_from_slice(&G::encode_point(point));
-        }
+        crate::config::append_entries::<G>(
+            &mut payload,
+            instance
+                .public_key_shares
+                .iter()
+                .map(|(participant, point)| (*participant, point)),
+        )?;
     }
     Ok(payload)
 }
@@ -150,6 +152,16 @@ fn public_result_root<G: DkgGroup>(
         b"golden-dkg/completion-root/v3",
         &public_payload::<G>(config_root, instances)?,
     )
+}
+fn kind_mismatch<G: DkgGroup>(
+    config: &DkgConfig<G>,
+    instance: &DkgPublicInstance<G>,
+    kind: DkgInstanceKind,
+) -> bool {
+    instance.kind != kind
+        || config.pinned_key(kind).map_or(true, |pinned| {
+            pinned.is_some_and(|key| key != instance.public_key)
+        })
 }
 
 /// Recompute the EHTDH1 `[Random, Zero]` public-result identity without creating an output.
@@ -205,6 +217,26 @@ pub(crate) fn interpolate<G: DkgGroup>(
     }
     Ok(point)
 }
+pub(crate) fn on_polynomial<G: DkgGroup>(
+    threshold: usize,
+    key: &G::Point,
+    shares: &BTreeMap<ParticipantIndex, G::Point>,
+) -> Result<bool> {
+    let basis = shares
+        .iter()
+        .take(threshold)
+        .map(|(participant, point)| (*participant, *point))
+        .collect::<Vec<_>>();
+    if interpolate::<G>(&basis, G::Scalar::ZERO)? != *key {
+        return Ok(false);
+    }
+    for (participant, point) in shares {
+        if interpolate::<G>(&basis, G::Scalar::from(u64::from(participant.get())))? != *point {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
 pub(crate) fn validate_public<G: DkgGroup>(
     config: &DkgConfig<G>,
@@ -214,29 +246,21 @@ pub(crate) fn validate_public<G: DkgGroup>(
         return Err(Error::InvalidPersistedState);
     }
     for (instance, kind) in output.instances.iter().zip(config.instances()) {
-        if instance.kind != *kind
+        if kind_mismatch(config, instance, *kind)
             || instance
                 .public_key_shares
                 .keys()
                 .copied()
                 .ne(config.registry().indexes())
-            || (*kind == DkgInstanceKind::Zero && !bool::from(instance.public_key.is_identity()))
         {
             return Err(Error::InvalidPersistedState);
         }
-        let basis = instance
-            .public_key_shares
-            .iter()
-            .take(config.threshold())
-            .map(|(participant, point)| (*participant, *point))
-            .collect::<Vec<_>>();
-        if interpolate::<G>(&basis, G::Scalar::ZERO)? != instance.public_key {
+        if !on_polynomial::<G>(
+            config.threshold(),
+            &instance.public_key,
+            &instance.public_key_shares,
+        )? {
             return Err(Error::InvalidPersistedState);
-        }
-        for (participant, point) in &instance.public_key_shares {
-            if interpolate::<G>(&basis, G::Scalar::from(u64::from(participant.get())))? != *point {
-                return Err(Error::InvalidPersistedState);
-            }
         }
     }
     if public_result_root::<G>(output.config_root, &output.instances)? != output.completion_root {

@@ -2,8 +2,7 @@
 use crate::dealer_proof::{DealerProofInstance, DealerProofReceiver};
 use crate::wire::{count, framed, reserve, Reader};
 use crate::{
-    DealerMessageNonce, DealerProofStatement, DkgConfig, DkgGroup, DkgInstanceKind, Error,
-    ParticipantIndex, Result,
+    DealerMessageNonce, DealerProofStatement, DkgConfig, DkgGroup, Error, ParticipantIndex, Result,
 };
 use ff::PrimeField;
 use group::Group;
@@ -30,7 +29,7 @@ pub(crate) fn encoded_prefix_len<G: DkgGroup>(config: &DkgConfig<G>) -> Result<u
         .and_then(|n| n.checked_add(32 + 4 + 8))
         .ok_or(Error::ArithmeticOverflow)?;
     for kind in config.instances() {
-        let coefficient_count = config.threshold() - usize::from(*kind == DkgInstanceKind::Zero);
+        let coefficient_count = config.threshold() - usize::from(kind.pins_constant());
         let body_size = coefficient_count
             .checked_mul(G::POINT_BYTES)
             .and_then(|n| n.checked_add(32))
@@ -70,8 +69,9 @@ pub(crate) fn validate_instances<G: DkgGroup>(
                     instance.nonce,
                 )?
             || instance.receivers.len() != config.receiver_count()
-            || (kind == DkgInstanceKind::Zero
-                && !bool::from(instance.coefficients[0].is_identity()))
+            || config
+                .pinned_constant(kind, dealer)?
+                .is_some_and(|pinned| pinned != instance.coefficients[0])
         {
             return Err(Error::InvalidEncoding);
         }
@@ -155,7 +155,7 @@ pub(crate) fn encode<G: DkgGroup>(
     out.extend_from_slice(&statement.dealer.get().to_be_bytes());
     for instance in &statement.instances {
         out.extend_from_slice(&instance.nonce.0);
-        let start = usize::from(instance.kind == DkgInstanceKind::Zero);
+        let start = usize::from(instance.kind.pins_constant());
         for coefficient in &instance.coefficients[start..] {
             out.extend_from_slice(&G::encode_point(coefficient));
         }
@@ -202,8 +202,8 @@ pub(crate) fn parse<'a, G: DkgGroup>(
             nonce,
         )?;
         let mut coefficients = reserve(config.threshold())?;
-        if kind == DkgInstanceKind::Zero {
-            coefficients.push(G::Point::identity());
+        if let Some(constant) = config.pinned_constant(kind, expected_dealer)? {
+            coefficients.push(constant);
         }
         for _ in coefficients.len()..config.threshold() {
             coefficients.push(G::decode_point(reader.take(G::POINT_BYTES)?)?);

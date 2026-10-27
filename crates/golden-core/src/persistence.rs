@@ -9,7 +9,7 @@ use crate::secret::{secret_vec, Wipeable};
 use crate::wire::{count, framed, reserve, Reader};
 use crate::{
     DkgConfig, DkgGroup, DkgInstanceKind, DkgOutput, DkgPublicOutput, Error, OwnDealing,
-    ParticipantIndex, ParticipantRegistry, Result, SessionId, PROTOCOL_VERSION,
+    ParticipantIndex, ParticipantRegistry, ResharePredecessor, Result, SessionId, PROTOCOL_VERSION,
 };
 use core::{fmt, marker::PhantomData};
 use std::collections::BTreeMap;
@@ -68,11 +68,61 @@ impl<G: DkgGroup> DkgConfig<G> {
 }
 fn restore_config<G: DkgGroup>(bytes: &[u8]) -> Result<DkgConfig<G>> {
     let mut reader = Reader::new(bytes);
-    if reader.u32()? != PROTOCOL_VERSION || reader.framed()? != G::GROUP_ID.as_bytes() {
+    if reader.u32()? != PROTOCOL_VERSION {
+        return Err(Error::InvalidEncoding);
+    }
+    let label = reader.framed()?;
+    if label == crate::config::RESHARE_LABEL {
+        return restore_reshare_config(&mut reader);
+    }
+    if label != G::GROUP_ID.as_bytes() {
         return Err(Error::InvalidEncoding);
     }
     let threshold = reader.count()?;
     let session_id = SessionId(reader.array()?);
+    let entries = read_entries::<G>(&mut reader)?;
+    let kinds = read_kinds(&mut reader)?;
+    reader.finish()?;
+    DkgConfig::new(
+        threshold,
+        session_id,
+        ParticipantRegistry::new(entries)?,
+        kinds,
+    )
+}
+fn restore_reshare_config<G: DkgGroup>(reader: &mut Reader<'_>) -> Result<DkgConfig<G>> {
+    if reader.framed()? != G::GROUP_ID.as_bytes() {
+        return Err(Error::InvalidEncoding);
+    }
+    let threshold = reader.count()?;
+    let max_corrupt_receivers = reader.count()?;
+    let session_id = SessionId(reader.array()?);
+    let receivers = read_entries::<G>(reader)?;
+    let dealers = read_entries::<G>(reader)?;
+    let predecessor_threshold = reader.count()?;
+    let public_key = G::decode_point(reader.take(G::POINT_BYTES)?)?;
+    let config_root = reader.array()?;
+    let completion_root = reader.array()?;
+    let shares = read_entries::<G>(reader)?;
+    let kinds = read_kinds(reader)?;
+    reader.finish()?;
+    DkgConfig::new_reshare(
+        threshold,
+        max_corrupt_receivers,
+        session_id,
+        ParticipantRegistry::new(dealers)?,
+        ParticipantRegistry::new(receivers)?,
+        ResharePredecessor::new(
+            predecessor_threshold,
+            public_key,
+            shares,
+            config_root,
+            completion_root,
+        )?,
+        kinds,
+    )
+}
+fn read_entries<G: DkgGroup>(reader: &mut Reader<'_>) -> Result<Vec<(ParticipantIndex, G::Point)>> {
     let participants = reader.count()?;
     reader.ensure_items(
         participants,
@@ -90,19 +140,16 @@ fn restore_config<G: DkgGroup>(bytes: &[u8]) -> Result<DkgConfig<G>> {
         previous = Some(participant);
         entries.push((participant, G::decode_point(reader.take(G::POINT_BYTES)?)?));
     }
+    Ok(entries)
+}
+fn read_kinds(reader: &mut Reader<'_>) -> Result<Vec<DkgInstanceKind>> {
     let instance_count = reader.count()?;
     reader.ensure_items(instance_count, 1)?;
     let mut kinds = reserve(instance_count)?;
     for _ in 0..instance_count {
         kinds.push(DkgInstanceKind::from_tag(reader.u8()?)?);
     }
-    reader.finish()?;
-    DkgConfig::new(
-        threshold,
-        session_id,
-        ParticipantRegistry::new(entries)?,
-        kinds,
-    )
+    Ok(kinds)
 }
 
 impl<G: DkgGroup> OwnDealing<G> {
@@ -159,12 +206,17 @@ fn restore_own<G: DkgGroup>(
     let broadcast = reader.framed()?;
     let message = crate::dealer_message::parse(config, expected, broadcast)?;
     let count = reader.count()?;
-    if count != config.instances().len() {
+    let held = if config.predecessor().is_none() {
+        config.instances().len()
+    } else {
+        0
+    };
+    if count != held {
         return Err(Error::InvalidPersistedState);
     }
     reader.ensure_items(count, 32)?;
     let mut shares = secret_vec(count)?;
-    for instance in &message.statement.instances {
+    for instance in message.statement.instances.iter().take(count) {
         let share = crate::secret::secret(G::decode_scalar(reader.take(32)?)?);
         if G::mul_generator(share.expose())
             != crate::dealer_message::evaluate::<G>(&instance.coefficients, expected)

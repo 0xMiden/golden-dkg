@@ -26,12 +26,12 @@ pub mod transcript;
 pub mod wire;
 
 pub use config::{
-    DealerMessageNonce, DkgConfig, DkgInstanceKind, EvrfMessage, ParticipantRegistry, SessionId,
-    DEALER_MESSAGE_NONCE_BYTES, PROTOCOL_VERSION,
+    DealerMessageNonce, DkgConfig, DkgInstanceKind, EvrfMessage, ParticipantRegistry,
+    ResharePredecessor, SessionId, DEALER_MESSAGE_NONCE_BYTES, PROTOCOL_VERSION,
 };
 pub use deal::{
-    aggregate_public, complete, deal, max_dealer_message_bytes, verify_dealer_message,
-    verify_dealer_messages, DealerMessageRef, OwnDealing,
+    aggregate_public, complete, complete_reshare, deal, deal_reshare, max_dealer_message_bytes,
+    verify_dealer_message, verify_dealer_messages, DealerMessageRef, OwnDealing,
 };
 pub use dealer_proof::{
     DealerProofInstanceView, DealerProofReceiverView, DealerProofRef, DealerProofStatement,

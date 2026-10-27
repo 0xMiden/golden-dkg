@@ -8,21 +8,26 @@ prepared generators live in `golden-bulletproofs`.
 ## Public workflow
 
 Build a `ParticipantRegistry<G>` and an immutable
-`DkgConfig::new(threshold, session_id, registry, ordered_kinds)`. Each instance is
-`DkgInstanceKind::Random` or `DkgInstanceKind::Zero`. Random samples every
-polynomial coefficient, including a possibly zero constant. Zero fixes the
-constant to zero. Instance positions are zero-based; repeated kinds are valid.
+`DkgConfig::new(threshold, session_id, registry, ordered_kinds)`, or move an
+existing group key to a new committee with `DkgConfig::new_reshare`. Each instance
+is `DkgInstanceKind::Random`, `DkgInstanceKind::Zero` or `DkgInstanceKind::Reshare`.
+Random samples every polynomial coefficient, including a possibly zero constant.
+Zero fixes the constant to zero. Instance positions are zero-based; repeated kinds
+are valid. Reshare fixes the constant to the dealer's predecessor share and appears
+exactly once in a reshare configuration, whose other instances are Zero.
 
-Every registered participant contributes as a dealer. The threshold controls
-reconstruction; completion requires all registered dealers.
+Every registered participant of a plain configuration contributes as a dealer.
+The threshold controls reconstruction; completion requires all registered dealers.
 
 | Operation | Input and result |
 | --- | --- |
 | `deal` | Borrows the proof system, configuration, identity secret and RNG; returns `OwnDealing<G>`. |
+| `deal_reshare` | Borrows the proof system, configuration, identity secret, predecessor share and RNG; returns `OwnDealing<G>` without self shares. |
 | `verify_dealer_message` | Checks opaque bytes against an expected dealer. |
 | `verify_dealer_messages` | Checks a nonempty partial or full board. |
 | `aggregate_public` | Checks a full board and returns `DkgPublicOutput<G>` without credentials. |
 | `complete` | Borrows own state and exactly the other dealers' messages; returns `DkgOutput<G>` atomically. |
+| `complete_reshare` | Borrows a receiver's identity secret and exactly every declared dealer's message; returns `DkgOutput<G>` atomically. |
 
 Transport input uses `DealerMessageRef { expected_dealer, bytes }` with borrowed
 bytes. `OwnDealing::broadcast_bytes()` exposes the exact outgoing broadcast;
@@ -40,7 +45,10 @@ results. `DkgOutput::public()` borrows those results and
 and proof witnesses are not cloneable. Equal public results under one
 configuration have the same completion root, independently of participant,
 proof bytes, proof implementation, or generator capacity. That root does not
-establish authenticated agreement or activation.
+establish authenticated agreement or activation. A reshare deployment also agrees
+on the dealer set, authenticates the predecessor, activates the new committee
+before erasing old shares and then retires the predecessor setup; see
+`docs/resharing.md` in the [workspace](https://github.com/0xMiden/golden-dkg).
 
 ## Algebra, proof extension and storage
 

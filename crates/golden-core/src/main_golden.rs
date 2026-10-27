@@ -164,11 +164,13 @@ fn check_relation<G: DkgGroup>(
     for position in 0..statement.instance_count() {
         let public = statement.instance(position).ok_or(Error::InvalidProof)?;
         let private = witness.instance(position).ok_or(Error::InvalidProof)?;
-        match (public.kind(), private.polynomial_constant()) {
-            (DkgInstanceKind::Random, Some(constant))
+        match (
+            config.pinned_constant(public.kind(), statement.dealer())?,
+            private.polynomial_constant(),
+        ) {
+            (None, Some(constant))
                 if G::mul_generator(constant) == public.commitment_coefficients()[0] => {}
-            (DkgInstanceKind::Zero, None)
-                if bool::from(public.commitment_coefficients()[0].is_identity()) => {}
+            (Some(pinned), None) if pinned == public.commitment_coefficients()[0] => {}
             _ => return Err(Error::InvalidProof),
         }
         for receiver_position in 0..public.receiver_count() {

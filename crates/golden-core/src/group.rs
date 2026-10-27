@@ -32,6 +32,8 @@ pub trait DkgGroup: Clone + Debug + Eq + Send + Sync + 'static {
     type BaseField: PrimeField;
 
     /// Stable mathematical group identifier, independent of arithmetic/proof backend.
+    ///
+    /// It never equals `golden-dkg/reshare`, which marks reshare configuration payloads.
     const GROUP_ID: &'static str;
     /// Exact byte length of every protocol point, including the identity.
     const POINT_BYTES: usize;

@@ -87,7 +87,7 @@ impl<G: DkgGroup> DealerProofStatement<G> {
     pub fn dealer_message_root(&self) -> TranscriptRoot {
         self.root
     }
-    /// Exact logical L payload, including reconstructed Zero constants.
+    /// Exact logical L payload, including reconstructed Zero and Reshare constants.
     pub fn logical_bytes(&self) -> &[u8] {
         &self.logical
     }
@@ -142,22 +142,22 @@ impl<'a, G: DkgGroup> DealerProofInstanceView<'a, G> {
     pub fn effective_message(&self) -> EvrfMessage {
         self.instance.effective_message
     }
-    /// Logical coefficients, including Zero's identity constant.
+    /// Logical coefficients, including Zero's identity and Reshare's pinned constant.
     pub fn commitment_coefficients(&self) -> &'a [G::Point] {
         &self.instance.coefficients
     }
-    /// Non-self receiver count.
+    /// Number of the dealer's receivers, as listed by [`DkgConfig::receivers`].
     pub fn receiver_count(&self) -> usize {
         self.instance.receivers.len()
     }
-    /// Receiver in canonical registry order excluding the dealer.
+    /// Receiver at a zero-based position in [`DkgConfig::receivers`] order.
     pub fn receiver(&self, position: usize) -> Option<DealerProofReceiverView<'a, G>> {
         self.instance
             .receivers
             .get(position)
             .map(|receiver| DealerProofReceiverView { receiver })
     }
-    /// Canonical non-self receivers.
+    /// The dealer's receivers in [`DkgConfig::receivers`] order.
     pub fn receivers(&self) -> impl ExactSizeIterator<Item = DealerProofReceiverView<'a, G>> + 'a {
         self.instance
             .receivers
@@ -235,7 +235,7 @@ impl<G: DkgGroup> DealerProofWitness<G> {
         }
         for (position, instance) in self.instances.iter().enumerate() {
             let expected = statement.instance(position).ok_or(Error::InvalidProof)?;
-            if instance.constant.is_some() != matches!(expected.kind(), DkgInstanceKind::Random)
+            if instance.constant.is_some() == expected.kind().pins_constant()
                 || instance.receivers.len() != expected.receiver_count()
             {
                 return Err(Error::InvalidProof);
@@ -257,11 +257,11 @@ pub struct DealerProofWitnessInstanceView<'a, G: DkgGroup> {
     instance: &'a InstanceWitness<G::Scalar>,
 }
 impl<'a, G: DkgGroup> DealerProofWitnessInstanceView<'a, G> {
-    /// Random constant opening; Zero has none.
+    /// Random constant opening; Zero and Reshare have none.
     pub fn polynomial_constant(&self) -> Option<&'a G::Scalar> {
         self.instance.constant.as_ref().map(|value| value.expose())
     }
-    /// Number of non-self receiver openings.
+    /// Number of receiver openings, in [`DkgConfig::receivers`] order.
     pub fn receiver_count(&self) -> usize {
         self.instance.receivers.len()
     }

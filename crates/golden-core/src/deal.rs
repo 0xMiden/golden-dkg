@@ -5,7 +5,7 @@ use crate::dealer_proof::{
 };
 use crate::error::normalize_validation_error;
 use crate::output::DkgPublicInstance;
-use crate::secret::{secret, secret_vec, SecretVec, Wipeable};
+use crate::secret::{secret, secret_vec, Secret, SecretVec, Wipeable};
 use crate::wire::reserve;
 use crate::{
     DealerMessageNonce, DealerProofRef, DealerProofSystem, DealerProofWitness, DkgConfig, DkgGroup,
@@ -76,6 +76,7 @@ pub const fn max_dealer_message_bytes() -> usize {
 }
 
 /// Sample every configured sharing and produce one joint proof/broadcast.
+/// Reshare configurations use [`deal_reshare`].
 pub fn deal<G, P>(
     proofs: &P,
     config: &DkgConfig<G>,
@@ -87,8 +88,60 @@ where
     G: DkgGroup,
     P: DealerProofSystem<G>,
 {
+    if config.predecessor().is_some() {
+        return Err(Error::ConfigurationKindMismatch);
+    }
+    deal_sharings(proofs, config, dealer, identity_secret, None, rng)
+}
+
+/// Reshare the dealer's predecessor share, sample every configured `Zero` sharing and produce
+/// one joint proof/broadcast. The dealing holds no self shares.
+pub fn deal_reshare<G, P>(
+    proofs: &P,
+    config: &DkgConfig<G>,
+    dealer: ParticipantIndex,
+    identity_secret: &G::Scalar,
+    predecessor_share: &G::Scalar,
+    rng: &mut impl CryptoRngCore,
+) -> Result<OwnDealing<G>>
+where
+    G: DkgGroup,
+    P: DealerProofSystem<G>,
+{
+    if config.predecessor().is_none() {
+        return Err(Error::ConfigurationKindMismatch);
+    }
+    deal_sharings(
+        proofs,
+        config,
+        dealer,
+        identity_secret,
+        Some(predecessor_share),
+        rng,
+    )
+}
+
+fn deal_sharings<G, P>(
+    proofs: &P,
+    config: &DkgConfig<G>,
+    dealer: ParticipantIndex,
+    identity_secret: &G::Scalar,
+    predecessor_share: Option<&G::Scalar>,
+    rng: &mut impl CryptoRngCore,
+) -> Result<OwnDealing<G>>
+where
+    G: DkgGroup,
+    P: DealerProofSystem<G>,
+{
     if G::mul_generator(identity_secret) != *config.dealers().public_key(dealer)? {
         return Err(Error::IdentityKeyMismatch);
+    }
+    if let Some(share) = predecessor_share {
+        if config.pinned_constant(DkgInstanceKind::Reshare, dealer)?
+            != Some(G::mul_generator(share))
+        {
+            return Err(Error::PredecessorShareMismatch);
+        }
     }
     dealer_message::encoded_prefix_len(config)?;
     let receiver_count = config.receiver_count();
@@ -103,10 +156,15 @@ where
                 config.threshold(),
                 rng,
             )?,
+            DkgInstanceKind::Reshare => Polynomial::<G::Scalar>::random_with_secret(
+                *predecessor_share.ok_or(Error::ConfigurationKindMismatch)?,
+                config.threshold(),
+                rng,
+            )?,
         };
         let commitment = FeldmanCommitment::<G>::commit(&polynomial)?;
         let coefficients = commitment.coefficients().to_vec();
-        let constant = if kind == DkgInstanceKind::Random {
+        let constant = if !kind.pins_constant() {
             Some(secret(
                 *polynomial
                     .coefficient(0)
@@ -115,8 +173,10 @@ where
         } else {
             None
         };
-        let own_share = polynomial.evaluate(dealer)?;
-        private_shares.push(Wipeable(*own_share.value()));
+        if config.predecessor().is_none() {
+            let own_share = polynomial.evaluate(dealer)?;
+            private_shares.push(Wipeable(*own_share.value()));
+        }
         let nonce = DealerMessageNonce::random(rng);
         let effective_message =
             crate::main_golden::effective_message(config.root(), dealer, position, kind, nonce)?;
@@ -222,10 +282,12 @@ where
     let board = crate::config::associate(config, messages, true)?;
     let parsed = validate_public(config, &board)?;
     verify_proofs(proofs, config, &parsed)?;
-    aggregate_verified(config, &parsed)
+    let weights = dealer_weights(config, &parsed)?;
+    aggregate_verified(config, &parsed, weights.as_deref())
 }
 /// Atomically recover participant shares after accepting every public relation and proof.
-/// Borrowed own state remains usable after a rejected candidate set.
+/// Borrowed own state remains usable after a rejected candidate set. Reshare configurations use
+/// [`complete_reshare`].
 pub fn complete<G, P>(
     proofs: &P,
     config: &DkgConfig<G>,
@@ -237,6 +299,9 @@ where
     G: DkgGroup,
     P: DealerProofSystem<G>,
 {
+    if config.predecessor().is_some() {
+        return Err(Error::ConfigurationKindMismatch);
+    }
     let participant = own.participant;
     let key = config
         .identity_public_key(participant)
@@ -258,59 +323,116 @@ where
         expected_dealer: participant,
         bytes: own.broadcast_bytes(),
     });
-    let board = crate::config::associate(config, &candidates, true)?;
+    complete_board(
+        proofs,
+        config,
+        identity_secret,
+        participant,
+        &candidates,
+        Some(&own.private_shares),
+    )
+}
+/// Atomically recover a reshare receiver's shares after accepting the public relations and
+/// proofs of every declared dealer. Each share weights the dealers' decrypted shares by their
+/// Lagrange coefficients at zero over the dealer indexes.
+pub fn complete_reshare<G, P>(
+    proofs: &P,
+    config: &DkgConfig<G>,
+    identity_secret: &G::Scalar,
+    receiver: ParticipantIndex,
+    messages: &[DealerMessageRef<'_>],
+) -> Result<DkgOutput<G>>
+where
+    G: DkgGroup,
+    P: DealerProofSystem<G>,
+{
+    if config.predecessor().is_none() {
+        return Err(Error::ConfigurationKindMismatch);
+    }
+    if config
+        .identity_public_key(receiver)
+        .is_none_or(|key| G::mul_generator(identity_secret) != *key)
+    {
+        return Err(Error::IdentityKeyMismatch);
+    }
+    complete_board(proofs, config, identity_secret, receiver, messages, None)
+}
+fn complete_board<G, P>(
+    proofs: &P,
+    config: &DkgConfig<G>,
+    identity_secret: &G::Scalar,
+    participant: ParticipantIndex,
+    candidates: &[DealerMessageRef<'_>],
+    own_shares: Option<&SecretVec<G::Scalar>>,
+) -> Result<DkgOutput<G>>
+where
+    G: DkgGroup,
+    P: DealerProofSystem<G>,
+{
+    let board = crate::config::associate(config, candidates, true)?;
     let parsed = validate_public(config, &board)?;
     verify_proofs(proofs, config, &parsed)?;
+    let weights = dealer_weights(config, &parsed)?;
     let mut secret_shares = secret_vec(config.instances().len())?;
     for position in 0..config.instances().len() {
         let mut sum = secret(G::Scalar::ZERO);
-        for message in &parsed {
+        for (index, message) in parsed.iter().enumerate() {
             let instance = &message.statement.instances[position];
-            let share = if message.statement.dealer == participant {
-                secret(
-                    *own.private_shares
-                        .get(position)
-                        .ok_or(Error::OwnDealingMismatch)?
-                        .expose(),
-                )
-            } else {
-                let receiver = instance
-                    .receivers
-                    .iter()
-                    .find(|receiver| receiver.participant == participant)
-                    .ok_or(Error::ShareDecryptionFailed)?;
-                let pad = secret(
-                    crate::main_golden::receiver_pad::<G>(
-                        instance.effective_message,
-                        identity_secret,
-                        message.statement.dealer_public_key(),
-                    )
-                    .map_err(|error| {
-                        normalize_validation_error(error, Error::ShareDecryptionFailed)
-                    })?,
-                );
-                if bool::from(pad.expose().is_zero())
-                    || G::mul_generator(pad.expose()) != receiver.pad_commitment
-                {
-                    return Err(Error::ShareDecryptionFailed);
+            let share = match own_shares {
+                Some(own) if message.statement.dealer == participant => {
+                    secret(*own.get(position).ok_or(Error::OwnDealingMismatch)?.expose())
                 }
-                secret(receiver.encrypted_share - pad.expose())
+                _ => decrypt_share(
+                    message.statement.dealer_public_key(),
+                    instance,
+                    identity_secret,
+                    participant,
+                )?,
             };
             if G::mul_generator(share.expose())
                 != dealer_message::evaluate::<G>(&instance.coefficients, participant)
             {
                 return Err(Error::ShareDecryptionFailed);
             }
-            sum.0 += share.expose();
+            match &weights {
+                Some(weights) => sum.0 += *share.expose() * weights[index],
+                None => sum.0 += share.expose(),
+            }
         }
         secret_shares.push(Wipeable(*sum.expose()));
     }
-    let public = aggregate_verified(config, &parsed)?;
+    let public = aggregate_verified(config, &parsed, weights.as_deref())?;
     Ok(DkgOutput {
         participant,
         public,
         secret_shares,
     })
+}
+fn decrypt_share<G: DkgGroup>(
+    dealer_public_key: &G::Point,
+    instance: &DealerProofInstance<G>,
+    identity_secret: &G::Scalar,
+    participant: ParticipantIndex,
+) -> Result<Secret<G::Scalar>> {
+    let receiver = instance
+        .receivers
+        .iter()
+        .find(|receiver| receiver.participant == participant)
+        .ok_or(Error::ShareDecryptionFailed)?;
+    let pad = secret(
+        crate::main_golden::receiver_pad::<G>(
+            instance.effective_message,
+            identity_secret,
+            dealer_public_key,
+        )
+        .map_err(|error| normalize_validation_error(error, Error::ShareDecryptionFailed))?,
+    );
+    if bool::from(pad.expose().is_zero())
+        || G::mul_generator(pad.expose()) != receiver.pad_commitment
+    {
+        return Err(Error::ShareDecryptionFailed);
+    }
+    Ok(secret(receiver.encrypted_share - pad.expose()))
 }
 
 fn validate_public<'a, G: DkgGroup>(
@@ -371,20 +493,38 @@ where
         Err(Error::InvalidDealerProofs { dealers: invalid })
     }
 }
+fn dealer_weights<G: DkgGroup>(
+    config: &DkgConfig<G>,
+    messages: &[ParsedDealerMessage<'_, G>],
+) -> Result<Option<Vec<G::Scalar>>> {
+    if config.predecessor().is_none() {
+        return Ok(None);
+    }
+    let mut indexes = reserve(messages.len())?;
+    for message in messages {
+        indexes.push(message.statement.dealer.to_scalar::<G::Scalar>()?);
+    }
+    crate::lagrange_coefficients_at_zero(&indexes).map(Some)
+}
 fn aggregate_verified<G: DkgGroup>(
     config: &DkgConfig<G>,
     messages: &[ParsedDealerMessage<'_, G>],
+    weights: Option<&[G::Scalar]>,
 ) -> Result<DkgPublicOutput<G>> {
     let mut outputs = reserve(config.instances().len())?;
     for (position, kind) in config.instances().iter().copied().enumerate() {
         let mut coefficients = reserve(config.threshold())?;
         coefficients.resize(config.threshold(), G::Point::identity());
-        for message in messages {
+        for (index, message) in messages.iter().enumerate() {
+            let weight = weights.map(|weights| weights[index]);
             for (sum, coefficient) in coefficients
                 .iter_mut()
                 .zip(&message.statement.instances[position].coefficients)
             {
-                *sum += coefficient;
+                match weight {
+                    Some(weight) => *sum += *coefficient * weight,
+                    None => *sum += coefficient,
+                }
             }
         }
         let public_key = coefficients[0];

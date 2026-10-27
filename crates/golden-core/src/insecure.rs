@@ -7,8 +7,7 @@ use crate::error::normalize_validation_error;
 use crate::secret::secret;
 use crate::wire::{framed, reserve, Reader};
 use crate::{
-    DealerProofStatement, DealerProofSystem, DealerProofWitness, DkgConfig, DkgGroup,
-    DkgInstanceKind, Error, Result,
+    DealerProofStatement, DealerProofSystem, DealerProofWitness, DkgConfig, DkgGroup, Error, Result,
 };
 use rand_core::CryptoRngCore;
 use zeroize::Zeroizing;
@@ -32,7 +31,7 @@ impl<G: DkgGroup> DealerProofSystem<G> for InsecureRevealedWitnessProof {
         let constants = config
             .instances()
             .iter()
-            .filter(|kind| **kind == DkgInstanceKind::Random)
+            .filter(|kind| !kind.pins_constant())
             .count();
         let scalar_count = receiver_count
             .checked_mul(config.instances().len())
@@ -92,7 +91,7 @@ fn verify<G: DkgGroup>(
     let identity_secret = secret(G::decode_scalar(reader.take(32)?)?);
     let mut instances = reserve(config.instances().len())?;
     for kind in config.instances() {
-        let constant = if *kind == DkgInstanceKind::Random {
+        let constant = if !kind.pins_constant() {
             Some(secret(G::decode_scalar(reader.take(32)?)?))
         } else {
             None
