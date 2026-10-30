@@ -29,12 +29,13 @@
 //!
 //! # Configuration
 //!
-//! [`ResharePredecessor`] is the predecessor's public key set: t_old, X, the
-//! full public-share column Y_i and the completion root. It holds no secrets,
-//! and applications establish its authenticity. The completion root is the
-//! lineage handle: it binds the predecessor's session, its registry or reshare
-//! root and every dealing coefficient, hence X and the Y column. The library
-//! never checks it against X and Y; it is an agreement handle.
+//! [`ResharePredecessor`] is the predecessor's public key set: t_old, X, a
+//! public-share column Y_i of at least t_old consistent shares (the `from_*`
+//! constructors supply the full column) and the completion root. It holds no
+//! secrets, and applications establish its authenticity. The completion root
+//! is the lineage handle: it binds the predecessor's session, its registry or
+//! reshare root and every dealing coefficient, hence X and the Y column. The
+//! library never checks it against X and Y; it is an agreement handle.
 //!
 //! [`ReshareConfig`] holds t_new, the declared bound `max_corrupt_receivers`
 //! on corrupt receivers in every attempt, the session, beta, Q as a dealer
@@ -62,7 +63,8 @@
 //! The paper backends' constant-term proof then proves knowledge of s_i. The
 //! dealer message codec, root grammars, relation, proof IDs and transcript
 //! labels are those of plain DKG. Every dealing has n_new ≥ t_new receiver
-//! slots, so a one-receiver reshare carries a proof.
+//! slots, so a one-receiver reshare carries a proof. Plain DKG wire bytes,
+//! roots, RNG draw order and error order are unchanged.
 //!
 //! Completion takes exactly every declared dealer, verifies every dealing,
 //! decrypts and checks the receiver's slot in each, and sets
@@ -241,7 +243,9 @@ impl<G: GoldenGroup> ResharePredecessor<G> {
     /// Requires `threshold ≥ 1`, at least `threshold` shares, a non-identity
     /// `public_key`, and every share on the degree `threshold − 1` polynomial
     /// that the first `threshold` shares, in index order, interpolate to
-    /// `public_key`. A share may be the identity. Any failure is
+    /// `public_key`. A share may be the identity: a corrupt dealer cooperating
+    /// with a corrupt receiver can force that receiver's share to zero, and
+    /// that member then reshares s_i = 0. Any failure is
     /// [`Error::InvalidPredecessor`].
     pub fn new(
         threshold: usize,
@@ -1153,6 +1157,18 @@ mod tests {
                 ..Topology::new()
             }
         };
+        // (x − 4)(x − 5) + 1 takes the same value at 4 and 5, so these columns
+        // differ only in the index of their last share.
+        let last_share_at = |last: u32| {
+            let shares = [(1, 13), (2, 7), (3, 3), (last, 1)]
+                .map(|(index, value)| (idx(index), key(value)))
+                .into();
+            Topology {
+                dealers: registry(&[(1, 11), (2, 12), (3, 13)]),
+                predecessor: ResharePredecessor::new(3, key(21), shares, [2; 32]).unwrap(),
+                ..Topology::new()
+            }
+        };
         // The same polynomial with a fourth share.
         let longer_column = {
             let (public_key, shares) = column(2, &[1, 2, 3, 4]);
@@ -1214,6 +1230,8 @@ mod tests {
             with(2, 1, SESSION, 99, &three_dealers(2, 2)).root(),
             with(2, 1, SESSION, 99, &three_dealers(3, 2)).root(),
             with(2, 1, SESSION, 99, &three_dealers(3, 3)).root(),
+            with(2, 1, SESSION, 99, &last_share_at(4)).root(),
+            with(2, 1, SESSION, 99, &last_share_at(5)).root(),
             topology.dealers.root(),
             topology.receivers.root(),
         ];
