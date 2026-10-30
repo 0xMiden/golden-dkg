@@ -401,6 +401,43 @@ pub struct DkgOutput<G: GoldenGroup> {
     pub transcript_root: TranscriptRoot,
 }
 
+/// Dealer set, receiver set and public parameters that shape one dealing.
+///
+/// Dealer keys come from `dealers` and receiver keys from `receivers`. The
+/// dealing evaluates the polynomial at every receiver index, and when
+/// `excludes_dealer` is set it sends no encrypted share or statement to the
+/// dealer's own index. `binding_root` fills the `registry_root` slot of the
+/// dealer message and of every statement.
+pub(crate) struct DealingLayout<'a, G: GoldenGroup> {
+    session_id: SessionId,
+    binding_root: TranscriptRoot,
+    threshold: usize,
+    beta: &'a G::Scalar,
+    dealers: &'a ParticipantRegistry<G>,
+    receivers: &'a ParticipantRegistry<G>,
+    excludes_dealer: bool,
+}
+
+impl<'a, G: GoldenGroup> DealingLayout<'a, G> {
+    /// Layout of a plain DKG: one registry deals to itself, without
+    /// self-shares, and its root binds the dealing.
+    fn plain(config: &'a DkgConfig<G>) -> Self {
+        Self {
+            session_id: config.session_id,
+            binding_root: config.registry.root(),
+            threshold: config.threshold,
+            beta: &config.beta,
+            dealers: &config.registry,
+            receivers: &config.registry,
+            excludes_dealer: true,
+        }
+    }
+
+    fn sends_to(&self, dealer: ParticipantIndex, receiver: ParticipantIndex) -> bool {
+        !self.excludes_dealer || receiver != dealer
+    }
+}
+
 /// Create one dealer message.
 pub fn create_dealing<G, B>(
     dealer: ParticipantIndex,
@@ -442,31 +479,76 @@ where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
 {
-    let dealer_public_key = config.registry.public_key(dealer)?;
+    let (message, shares) = deal_with_layout::<G, B>(
+        &DealingLayout::plain(config),
+        dealer,
+        dealer_identity_secret,
+        polynomial_secret,
+        rng,
+    )?;
+
+    let private_share = Share {
+        participant: dealer,
+        value: shares
+            .get(&dealer)
+            .cloned()
+            .ok_or(Error::MissingShare(dealer.get()))?,
+    };
+    if !message.commitment.verify_share(&private_share)? {
+        return Err(Error::CommitmentVerificationFailed);
+    }
+
+    Ok(DkgDealing {
+        message,
+        private_share,
+    })
+}
+
+/// Share values of one dealing, keyed by receiver.
+type DealtShares<G> = BTreeMap<ParticipantIndex, <G as GoldenGroup>::Scalar>;
+
+/// Deal `polynomial_secret` to the layout's receivers.
+///
+/// Returns the dealer message and the share value at every receiver index.
+fn deal_with_layout<G, B>(
+    layout: &DealingLayout<'_, G>,
+    dealer: ParticipantIndex,
+    dealer_identity_secret: &G::Scalar,
+    polynomial_secret: G::Scalar,
+    rng: &mut impl CryptoRngCore,
+) -> Result<(DealerMessage<G>, DealtShares<G>)>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    let dealer_public_key = layout.dealers.public_key(dealer)?;
     if G::mul_generator(dealer_identity_secret) != *dealer_public_key {
         return Err(Error::IdentityKeyMismatch);
     }
 
-    let polynomial = Polynomial::random_with_secret(polynomial_secret, config.threshold, rng)?;
+    let polynomial = Polynomial::random_with_secret(polynomial_secret, layout.threshold, rng)?;
     let commitment = FeldmanCommitment::<G>::commit(&polynomial)?;
     let msg_i = DealerMessageNonce::random(rng);
 
     let mut shares = BTreeMap::new();
-    for receiver in config.registry.indexes() {
+    for receiver in layout.receivers.indexes() {
         let share = polynomial.evaluate(receiver)?;
         shares.insert(receiver, share.value);
     }
 
     let mut encrypted_shares = BTreeMap::new();
     let mut pads = BTreeMap::new();
-    for (receiver, share) in shares.iter().filter(|(receiver, _)| **receiver != dealer) {
-        let receiver_public_key = config.registry.public_key(*receiver)?;
+    for (receiver, share) in shares
+        .iter()
+        .filter(|(receiver, _)| layout.sends_to(dealer, **receiver))
+    {
+        let receiver_public_key = layout.receivers.public_key(*receiver)?;
         // Dealer-side pad: DH peer is the receiver, so they can re-derive the
         // same pad with `dealer_public_key` + their own identity secret. See
         // `EvrfProofBackend::derive_pad` for why the two PK arguments match.
         let pad = B::derive_pad(
             msg_i,
-            &config.beta,
+            layout.beta,
             dealer_identity_secret,
             receiver_public_key,
             receiver_public_key,
@@ -482,8 +564,8 @@ where
     }
 
     let transcript_root = dealing_root::<G>(
-        config.session_id,
-        config.registry.root(),
+        layout.session_id,
+        layout.binding_root,
         dealer,
         msg_i,
         &commitment,
@@ -492,7 +574,10 @@ where
 
     let mut statements = Vec::new();
     let mut witnesses = Vec::new();
-    for (receiver, share_value) in shares.iter().filter(|(receiver, _)| **receiver != dealer) {
+    for (receiver, share_value) in shares
+        .iter()
+        .filter(|(receiver, _)| layout.sends_to(dealer, **receiver))
+    {
         // The dealer knows f(receiver) directly, so this fixed-base mul
         // equals `commitment.public_key_share(*receiver)` without evaluating it twice.
         let share_commitment = G::mul_generator(share_value);
@@ -501,7 +586,7 @@ where
             .cloned()
             .ok_or(Error::MissingShare(receiver.get()))?;
         let statement = statement_for_receiver::<G>(
-            config,
+            layout,
             dealer,
             *receiver,
             msg_i,
@@ -529,28 +614,17 @@ where
     }
 
     // A dealer with no other receivers has nothing for the eVRF proof to
-    // attest to; the sole share is checked directly below instead.
+    // attest to; `create_dealing_with_secret` checks the sole share instead.
     let proof = if statements.is_empty() {
         Vec::new()
     } else {
         B::prove_batch(&statements, &witnesses, rng)?
     };
 
-    let private_share = Share {
-        participant: dealer,
-        value: shares
-            .get(&dealer)
-            .cloned()
-            .ok_or(Error::MissingShare(dealer.get()))?,
-    };
-    if !commitment.verify_share(&private_share)? {
-        return Err(Error::CommitmentVerificationFailed);
-    }
-
-    Ok(DkgDealing {
-        message: DealerMessage {
-            session_id: config.session_id,
-            registry_root: config.registry.root(),
+    Ok((
+        DealerMessage {
+            session_id: layout.session_id,
+            registry_root: layout.binding_root,
             dealer,
             msg_i,
             commitment,
@@ -558,27 +632,27 @@ where
             proof,
             transcript_root,
         },
-        private_share,
-    })
+        shares,
+    ))
 }
 
 fn dealing_statements<G>(
     message: &DealerMessage<G>,
-    config: &DkgConfig<G>,
+    layout: &DealingLayout<'_, G>,
 ) -> Result<Vec<EvrfStatement<G>>>
 where
     G: GoldenGroup,
 {
-    if message.session_id != config.session_id {
+    if message.session_id != layout.session_id {
         return Err(Error::SessionMismatch);
     }
-    if message.registry_root != config.registry.root() {
+    if message.registry_root != layout.binding_root {
         return Err(Error::RegistryMismatch);
     }
-    config.registry.public_key(message.dealer)?;
-    if message.commitment.coefficients().len() != config.threshold {
+    layout.dealers.public_key(message.dealer)?;
+    if message.commitment.coefficients().len() != layout.threshold {
         return Err(Error::InvalidCommitmentDegree {
-            expected: config.threshold,
+            expected: layout.threshold,
             actual: message.commitment.coefficients().len(),
         });
     }
@@ -594,9 +668,9 @@ where
     if expected_root != message.transcript_root {
         return Err(Error::ProofVerificationFailed);
     }
-    ensure_public_share_keys(message, config)?;
+    ensure_public_share_keys(message, layout)?;
 
-    let receivers: Vec<ParticipantIndex> = public_share_receivers(config, message.dealer).collect();
+    let receivers: Vec<ParticipantIndex> = public_share_receivers(layout, message.dealer).collect();
     // Collect per-receiver results into a `Vec` first (order-preserving,
     // even when computed in parallel), then reduce sequentially: `Result`'s
     // own `FromParallelIterator` impl picks an arbitrary error when several
@@ -617,7 +691,7 @@ where
                 G::sub(&encrypted_share_commitment, &encrypted_share.pad_commitment);
 
             statement_for_receiver::<G>(
-                config,
+                layout,
                 message.dealer,
                 receiver,
                 message.msg_i,
@@ -637,7 +711,18 @@ where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
 {
-    let statements = dealing_statements::<G>(message, config)?;
+    verify_dealing_with_layout::<G, B>(message, &DealingLayout::plain(config))
+}
+
+fn verify_dealing_with_layout<G, B>(
+    message: &DealerMessage<G>,
+    layout: &DealingLayout<'_, G>,
+) -> Result<()>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    let statements = dealing_statements::<G>(message, layout)?;
     if statements.is_empty() {
         // A dealer with no other receivers (n=1) has no eVRF statements to
         // prove, so an empty proof is accepted without verifying knowledge of
@@ -665,12 +750,23 @@ where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
 {
+    verify_dealings_with_layout::<G, B>(messages, &DealingLayout::plain(config))
+}
+
+fn verify_dealings_with_layout<G, B>(
+    messages: &[&DealerMessage<G>],
+    layout: &DealingLayout<'_, G>,
+) -> Result<()>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
     if messages.is_empty() {
         return Err(Error::ProofVerificationFailed);
     }
     let statement_batches: Vec<Vec<EvrfStatement<G>>> = messages
         .iter()
-        .map(|message| dealing_statements::<G>(message, config))
+        .map(|message| dealing_statements::<G>(message, layout))
         .collect::<Result<_>>()?;
     if statement_batches.iter().all(Vec::is_empty) {
         // Every message is from a dealer with no other receivers (n=1), so
@@ -715,13 +811,31 @@ where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
 {
-    let receiver_public_key = config.registry.public_key(receiver)?;
+    verify_dealing_for_receiver_with_layout::<G, B>(
+        receiver,
+        receiver_identity_secret,
+        message,
+        &DealingLayout::plain(config),
+    )
+}
+
+fn verify_dealing_for_receiver_with_layout<G, B>(
+    receiver: ParticipantIndex,
+    receiver_identity_secret: &G::Scalar,
+    message: &DealerMessage<G>,
+    layout: &DealingLayout<'_, G>,
+) -> Result<()>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    let receiver_public_key = layout.receivers.public_key(receiver)?;
     if G::mul_generator(receiver_identity_secret) != *receiver_public_key {
         return Err(Error::IdentityKeyMismatch);
     }
-    verify_dealing::<G, B>(message, config)?;
-    if receiver != message.dealer {
-        decrypt_share_for_receiver::<G, B>(receiver, receiver_identity_secret, message, config)?;
+    verify_dealing_with_layout::<G, B>(message, layout)?;
+    if layout.sends_to(message.dealer, receiver) {
+        decrypt_share_for_receiver::<G, B>(receiver, receiver_identity_secret, message, layout)?;
     }
     Ok(())
 }
@@ -782,7 +896,8 @@ where
                 .ok_or(Error::MissingDealing(dealer.get()))
         })
         .collect::<Result<_>>()?;
-    verify_dealings::<G, B>(&messages, config)?;
+    let layout = DealingLayout::plain(config);
+    verify_dealings_with_layout::<G, B>(&messages, &layout)?;
 
     // Aggregate coefficients while walking dealings, then evaluate once per
     // participant below: `n * t` muls instead of `n^2 * t`.
@@ -792,7 +907,12 @@ where
         let share = if message.dealer == receiver {
             own_dealing.private_share.clone()
         } else {
-            decrypt_share_for_receiver::<G, B>(receiver, receiver_identity_secret, message, config)?
+            decrypt_share_for_receiver::<G, B>(
+                receiver,
+                receiver_identity_secret,
+                message,
+                &layout,
+            )?
         };
         if !message.commitment.verify_share(&share)? {
             return Err(Error::CommitmentVerificationFailed);
@@ -893,26 +1013,31 @@ fn dealing_root<G: GoldenGroup>(
     transcript.root()
 }
 
-fn public_share_receivers<G: GoldenGroup>(
-    config: &DkgConfig<G>,
+fn public_share_receivers<'a, G: GoldenGroup>(
+    layout: &'a DealingLayout<'_, G>,
     dealer: ParticipantIndex,
-) -> impl Iterator<Item = ParticipantIndex> + '_ {
-    config
-        .registry
+) -> impl Iterator<Item = ParticipantIndex> + 'a {
+    layout
+        .receivers
         .indexes()
-        .filter(move |receiver| *receiver != dealer)
+        .filter(move |receiver| layout.sends_to(dealer, *receiver))
 }
 
-fn ensure_public_share_keys<G>(message: &DealerMessage<G>, config: &DkgConfig<G>) -> Result<()>
+fn ensure_public_share_keys<G>(
+    message: &DealerMessage<G>,
+    layout: &DealingLayout<'_, G>,
+) -> Result<()>
 where
     G: GoldenGroup,
 {
     for receiver in message.encrypted_shares.keys() {
-        if *receiver == message.dealer || config.registry.public_key(*receiver).is_err() {
+        if !layout.sends_to(message.dealer, *receiver)
+            || layout.receivers.public_key(*receiver).is_err()
+        {
             return Err(Error::UnexpectedShare(receiver.get()));
         }
     }
-    for receiver in public_share_receivers(config, message.dealer) {
+    for receiver in public_share_receivers(layout, message.dealer) {
         if !message.encrypted_shares.contains_key(&receiver) {
             return Err(Error::MissingShare(receiver.get()));
         }
@@ -924,7 +1049,7 @@ fn decrypt_share_for_receiver<G, B>(
     receiver: ParticipantIndex,
     receiver_identity_secret: &G::Scalar,
     message: &DealerMessage<G>,
-    config: &DkgConfig<G>,
+    layout: &DealingLayout<'_, G>,
 ) -> Result<Share<G::Scalar>>
 where
     G: GoldenGroup,
@@ -935,7 +1060,7 @@ where
         .get(&receiver)
         .ok_or(Error::MissingShare(receiver.get()))?;
     let pad = derive_receiver_pad::<G, B>(
-        config,
+        layout,
         message.dealer,
         receiver,
         receiver_identity_secret,
@@ -968,7 +1093,7 @@ fn completion_root<G: GoldenGroup>(
 
 #[allow(clippy::too_many_arguments)]
 fn statement_for_receiver<G: GoldenGroup>(
-    config: &DkgConfig<G>,
+    layout: &DealingLayout<'_, G>,
     dealer: ParticipantIndex,
     receiver: ParticipantIndex,
     msg_i: DealerMessageNonce,
@@ -980,15 +1105,15 @@ fn statement_for_receiver<G: GoldenGroup>(
     Ok(EvrfStatement {
         protocol_version: PROTOCOL_VERSION,
         backend_id: G::BACKEND_ID,
-        session_id: config.session_id,
-        registry_root: config.registry.root(),
-        threshold: config.threshold,
+        session_id: layout.session_id,
+        registry_root: layout.binding_root,
+        threshold: layout.threshold,
         dealer,
         receiver,
         msg_i,
-        beta: config.beta.clone(),
-        dealer_public_key: config.registry.public_key(dealer)?.clone(),
-        receiver_public_key: config.registry.public_key(receiver)?.clone(),
+        beta: layout.beta.clone(),
+        dealer_public_key: layout.dealers.public_key(dealer)?.clone(),
+        receiver_public_key: layout.receivers.public_key(receiver)?.clone(),
         commitment_coefficients,
         share_commitment,
         pad_commitment: encrypted_share.pad_commitment,
@@ -1035,7 +1160,7 @@ fn statement_root_with_coefficients<G: GoldenGroup>(
 }
 
 fn derive_receiver_pad<G, B>(
-    config: &DkgConfig<G>,
+    layout: &DealingLayout<'_, G>,
     dealer: ParticipantIndex,
     receiver: ParticipantIndex,
     receiver_identity_secret: &G::Scalar,
@@ -1045,11 +1170,11 @@ where
     G: GoldenGroup,
     B: EvrfProofBackend<G>,
 {
-    let dealer_public_key = config.registry.public_key(dealer)?;
-    let receiver_public_key = config.registry.public_key(receiver)?;
+    let dealer_public_key = layout.dealers.public_key(dealer)?;
+    let receiver_public_key = layout.receivers.public_key(receiver)?;
     B::derive_pad(
         msg_i,
-        &config.beta,
+        layout.beta,
         receiver_identity_secret,
         dealer_public_key,
         receiver_public_key,
@@ -1331,7 +1456,8 @@ mod tests {
             &mut rng,
         )
         .unwrap();
-        let mut statements = dealing_statements(&dealing.message, &config).unwrap();
+        let mut statements =
+            dealing_statements(&dealing.message, &DealingLayout::plain(&config)).unwrap();
         let reference: Vec<_> = statements.iter().map(EvrfStatement::root).collect();
         assert_eq!(EvrfStatement::batch_roots(&statements), reference);
         let mut reordered = statements.clone();
@@ -1952,9 +2078,10 @@ mod tests {
         )
         .unwrap();
 
+        let layout = DealingLayout::plain(&config);
         let encrypted_share = dealing.message.encrypted_shares.get(&receiver).unwrap();
         let default_pad = derive_receiver_pad::<TinyGroup, FakeEvrfBackend>(
-            &config,
+            &layout,
             dealing.message.dealer,
             receiver,
             &identity_secret(receiver),
@@ -1962,7 +2089,7 @@ mod tests {
         )
         .unwrap();
         let offset_pad = derive_receiver_pad::<TinyGroup, OffsetPadBackend>(
-            &config,
+            &layout,
             dealing.message.dealer,
             receiver,
             &identity_secret(receiver),
@@ -2429,13 +2556,14 @@ mod tests {
         )
         .unwrap();
         let receiver = idx(2);
+        let layout = DealingLayout::plain(&config);
         let share_commitment = dealing
             .message
             .commitment
             .public_key_share(receiver)
             .unwrap();
         let real_pad = derive_receiver_pad::<TinyGroup, FakeEvrfBackend>(
-            &config,
+            &layout,
             dealing.message.dealer,
             receiver,
             &identity_secret(receiver),
@@ -2461,11 +2589,11 @@ mod tests {
             &dealing.message.commitment,
             &dealing.message.encrypted_shares,
         );
-        let statements = public_share_receivers(&config, dealing.message.dealer)
+        let statements = public_share_receivers(&layout, dealing.message.dealer)
             .map(|proof_receiver| {
                 let encrypted_share = dealing.message.encrypted_shares[&proof_receiver].clone();
                 statement_for_receiver::<TinyGroup>(
-                    &config,
+                    &layout,
                     dealing.message.dealer,
                     proof_receiver,
                     dealing.message.msg_i,
