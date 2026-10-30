@@ -1078,8 +1078,11 @@ mod tests {
         ChaCha20Rng,
     };
 
+    use sha2::{Digest, Sha256};
+
     use super::*;
     use crate::test_support::{TinyGroup, TinyScalar};
+    use crate::wire::to_wire_bytes;
     use crate::GoldenScalar;
 
     const FAKE_PROOF_ID: &[u8] = b"golden-core/fake-evrf-proof/v1";
@@ -1385,6 +1388,82 @@ mod tests {
         );
         statement.commitment_coefficients.swap(0, 1);
         assert_ne!(statement.root(), expected);
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    // Deterministic plain n = 3, t = 2 DKG over `FakeEvrfBackend`. Do not
+    // regenerate these to absorb a change to the dealing, verification or
+    // completion paths: plain DKG bytes must stay stable.
+    const PLAIN_REGISTRY_ROOT: &str =
+        "35350a5c26d110b48b5930f303f83090cc107702c01fe63da38df03b4d3c2f9e";
+    const PLAIN_DEALING_ROOTS: [&str; 3] = [
+        "74e1a3de2e9fae021ddde169a087835d61f0b2801033350dd496bfc99d3d1750",
+        "2ea26c972f1c204830193f7cd39ca9385b97cd9cb8090939bb9967733a2490a4",
+        "a0304b5def61f5be4da1ca318b13820cc9c4e21f77b1b28bb3407d025d7f2588",
+    ];
+    const PLAIN_DEALER_MESSAGE_SHA256: [&str; 3] = [
+        "369669a4f3a1eb525a04e182496e56757fb7ac93ac8f8272b9050c2c02858c4e",
+        "4dcda7e51ad15f6c0914c796b868a6315f15b08e90f134449dd3e909864df04a",
+        "4191ea659d90a6c0813c8cdefc374f1a4a4d5a4125326cda92432477a68ae95b",
+    ];
+    const PLAIN_COMPLETION_ROOT: &str =
+        "356276c54535b30ada836d418e1f06fa64003c54eac757eda3c7c835b92fd5ef";
+    const PLAIN_PUBLIC_KEY: &str = "19";
+
+    #[test]
+    fn plain_dkg_wire_vectors_are_pinned() {
+        let config = config();
+        assert_eq!(hex(&config.registry.root()), PLAIN_REGISTRY_ROOT);
+
+        let mut rng = ChaCha20Rng::from_seed([0x3c; 32]);
+        let dealings: BTreeMap<_, _> = config
+            .registry
+            .indexes()
+            .map(|dealer| {
+                let dealing = create_dealing::<TinyGroup, FakeEvrfBackend>(
+                    dealer,
+                    &identity_secret(dealer),
+                    &config,
+                    &mut rng,
+                )
+                .unwrap();
+                (dealer, dealing)
+            })
+            .collect();
+        let dealing_roots: Vec<_> = dealings
+            .values()
+            .map(|dealing| hex(&dealing.message.transcript_root))
+            .collect();
+        assert_eq!(dealing_roots, PLAIN_DEALING_ROOTS);
+        let message_digests: Vec<_> = dealings
+            .values()
+            .map(|dealing| hex(&Sha256::digest(to_wire_bytes(&dealing.message))))
+            .collect();
+        assert_eq!(message_digests, PLAIN_DEALER_MESSAGE_SHA256);
+
+        for receiver in config.registry.indexes() {
+            let peer_dealings = dealings
+                .iter()
+                .filter(|(dealer, _)| **dealer != receiver)
+                .map(|(dealer, dealing)| (*dealer, dealing.message.clone()))
+                .collect();
+            let output = complete::<TinyGroup, FakeEvrfBackend>(
+                receiver,
+                &identity_secret(receiver),
+                &dealings[&receiver],
+                &peer_dealings,
+                &config,
+            )
+            .unwrap();
+            assert_eq!(hex(&output.transcript_root), PLAIN_COMPLETION_ROOT);
+            assert_eq!(
+                hex(TinyGroup::encode_element(&output.public_key).as_ref()),
+                PLAIN_PUBLIC_KEY
+            );
+        }
     }
 
     fn config_for(n: usize, threshold: usize, session_byte: u8) -> DkgConfig<TinyGroup> {
