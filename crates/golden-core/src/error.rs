@@ -127,4 +127,57 @@ pub enum Error {
     /// Authenticated decryption failed.
     #[error("decryption failed")]
     DecryptionFailed,
+
+    /// A reshare predecessor key set was not a consistent sharing.
+    #[error("invalid reshare predecessor")]
+    InvalidPredecessor,
+
+    /// A reshare dealer set was not drawn from the predecessor's shares, or
+    /// was smaller than the predecessor threshold.
+    #[error("invalid reshare configuration")]
+    InvalidReshareConfiguration,
+
+    /// A reshare dealer key equals or negates a receiver key.
+    #[error("reshare key collision between dealer {dealer} and receiver {receiver}")]
+    ReshareKeyCollision {
+        /// Dealer index, in the predecessor's index space.
+        dealer: u32,
+        /// Receiver index, in the new committee's index space.
+        receiver: u32,
+    },
+
+    /// The declared corrupt-receiver bound reached the reshare threshold.
+    #[error(
+        "insecure reshare threshold: threshold={threshold}, \
+         max_corrupt_receivers={max_corrupt_receivers}"
+    )]
+    InsecureReshareThreshold {
+        /// Requested reshare threshold.
+        threshold: usize,
+        /// Declared bound on corrupt receivers.
+        max_corrupt_receivers: usize,
+    },
+
+    /// Honest receivers could not reach the reshare threshold.
+    #[error(
+        "honest receivers cannot reach the reshare threshold: threshold={threshold}, \
+         receivers={receivers}, max_corrupt_receivers={max_corrupt_receivers}"
+    )]
+    InsufficientHonestReceivers {
+        /// Requested reshare threshold.
+        threshold: usize,
+        /// Number of receivers.
+        receivers: usize,
+        /// Declared bound on corrupt receivers.
+        max_corrupt_receivers: usize,
+    },
+
+    /// A reshare dealer's predecessor share did not match its public share.
+    #[error("predecessor share does not match the dealer's public share")]
+    PredecessorShareMismatch,
+
+    /// A reshare dealing's constant commitment differed from the dealer's
+    /// predecessor public share. The index is the dealer's predecessor index.
+    #[error("reshare constant commitment mismatch for dealer {0}")]
+    ReshareConstantMismatch(u32),
 }
