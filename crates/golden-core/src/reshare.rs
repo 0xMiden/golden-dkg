@@ -208,6 +208,13 @@
 //!   is 0. Every receiver then opens each dealer's s_i and derives every other
 //!   receiver's pad in that dealing. Should t_new = 1 be restricted to
 //!   n_new = 1?
+//! * **Q10. Predecessor batch check.** [`ResharePredecessor::new`] checks X
+//!   exactly and the shares past the first t_old by one Fiat–Shamir random
+//!   linear combination, under the label `reshare-predecessor-check` over
+//!   t_old, X and the full column. A false accept needs a challenge that
+//!   cancels the defects, at most Q·2^-|q| for Q hash queries in the ROM. It
+//!   relies on prime-order decoding, and requirement 4 already excludes
+//!   adversarial predecessors. Is this acceptable?
 
 use std::collections::BTreeMap;
 
@@ -243,10 +250,11 @@ impl<G: GoldenGroup> ResharePredecessor<G> {
     /// Requires `threshold ≥ 1`, at least `threshold` shares, a non-identity
     /// `public_key`, and every share on the degree `threshold − 1` polynomial
     /// that the first `threshold` shares, in index order, interpolate to
-    /// `public_key`. A share may be the identity: a corrupt dealer cooperating
-    /// with a corrupt receiver can force that receiver's share to zero, and
-    /// that member then reshares s_i = 0. Any failure is
-    /// [`Error::InvalidPredecessor`].
+    /// `public_key`. The key is checked exactly and the remaining shares by a
+    /// Fiat–Shamir random linear combination (Q10). A share may be the
+    /// identity: a corrupt dealer cooperating with a corrupt receiver can
+    /// force that receiver's share to zero, and that member then reshares
+    /// s_i = 0. Any failure is [`Error::InvalidPredecessor`].
     pub fn new(
         threshold: usize,
         public_key: G::Element,
@@ -740,6 +748,17 @@ fn aggregate_verified<G: GoldenGroup>(
 /// Whether every share lies on the polynomial of degree `threshold − 1` that
 /// the first `threshold` shares interpolate, and that polynomial is
 /// `public_key` at zero.
+///
+/// The key is checked exactly, as X == Σ_i ℓ_i(0)·Y_i over the basis of the
+/// first `threshold` indices. The remaining shares are checked by one random
+/// linear combination with the weights r_j of [`predecessor_check_weights`]:
+/// Σ_j r_j·Y_j − Σ_i (Σ_j r_j·ℓ_i(x_j))·Y_i must be the identity. The checks
+/// cost about n + t group scalar multiplications and O(n·t) field operations.
+///
+/// Soundness requires every element to lie in the prime-order group: each
+/// r_j is nonzero, so a single wrong share is always caught, and a false
+/// accept needs the weights to cancel the defects. Every backend's
+/// `decode_element` returns only prime-order elements.
 fn on_polynomial<G: GoldenGroup>(
     threshold: usize,
     public_key: &G::Element,
@@ -755,13 +774,53 @@ fn on_polynomial<G: GoldenGroup>(
     if interpolate_at::<G>(&G::Scalar::zero(), &xs, &weights, &points) != *public_key {
         return Ok(false);
     }
-    for (participant, point) in shares.iter().skip(threshold) {
-        let x = participant.to_scalar::<G::Scalar>()?;
-        if interpolate_at::<G>(&x, &xs, &weights, &points) != *point {
-            return Ok(false);
-        }
+    if shares.len() == threshold {
+        return Ok(true);
     }
-    Ok(true)
+    let challenges = predecessor_check_weights::<G>(threshold, public_key, shares)?;
+    let mut basis_weights = vec![G::Scalar::zero(); threshold];
+    let mut combination = G::identity();
+    for ((participant, point), challenge) in shares.iter().skip(threshold).zip(&challenges) {
+        let x = participant.to_scalar::<G::Scalar>()?;
+        for (sum, value) in basis_weights.iter_mut().zip(basis_at(&x, &xs, &weights)) {
+            *sum = sum.add(&challenge.mul(&value));
+        }
+        combination = G::add(&combination, &G::mul(point, challenge));
+    }
+    for (weight, point) in basis_weights.iter().zip(&points) {
+        combination = G::sub(&combination, &G::mul(point, weight));
+    }
+    Ok(bool::from(G::is_identity(&combination)))
+}
+
+/// Fiat–Shamir weights r_j of the predecessor batch check, one per share past
+/// the first `threshold`, in index order. A transcript under the label
+/// `reshare-predecessor-check` absorbs t_old, X and every (index, Y_i) of the
+/// column, and r_j is the nonzero scalar
+/// `hash_to_scalar("golden-reshare-predecessor-check-v1", root ‖ j)`.
+fn predecessor_check_weights<G: GoldenGroup>(
+    threshold: usize,
+    public_key: &G::Element,
+    shares: &BTreeMap<ParticipantIndex, G::Element>,
+) -> Result<Vec<G::Scalar>> {
+    let mut transcript = TranscriptBuilder::new(b"reshare-predecessor-check");
+    transcript.usize(b"predecessor-threshold", threshold);
+    transcript.element::<G>(b"predecessor-key", public_key);
+    transcript.usize(b"predecessor-shares-len", shares.len());
+    for (participant, share) in shares {
+        transcript.participant(b"predecessor-participant", *participant);
+        transcript.element::<G>(b"predecessor-share", share);
+    }
+    let root = transcript.root();
+    shares
+        .keys()
+        .skip(threshold)
+        .map(|participant| {
+            let mut message = root.to_vec();
+            message.extend_from_slice(&participant.get().to_be_bytes());
+            G::Scalar::hash_to_scalar(b"golden-reshare-predecessor-check-v1", &message)
+        })
+        .collect()
 }
 
 /// Barycentric weights w_i = 1 / ∏_{k≠i} (x_i − x_k), with one batch
@@ -782,28 +841,37 @@ fn barycentric_weights<S: GoldenScalar>(xs: &[S]) -> Result<Vec<S>> {
     Ok(weights)
 }
 
+/// Lagrange basis values ℓ_i(x) = w_i · ∏_{k≠i} (x − x_k) of the points
+/// `xs`. Prefix and suffix products form each ∏_{k≠i} in O(|xs|) without
+/// inverting x − x_i, so an `x` equal to some x_k yields the unit vector at k.
+fn basis_at<S: GoldenScalar>(x: &S, xs: &[S], weights: &[S]) -> Vec<S> {
+    let mut suffixes = vec![S::one(); xs.len()];
+    for i in (1..xs.len()).rev() {
+        suffixes[i - 1] = suffixes[i].mul(&x.sub(&xs[i]));
+    }
+    let mut prefix = S::one();
+    let mut values = Vec::with_capacity(xs.len());
+    for ((xi, weight), suffix) in xs.iter().zip(weights).zip(&suffixes) {
+        values.push(weight.mul(&prefix).mul(suffix));
+        prefix = prefix.mul(&x.sub(xi));
+    }
+    values
+}
+
 /// Value at `x` of the polynomial through `(xs[i], points[i])`, as
-/// Σ w_i · ∏_{k≠i} (x − x_k) · points[i]. Prefix and suffix products form each
-/// ∏_{k≠i} in O(|xs|) without inverting x − x_i, so an `x` equal to some x_k
-/// yields `points[k]`.
+/// Σ ℓ_i(x) · points[i].
 fn interpolate_at<G: GoldenGroup>(
     x: &G::Scalar,
     xs: &[G::Scalar],
     weights: &[G::Scalar],
     points: &[&G::Element],
 ) -> G::Element {
-    let mut suffixes = vec![G::Scalar::one(); xs.len()];
-    for i in (1..xs.len()).rev() {
-        suffixes[i - 1] = suffixes[i].mul(&x.sub(&xs[i]));
-    }
-    let mut prefix = G::Scalar::one();
-    let mut sum = G::identity();
-    for (((xi, weight), suffix), point) in xs.iter().zip(weights).zip(&suffixes).zip(points) {
-        let coefficient = weight.mul(&prefix).mul(suffix);
-        sum = G::add(&sum, &G::mul(point, &coefficient));
-        prefix = prefix.mul(&x.sub(xi));
-    }
-    sum
+    basis_at(x, xs, weights)
+        .iter()
+        .zip(points)
+        .fold(G::identity(), |sum, (coefficient, point)| {
+            G::add(&sum, &G::mul(point, coefficient))
+        })
 }
 
 fn ensure_distinct_role_keys<G: GoldenGroup>(
@@ -1394,6 +1462,72 @@ mod tests {
                 Error::InvalidPredecessor
             );
         }
+    }
+
+    #[test]
+    fn predecessor_rejects_every_single_wrong_extra_share() {
+        // Every batch weight is nonzero, so in a prime-order group one wrong
+        // share is caught for every offset, including the aliased index 98.
+        let long = (1..=64).chain([98]).collect::<Vec<_>>();
+        for (threshold, indexes) in [(2, vec![1, 2, 3, 4]), (32, long)] {
+            let (public_key, shares) = column(threshold, &indexes);
+            ResharePredecessor::<TinyGroup>::new(threshold, public_key, shares.clone(), [2; 32])
+                .unwrap();
+            for index in &indexes[threshold..] {
+                for offset in 1..97 {
+                    let mut changed = shares.clone();
+                    changed.insert(idx(*index), shares[&idx(*index)].add(&key(offset)));
+                    assert_eq!(
+                        ResharePredecessor::<TinyGroup>::new(
+                            threshold, public_key, changed, [2; 32]
+                        )
+                        .unwrap_err(),
+                        Error::InvalidPredecessor,
+                        "index {index}, offset {offset}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn predecessor_check_weights_bind_their_inputs() {
+        let indexes = (1..=40).collect::<Vec<_>>();
+        let (public_key, shares) = column(8, &indexes);
+        let weights = |threshold: usize,
+                       public_key: &TinyScalar,
+                       shares: &BTreeMap<ParticipantIndex, TinyScalar>| {
+            predecessor_check_weights::<TinyGroup>(threshold, public_key, shares).unwrap()
+        };
+        let replace = |index: u32, value: TinyScalar| {
+            let mut changed = shares.clone();
+            changed.insert(idx(index), value);
+            changed
+        };
+        let base = weights(8, &public_key, &shares);
+        assert_eq!(base.len(), 32);
+        assert!(base.iter().all(|weight| !bool::from(weight.is_zero())));
+        assert_eq!(weights(8, &public_key, &shares), base);
+        assert_eq!(weights(40, &public_key, &shares), Vec::new());
+
+        let generator = TinyGroup::generator();
+        for changed in [
+            replace(1, shares[&idx(1)].add(&generator)),
+            replace(20, shares[&idx(20)].add(&generator)),
+        ] {
+            assert_ne!(weights(8, &public_key, &changed), base);
+        }
+        assert_ne!(weights(8, &public_key.add(&generator), &shares), base);
+
+        // Moving the share at 40 to 41 changes the weights of the shares
+        // whose indices stay.
+        let mut moved = shares.clone();
+        let last = moved.remove(&idx(40)).unwrap();
+        moved.insert(idx(41), last);
+        assert_ne!(weights(8, &public_key, &moved)[..31], base[..31]);
+
+        // t_old = 9 changes the weights of the shares at 10..=40.
+        assert_ne!(weights(9, &public_key, &shares), base[1..]);
     }
 
     /// Complete a plain TinyGroup DKG and return its config and every output.
