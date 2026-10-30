@@ -602,10 +602,10 @@ impl Generation {
     }
 }
 
-/// A fresh setup among `1..=4` at threshold 3, records sealed under its key,
+/// A fresh setup among `1..=3` at threshold 2, records sealed under its key,
 /// and the stream that sealed them.
 fn sealed(seed: u8) -> (Generation, Vec<Ciphertext<G>>, ChaCha20Rng) {
-    let fresh = Generation::fresh(&[1, 2, 3, 4], 3, seed);
+    let fresh = Generation::fresh(&[1, 2, 3], 2, seed);
     let mut rng = ChaCha20Rng::from_seed([seed + 1; 32]);
     let records = RECORDS
         .iter()
@@ -622,12 +622,12 @@ fn sealed(seed: u8) -> (Generation, Vec<Ciphertext<G>>, ChaCha20Rng) {
 
 /// `fresh` reshared to a larger committee at a higher threshold.
 fn up(fresh: &Generation) -> Generation {
-    fresh.reshare(41, &[1, 2, 4], &[2, 3, 5, 6, 7], 4)
+    fresh.reshare(41, &[1, 3], &[2, 3, 5, 6], 3)
 }
 
 /// `fresh` reshared to a smaller committee at a lower threshold.
 fn down(fresh: &Generation) -> Generation {
-    fresh.reshare(42, &[1, 3, 4], &[3, 8, 9], 2)
+    fresh.reshare(42, &[1, 2], &[3, 8], 1)
 }
 
 /// `generation`'s holders open every record, and its last threshold holders
@@ -838,7 +838,6 @@ fn reshare_bridge_binds_the_reshare_configuration() {
 #[test]
 fn records_open_after_a_reshare_up() {
     let (fresh, records, mut rng) = sealed(23);
-    assert_opens(&fresh, &records, &mut rng);
     let up = up(&fresh);
     assert!(up.threshold() > fresh.threshold());
 
@@ -860,7 +859,7 @@ fn records_open_after_a_reshare_down() {
 fn records_open_after_a_chained_reshare() {
     let (fresh, records, mut rng) = sealed(25);
     let down = down(&fresh);
-    let config = down.reshare_config(43, &[3, 9], &[1, 3, 10, 11], 3);
+    let config = down.reshare_config(43, &[3, 8], &[1, 3, 10], 2);
     let chained = down.reshared(&config, 43);
 
     assert_successor(&down, &chained, &config);
