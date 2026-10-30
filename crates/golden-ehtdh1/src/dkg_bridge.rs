@@ -4,7 +4,9 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use golden_core::{DkgConfig, DkgOutput, GoldenHashToGroup};
+use golden_core::{
+    DkgConfig, DkgOutput, GoldenHashToGroup, ParticipantRegistry, ReshareConfig, SessionId,
+};
 
 use crate::context::{
     derive_context_session_id, Error, PublicKeySet, PublicShare, SecretShare, SetupContext,
@@ -49,13 +51,70 @@ pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
     context_output: &DkgOutput<G>,
     epoch: [u8; 32],
 ) -> Result<Ehtdh1Material<G>, Error> {
-    if decryption_config.threshold != context_config.threshold {
+    material_from_runs(
+        decryption_config.threshold,
+        &decryption_config.registry,
+        decryption_config.session_id,
+        decryption_output,
+        context_config,
+        context_output,
+        epoch,
+    )
+}
+
+/// Convert a completed reshare and a zero sharing run by its new committee
+/// into paper `(pk, pkc, sk_1..sk_N)` material.
+///
+/// The reshare is the decryption run. Its key must be the predecessor's key
+/// `X`, so the sealing key does not change. The context run is a plain zero
+/// sharing DKG by the new committee over `reshare_config.receivers()` at
+/// threshold `reshare_config.threshold()`, with session
+/// `derive_context_session_id(SessionId(reshare_config.root()))`. The reshare
+/// configuration root stands in for the decryption session:
+/// [`SetupContext::decryption_session_id`] holds it, so the context run is
+/// bound to the declared dealers, both registries, the threshold, beta and
+/// the predecessor, not only to the reshare session id.
+///
+/// The remaining checks are those of [`material_from_dkg_outputs`], read
+/// against the receiver registry and the reshare threshold.
+pub fn material_from_reshare_outputs<G: GoldenHashToGroup>(
+    reshare_config: &ReshareConfig<G>,
+    reshare_output: &DkgOutput<G>,
+    context_config: &DkgConfig<G>,
+    context_output: &DkgOutput<G>,
+    epoch: [u8; 32],
+) -> Result<Ehtdh1Material<G>, Error> {
+    if reshare_output.public_key != *reshare_config.predecessor().public_key() {
+        return Err(Error::InvalidBridge("reshared key mismatch"));
+    }
+    material_from_runs(
+        reshare_config.threshold(),
+        reshare_config.receivers(),
+        SessionId(reshare_config.root()),
+        reshare_output,
+        context_config,
+        context_output,
+        epoch,
+    )
+}
+
+/// Pair a decryption run over `registry` at `threshold` with its context run.
+fn material_from_runs<G: GoldenHashToGroup>(
+    threshold: usize,
+    registry: &ParticipantRegistry<G>,
+    decryption_session_id: SessionId,
+    decryption_output: &DkgOutput<G>,
+    context_config: &DkgConfig<G>,
+    context_output: &DkgOutput<G>,
+    epoch: [u8; 32],
+) -> Result<Ehtdh1Material<G>, Error> {
+    if threshold != context_config.threshold {
         return Err(Error::InvalidBridge("threshold mismatch"));
     }
-    if decryption_config.registry.root() != context_config.registry.root() {
+    if registry.root() != context_config.registry.root() {
         return Err(Error::InvalidBridge("registry root mismatch"));
     }
-    if context_config.session_id != derive_context_session_id(decryption_config.session_id) {
+    if context_config.session_id != derive_context_session_id(decryption_session_id) {
         return Err(Error::InvalidBridge("context session mismatch"));
     }
     if decryption_output.secret_share.participant != context_output.secret_share.participant {
@@ -77,7 +136,7 @@ pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
         return Err(Error::InvalidBridge("decryption public key is identity"));
     }
 
-    let participants = decryption_config.registry.indexes().collect::<Vec<_>>();
+    let participants = registry.indexes().collect::<Vec<_>>();
     if participants != context_config.registry.indexes().collect::<Vec<_>>() {
         return Err(Error::InvalidBridge("participant set mismatch"));
     }
@@ -104,7 +163,7 @@ pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
     }
 
     let public_key_set = PublicKeySet::new(
-        decryption_config.threshold,
+        threshold,
         decryption_output.public_key.clone(),
         public_shares,
     )?;
@@ -115,10 +174,10 @@ pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
     };
     let setup_context = SetupContext {
         backend_id: G::BACKEND_ID.to_owned(),
-        threshold: decryption_config.threshold,
-        registry_root: decryption_config.registry.root(),
+        threshold,
+        registry_root: registry.root(),
         participants,
-        decryption_session_id: decryption_config.session_id,
+        decryption_session_id,
         context_session_id: context_config.session_id,
         decryption_transcript_root: decryption_output.transcript_root,
         context_transcript_root: context_output.transcript_root,

@@ -9,6 +9,12 @@ secret share for each participant. The first DKG run shares the decryption
 secret. The second shares zero so that each decryption share is bound to one
 decryption context.
 
+A Golden reshare moves the decryption secret to a new committee or threshold
+without changing the sealing key. The reshare takes the place of the first run, and the
+new committee runs the zero sharing under a session derived from the reshare
+configuration root. Records sealed before the reshare open with the new
+committee, and decryption shares from the old and new setups do not combine.
+
 The crate provides:
 
 * Writers can encrypt data with the public sealing key.
@@ -48,9 +54,11 @@ Callers must:
 * Protect participant secret shares.
 * Authenticate requests for decryption shares.
 * Supply the intended setup, associated data, and decryption context.
+* Retire the predecessor setup after a reshare, so that it stops answering
+  decryption requests.
 
 This crate does not encrypt record values. It does not provide authorization,
-networking, replay prevention, secret share refresh, or secret share custody.
+networking, replay prevention, or secret share custody.
 
 See the [crate documentation](https://docs.rs/golden-ehtdh1) for the protocol
 mapping, caller obligations, and API examples. See the

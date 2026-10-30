@@ -28,6 +28,18 @@
 //! share owners, nonzero zero sharing output, and identity decryption keys. It
 //! binds both DKG transcript roots into [`SetupContext`].
 //!
+//! [`material_from_reshare_outputs`] does the same for a reshare from
+//! [`golden_core::reshare`], which moves `X` to a new committee or threshold:
+//!
+//! - the reshare as the decryption run, whose key must stay `X`;
+//! - a zero sharing run by the new committee over the reshare's receiver
+//!   registry and threshold, whose session id is derived with
+//!   [`derive_context_session_id`] from the reshare configuration root.
+//!
+//! The reshare configuration root fills [`SetupContext::decryption_session_id`].
+//! Records sealed under `X` open with the new committee, and decryption shares
+//! of one setup neither verify nor combine under another.
+//!
 //! [`Combiner::new`] checks that a manually supplied [`PublicKeySet`] and
 //! [`SetupContext`] agree on backend id, threshold, participant order, and
 //! context session derivation.
@@ -75,6 +87,8 @@
 //! - checking [`Ciphertext::associated_data`] or using the `*_with_associated_data`
 //!   methods when the application expects a specific associated data value;
 //! - supplying the intended decryption context to validators and combiners;
+//! - retiring the predecessor setup after a reshare, so that it stops
+//!   answering decryption requests;
 //! - handling replay, validator identity, transport authentication, and
 //!   malformed share reporting outside this crate.
 //!
@@ -95,8 +109,7 @@
 //! # Non-goals
 //!
 //! This crate does not provide AEAD authentication of plaintext, validator
-//! networking, accountable decryption, refresh, resharing, TEE custody, replay
-//! prevention.
+//! networking, accountable decryption, TEE custody, replay prevention.
 //!
 //! [`wire`] defines canonical bytes for setup material, keys, ciphertexts, and
 //! decryption shares. The `miden-serde` and `serde` features adapt those same
@@ -105,7 +118,8 @@
 //! # Provided APIs
 //!
 //! This crate provides client sealing, validator decryption shares, exact
-//! combining, quorum search, and a bridge from two Golden DKG runs.
+//! combining, quorum search, and bridges from two Golden DKG runs or from a
+//! Golden reshare and a zero sharing run.
 //!
 //! Run the full three party threshold record example with:
 //!
@@ -228,7 +242,7 @@ pub use context::{
     SetupContext,
 };
 pub use decrypt::{Combiner, DecryptionShare, UnsealingShare};
-pub use dkg_bridge::{material_from_dkg_outputs, Ehtdh1Material};
+pub use dkg_bridge::{material_from_dkg_outputs, material_from_reshare_outputs, Ehtdh1Material};
 pub use encrypt::{Ciphertext, SealingKey};
 
 #[cfg(test)]
