@@ -31,7 +31,11 @@ pub use feldman::FeldmanCommitment;
 pub use group::{FieldByteOrder, GoldenEvrfCurve, GoldenGroup, GoldenHashToGroup, GoldenScalar};
 pub use identity_key::IdentityKeyProof;
 pub use participant::ParticipantIndex;
-pub use reshare::{ReshareConfig, ResharePredecessor};
+pub use reshare::{
+    aggregate_reshare_public, complete_reshare, create_reshare_dealing, verify_reshare_dealing,
+    verify_reshare_dealing_for_receiver, verify_reshare_dealings, ReshareConfig,
+    ResharePredecessor, ResharePublicOutput,
+};
 pub use shamir::{
     batch_invert, lagrange_coefficients_at_zero, lagrange_interpolate_at_zero, reconstruct_secret,
     Polynomial, Share,

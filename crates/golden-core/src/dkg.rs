@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use p3_maybe_rayon::prelude::*;
 use rand_core::CryptoRngCore;
 
+use crate::reshare::ReshareConfig;
 use crate::transcript::{TranscriptBuilder, TranscriptRoot};
 use crate::{
     Error, FeldmanCommitment, GoldenGroup, GoldenScalar, IdentityKeyProof, ParticipantIndex,
@@ -192,7 +193,7 @@ pub struct EvrfStatement<G: GoldenGroup> {
     pub backend_id: &'static str,
     /// Session ID.
     pub session_id: SessionId,
-    /// Registry root.
+    /// Registry root, or the reshare configuration root for a reshare.
     pub registry_root: TranscriptRoot,
     /// DKG threshold.
     pub threshold: usize,
@@ -278,7 +279,7 @@ impl<G: GoldenGroup> core::fmt::Debug for EvrfWitness<G> {
 
 /// eVRF proof backend boundary.
 ///
-/// One proof object covers every non-self receiver in a dealer message. The
+/// One proof object covers every receiver of a dealer message. The
 /// dealer produces a single batched proof via [`EvrfProofBackend::prove_batch`]
 /// and the public verifier checks it once via [`EvrfProofBackend::verify_batch`]
 /// against the full ordered receiver statement list. Per-receiver pad
@@ -314,9 +315,9 @@ pub trait EvrfProofBackend<G: GoldenGroup> {
 
     /// Produce one batched proof covering every receiver statement.
     ///
-    /// `statements` and `witnesses` are in the canonical ordered receiver list
-    /// (excluding the dealer). The backend must bind the full ordered list into
-    /// the proof transcript.
+    /// `statements` and `witnesses` are the dealing's receivers, in canonical
+    /// order. The backend must bind the full ordered list into the proof
+    /// transcript.
     fn prove_batch(
         statements: &[EvrfStatement<G>],
         witnesses: &[EvrfWitness<G>],
@@ -363,7 +364,7 @@ pub struct EncryptedShare<G: GoldenGroup> {
 pub struct DealerMessage<G: GoldenGroup> {
     /// Session ID.
     pub session_id: SessionId,
-    /// Registry root.
+    /// Registry root, or the reshare configuration root for a reshare.
     pub registry_root: TranscriptRoot,
     /// Dealer.
     pub dealer: ParticipantIndex,
@@ -373,7 +374,7 @@ pub struct DealerMessage<G: GoldenGroup> {
     pub commitment: FeldmanCommitment<G>,
     /// Public encrypted-share data, keyed by receiver.
     pub encrypted_shares: BTreeMap<ParticipantIndex, EncryptedShare<G>>,
-    /// Batched proof covering every non-self receiver in this message.
+    /// Batched proof covering every receiver of this message.
     pub proof: Vec<u8>,
     /// Transcript root for the dealing.
     pub transcript_root: TranscriptRoot,
@@ -407,7 +408,8 @@ pub struct DkgOutput<G: GoldenGroup> {
 /// dealing evaluates the polynomial at every receiver index, and when
 /// `excludes_dealer` is set it sends no encrypted share or statement to the
 /// dealer's own index. `binding_root` fills the `registry_root` slot of the
-/// dealer message and of every statement.
+/// dealer message and of every statement. When `pinned_constants` is set,
+/// every dealer's constant commitment must equal its pinned element.
 pub(crate) struct DealingLayout<'a, G: GoldenGroup> {
     session_id: SessionId,
     binding_root: TranscriptRoot,
@@ -416,6 +418,7 @@ pub(crate) struct DealingLayout<'a, G: GoldenGroup> {
     dealers: &'a ParticipantRegistry<G>,
     receivers: &'a ParticipantRegistry<G>,
     excludes_dealer: bool,
+    pinned_constants: Option<&'a BTreeMap<ParticipantIndex, G::Element>>,
 }
 
 impl<'a, G: GoldenGroup> DealingLayout<'a, G> {
@@ -430,6 +433,23 @@ impl<'a, G: GoldenGroup> DealingLayout<'a, G> {
             dealers: &config.registry,
             receivers: &config.registry,
             excludes_dealer: true,
+            pinned_constants: None,
+        }
+    }
+
+    /// Layout of a reshare: the declared dealers deal to every receiver, the
+    /// reshare configuration root binds the dealing, and each dealer's
+    /// constant is pinned to its predecessor public share.
+    pub(crate) fn reshare(config: &'a ReshareConfig<G>) -> Self {
+        Self {
+            session_id: config.session_id(),
+            binding_root: config.root(),
+            threshold: config.threshold(),
+            beta: config.beta(),
+            dealers: config.dealers(),
+            receivers: config.receivers(),
+            excludes_dealer: false,
+            pinned_constants: Some(config.predecessor().public_key_shares()),
         }
     }
 
@@ -510,7 +530,7 @@ type DealtShares<G> = BTreeMap<ParticipantIndex, <G as GoldenGroup>::Scalar>;
 /// Deal `polynomial_secret` to the layout's receivers.
 ///
 /// Returns the dealer message and the share value at every receiver index.
-fn deal_with_layout<G, B>(
+pub(crate) fn deal_with_layout<G, B>(
     layout: &DealingLayout<'_, G>,
     dealer: ParticipantIndex,
     dealer_identity_secret: &G::Scalar,
@@ -656,6 +676,11 @@ where
             actual: message.commitment.coefficients().len(),
         });
     }
+    if let Some(pinned_constants) = layout.pinned_constants {
+        if pinned_constants.get(&message.dealer) != message.commitment.coefficients().first() {
+            return Err(Error::ReshareConstantMismatch(message.dealer.get()));
+        }
+    }
 
     let expected_root = dealing_root::<G>(
         message.session_id,
@@ -714,7 +739,7 @@ where
     verify_dealing_with_layout::<G, B>(message, &DealingLayout::plain(config))
 }
 
-fn verify_dealing_with_layout<G, B>(
+pub(crate) fn verify_dealing_with_layout<G, B>(
     message: &DealerMessage<G>,
     layout: &DealingLayout<'_, G>,
 ) -> Result<()>
@@ -753,7 +778,7 @@ where
     verify_dealings_with_layout::<G, B>(messages, &DealingLayout::plain(config))
 }
 
-fn verify_dealings_with_layout<G, B>(
+pub(crate) fn verify_dealings_with_layout<G, B>(
     messages: &[&DealerMessage<G>],
     layout: &DealingLayout<'_, G>,
 ) -> Result<()>
@@ -1045,7 +1070,7 @@ where
     Ok(())
 }
 
-fn decrypt_share_for_receiver<G, B>(
+pub(crate) fn decrypt_share_for_receiver<G, B>(
     receiver: ParticipantIndex,
     receiver_identity_secret: &G::Scalar,
     message: &DealerMessage<G>,
@@ -1078,7 +1103,7 @@ where
     Ok(share)
 }
 
-fn completion_root<G: GoldenGroup>(
+pub(crate) fn completion_root<G: GoldenGroup>(
     dealings: &BTreeMap<ParticipantIndex, &DealerMessage<G>>,
 ) -> TranscriptRoot {
     let mut transcript = TranscriptBuilder::new(b"completion");
@@ -1206,6 +1231,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::reshare::{complete_reshare, create_reshare_dealing, ResharePredecessor};
     use crate::test_support::{TinyGroup, TinyScalar};
     use crate::wire::to_wire_bytes;
     use crate::GoldenScalar;
@@ -1589,6 +1615,110 @@ mod tests {
                 hex(TinyGroup::encode_element(&output.public_key).as_ref()),
                 PLAIN_PUBLIC_KEY
             );
+        }
+    }
+
+    // Deterministic reshare of a completed plain n = 3, t = 2 DKG from dealers
+    // 1 and 3 to four receivers at t = 3, over `FakeEvrfBackend`. Do not
+    // regenerate these to absorb a change to the reshare paths.
+    const RESHARE_CONFIG_ROOT: &str =
+        "d81e9862a564ffa2993daca978bb2296926ebcd5fe33c5ab06c684fb522a2644";
+    const RESHARE_DEALING_ROOTS: [&str; 2] = [
+        "e542affedd96ac00c3de6834f51f1f8910c3b4b930d59a5b657c75937d005b6f",
+        "1924e99b18742e630e64acecaa7a00ba96f937c27fb2f7d4e799294a8e8cf4d2",
+    ];
+    const RESHARE_DEALER_MESSAGE_SHA256: [&str; 2] = [
+        "c86f8f58684637fae4e22bfa31e88611801cf47cac2531c98290a824af57f75b",
+        "20585b17f7e4f51df7aac5e69a20834358e103394234fdc8b5ecc0c0822ada54",
+    ];
+    const RESHARE_COMPLETION_ROOT: &str =
+        "f9132ecdca300866a4aad27cf8281161f056a4737b28e8c6f5935f73a523597c";
+
+    #[test]
+    fn reshare_wire_vectors_are_pinned() {
+        let plain = config();
+        let plain_dealings = all_dealings(&plain);
+        let plain_output = |receiver: ParticipantIndex| {
+            let peer_dealings = plain_dealings
+                .iter()
+                .filter(|(dealer, _)| **dealer != receiver)
+                .map(|(dealer, dealing)| (*dealer, dealing.message.clone()))
+                .collect();
+            complete::<TinyGroup, FakeEvrfBackend>(
+                receiver,
+                &identity_secret(receiver),
+                &plain_dealings[&receiver],
+                &peer_dealings,
+                &plain,
+            )
+            .unwrap()
+        };
+        let predecessor =
+            ResharePredecessor::from_dkg_output(&plain, &plain_output(idx(1))).unwrap();
+        let receiver_secret = |receiver: ParticipantIndex| {
+            TinyScalar::from_u64(40 + u64::from(receiver.get())).unwrap()
+        };
+        let dealers = ParticipantRegistry::new(
+            [1, 3]
+                .map(|dealer| registry_entry(idx(dealer), &identity_secret(idx(dealer))))
+                .into(),
+        )
+        .unwrap();
+        let receivers = ParticipantRegistry::new(
+            (1..=4)
+                .map(|receiver| registry_entry(idx(receiver), &receiver_secret(idx(receiver))))
+                .collect(),
+        )
+        .unwrap();
+        let config = ReshareConfig::new(
+            3,
+            1,
+            SessionId([43; 32]),
+            TinyScalar::from_u64(99).unwrap(),
+            dealers,
+            receivers,
+            predecessor,
+        )
+        .unwrap();
+        assert_eq!(hex(&config.root()), RESHARE_CONFIG_ROOT);
+
+        let mut rng = ChaCha20Rng::from_seed([0x5a; 32]);
+        let dealings: BTreeMap<_, _> = config
+            .dealers()
+            .indexes()
+            .map(|dealer| {
+                let message = create_reshare_dealing::<TinyGroup, FakeEvrfBackend>(
+                    dealer,
+                    &identity_secret(dealer),
+                    &plain_output(dealer).secret_share,
+                    &config,
+                    &mut rng,
+                )
+                .unwrap();
+                (dealer, message)
+            })
+            .collect();
+        let dealing_roots: Vec<_> = dealings
+            .values()
+            .map(|message| hex(&message.transcript_root))
+            .collect();
+        assert_eq!(dealing_roots, RESHARE_DEALING_ROOTS);
+        let message_digests: Vec<_> = dealings
+            .values()
+            .map(|message| hex(&Sha256::digest(to_wire_bytes(message))))
+            .collect();
+        assert_eq!(message_digests, RESHARE_DEALER_MESSAGE_SHA256);
+
+        for receiver in config.receivers().indexes() {
+            let output = complete_reshare::<TinyGroup, FakeEvrfBackend>(
+                receiver,
+                &receiver_secret(receiver),
+                &dealings,
+                &config,
+            )
+            .unwrap();
+            assert_eq!(hex(&output.transcript_root), RESHARE_COMPLETION_ROOT);
+            assert_eq!(&output.public_key, config.predecessor().public_key());
         }
     }
 

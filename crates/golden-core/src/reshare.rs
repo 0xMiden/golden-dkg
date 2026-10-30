@@ -71,6 +71,14 @@
 //! dealing is on the board like any other. Public aggregation runs the same
 //! steps without a receiver, so leaving members can confirm the result.
 //!
+//! In the reshare entry points, [`Error::UnknownParticipant`],
+//! [`Error::MissingDealing`], [`Error::DealerKeyMismatch`],
+//! [`Error::DealerProofVerificationFailed`] and
+//! [`Error::ReshareConstantMismatch`] name old dealer indices, and
+//! [`Error::MissingShare`] and [`Error::UnexpectedShare`] name new receiver
+//! indices. A receiver outside the new committee is
+//! [`Error::IdentityKeyMismatch`].
+//!
 //! # EHTDH1
 //!
 //! The decryption run is the reshare, and its decryption key must equal X, so
@@ -201,10 +209,17 @@
 
 use std::collections::BTreeMap;
 
-use crate::dkg::{DkgConfig, DkgOutput, ParticipantRegistry, SessionId, PROTOCOL_VERSION};
+use rand_core::CryptoRngCore;
+
+use crate::dkg::{
+    completion_root, deal_with_layout, decrypt_share_for_receiver, verify_dealing_with_layout,
+    verify_dealings_with_layout, DealerMessage, DealingLayout, DkgConfig, DkgOutput,
+    EvrfProofBackend, ParticipantRegistry, SessionId, PROTOCOL_VERSION,
+};
 use crate::transcript::{TranscriptBuilder, TranscriptRoot};
 use crate::{
-    lagrange_coefficients_at_zero, Error, GoldenGroup, GoldenScalar, ParticipantIndex, Result,
+    lagrange_coefficients_at_zero, Error, FeldmanCommitment, GoldenGroup, GoldenScalar,
+    ParticipantIndex, Result, Share,
 };
 
 /// Public key set of the sharing a reshare preserves.
@@ -455,6 +470,269 @@ impl<G: GoldenGroup> ReshareConfig<G> {
     }
 }
 
+/// Public result of a completed reshare, without a secret share.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResharePublicOutput<G: GoldenGroup> {
+    /// Group key, equal to the predecessor's.
+    pub public_key: G::Element,
+    /// Public key shares for each receiver.
+    pub public_key_shares: BTreeMap<ParticipantIndex, G::Element>,
+    /// Transcript root over the verified dealings.
+    pub transcript_root: TranscriptRoot,
+}
+
+/// Reshare one dealer's predecessor share to every receiver.
+///
+/// Before drawing randomness, checks that `dealer` is a declared dealer
+/// ([`Error::UnknownParticipant`]), that `dealer_identity_secret` opens its
+/// dealer key ([`Error::IdentityKeyMismatch`]), and that `predecessor_share`
+/// belongs to `dealer` and opens its predecessor public share
+/// ([`Error::PredecessorShareMismatch`]).
+pub fn create_reshare_dealing<G, B>(
+    dealer: ParticipantIndex,
+    dealer_identity_secret: &G::Scalar,
+    predecessor_share: &Share<G::Scalar>,
+    config: &ReshareConfig<G>,
+    rng: &mut impl CryptoRngCore,
+) -> Result<DealerMessage<G>>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    if G::mul_generator(dealer_identity_secret) != *config.dealers.public_key(dealer)? {
+        return Err(Error::IdentityKeyMismatch);
+    }
+    if predecessor_share.participant != dealer
+        || config.predecessor.public_key_share(dealer)
+            != Some(&G::mul_generator(&predecessor_share.value))
+    {
+        return Err(Error::PredecessorShareMismatch);
+    }
+    let (message, _) = deal_with_layout::<G, B>(
+        &DealingLayout::reshare(config),
+        dealer,
+        dealer_identity_secret,
+        predecessor_share.value.clone(),
+        rng,
+    )?;
+    Ok(message)
+}
+
+/// Verify one reshare dealer message.
+pub fn verify_reshare_dealing<G, B>(
+    message: &DealerMessage<G>,
+    config: &ReshareConfig<G>,
+) -> Result<()>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    verify_dealing_with_layout::<G, B>(message, &DealingLayout::reshare(config))
+}
+
+/// Verify several reshare dealer messages in one backend call.
+///
+/// As [`crate::verify_dealings`], a failed combined verification retries each
+/// proof so the error can name an invalid dealer.
+pub fn verify_reshare_dealings<G, B>(
+    messages: &[&DealerMessage<G>],
+    config: &ReshareConfig<G>,
+) -> Result<()>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    verify_dealings_with_layout::<G, B>(messages, &DealingLayout::reshare(config))
+}
+
+/// Verify one reshare dealer message for a concrete receiver.
+///
+/// Performs public verification, then decrypts and checks the receiver's
+/// share. A receiver outside `config.receivers()` or a secret that does not
+/// open its receiver key is [`Error::IdentityKeyMismatch`].
+pub fn verify_reshare_dealing_for_receiver<G, B>(
+    receiver: ParticipantIndex,
+    receiver_identity_secret: &G::Scalar,
+    message: &DealerMessage<G>,
+    config: &ReshareConfig<G>,
+) -> Result<()>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    ensure_receiver_key(receiver, receiver_identity_secret, config)?;
+    let layout = DealingLayout::reshare(config);
+    verify_dealing_with_layout::<G, B>(message, &layout)?;
+    decrypt_share_for_receiver::<G, B>(receiver, receiver_identity_secret, message, &layout)?;
+    Ok(())
+}
+
+/// Complete a reshare for one receiver.
+///
+/// `dealings` is the board, keyed by old dealer index, and must hold exactly
+/// the declared dealers. Every dealing is verified, the receiver's share is
+/// decrypted and checked in each, and the output share is
+/// x'_j = Σ λ^Q_i·f_i(j). The group key equals the predecessor's, and
+/// `transcript_root` is the completion root over (old dealer index, dealing
+/// root) pairs, where each dealing root binds the reshare configuration root.
+///
+/// A receiver outside `config.receivers()` or a secret that does not open its
+/// receiver key is [`Error::IdentityKeyMismatch`]. A map key that differs from
+/// its message's dealer is [`Error::DealerKeyMismatch`], an absent declared
+/// dealer is [`Error::MissingDealing`], and an undeclared one is
+/// [`Error::UnknownParticipant`], each naming old indices.
+pub fn complete_reshare<G, B>(
+    receiver: ParticipantIndex,
+    receiver_identity_secret: &G::Scalar,
+    dealings: &BTreeMap<ParticipantIndex, DealerMessage<G>>,
+    config: &ReshareConfig<G>,
+) -> Result<DkgOutput<G>>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    ensure_receiver_key(receiver, receiver_identity_secret, config)?;
+    let board = declared_dealings(dealings, config)?;
+    let layout = DealingLayout::reshare(config);
+    let weights = verified_weights::<G, B>(&board, &layout)?;
+
+    let mut secret_share_value = G::Scalar::zero();
+    for (message, weight) in board.values().zip(&weights) {
+        let share = decrypt_share_for_receiver::<G, B>(
+            receiver,
+            receiver_identity_secret,
+            message,
+            &layout,
+        )?;
+        secret_share_value = secret_share_value.add(&share.value.mul(weight));
+    }
+    let public = aggregate_verified(&board, &weights, config)?;
+
+    Ok(DkgOutput {
+        public_key: public.public_key,
+        secret_share: Share {
+            participant: receiver,
+            value: secret_share_value,
+        },
+        public_key_shares: public.public_key_shares,
+        transcript_root: public.transcript_root,
+    })
+}
+
+/// Verify a reshare board and compute its public result without a receiver.
+///
+/// Runs the checks of [`complete_reshare`] that need no receiver key, so
+/// members leaving the committee can confirm the result.
+pub fn aggregate_reshare_public<G, B>(
+    dealings: &BTreeMap<ParticipantIndex, DealerMessage<G>>,
+    config: &ReshareConfig<G>,
+) -> Result<ResharePublicOutput<G>>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    let board = declared_dealings(dealings, config)?;
+    let weights = verified_weights::<G, B>(&board, &DealingLayout::reshare(config))?;
+    aggregate_verified(&board, &weights, config)
+}
+
+fn ensure_receiver_key<G: GoldenGroup>(
+    receiver: ParticipantIndex,
+    receiver_identity_secret: &G::Scalar,
+    config: &ReshareConfig<G>,
+) -> Result<()> {
+    match config.receivers.public_key(receiver) {
+        Ok(public_key) if G::mul_generator(receiver_identity_secret) == *public_key => Ok(()),
+        _ => Err(Error::IdentityKeyMismatch),
+    }
+}
+
+/// The board keyed by old dealer index, holding exactly the declared dealers.
+fn declared_dealings<'a, G: GoldenGroup>(
+    dealings: &'a BTreeMap<ParticipantIndex, DealerMessage<G>>,
+    config: &ReshareConfig<G>,
+) -> Result<BTreeMap<ParticipantIndex, &'a DealerMessage<G>>> {
+    for (dealer, message) in dealings {
+        if *dealer != message.dealer {
+            return Err(Error::DealerKeyMismatch {
+                map_key: dealer.get(),
+                message_dealer: message.dealer.get(),
+            });
+        }
+    }
+    if let Some(dealer) = config
+        .dealers
+        .indexes()
+        .find(|dealer| !dealings.contains_key(dealer))
+    {
+        return Err(Error::MissingDealing(dealer.get()));
+    }
+    if let Some(dealer) = dealings
+        .keys()
+        .find(|dealer| config.dealers.public_key(**dealer).is_err())
+    {
+        return Err(Error::UnknownParticipant(dealer.get()));
+    }
+    Ok(dealings
+        .iter()
+        .map(|(dealer, message)| (*dealer, message))
+        .collect())
+}
+
+/// Verify every dealing and return the dealers' Lagrange coefficients at zero
+/// over their old indices, in board order.
+fn verified_weights<G, B>(
+    board: &BTreeMap<ParticipantIndex, &DealerMessage<G>>,
+    layout: &DealingLayout<'_, G>,
+) -> Result<Vec<G::Scalar>>
+where
+    G: GoldenGroup,
+    B: EvrfProofBackend<G>,
+{
+    let messages: Vec<_> = board.values().copied().collect();
+    verify_dealings_with_layout::<G, B>(&messages, layout)?;
+    let xs = board
+        .keys()
+        .map(|dealer| dealer.to_scalar::<G::Scalar>())
+        .collect::<Result<Vec<_>>>()?;
+    lagrange_coefficients_at_zero(&xs)
+}
+
+/// Weight each verified dealer's commitment by its coefficient, check that the
+/// aggregate preserves the predecessor key, and evaluate it at every receiver.
+fn aggregate_verified<G: GoldenGroup>(
+    board: &BTreeMap<ParticipantIndex, &DealerMessage<G>>,
+    weights: &[G::Scalar],
+    config: &ReshareConfig<G>,
+) -> Result<ResharePublicOutput<G>> {
+    let mut aggregate_coefficients = vec![G::identity(); config.threshold];
+    for (message, weight) in board.values().zip(weights) {
+        for (aggregate, coefficient) in aggregate_coefficients
+            .iter_mut()
+            .zip(message.commitment.coefficients())
+        {
+            *aggregate = G::add(aggregate, &G::mul(coefficient, weight));
+        }
+    }
+    let aggregate_commitment = FeldmanCommitment::<G>::from_coefficients(aggregate_coefficients)?;
+
+    let public_key = aggregate_commitment.public_key();
+    if public_key != config.predecessor.public_key {
+        return Err(Error::CommitmentVerificationFailed);
+    }
+    let public_key_shares = config
+        .receivers
+        .indexes()
+        .map(|receiver| Ok((receiver, aggregate_commitment.public_key_share(receiver)?)))
+        .collect::<Result<_>>()?;
+
+    Ok(ResharePublicOutput {
+        public_key,
+        public_key_shares,
+        transcript_root: completion_root::<G>(board),
+    })
+}
+
 /// Whether every share lies on the polynomial of degree `threshold − 1` that
 /// the first `threshold` shares interpolate, and that polynomial is
 /// `public_key` at zero.
@@ -555,12 +833,15 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-    use rand_core::CryptoRngCore;
+    use rand_core::{CryptoRng, CryptoRngCore, RngCore};
 
     use super::*;
-    use crate::dkg::{complete, create_dealing, EvrfProofBackend, EvrfStatement, EvrfWitness};
+    use crate::dkg::{
+        complete, create_dealing, create_dealing_with_secret, verify_dealing, verify_dealings,
+        EvrfProofBackend, EvrfStatement, EvrfWitness,
+    };
     use crate::test_support::{TinyGroup, TinyScalar};
-    use crate::IdentityKeyProof;
+    use crate::{lagrange_interpolate_at_zero, reconstruct_secret, IdentityKeyProof};
 
     /// Backend whose proofs are empty and always verify. These tests need
     /// completed outputs, not proofs.
@@ -1173,5 +1454,907 @@ mod tests {
                 Error::InvalidPredecessor
             );
         }
+    }
+
+    /// Backend whose proof is the concatenation of the statement roots, so it
+    /// binds every statement field. Proving checks that the witness opens the
+    /// dealer key, the constant commitment, the share and the pad.
+    enum RootsBackend {}
+
+    impl EvrfProofBackend<TinyGroup> for RootsBackend {
+        const PROOF_ID: &'static [u8] = b"golden-core/reshare-test-roots/v1";
+
+        fn prove_batch(
+            statements: &[EvrfStatement<TinyGroup>],
+            witnesses: &[EvrfWitness<TinyGroup>],
+            _rng: &mut impl CryptoRngCore,
+        ) -> Result<Vec<u8>> {
+            if statements.len() != witnesses.len() {
+                return Err(Error::ProofVerificationFailed);
+            }
+            for (statement, witness) in statements.iter().zip(witnesses) {
+                let constant = witness
+                    .polynomial_coefficients
+                    .first()
+                    .map(TinyGroup::mul_generator);
+                if TinyGroup::mul_generator(&witness.identity_secret) != statement.dealer_public_key
+                    || constant.as_ref() != statement.commitment_coefficients.first()
+                    || TinyGroup::mul_generator(&witness.share) != statement.share_commitment
+                    || TinyGroup::mul_generator(&witness.pad) != statement.pad_commitment
+                {
+                    return Err(Error::ProofVerificationFailed);
+                }
+            }
+            Ok(statement_roots(statements))
+        }
+
+        fn verify_batch(statements: &[EvrfStatement<TinyGroup>], proof: &[u8]) -> Result<()> {
+            if proof == statement_roots(statements) {
+                Ok(())
+            } else {
+                Err(Error::ProofVerificationFailed)
+            }
+        }
+    }
+
+    fn statement_roots(statements: &[EvrfStatement<TinyGroup>]) -> Vec<u8> {
+        statements.iter().flat_map(EvrfStatement::root).collect()
+    }
+
+    /// RNG whose first `next_u32` calls return `chosen`, so a test fixes the
+    /// sampled polynomial coefficients; everything else comes from ChaCha.
+    struct ChosenRng {
+        chosen: Vec<u32>,
+        rest: ChaCha20Rng,
+    }
+
+    impl ChosenRng {
+        fn new(chosen: &[TinyScalar], seed: u8) -> Self {
+            Self {
+                chosen: chosen
+                    .iter()
+                    .rev()
+                    .map(|value| u32::from(value.to_repr()[0]))
+                    .collect(),
+                rest: ChaCha20Rng::from_seed([seed; 32]),
+            }
+        }
+    }
+
+    impl RngCore for ChosenRng {
+        fn next_u32(&mut self) -> u32 {
+            self.chosen.pop().unwrap_or_else(|| self.rest.next_u32())
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.rest.next_u64()
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            self.rest.fill_bytes(dest);
+        }
+
+        fn try_fill_bytes(
+            &mut self,
+            dest: &mut [u8],
+        ) -> core::result::Result<(), rand_core::Error> {
+            self.rest.try_fill_bytes(dest)
+        }
+    }
+
+    impl CryptoRng for ChosenRng {}
+
+    fn dealer_secret(dealer: ParticipantIndex) -> TinyScalar {
+        scalar(10 + u64::from(dealer.get()))
+    }
+
+    fn receiver_secret(receiver: ParticipantIndex) -> TinyScalar {
+        scalar(20 + u64::from(receiver.get()))
+    }
+
+    /// Registry of `indexes`, each under the key of `secret(index)`.
+    fn seats(
+        indexes: &[u32],
+        secret: fn(ParticipantIndex) -> TinyScalar,
+    ) -> ParticipantRegistry<TinyGroup> {
+        registry(
+            &indexes
+                .iter()
+                .map(|index| (*index, u64::from(secret(idx(*index)).to_repr()[0])))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// `receiver`'s share of `message`, decrypted as the receiver would.
+    fn decrypt(
+        message: &DealerMessage<TinyGroup>,
+        config: &ReshareConfig<TinyGroup>,
+        receiver: ParticipantIndex,
+    ) -> TinyScalar {
+        let secret = receiver_secret(receiver);
+        let pad = <RootsBackend as EvrfProofBackend<TinyGroup>>::derive_pad(
+            message.msg_i,
+            config.beta(),
+            &secret,
+            config.dealers().public_key(message.dealer).unwrap(),
+            config.receivers().public_key(receiver).unwrap(),
+        )
+        .unwrap();
+        message.encrypted_shares[&receiver]
+            .encrypted_share
+            .sub(&pad)
+    }
+
+    fn subsets(items: &[ParticipantIndex], size: usize) -> Vec<Vec<ParticipantIndex>> {
+        if size == 0 {
+            return vec![Vec::new()];
+        }
+        let Some((first, rest)) = items.split_first() else {
+            return Vec::new();
+        };
+        let mut with_first = subsets(rest, size - 1);
+        for subset in &mut with_first {
+            subset.insert(0, *first);
+        }
+        with_first.extend(subsets(rest, size));
+        with_first
+    }
+
+    /// A completed sharing: its public key set and every holder's share.
+    struct Generation {
+        predecessor: ResharePredecessor<TinyGroup>,
+        shares: BTreeMap<ParticipantIndex, TinyScalar>,
+    }
+
+    impl Generation {
+        fn from_dkg(
+            config: &DkgConfig<TinyGroup>,
+            outputs: &BTreeMap<ParticipantIndex, DkgOutput<TinyGroup>>,
+        ) -> Self {
+            let first = outputs.values().next().unwrap();
+            Self {
+                predecessor: ResharePredecessor::from_dkg_output(config, first).unwrap(),
+                shares: outputs
+                    .iter()
+                    .map(|(holder, output)| (*holder, output.secret_share.value))
+                    .collect(),
+            }
+        }
+
+        fn plain() -> Self {
+            let (config, outputs) = completed_dkg();
+            Self::from_dkg(&config, &outputs)
+        }
+
+        fn share(&self, holder: ParticipantIndex) -> Share<TinyScalar> {
+            Share {
+                participant: holder,
+                value: self.shares[&holder],
+            }
+        }
+
+        fn secret(&self) -> TinyScalar {
+            let basis = self
+                .shares
+                .keys()
+                .take(self.predecessor.threshold())
+                .map(|holder| self.share(*holder))
+                .collect::<Vec<_>>();
+            lagrange_interpolate_at_zero(&basis).unwrap()
+        }
+
+        fn reshare_config(
+            &self,
+            dealers: &[u32],
+            receivers: &[u32],
+            threshold: usize,
+            session: u8,
+        ) -> ReshareConfig<TinyGroup> {
+            ReshareConfig::new(
+                threshold,
+                0,
+                SessionId([session; 32]),
+                scalar(99),
+                seats(dealers, dealer_secret),
+                seats(receivers, receiver_secret),
+                self.predecessor.clone(),
+            )
+            .unwrap()
+        }
+
+        fn deal(
+            &self,
+            config: &ReshareConfig<TinyGroup>,
+            dealer: ParticipantIndex,
+            rng: &mut impl CryptoRngCore,
+        ) -> DealerMessage<TinyGroup> {
+            create_reshare_dealing::<TinyGroup, RootsBackend>(
+                dealer,
+                &dealer_secret(dealer),
+                &self.share(dealer),
+                config,
+                rng,
+            )
+            .unwrap()
+        }
+
+        /// One honest dealing from every declared dealer.
+        fn board(
+            &self,
+            config: &ReshareConfig<TinyGroup>,
+            seed: u8,
+        ) -> BTreeMap<ParticipantIndex, DealerMessage<TinyGroup>> {
+            let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+            config
+                .dealers()
+                .indexes()
+                .map(|dealer| (dealer, self.deal(config, dealer, &mut rng)))
+                .collect()
+        }
+
+        /// Complete `board` for every receiver and check the result: every
+        /// output and the public aggregation agree, X is unchanged, every
+        /// t_new shares reconstruct x and t_new − 1 shares do not.
+        fn complete(
+            &self,
+            config: &ReshareConfig<TinyGroup>,
+            board: &BTreeMap<ParticipantIndex, DealerMessage<TinyGroup>>,
+        ) -> Self {
+            let public =
+                aggregate_reshare_public::<TinyGroup, RootsBackend>(board, config).unwrap();
+            assert_eq!(&public.public_key, self.predecessor.public_key());
+            let outputs = config
+                .receivers()
+                .indexes()
+                .map(|receiver| {
+                    let output = complete_reshare::<TinyGroup, RootsBackend>(
+                        receiver,
+                        &receiver_secret(receiver),
+                        board,
+                        config,
+                    )
+                    .unwrap();
+                    assert_eq!(output.public_key, public.public_key);
+                    assert_eq!(output.public_key_shares, public.public_key_shares);
+                    assert_eq!(output.transcript_root, public.transcript_root);
+                    assert_eq!(output.secret_share.participant, receiver);
+                    assert_eq!(
+                        TinyGroup::mul_generator(&output.secret_share.value),
+                        public.public_key_shares[&receiver]
+                    );
+                    (receiver, output)
+                })
+                .collect::<BTreeMap<_, _>>();
+            let next = Self {
+                predecessor: ResharePredecessor::from_reshare_output(
+                    config,
+                    outputs.values().next().unwrap(),
+                )
+                .unwrap(),
+                shares: outputs
+                    .iter()
+                    .map(|(holder, output)| (*holder, output.secret_share.value))
+                    .collect(),
+            };
+
+            let secret = self.secret();
+            let threshold = config.threshold();
+            let holders = next.shares.keys().copied().collect::<Vec<_>>();
+            let shares = |subset: &[ParticipantIndex]| {
+                subset
+                    .iter()
+                    .map(|holder| next.share(*holder))
+                    .collect::<Vec<_>>()
+            };
+            for subset in subsets(&holders, threshold) {
+                assert_eq!(
+                    reconstruct_secret(&shares(&subset), threshold).unwrap(),
+                    secret
+                );
+            }
+            if threshold > 1 {
+                for subset in subsets(&holders, threshold - 1) {
+                    assert_ne!(
+                        lagrange_interpolate_at_zero(&shares(&subset)).unwrap(),
+                        secret
+                    );
+                }
+            }
+            next
+        }
+    }
+
+    #[test]
+    fn reshare_preserves_the_key_and_every_threshold_set_reconstructs_it() {
+        let old = Generation::plain();
+        for (dealers, receivers, threshold, seed) in [
+            (&[1, 3][..], &[1, 2, 3, 4][..], 3, 1),
+            (&[1, 2, 3][..], &[2, 5][..], 2, 2),
+            (&[2, 3][..], &[1, 2, 3][..], 1, 3),
+        ] {
+            let config = old.reshare_config(dealers, receivers, threshold, 5);
+            let board = old.board(&config, seed);
+            for message in board.values() {
+                for receiver in config.receivers().indexes() {
+                    verify_reshare_dealing_for_receiver::<TinyGroup, RootsBackend>(
+                        receiver,
+                        &receiver_secret(receiver),
+                        message,
+                        &config,
+                    )
+                    .unwrap();
+                }
+            }
+            let next = old.complete(&config, &board);
+            assert_eq!(next.predecessor.public_key(), old.predecessor.public_key());
+            assert_eq!(next.predecessor.threshold(), threshold);
+        }
+    }
+
+    #[test]
+    fn reshare_dealings_pin_the_predecessor_share_and_reach_every_receiver() {
+        let old = Generation::plain();
+        // Old index 1 is also a receiver index: the dealing has a slot for it.
+        let config = old.reshare_config(&[1, 3], &[1, 2, 3, 4], 3, 5);
+        for (dealer, message) in old.board(&config, 1) {
+            assert_eq!(message.registry_root, config.root());
+            assert_eq!(message.session_id, config.session_id());
+            assert_eq!(message.commitment.coefficients().len(), 3);
+            assert_eq!(
+                message.commitment.coefficients().first(),
+                config.predecessor().public_key_share(dealer)
+            );
+            assert!(message
+                .encrypted_shares
+                .keys()
+                .copied()
+                .eq(config.receivers().indexes()));
+            assert_eq!(message.proof.len(), 32 * config.receivers().len());
+            assert_eq!(message.transcript_root, message.recompute_transcript_root());
+            verify_reshare_dealing::<TinyGroup, RootsBackend>(&message, &config).unwrap();
+        }
+    }
+
+    #[test]
+    fn reshare_dealer_checks_precede_sampling() {
+        let old = Generation::plain();
+        let config = old.reshare_config(&[1, 2], &[1, 2, 3], 2, 5);
+        let mut rng = ChaCha20Rng::from_seed([4; 32]);
+        let dealer = idx(1);
+        let share = old.share(dealer);
+        let with_value = |value: TinyScalar| Share {
+            participant: dealer,
+            value,
+        };
+        let mut attempt = |dealer: ParticipantIndex, identity: TinyScalar, share: &Share<_>| {
+            create_reshare_dealing::<TinyGroup, RootsBackend>(
+                dealer, &identity, share, &config, &mut rng,
+            )
+            .unwrap_err()
+        };
+
+        // A dealer outside Q fails first, even with a wrong key and share.
+        for outsider in [3, 4] {
+            assert_eq!(
+                attempt(idx(outsider), scalar(1), &with_value(scalar(1))),
+                Error::UnknownParticipant(outsider)
+            );
+        }
+        // Then the dealer key, even with a wrong share.
+        for identity in [dealer_secret(idx(2)), receiver_secret(dealer), scalar(31)] {
+            assert_eq!(
+                attempt(dealer, identity, &with_value(scalar(1))),
+                Error::IdentityKeyMismatch
+            );
+        }
+        // Then the predecessor share.
+        let wrong_shares = [
+            with_value(share.value.add(&TinyScalar::one())),
+            with_value(TinyScalar::zero().sub(&share.value)),
+            with_value(TinyScalar::zero()),
+            with_value(old.share(idx(2)).value),
+            old.share(idx(2)),
+            Share {
+                participant: idx(2),
+                value: share.value,
+            },
+        ];
+        for wrong in &wrong_shares {
+            assert_eq!(
+                attempt(dealer, dealer_secret(dealer), wrong),
+                Error::PredecessorShareMismatch
+            );
+        }
+        assert_eq!(rng.get_word_pos(), 0);
+
+        old.deal(&config, dealer, &mut rng);
+        assert_ne!(rng.get_word_pos(), 0);
+    }
+
+    #[test]
+    fn a_constant_other_than_the_predecessor_share_is_rejected_before_proofs() {
+        let old = Generation::plain();
+        let config = old.reshare_config(&[1, 3], &[1, 2, 3, 4], 3, 5);
+        let mut board = old.board(&config, 1);
+        let dealer = idx(3);
+
+        // A dealer that deals another constant with a valid proof.
+        let (dishonest, _) = deal_with_layout::<TinyGroup, RootsBackend>(
+            &DealingLayout::reshare(&config),
+            dealer,
+            &dealer_secret(dealer),
+            old.share(dealer).value.add(&TinyScalar::one()),
+            &mut ChaCha20Rng::from_seed([6; 32]),
+        )
+        .unwrap();
+        // A broadcast whose constant changed after its dealing root was
+        // computed: the constant check runs before the root recompute.
+        let mut tampered = board[&dealer].clone();
+        let mut coefficients = tampered.commitment.coefficients().to_vec();
+        coefficients[0] = coefficients[0].add(&TinyGroup::generator());
+        tampered.commitment = FeldmanCommitment::from_coefficients(coefficients).unwrap();
+
+        for message in [dishonest, tampered] {
+            let expected = Error::ReshareConstantMismatch(dealer.get());
+            assert_eq!(
+                verify_reshare_dealing::<TinyGroup, RootsBackend>(&message, &config).unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                verify_reshare_dealing_for_receiver::<TinyGroup, RootsBackend>(
+                    idx(1),
+                    &receiver_secret(idx(1)),
+                    &message,
+                    &config,
+                )
+                .unwrap_err(),
+                expected
+            );
+            board.insert(dealer, message);
+            let messages = board.values().collect::<Vec<_>>();
+            assert_eq!(
+                verify_reshare_dealings::<TinyGroup, RootsBackend>(&messages, &config).unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                complete_reshare::<TinyGroup, RootsBackend>(
+                    idx(1),
+                    &receiver_secret(idx(1)),
+                    &board,
+                    &config,
+                )
+                .unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                aggregate_reshare_public::<TinyGroup, RootsBackend>(&board, &config).unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn aggregation_rejects_a_board_that_moves_the_group_key() {
+        let old = Generation::plain();
+        let config = old.reshare_config(&[1, 3], &[1, 2, 3, 4], 3, 5);
+        let mut board = old.board(&config, 1);
+        let mut coefficients = board[&idx(1)].commitment.coefficients().to_vec();
+        coefficients[0] = coefficients[0].add(&TinyGroup::generator());
+        board.get_mut(&idx(1)).unwrap().commitment =
+            FeldmanCommitment::from_coefficients(coefficients).unwrap();
+        let references = board
+            .iter()
+            .map(|(dealer, message)| (*dealer, message))
+            .collect();
+        let weights = lagrange_coefficients_at_zero(&[scalar(1), scalar(3)]).unwrap();
+        assert_eq!(
+            aggregate_verified(&references, &weights, &config).unwrap_err(),
+            Error::CommitmentVerificationFailed
+        );
+    }
+
+    #[test]
+    fn plain_and_reshare_dealings_do_not_replay_into_each_other() {
+        let old = Generation::plain();
+        let (plain, _) = completed_dkg();
+        let plain_dealings = [1, 3]
+            .into_iter()
+            .map(|dealer| {
+                let dealing = create_dealing::<TinyGroup, RootsBackend>(
+                    idx(dealer),
+                    &scalar(30 + u64::from(dealer)),
+                    &plain,
+                    &mut ChaCha20Rng::from_seed([dealer as u8; 32]),
+                )
+                .unwrap();
+                (idx(dealer), dealing.message)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        // Same session as the plain run: the binding roots differ.
+        let same_session = old.reshare_config(&[1, 3], &[1, 2, 3], 2, 7);
+        assert_eq!(same_session.session_id(), plain.session_id);
+        // Another session: the session check comes first.
+        let other_session = old.reshare_config(&[1, 3], &[1, 2, 3], 2, 5);
+        for (config, expected) in [
+            (&same_session, Error::RegistryMismatch),
+            (&other_session, Error::SessionMismatch),
+        ] {
+            let reshare_dealings = old.board(config, 1);
+            for (plain_message, reshare_message) in
+                plain_dealings.values().zip(reshare_dealings.values())
+            {
+                assert_eq!(
+                    verify_reshare_dealing::<TinyGroup, RootsBackend>(plain_message, config)
+                        .unwrap_err(),
+                    expected
+                );
+                assert_eq!(
+                    verify_dealing::<TinyGroup, RootsBackend>(reshare_message, &plain).unwrap_err(),
+                    expected
+                );
+            }
+            assert_eq!(
+                verify_dealings::<TinyGroup, RootsBackend>(
+                    &reshare_dealings.values().collect::<Vec<_>>(),
+                    &plain
+                )
+                .unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                complete_reshare::<TinyGroup, RootsBackend>(
+                    idx(1),
+                    &receiver_secret(idx(1)),
+                    &plain_dealings,
+                    config,
+                )
+                .unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                aggregate_reshare_public::<TinyGroup, RootsBackend>(&plain_dealings, config)
+                    .unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn reshare_dealings_bind_their_predecessor() {
+        let old = Generation::plain();
+        let config = old.reshare_config(&[1, 3], &[1, 2, 3], 2, 5);
+        let message = old.board(&config, 1).remove(&idx(1)).unwrap();
+        let config_with = |predecessor: ResharePredecessor<TinyGroup>| {
+            Generation {
+                predecessor,
+                shares: BTreeMap::new(),
+            }
+            .reshare_config(&[1, 3], &[1, 2, 3], 2, 5)
+        };
+        // The same key set under another completion root.
+        let sibling = config_with(
+            ResharePredecessor::new(
+                2,
+                *old.predecessor.public_key(),
+                old.predecessor.public_key_shares().clone(),
+                [9; 32],
+            )
+            .unwrap(),
+        );
+        // Another sharing altogether.
+        let (public_key, shares) = column(2, &[1, 2, 3]);
+        let other = config_with(ResharePredecessor::new(2, public_key, shares, [2; 32]).unwrap());
+        assert_ne!(
+            other.predecessor().public_key_share(idx(1)),
+            config.predecessor().public_key_share(idx(1))
+        );
+
+        for (target, relabelled) in [
+            (&sibling, Error::ProofVerificationFailed),
+            (&other, Error::ReshareConstantMismatch(1)),
+        ] {
+            assert_ne!(target.root(), config.root());
+            assert_eq!(
+                verify_reshare_dealing::<TinyGroup, RootsBackend>(&message, target).unwrap_err(),
+                Error::RegistryMismatch
+            );
+            // Moved into the other configuration's slot, with a consistent
+            // dealing root.
+            let mut moved = message.clone();
+            moved.registry_root = target.root();
+            moved.transcript_root = moved.recompute_transcript_root();
+            assert_eq!(
+                verify_reshare_dealing::<TinyGroup, RootsBackend>(&moved, target).unwrap_err(),
+                relabelled
+            );
+        }
+        assert_eq!(
+            create_reshare_dealing::<TinyGroup, RootsBackend>(
+                idx(1),
+                &dealer_secret(idx(1)),
+                &old.share(idx(1)),
+                &other,
+                &mut ChaCha20Rng::from_seed([3; 32]),
+            )
+            .unwrap_err(),
+            Error::PredecessorShareMismatch
+        );
+    }
+
+    #[test]
+    fn completion_requires_exactly_the_declared_dealers() {
+        let old = Generation::plain();
+        let config = old.reshare_config(&[1, 3], &[1, 2, 3], 2, 5);
+        let board = old.board(&config, 1);
+        // A valid dealing from old index 2 under a configuration that
+        // declares it.
+        let wider = old.reshare_config(&[1, 2, 3], &[1, 2, 3], 2, 5);
+        let undeclared = old.deal(&wider, idx(2), &mut ChaCha20Rng::from_seed([2; 32]));
+
+        let mut missing = board.clone();
+        missing.remove(&idx(3));
+        let mut extra = board.clone();
+        extra.insert(idx(2), undeclared);
+        let mut relabelled = board.clone();
+        let moved = relabelled.remove(&idx(3)).unwrap();
+        relabelled.insert(idx(2), moved);
+        let mut swapped = board.clone();
+        let first = swapped[&idx(1)].clone();
+        swapped.insert(idx(1), swapped[&idx(3)].clone());
+        swapped.insert(idx(3), first);
+
+        for (candidate, expected) in [
+            (missing, Error::MissingDealing(3)),
+            (extra, Error::UnknownParticipant(2)),
+            (
+                relabelled,
+                Error::DealerKeyMismatch {
+                    map_key: 2,
+                    message_dealer: 3,
+                },
+            ),
+            (
+                swapped,
+                Error::DealerKeyMismatch {
+                    map_key: 1,
+                    message_dealer: 3,
+                },
+            ),
+            (BTreeMap::new(), Error::MissingDealing(1)),
+        ] {
+            assert_eq!(
+                complete_reshare::<TinyGroup, RootsBackend>(
+                    idx(2),
+                    &receiver_secret(idx(2)),
+                    &candidate,
+                    &config,
+                )
+                .unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                aggregate_reshare_public::<TinyGroup, RootsBackend>(&candidate, &config)
+                    .unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn completion_rejects_a_wrong_receiver_key() {
+        let old = Generation::plain();
+        let config = old.reshare_config(&[1, 3], &[1, 2, 3], 2, 5);
+        let board = old.board(&config, 1);
+        let message = &board[&idx(1)];
+        for (receiver, secret) in [
+            (idx(1), receiver_secret(idx(2))),
+            (idx(1), dealer_secret(idx(1))),
+            (idx(1), scalar(31)),
+            (idx(4), receiver_secret(idx(4))),
+        ] {
+            assert_eq!(
+                complete_reshare::<TinyGroup, RootsBackend>(receiver, &secret, &board, &config)
+                    .unwrap_err(),
+                Error::IdentityKeyMismatch
+            );
+            assert_eq!(
+                verify_reshare_dealing_for_receiver::<TinyGroup, RootsBackend>(
+                    receiver, &secret, message, &config,
+                )
+                .unwrap_err(),
+                Error::IdentityKeyMismatch
+            );
+        }
+    }
+
+    #[test]
+    fn one_receiver_reshare_requires_a_proof() {
+        let old = Generation::plain();
+        let config = old.reshare_config(&[1, 2], &[1], 1, 5);
+        let board = old.board(&config, 1);
+        for (dealer, message) in &board {
+            assert_eq!(message.proof.len(), 32);
+            let mut unproven = message.clone();
+            unproven.proof.clear();
+            assert_eq!(
+                verify_reshare_dealing::<TinyGroup, RootsBackend>(&unproven, &config).unwrap_err(),
+                Error::ProofVerificationFailed
+            );
+            assert_eq!(
+                verify_reshare_dealings::<TinyGroup, RootsBackend>(&[&unproven], &config)
+                    .unwrap_err(),
+                Error::DealerProofVerificationFailed(dealer.get())
+            );
+            let mut unproven_board = board.clone();
+            unproven_board.insert(*dealer, unproven);
+            assert_eq!(
+                complete_reshare::<TinyGroup, RootsBackend>(
+                    idx(1),
+                    &receiver_secret(idx(1)),
+                    &unproven_board,
+                    &config,
+                )
+                .unwrap_err(),
+                Error::DealerProofVerificationFailed(dealer.get())
+            );
+        }
+        // The dealer asks the backend for a proof even for one receiver.
+        assert_eq!(
+            create_reshare_dealing::<TinyGroup, FailingProver>(
+                idx(1),
+                &dealer_secret(idx(1)),
+                &old.share(idx(1)),
+                &config,
+                &mut ChaCha20Rng::from_seed([1; 32]),
+            )
+            .unwrap_err(),
+            Error::DecryptionFailed
+        );
+        let next = old.complete(&config, &board);
+        assert_eq!(next.shares[&idx(1)], old.secret());
+    }
+
+    /// Backend whose prover fails with a marker error.
+    enum FailingProver {}
+
+    impl EvrfProofBackend<TinyGroup> for FailingProver {
+        const PROOF_ID: &'static [u8] = b"golden-core/reshare-test-failing-prover/v1";
+
+        fn prove_batch(
+            _statements: &[EvrfStatement<TinyGroup>],
+            _witnesses: &[EvrfWitness<TinyGroup>],
+            _rng: &mut impl CryptoRngCore,
+        ) -> Result<Vec<u8>> {
+            Err(Error::DecryptionFailed)
+        }
+
+        fn verify_batch(_statements: &[EvrfStatement<TinyGroup>], _proof: &[u8]) -> Result<()> {
+            Err(Error::ProofVerificationFailed)
+        }
+    }
+
+    #[test]
+    fn reshares_chain_through_a_forced_zero_share() {
+        let old = Generation::plain();
+        // Dealer 2 and new receiver 1 are corrupt, one member of each
+        // committee.
+        let config = old.reshare_config(&[1, 2], &[1, 2, 3], 2, 5);
+        let honest = old.deal(&config, idx(1), &mut ChaCha20Rng::from_seed([2; 32]));
+        let received = decrypt(&honest, &config, idx(1));
+        // The weights of dealers 1 and 2 at zero are 2 and −1, so
+        // f_2(1) = 2·f_1(1) zeroes receiver 1's share while f_2(0) stays
+        // dealer 2's predecessor share.
+        let slope = received.add(&received).sub(&old.share(idx(2)).value);
+        let corrupt = old.deal(&config, idx(2), &mut ChosenRng::new(&[slope], 3));
+        let board = [(idx(1), honest), (idx(2), corrupt)].into();
+        let next = old.complete(&config, &board);
+        assert_eq!(next.shares[&idx(1)], TinyScalar::zero());
+        assert_eq!(
+            next.predecessor.public_key_share(idx(1)),
+            Some(&TinyGroup::identity())
+        );
+
+        for (dealers, seed) in [(&[1, 2][..], 4), (&[1, 3][..], 5)] {
+            let config = next.reshare_config(dealers, &[1, 2, 3, 4], 3, 6);
+            assert_eq!(
+                config.predecessor().public_key_share(idx(1)),
+                Some(&TinyGroup::identity())
+            );
+            let last = next.complete(&config, &next.board(&config, seed));
+            assert_eq!(last.secret(), old.secret());
+        }
+    }
+
+    #[test]
+    fn plain_outputs_with_a_forced_identity_share_reshare() {
+        const SECRETS: &[(u32, u64)] = &[(1, 31), (2, 32), (3, 33)];
+        let config = DkgConfig::new(2, SessionId([6; 32]), scalar(99), registry(SECRETS)).unwrap();
+        let mut rng = ChaCha20Rng::from_seed([6; 32]);
+        let mut dealings = [1, 2]
+            .into_iter()
+            .map(|dealer| {
+                let dealer = idx(dealer);
+                let dealing = create_dealing::<TinyGroup, RootsBackend>(
+                    dealer,
+                    &scalar(30 + u64::from(dealer.get())),
+                    &config,
+                    &mut rng,
+                )
+                .unwrap();
+                (dealer, dealing)
+            })
+            .collect::<BTreeMap<_, _>>();
+        // Participant 3 is corrupt and rushing: it decrypts its shares of the
+        // honest dealings, then deals f_3 = c + a·x with f_3(3) cancelling
+        // their sum, so its share is zero.
+        let me = idx(3);
+        let my_secret = scalar(33);
+        let received = dealings
+            .values()
+            .map(|dealing| {
+                let message = &dealing.message;
+                let pad = <RootsBackend as EvrfProofBackend<TinyGroup>>::derive_pad(
+                    message.msg_i,
+                    &config.beta,
+                    &my_secret,
+                    config.registry.public_key(message.dealer).unwrap(),
+                    config.registry.public_key(me).unwrap(),
+                )
+                .unwrap();
+                message.encrypted_shares[&me].encrypted_share.sub(&pad)
+            })
+            .fold(TinyScalar::zero(), |sum, share| sum.add(&share));
+        let constant = scalar(5);
+        let slope = TinyScalar::zero()
+            .sub(&received.add(&constant))
+            .mul(&scalar(3).invert().unwrap());
+        dealings.insert(
+            me,
+            create_dealing_with_secret::<TinyGroup, RootsBackend>(
+                me,
+                &my_secret,
+                constant,
+                &config,
+                &mut ChosenRng::new(&[slope], 7),
+            )
+            .unwrap(),
+        );
+        let outputs = config
+            .registry
+            .indexes()
+            .map(|receiver| {
+                let peers = dealings
+                    .iter()
+                    .filter(|(dealer, _)| **dealer != receiver)
+                    .map(|(dealer, dealing)| (*dealer, dealing.message.clone()))
+                    .collect();
+                let output = complete::<TinyGroup, RootsBackend>(
+                    receiver,
+                    &scalar(30 + u64::from(receiver.get())),
+                    &dealings[&receiver],
+                    &peers,
+                    &config,
+                )
+                .unwrap();
+                (receiver, output)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let plain = Generation::from_dkg(&config, &outputs);
+        assert_eq!(plain.shares[&me], TinyScalar::zero());
+        assert_eq!(
+            plain.predecessor.public_key_share(me),
+            Some(&TinyGroup::identity())
+        );
+        assert!(!bool::from(TinyGroup::is_identity(
+            plain.predecessor.public_key()
+        )));
+
+        let config = plain.reshare_config(&[1, 3], &[1, 2, 3], 2, 8);
+        assert_eq!(
+            config.predecessor().public_key_share(me),
+            Some(&TinyGroup::identity())
+        );
+        plain.complete(&config, &plain.board(&config, 8));
     }
 }
