@@ -10,11 +10,11 @@ secret. The second shares zero so that each decryption share is bound to one
 decryption context.
 
 A Golden reshare moves the decryption secret to a new committee or threshold
-without changing the sealing key. The reshare takes the place of the first run, and the
-new committee runs the zero sharing under the session that
+without changing the sealing key. The reshare takes the place of the first
+run, and the new committee runs the zero sharing under the session that
 `derive_reshare_context_session_id` derives from the reshare configuration
-root. Records sealed before the reshare open with the new
-committee, and decryption shares from the old and new setups do not combine.
+root. Records sealed before the reshare open with the new committee, and
+decryption shares from the old and new setups do not combine.
 
 The crate provides:
 
