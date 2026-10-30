@@ -97,7 +97,8 @@ pub struct SetupContext {
     pub registry_root: TranscriptRoot,
     /// Participants in canonical order.
     pub participants: Vec<ParticipantIndex>,
-    /// Session id for the `x` sharing.
+    /// Session id for the `x` sharing or, for a reshared setup, the reshare
+    /// configuration root.
     pub decryption_session_id: SessionId,
     /// Session id for the zero sharing run.
     pub context_session_id: SessionId,

@@ -45,6 +45,9 @@ impl<G: GoldenHashToGroup> fmt::Debug for Ehtdh1Material<G> {
 /// threshold, registry, context session, participants, local share owner, zero
 /// key identity, and non-identity decryption key. `PublicKeySet::new` also
 /// checks that `X_i` interpolates to `X` and `Z_i` interpolates to identity.
+///
+/// `decryption_output` must be the caller's own `complete` output under
+/// `decryption_config`; the bridge checks only its key and index set.
 pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
     decryption_config: &DkgConfig<G>,
     decryption_output: &DkgOutput<G>,
@@ -75,7 +78,12 @@ pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
 /// configuration root. That root stands in for the decryption session:
 /// [`SetupContext::decryption_session_id`] holds it, so the context run is
 /// bound to the declared dealers, both registries, the threshold, beta and
-/// the predecessor, not only to the reshare session id.
+/// the predecessor, not only to the reshare session id. No plain DKG may use
+/// a reshare configuration root as its session id, as requirement 5 of
+/// [`golden_core::reshare`] states.
+///
+/// `reshare_output` must be the caller's own `complete_reshare` output under
+/// `reshare_config`; the bridge checks only its key and index set.
 ///
 /// The remaining checks are those of [`material_from_dkg_outputs`], read
 /// against the receiver registry and the reshare threshold.
