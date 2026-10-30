@@ -213,10 +213,10 @@
 //! * **Q10. Predecessor batch check.** [`ResharePredecessor::new`] checks X
 //!   exactly and the shares past the first t_old by one Fiat–Shamir random
 //!   linear combination, under the label `reshare-predecessor-check` over
-//!   t_old, X and the full column. A false accept needs a challenge that
-//!   cancels the defects, at most Q·2^-|q| for Q hash queries in the ROM. It
-//!   relies on prime-order decoding, and requirement 4 already excludes
-//!   adversarial predecessors. Is this acceptable?
+//!   the backend, t_old, X and the full column. A false accept needs a
+//!   challenge that cancels the defects, at most Q/(q−1) for Q hash queries in
+//!   the ROM. It relies on prime-order decoding, and requirement 4 already
+//!   excludes adversarial predecessors. Is this acceptable?
 
 use std::collections::BTreeMap;
 
@@ -797,8 +797,8 @@ fn on_polynomial<G: GoldenGroup>(
 
 /// Fiat–Shamir weights r_j of the predecessor batch check, one per share past
 /// the first `threshold`, in index order. A transcript under the label
-/// `reshare-predecessor-check` absorbs t_old, X and every (index, Y_i) of the
-/// column, and r_j is the nonzero scalar
+/// `reshare-predecessor-check` absorbs the protocol version, the backend, t_old,
+/// X and every (index, Y_i) of the column, and r_j is the nonzero scalar
 /// `hash_to_scalar("golden-reshare-predecessor-check-v1", root ‖ j)`.
 fn predecessor_check_weights<G: GoldenGroup>(
     threshold: usize,
@@ -806,6 +806,8 @@ fn predecessor_check_weights<G: GoldenGroup>(
     shares: &BTreeMap<ParticipantIndex, G::Element>,
 ) -> Result<Vec<G::Scalar>> {
     let mut transcript = TranscriptBuilder::new(b"reshare-predecessor-check");
+    transcript.u32(b"version", PROTOCOL_VERSION);
+    transcript.bytes(b"backend", G::BACKEND_ID.as_bytes());
     transcript.usize(b"predecessor-threshold", threshold);
     transcript.element::<G>(b"predecessor-key", public_key);
     transcript.usize(b"predecessor-shares-len", shares.len());
