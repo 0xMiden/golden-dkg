@@ -226,9 +226,9 @@ use crate::{
 
 /// Public key set of the sharing a reshare preserves.
 ///
-/// Holds the predecessor threshold t_old, the group key X, the public share
-/// Y_i of every predecessor participant and the predecessor's completion
-/// root. It holds no secrets.
+/// Holds the predecessor threshold t_old, the group key X, the public shares
+/// Y_i of at least t_old predecessor participants and the predecessor's
+/// completion root. It holds no secrets.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResharePredecessor<G: GoldenGroup> {
     threshold: usize,

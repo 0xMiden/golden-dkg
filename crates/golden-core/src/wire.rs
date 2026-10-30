@@ -481,39 +481,37 @@ where
     }
 }
 
-impl<G: GoldenGroup> WireEncode for ResharePredecessor<G> {
-    fn write_wire(&self, out: &mut Vec<u8>) {
-        write_len(out, self.threshold());
-        write_element::<G>(out, self.public_key());
-        write_len(out, self.public_key_shares().len());
-        for (participant, share) in self.public_key_shares() {
-            participant.write_wire(out);
-            write_element::<G>(out, share);
-        }
-        self.completion_root().write_wire(out);
+/// Write the predecessor field of a reshare configuration.
+fn write_predecessor<G: GoldenGroup>(out: &mut Vec<u8>, predecessor: &ResharePredecessor<G>) {
+    write_len(out, predecessor.threshold());
+    write_element::<G>(out, predecessor.public_key());
+    write_len(out, predecessor.public_key_shares().len());
+    for (participant, share) in predecessor.public_key_shares() {
+        participant.write_wire(out);
+        write_element::<G>(out, share);
     }
+    predecessor.completion_root().write_wire(out);
 }
 
-impl<G> WireDecode for ResharePredecessor<G>
+/// Read and validate the predecessor field of a reshare configuration.
+fn read_predecessor<G>(reader: &mut WireReader<'_>) -> Result<ResharePredecessor<G>>
 where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,
 {
-    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
-        let threshold = reader.read_len()?;
-        let public_key = read_element::<G>(reader)?;
-        let len = reader.read_len()?;
-        reader.ensure_remaining_items(len, 4 + G::ELEMENT_REPR_BYTES)?;
-        let mut public_key_shares = BTreeMap::new();
-        let mut last = None;
-        for _ in 0..len {
-            let participant = ParticipantIndex::read_wire(reader)?;
-            ensure_increasing(&mut last, participant)?;
-            public_key_shares.insert(participant, read_element::<G>(reader)?);
-        }
-        let completion_root = TranscriptRoot::read_wire(reader)?;
-        Self::new(threshold, public_key, public_key_shares, completion_root)
+    let threshold = reader.read_len()?;
+    let public_key = read_element::<G>(reader)?;
+    let len = reader.read_len()?;
+    reader.ensure_remaining_items(len, 4 + G::ELEMENT_REPR_BYTES)?;
+    let mut public_key_shares = BTreeMap::new();
+    let mut last = None;
+    for _ in 0..len {
+        let participant = ParticipantIndex::read_wire(reader)?;
+        ensure_increasing(&mut last, participant)?;
+        public_key_shares.insert(participant, read_element::<G>(reader)?);
     }
+    let completion_root = TranscriptRoot::read_wire(reader)?;
+    ResharePredecessor::new(threshold, public_key, public_key_shares, completion_root)
 }
 
 impl<G: GoldenGroup> WireEncode for ReshareConfig<G> {
@@ -524,7 +522,7 @@ impl<G: GoldenGroup> WireEncode for ReshareConfig<G> {
         write_scalar::<G>(out, self.beta());
         self.dealers().write_wire(out);
         self.receivers().write_wire(out);
-        self.predecessor().write_wire(out);
+        write_predecessor::<G>(out, self.predecessor());
     }
 }
 
@@ -540,7 +538,7 @@ where
         let beta = read_scalar::<G>(reader)?;
         let dealers = ParticipantRegistry::read_wire(reader)?;
         let receivers = ParticipantRegistry::read_wire(reader)?;
-        let predecessor = ResharePredecessor::read_wire(reader)?;
+        let predecessor = read_predecessor::<G>(reader)?;
         Self::new(
             threshold,
             max_corrupt_receivers,
@@ -1686,6 +1684,18 @@ mod tests {
         ] {
             assert_eq!(fields.decode().unwrap_err(), expected);
         }
+
+        // The receiver registry ends with the proof response of receiver 3,
+        // just before the predecessor field.
+        let mut predecessor = Vec::new();
+        write_predecessor::<TinyGroup>(&mut predecessor, reshare_config().predecessor());
+        let mut tampered = VALID_RESHARE.to_bytes();
+        let response = tampered.len() - predecessor.len() - 1;
+        tampered[response] = (tampered[response] + 1) % 97;
+        assert_eq!(
+            from_wire_bytes::<ReshareConfig<TinyGroup>>(&tampered).unwrap_err(),
+            Error::InvalidIdentityKeyProof(3)
+        );
 
         // Swapped registries are valid here, under a different root.
         let swapped = ReshareConfigFields {
