@@ -969,15 +969,28 @@ fn reshare_bridge_requires_the_derived_context_session() {
 fn reshare_bridge_rejects_the_context_run_of_a_reshare_by_other_dealers() {
     let run = ReshareRun::new(66);
     let sibling = run.sibling(&run.fresh, &[2, 3]);
-    let context_config = reshare_context_config(&sibling);
-    let context_output = run.context_output(&context_config, 69);
+    // The sibling shares the reshare's session id, so only a context session
+    // derived from the configuration root tells the two reshares apart.
+    for session_id in [
+        derive_reshare_context_session_id(&sibling),
+        derive_context_session_id(sibling.session_id()),
+    ] {
+        let context_config = DkgConfig::new(
+            sibling.threshold(),
+            session_id,
+            scalar(77),
+            sibling.receivers().clone(),
+        )
+        .unwrap();
+        let context_output = run.context_output(&context_config, 69);
 
-    let result = run.bridge(&context_config, &context_output);
+        let result = run.bridge(&context_config, &context_output);
 
-    assert_eq!(
-        result.unwrap_err(),
-        Error::InvalidBridge("context session mismatch")
-    );
+        assert_eq!(
+            result.unwrap_err(),
+            Error::InvalidBridge("context session mismatch")
+        );
+    }
 }
 
 #[test]
