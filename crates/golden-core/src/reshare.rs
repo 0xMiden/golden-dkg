@@ -220,8 +220,8 @@ use crate::dkg::{
 };
 use crate::transcript::{TranscriptBuilder, TranscriptRoot};
 use crate::{
-    lagrange_coefficients_at_zero, Error, FeldmanCommitment, GoldenGroup, GoldenScalar,
-    ParticipantIndex, Result, Share,
+    batch_invert, lagrange_coefficients_at_zero, Error, FeldmanCommitment, GoldenGroup,
+    GoldenScalar, ParticipantIndex, Result, Share,
 };
 
 /// Public key set of the sharing a reshare preserves.
@@ -751,31 +751,59 @@ fn on_polynomial<G: GoldenGroup>(
         .map(|(participant, _)| participant.to_scalar::<G::Scalar>())
         .collect::<Result<Vec<_>>>()?;
     let points = basis.iter().map(|(_, point)| *point).collect::<Vec<_>>();
-    if interpolate_at_zero::<G>(&xs, &points)? != *public_key {
+    let weights = barycentric_weights(&xs)?;
+    if interpolate_at::<G>(&G::Scalar::zero(), &xs, &weights, &points) != *public_key {
         return Ok(false);
     }
     for (participant, point) in shares.iter().skip(threshold) {
-        // Shifting every x by -x_j moves the evaluation at x_j to zero.
         let x = participant.to_scalar::<G::Scalar>()?;
-        let shifted = xs.iter().map(|xi| xi.sub(&x)).collect::<Vec<_>>();
-        if interpolate_at_zero::<G>(&shifted, &points)? != *point {
+        if interpolate_at::<G>(&x, &xs, &weights, &points) != *point {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-fn interpolate_at_zero<G: GoldenGroup>(
-    xs: &[G::Scalar],
-    points: &[&G::Element],
-) -> Result<G::Element> {
-    let coefficients = lagrange_coefficients_at_zero(xs)?;
-    Ok(points
+/// Barycentric weights w_i = 1 / ∏_{k≠i} (x_i − x_k), with one batch
+/// inversion. Fails with [`Error::NonInvertibleDenominator`] when two `xs`
+/// coincide.
+fn barycentric_weights<S: GoldenScalar>(xs: &[S]) -> Result<Vec<S>> {
+    let mut weights = xs
         .iter()
-        .zip(&coefficients)
-        .fold(G::identity(), |sum, (point, coefficient)| {
-            G::add(&sum, &G::mul(point, coefficient))
-        }))
+        .enumerate()
+        .map(|(i, xi)| {
+            xs.iter()
+                .enumerate()
+                .filter(|(k, _)| *k != i)
+                .fold(S::one(), |product, (_, xk)| product.mul(&xi.sub(xk)))
+        })
+        .collect::<Vec<_>>();
+    batch_invert(&mut weights).ok_or(Error::NonInvertibleDenominator)?;
+    Ok(weights)
+}
+
+/// Value at `x` of the polynomial through `(xs[i], points[i])`, as
+/// Σ w_i · ∏_{k≠i} (x − x_k) · points[i]. Prefix and suffix products form each
+/// ∏_{k≠i} in O(|xs|) without inverting x − x_i, so an `x` equal to some x_k
+/// yields `points[k]`.
+fn interpolate_at<G: GoldenGroup>(
+    x: &G::Scalar,
+    xs: &[G::Scalar],
+    weights: &[G::Scalar],
+    points: &[&G::Element],
+) -> G::Element {
+    let mut suffixes = vec![G::Scalar::one(); xs.len()];
+    for i in (1..xs.len()).rev() {
+        suffixes[i - 1] = suffixes[i].mul(&x.sub(&xs[i]));
+    }
+    let mut prefix = G::Scalar::one();
+    let mut sum = G::identity();
+    for (((xi, weight), suffix), point) in xs.iter().zip(weights).zip(&suffixes).zip(points) {
+        let coefficient = weight.mul(&prefix).mul(suffix);
+        sum = G::add(&sum, &G::mul(point, &coefficient));
+        prefix = prefix.mul(&x.sub(xi));
+    }
+    sum
 }
 
 fn ensure_distinct_role_keys<G: GoldenGroup>(
@@ -1319,6 +1347,50 @@ mod tests {
             assert_eq!(
                 ResharePredecessor::<TinyGroup>::new(threshold, public_key, shares, [2; 32])
                     .unwrap_err(),
+                Error::InvalidPredecessor
+            );
+        }
+    }
+
+    #[test]
+    fn predecessor_validates_a_long_column() {
+        // Index 98 is index 1 mod 97: as an extra share it must equal the
+        // share at 1, and in the basis it leaves interpolation without an
+        // inverse.
+        let indexes = (1..=64).chain([98]).collect::<Vec<_>>();
+        let (public_key, shares) = column(32, &indexes);
+        let replace = |index: u32, value: TinyScalar| {
+            let mut changed = shares.clone();
+            changed.insert(idx(index), value);
+            changed
+        };
+        let generator = TinyGroup::generator();
+        for (threshold, accepted) in [(1, false), (32, true), (33, true), (64, true), (65, false)] {
+            assert_eq!(
+                ResharePredecessor::<TinyGroup>::new(
+                    threshold,
+                    public_key,
+                    shares.clone(),
+                    [2; 32]
+                )
+                .is_ok(),
+                accepted,
+                "threshold {threshold}"
+            );
+        }
+
+        let (_, degree_32) = column(33, &indexes);
+        for (public_key, shares) in [
+            (public_key.add(&generator), shares.clone()),
+            (public_key, replace(1, shares[&idx(1)].add(&generator))),
+            (public_key, replace(33, shares[&idx(33)].add(&generator))),
+            (public_key, replace(64, shares[&idx(64)].add(&generator))),
+            (public_key, replace(98, shares[&idx(98)].add(&generator))),
+            (public_key, replace(98, shares[&idx(2)])),
+            (public_key, degree_32),
+        ] {
+            assert_eq!(
+                ResharePredecessor::<TinyGroup>::new(32, public_key, shares, [2; 32]).unwrap_err(),
                 Error::InvalidPredecessor
             );
         }
