@@ -34,7 +34,7 @@
 //! - the reshare as the decryption run, whose key must stay `X`;
 //! - a zero sharing run by the new committee over the reshare's receiver
 //!   registry and threshold, whose session id is derived with
-//!   [`derive_context_session_id`] from the reshare configuration root.
+//!   [`derive_reshare_context_session_id`] from the reshare configuration root.
 //!
 //! The reshare configuration root fills [`SetupContext::decryption_session_id`].
 //! Records sealed under `X` open with the new committee, and decryption shares
@@ -242,7 +242,10 @@ pub use context::{
     SetupContext,
 };
 pub use decrypt::{Combiner, DecryptionShare, UnsealingShare};
-pub use dkg_bridge::{material_from_dkg_outputs, material_from_reshare_outputs, Ehtdh1Material};
+pub use dkg_bridge::{
+    derive_reshare_context_session_id, material_from_dkg_outputs, material_from_reshare_outputs,
+    Ehtdh1Material,
+};
 pub use encrypt::{Ciphertext, SealingKey};
 
 #[cfg(test)]

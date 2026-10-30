@@ -5,7 +5,8 @@
 use std::{collections::BTreeMap, fmt};
 
 use golden_core::{
-    DkgConfig, DkgOutput, GoldenHashToGroup, ParticipantRegistry, ReshareConfig, SessionId,
+    DkgConfig, DkgOutput, GoldenGroup, GoldenHashToGroup, ParticipantRegistry, ReshareConfig,
+    SessionId,
 };
 
 use crate::context::{
@@ -55,6 +56,7 @@ pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
         decryption_config.threshold,
         &decryption_config.registry,
         decryption_config.session_id,
+        derive_context_session_id(decryption_config.session_id),
         decryption_output,
         context_config,
         context_output,
@@ -68,9 +70,9 @@ pub fn material_from_dkg_outputs<G: GoldenHashToGroup>(
 /// The reshare is the decryption run. Its key must be the predecessor's key
 /// `X`, so the sealing key does not change. The context run is a plain zero
 /// sharing DKG by the new committee over `reshare_config.receivers()` at
-/// threshold `reshare_config.threshold()`, with session
-/// `derive_context_session_id(SessionId(reshare_config.root()))`. The reshare
-/// configuration root stands in for the decryption session:
+/// threshold `reshare_config.threshold()`, with the session id that
+/// [`derive_reshare_context_session_id`] derives from the reshare
+/// configuration root. That root stands in for the decryption session:
 /// [`SetupContext::decryption_session_id`] holds it, so the context run is
 /// bound to the declared dealers, both registries, the threshold, beta and
 /// the predecessor, not only to the reshare session id.
@@ -91,6 +93,7 @@ pub fn material_from_reshare_outputs<G: GoldenHashToGroup>(
         reshare_config.threshold(),
         reshare_config.receivers(),
         SessionId(reshare_config.root()),
+        derive_reshare_context_session_id(reshare_config),
         reshare_output,
         context_config,
         context_output,
@@ -98,11 +101,20 @@ pub fn material_from_reshare_outputs<G: GoldenHashToGroup>(
     )
 }
 
-/// Pair a decryption run over `registry` at `threshold` with its context run.
+/// Session id of the EHTDH1 context run that pairs with the reshare under
+/// `config`: [`derive_context_session_id`] of its configuration root.
+pub fn derive_reshare_context_session_id<G: GoldenGroup>(config: &ReshareConfig<G>) -> SessionId {
+    derive_context_session_id(SessionId(config.root()))
+}
+
+/// Pair a decryption run over `registry` at `threshold` with its context run
+/// under `context_session_id`.
+#[allow(clippy::too_many_arguments)]
 fn material_from_runs<G: GoldenHashToGroup>(
     threshold: usize,
     registry: &ParticipantRegistry<G>,
     decryption_session_id: SessionId,
+    context_session_id: SessionId,
     decryption_output: &DkgOutput<G>,
     context_config: &DkgConfig<G>,
     context_output: &DkgOutput<G>,
@@ -114,7 +126,7 @@ fn material_from_runs<G: GoldenHashToGroup>(
     if registry.root() != context_config.registry.root() {
         return Err(Error::InvalidBridge("registry root mismatch"));
     }
-    if context_config.session_id != derive_context_session_id(decryption_session_id) {
+    if context_config.session_id != context_session_id {
         return Err(Error::InvalidBridge("context session mismatch"));
     }
     if decryption_output.secret_share.participant != context_output.secret_share.participant {

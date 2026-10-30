@@ -11,9 +11,9 @@ use golden_core::{
     ParticipantIndex, ParticipantRegistry, ReshareConfig, ResharePredecessor, SessionId,
 };
 use golden_ehtdh1::{
-    derive_context_session_id, material_from_dkg_outputs, material_from_reshare_outputs,
-    Ciphertext, CombineError, Combiner, DecryptionShare, Ehtdh1Material, Error, SetupContext,
-    UnsealingShare,
+    derive_context_session_id, derive_reshare_context_session_id, material_from_dkg_outputs,
+    material_from_reshare_outputs, Ciphertext, CombineError, Combiner, DecryptionShare,
+    Ehtdh1Material, Error, SetupContext, UnsealingShare,
 };
 use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
@@ -387,7 +387,7 @@ fn registry(generation: u64, members: &[u32]) -> ParticipantRegistry<G> {
 fn reshare_context_config(config: &ReshareConfig<G>) -> DkgConfig<G> {
     DkgConfig::new(
         config.threshold(),
-        derive_context_session_id(SessionId(config.root())),
+        derive_reshare_context_session_id(config),
         scalar(77),
         config.receivers().clone(),
     )
@@ -675,10 +675,12 @@ fn assert_successor(previous: &Generation, next: &Generation, config: &ReshareCo
         .copied()
         .eq(config.receivers().indexes()));
     assert_eq!(setup.decryption_session_id, decryption_session_id);
+    let context_session_id = derive_reshare_context_session_id(config);
     assert_eq!(
-        setup.context_session_id,
+        context_session_id,
         derive_context_session_id(decryption_session_id)
     );
+    assert_eq!(setup.context_session_id, context_session_id);
     assert_eq!(
         setup.decryption_transcript_root,
         next.outputs.values().next().unwrap().transcript_root
@@ -1032,8 +1034,8 @@ mod secp_secq {
         SessionId,
     };
     use golden_ehtdh1::{
-        derive_context_session_id, material_from_dkg_outputs, material_from_reshare_outputs,
-        Combiner, SealingKey, UnsealingShare,
+        derive_context_session_id, derive_reshare_context_session_id, material_from_dkg_outputs,
+        material_from_reshare_outputs, Combiner, SealingKey, UnsealingShare,
     };
     use golden_evrf::paper::secp_secq::SecpSecqBackend;
     use golden_halo2curves::golden_group::{Secp256k1GoldenGroup, Secp256k1Scalar};
@@ -1269,7 +1271,7 @@ mod secp_secq {
             .collect();
         let context_config = DkgConfig::new(
             2,
-            derive_context_session_id(SessionId(reshare_config.root())),
+            derive_reshare_context_session_id(&reshare_config),
             scalar(77),
             receivers.clone(),
         )
