@@ -128,7 +128,9 @@
 //!    shares of different polynomials with the same X, and the key does not
 //!    show it.
 //! 5. **Fresh attempts.** A `SessionId` is used by at most one plain or
-//!    reshare configuration, ever, and each attempt uses fresh keys. Reason:
+//!    reshare configuration, ever, and each attempt uses fresh keys. No plain
+//!    session id equals a reshare configuration root, because the EHTDH1
+//!    bridge uses that root as the reshare's decryption session id. Reason:
 //!    the library does not detect a reused session or configuration root.
 //! 6. **Dealer secrets are share-equivalent.** Zeroize a dealer's identity
 //!    secret, encrypt it at rest if it is persisted to resend after a crash,
