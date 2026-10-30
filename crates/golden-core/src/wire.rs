@@ -21,8 +21,8 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     DealerMessage, DealerMessageNonce, DkgConfig, EncryptedShare, Error, FeldmanCommitment,
-    GoldenGroup, GoldenScalar, IdentityKeyProof, ParticipantIndex, ParticipantRegistry, Result,
-    SessionId, TranscriptRoot,
+    GoldenGroup, GoldenScalar, IdentityKeyProof, ParticipantIndex, ParticipantRegistry,
+    ReshareConfig, ResharePredecessor, Result, SessionId, TranscriptRoot,
 };
 
 /// Magic prefix for every standalone DKG wire value.
@@ -44,6 +44,8 @@ pub const TAG_DKG_CONFIG: u8 = 0x06;
 pub const TAG_DEALER_MESSAGE: u8 = 0x07;
 /// Standalone tag for [`IdentityKeyProof`].
 pub const TAG_IDENTITY_KEY_PROOF: u8 = 0x08;
+/// Standalone tag for [`ReshareConfig`].
+pub const TAG_RESHARE_CONFIG: u8 = 0x09;
 
 /// Encode a value into its nested canonical wire representation.
 pub trait WireEncode {
@@ -479,6 +481,97 @@ where
     }
 }
 
+impl<G: GoldenGroup> WireEncode for ResharePredecessor<G> {
+    fn write_wire(&self, out: &mut Vec<u8>) {
+        write_len(out, self.threshold());
+        write_element::<G>(out, self.public_key());
+        write_len(out, self.public_key_shares().len());
+        for (participant, share) in self.public_key_shares() {
+            participant.write_wire(out);
+            write_element::<G>(out, share);
+        }
+        self.completion_root().write_wire(out);
+    }
+}
+
+impl<G> WireDecode for ResharePredecessor<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
+        let threshold = reader.read_len()?;
+        let public_key = read_element::<G>(reader)?;
+        let len = reader.read_len()?;
+        reader.ensure_remaining_items(len, 4 + G::ELEMENT_REPR_BYTES)?;
+        let mut public_key_shares = BTreeMap::new();
+        let mut last = None;
+        for _ in 0..len {
+            let participant = ParticipantIndex::read_wire(reader)?;
+            ensure_increasing(&mut last, participant)?;
+            public_key_shares.insert(participant, read_element::<G>(reader)?);
+        }
+        let completion_root = TranscriptRoot::read_wire(reader)?;
+        Self::new(threshold, public_key, public_key_shares, completion_root)
+    }
+}
+
+impl<G: GoldenGroup> WireEncode for ReshareConfig<G> {
+    fn write_wire(&self, out: &mut Vec<u8>) {
+        write_len(out, self.threshold());
+        write_len(out, self.max_corrupt_receivers());
+        self.session_id().write_wire(out);
+        write_scalar::<G>(out, self.beta());
+        self.dealers().write_wire(out);
+        self.receivers().write_wire(out);
+        self.predecessor().write_wire(out);
+    }
+}
+
+impl<G> WireDecode for ReshareConfig<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn read_wire(reader: &mut WireReader<'_>) -> Result<Self> {
+        let threshold = reader.read_len()?;
+        let max_corrupt_receivers = reader.read_len()?;
+        let session_id = SessionId::read_wire(reader)?;
+        let beta = read_scalar::<G>(reader)?;
+        let dealers = ParticipantRegistry::read_wire(reader)?;
+        let receivers = ParticipantRegistry::read_wire(reader)?;
+        let predecessor = ResharePredecessor::read_wire(reader)?;
+        Self::new(
+            threshold,
+            max_corrupt_receivers,
+            session_id,
+            beta,
+            dealers,
+            receivers,
+            predecessor,
+        )
+    }
+}
+
+impl<G> WireMessage for ReshareConfig<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    const TAG: u8 = TAG_RESHARE_CONFIG;
+    const CODEC_ID: &'static str = "reshare-config-v1";
+
+    fn write_wire_context(out: &mut Vec<u8>) {
+        write_context_field(out, Self::CODEC_ID.as_bytes());
+        write_context_field(out, G::BACKEND_ID.as_bytes());
+    }
+
+    fn read_wire_context(reader: &mut WireReader<'_>) -> Result<()> {
+        expect_context_field(reader, Self::CODEC_ID.as_bytes())?;
+        expect_context_field(reader, G::BACKEND_ID.as_bytes())
+    }
+}
+
 impl<G: GoldenGroup> WireEncode for DealerMessage<G> {
     fn write_wire(&self, out: &mut Vec<u8>) {
         self.session_id.write_wire(out);
@@ -745,6 +838,34 @@ where
 }
 
 #[cfg(feature = "miden-serde")]
+impl<G> Serializable for ReshareConfig<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        write_miden_wire(self, target);
+    }
+
+    fn get_size_hint(&self) -> usize {
+        miden_wire_size_hint(self)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
+impl<G> Deserializable for ReshareConfig<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn read_from<R: ByteReader>(
+        source: &mut R,
+    ) -> core::result::Result<Self, DeserializationError> {
+        read_miden_wire(source)
+    }
+}
+
+#[cfg(feature = "miden-serde")]
 impl<G> Serializable for DealerMessage<G>
 where
     G: GoldenGroup,
@@ -947,6 +1068,28 @@ where
 
 #[cfg(feature = "serde")]
 impl<'de, G> Deserialize<'de> for DkgConfig<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        deserialize_wire(deserializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<G> Serialize for ReshareConfig<G>
+where
+    G: GoldenGroup,
+    G::ElementRepr: TryFrom<Vec<u8>>,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serialize_wire(self, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, G> Deserialize<'de> for ReshareConfig<G>
 where
     G: GoldenGroup,
     G::ElementRepr: TryFrom<Vec<u8>>,
@@ -1289,6 +1432,309 @@ mod tests {
     }
 
     #[test]
+    fn reshare_config_v1_fixed_wire_vector() {
+        let bytes = concat!(
+            "golden-dkg-wire-v3\x09", // Magic and reshare config tag.
+            "\x00\x00\x00\x00\x00\x00\x00\x11reshare-config-v1",
+            "\x00\x00\x00\x00\x00\x00\x00\x13golden-test-tiny-v1",
+            "\x00\x00\x00\x00\x00\x00\x00\x02", // Threshold.
+            "\x00\x00\x00\x00\x00\x00\x00\x01", // Max corrupt receivers.
+            "0123456789abcdef0123456789abcdef", // Session ID.
+            "\x07",                             // Beta.
+            "\x00\x00\x00\x00\x00\x00\x00\x02", // Dealer registry entry count.
+            "\x00\x00\x00\x01\x0b\x09\x19",     // Index, key, nonce point, response.
+            "\x01\x02\x03\x04\x0c\x3e\x5f",
+            "\x00\x00\x00\x00\x00\x00\x00\x03", // Receiver registry entry count.
+            "\x00\x00\x00\x01\x15\x2c\x03",
+            "\x00\x00\x00\x02\x16\x1e\x18",
+            "\x00\x00\x00\x03\x17\x5a\x5e",
+            "\x00\x00\x00\x00\x00\x00\x00\x02", // Predecessor threshold.
+            "\x03",                             // Predecessor key.
+            "\x00\x00\x00\x00\x00\x00\x00\x03", // Predecessor share count.
+            "\x00\x00\x00\x01\x0a",             // Index, public share.
+            "\x00\x00\x00\x02\x11",
+            "\x01\x02\x03\x04\x2e",
+            "fedcba9876543210fedcba9876543210", // Predecessor completion root.
+        )
+        .as_bytes();
+        // Fixed fields, including valid proofs for identity secrets 21, 22
+        // and 23 and the column of 3 + 7x. Do not regenerate these with the
+        // prover or wire encoder.
+        let receivers = ParticipantRegistry::new(
+            [(1, 21, 44, 3), (2, 22, 30, 24), (3, 23, 90, 94)]
+                .into_iter()
+                .map(|(participant, public_key, nonce_point, response)| {
+                    (
+                        idx(participant),
+                        TinyScalar::from_u64(public_key).unwrap(),
+                        IdentityKeyProof {
+                            nonce_point: TinyScalar::from_u64(nonce_point).unwrap(),
+                            response: TinyScalar::from_u64(response).unwrap(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let predecessor = ResharePredecessor::new(
+            2,
+            TinyScalar::from_u64(3).unwrap(),
+            [(1, 10), (2, 17), (0x0102_0304, 46)]
+                .map(|(participant, share)| {
+                    (idx(participant), TinyScalar::from_u64(share).unwrap())
+                })
+                .into(),
+            *b"fedcba9876543210fedcba9876543210",
+        )
+        .unwrap();
+        let expected = ReshareConfig::new(
+            2,
+            1,
+            SessionId(*b"0123456789abcdef0123456789abcdef"),
+            TinyScalar::from_u64(7).unwrap(),
+            fixed_registry(),
+            receivers,
+            predecessor,
+        )
+        .unwrap();
+
+        assert_eq!(
+            from_wire_bytes::<ReshareConfig<TinyGroup>>(bytes).unwrap(),
+            expected
+        );
+        assert_eq!(to_wire_bytes(&expected), bytes);
+    }
+
+    /// Reshare config fields, written by [`Self::to_bytes`] without
+    /// validation.
+    #[derive(Clone, Copy)]
+    struct ReshareConfigFields {
+        threshold: usize,
+        max_corrupt_receivers: usize,
+        dealers: &'static [(u32, u64)],
+        receivers: &'static [(u32, u64)],
+        predecessor_threshold: usize,
+        public_key: u64,
+        column: &'static [(u32, u64)],
+    }
+
+    // A valid configuration over the column of 1 − x, whose share at 1 is the
+    // identity.
+    const VALID_RESHARE: ReshareConfigFields = ReshareConfigFields {
+        threshold: 2,
+        max_corrupt_receivers: 1,
+        dealers: &[(1, 11), (2, 12), (3, 13)],
+        receivers: &[(1, 21), (2, 22), (3, 23)],
+        predecessor_threshold: 2,
+        public_key: 1,
+        column: &[(1, 0), (2, 96), (3, 95)],
+    };
+
+    fn tiny(value: u64) -> TinyScalar {
+        TinyScalar::from_u64(value).unwrap()
+    }
+
+    fn registry(entries: &[(u32, u64)]) -> ParticipantRegistry<TinyGroup> {
+        ParticipantRegistry::new(
+            entries
+                .iter()
+                .map(|(participant, secret)| registry_entry(idx(*participant), *secret))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    impl ReshareConfigFields {
+        fn to_bytes(self) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(MAGIC);
+            bytes.push(TAG_RESHARE_CONFIG);
+            <ReshareConfig<TinyGroup> as WireMessage>::write_wire_context(&mut bytes);
+            write_len(&mut bytes, self.threshold);
+            write_len(&mut bytes, self.max_corrupt_receivers);
+            SessionId([1u8; 32]).write_wire(&mut bytes);
+            write_scalar::<TinyGroup>(&mut bytes, &tiny(7));
+            registry(self.dealers).write_wire(&mut bytes);
+            registry(self.receivers).write_wire(&mut bytes);
+            write_len(&mut bytes, self.predecessor_threshold);
+            write_element::<TinyGroup>(&mut bytes, &tiny(self.public_key));
+            write_len(&mut bytes, self.column.len());
+            for (participant, share) in self.column {
+                write_u32(&mut bytes, *participant);
+                write_element::<TinyGroup>(&mut bytes, &tiny(*share));
+            }
+            bytes.extend_from_slice(&[2u8; 32]);
+            bytes
+        }
+
+        fn decode(self) -> Result<ReshareConfig<TinyGroup>> {
+            from_wire_bytes(&self.to_bytes())
+        }
+    }
+
+    fn reshare_config() -> ReshareConfig<TinyGroup> {
+        let fields = VALID_RESHARE;
+        ReshareConfig::new(
+            fields.threshold,
+            fields.max_corrupt_receivers,
+            SessionId([1u8; 32]),
+            tiny(7),
+            registry(fields.dealers),
+            registry(fields.receivers),
+            ResharePredecessor::new(
+                fields.predecessor_threshold,
+                tiny(fields.public_key),
+                fields
+                    .column
+                    .iter()
+                    .map(|(participant, share)| (idx(*participant), tiny(*share)))
+                    .collect(),
+                [2u8; 32],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reshare_config_round_trips() {
+        let config = reshare_config();
+        let bytes = to_wire_bytes(&config);
+
+        assert_eq!(VALID_RESHARE.to_bytes(), bytes);
+        let decoded = from_wire_bytes::<ReshareConfig<TinyGroup>>(&bytes).unwrap();
+        assert_eq!(decoded, config);
+        assert_eq!(decoded.root(), config.root());
+        assert_eq!(
+            decoded.predecessor().public_key_share(idx(1)),
+            Some(&TinyGroup::identity())
+        );
+    }
+
+    #[test]
+    fn reshare_config_decode_reruns_validation() {
+        for (fields, expected) in [
+            (
+                ReshareConfigFields {
+                    column: &[(1, 0), (2, 96), (3, 94)],
+                    ..VALID_RESHARE
+                },
+                Error::InvalidPredecessor,
+            ),
+            (
+                ReshareConfigFields {
+                    public_key: 2,
+                    ..VALID_RESHARE
+                },
+                Error::InvalidPredecessor,
+            ),
+            (
+                ReshareConfigFields {
+                    predecessor_threshold: 4,
+                    ..VALID_RESHARE
+                },
+                Error::InvalidPredecessor,
+            ),
+            (
+                ReshareConfigFields {
+                    threshold: 4,
+                    ..VALID_RESHARE
+                },
+                Error::InvalidThreshold {
+                    threshold: 4,
+                    participants: 3,
+                },
+            ),
+            (
+                ReshareConfigFields {
+                    max_corrupt_receivers: 2,
+                    ..VALID_RESHARE
+                },
+                Error::InsecureReshareThreshold {
+                    threshold: 2,
+                    max_corrupt_receivers: 2,
+                },
+            ),
+            (
+                ReshareConfigFields {
+                    threshold: 3,
+                    ..VALID_RESHARE
+                },
+                Error::InsufficientHonestReceivers {
+                    threshold: 3,
+                    receivers: 3,
+                    max_corrupt_receivers: 1,
+                },
+            ),
+            (
+                ReshareConfigFields {
+                    dealers: &[(1, 11), (4, 14)],
+                    ..VALID_RESHARE
+                },
+                Error::InvalidReshareConfiguration,
+            ),
+            (
+                ReshareConfigFields {
+                    receivers: VALID_RESHARE.dealers,
+                    ..VALID_RESHARE
+                },
+                Error::ReshareKeyCollision {
+                    dealer: 1,
+                    receiver: 1,
+                },
+            ),
+        ] {
+            assert_eq!(fields.decode().unwrap_err(), expected);
+        }
+
+        // Swapped registries are valid here, under a different root.
+        let swapped = ReshareConfigFields {
+            dealers: VALID_RESHARE.receivers,
+            receivers: VALID_RESHARE.dealers,
+            ..VALID_RESHARE
+        }
+        .decode()
+        .unwrap();
+        assert_eq!(swapped.dealers(), reshare_config().receivers());
+        assert_ne!(swapped.root(), reshare_config().root());
+    }
+
+    #[test]
+    fn reshare_config_rejects_non_increasing_columns() {
+        for (column, duplicate) in [
+            (&[(1, 0), (3, 95), (2, 96)][..], 2),
+            (&[(1, 0), (1, 0), (2, 96)][..], 1),
+        ] {
+            let fields = ReshareConfigFields {
+                column,
+                ..VALID_RESHARE
+            };
+            assert_eq!(
+                fields.decode().unwrap_err(),
+                Error::DuplicateParticipantIndex(duplicate)
+            );
+        }
+    }
+
+    #[test]
+    fn reshare_config_rejects_trailing_and_truncated_bytes() {
+        let bytes = to_wire_bytes(&reshare_config());
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            from_wire_bytes::<ReshareConfig<TinyGroup>>(&trailing).unwrap_err(),
+            Error::InvalidEncoding
+        );
+        for len in 0..bytes.len() {
+            assert_eq!(
+                from_wire_bytes::<ReshareConfig<TinyGroup>>(&bytes[..len]).unwrap_err(),
+                Error::InvalidEncoding
+            );
+        }
+    }
+
+    #[test]
     fn identity_key_proof_round_trips() {
         let (_, _, proof) = registry_entry(idx(1), 11);
 
@@ -1540,5 +1986,32 @@ mod tests {
         assert!(declared_len > 8);
         let mut budgeted = BudgetedReader::new(SliceReader::new(&bytes), 8);
         assert!(read_miden_wire::<DealerMessage<TinyGroup>, _>(&mut budgeted).is_err());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn reshare_config_serde_uses_canonical_wire_bytes() {
+        use serde_test::{assert_tokens, Token};
+
+        let config = reshare_config();
+        let bytes: &'static [u8] = Box::leak(to_wire_bytes(&config).into_boxed_slice());
+
+        assert_tokens(&config, &[Token::Bytes(bytes)]);
+    }
+
+    #[cfg(feature = "miden-serde")]
+    #[test]
+    fn reshare_config_miden_serde_uses_canonical_wire_bytes() {
+        use miden_serde_utils::{Deserializable, Serializable};
+
+        let config = reshare_config();
+        let bytes = config.to_bytes();
+
+        assert!(bytes.ends_with(&to_wire_bytes(&config)));
+        assert_eq!(bytes.len(), config.get_size_hint());
+        assert_eq!(
+            ReshareConfig::<TinyGroup>::read_from_bytes(&bytes).unwrap(),
+            config
+        );
     }
 }
