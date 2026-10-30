@@ -301,8 +301,9 @@ where
 }
 
 /// Reshare dealers 1 and 3 to receivers 1, 2 and 4, raising the threshold
-/// from 2 to 3. Every proof has the reshare shape (t_new, n_new) = (3, 3),
-/// whose wire length `wire_len` gives.
+/// from 2 to 3. For every dealing, the proof length matches shape
+/// (t_new, n_new) = (3, 3), whose wire length `wire_len` gives, and
+/// verification passes under that shape's parameters.
 pub fn three_receiver_reshare_raises_the_threshold<G, B>(
     wire_len: fn(usize, usize) -> Result<usize>,
 ) where

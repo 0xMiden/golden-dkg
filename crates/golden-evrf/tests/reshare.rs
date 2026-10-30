@@ -13,8 +13,8 @@ use golden_core::{
     aggregate_reshare_public, complete, complete_reshare, create_dealing, create_reshare_dealing,
     lagrange_interpolate_at_zero, reconstruct_secret, verify_reshare_dealing,
     verify_reshare_dealing_for_receiver, verify_reshare_dealings, DealerMessage, DkgConfig,
-    DkgOutput, Error, GoldenGroup, GoldenScalar, IdentityKeyProof, ParticipantIndex,
-    ParticipantRegistry, ReshareConfig, ResharePredecessor, SessionId, Share,
+    DkgOutput, Error, FeldmanCommitment, GoldenGroup, GoldenScalar, IdentityKeyProof,
+    ParticipantIndex, ParticipantRegistry, ReshareConfig, ResharePredecessor, SessionId, Share,
 };
 use golden_evrf::prototype::ShareOpeningBackend;
 use golden_rustcrypto::{P256Backend, P256Scalar};
@@ -511,7 +511,10 @@ fn reshare_completion_requires_every_declared_dealer() {
     assert_eq!(complete_with(&mislabeled), mismatch);
     assert_eq!(aggregate_with(&mislabeled), mismatch);
 
-    assert_eq!(complete_with(&board), aggregate_with(&board));
+    assert_eq!(
+        complete_with(&board).unwrap(),
+        aggregate_with(&board).unwrap()
+    );
 }
 
 #[test]
@@ -565,6 +568,7 @@ fn reshare_completion_rejects_wrong_credentials_and_boards() {
     assert_eq!(complete_with(&Board::new()), Error::MissingDealing(1));
 
     let other_session = plain.reshare_config(214, &[1, 2], &[2, 3, 4], 2);
+    assert_ne!(other_session.root(), config.root());
     let other_receivers = plain.reshare_config(114, &[1, 2], &[2, 3, 5], 2);
     assert_eq!(
         complete_with(&plain.dealings(&other_session, &mut rng(14, 2))),
@@ -579,4 +583,26 @@ fn reshare_completion_rejects_wrong_credentials_and_boards() {
         complete_with(&tamper(&board, idx(1))),
         Error::DealerProofVerificationFailed(1)
     );
+
+    // A constant other than Y_1 under a matching dealing root reaches the
+    // C_0 comparison.
+    let dealer = idx(1);
+    let mut shifted = board.clone();
+    let message = shifted.get_mut(&dealer).unwrap();
+    let mut coefficients = message.commitment.coefficients().to_vec();
+    coefficients[0] = P256Backend::add(&coefficients[0], &P256Backend::generator());
+    message.commitment = FeldmanCommitment::from_coefficients(coefficients).unwrap();
+    message.transcript_root = message.recompute_transcript_root();
+    let mismatch = Error::ReshareConstantMismatch(dealer.get());
+    assert_eq!(
+        verify_reshare_dealing::<P256Backend, ShareOpeningBackend>(&shifted[&dealer], &config)
+            .unwrap_err(),
+        mismatch
+    );
+    assert_eq!(
+        verify_reshare_dealings::<P256Backend, ShareOpeningBackend>(&messages(&shifted), &config)
+            .unwrap_err(),
+        mismatch
+    );
+    assert_eq!(complete_with(&shifted), mismatch);
 }
