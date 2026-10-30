@@ -95,6 +95,14 @@ required-features = ["bls12-381-jubjub"]
 name = "bls_paper_public_api"
 required-features = ["bls12-381-jubjub"]
 
+[[test]]
+name = "reshare_paper"
+required-features = ["halo2curves-secp256k1"]
+
+[[test]]
+name = "bls_reshare_paper"
+required-features = ["bls12-381-jubjub"]
+
 [[bench]]
 name = "evrf_prove"
 harness = false
